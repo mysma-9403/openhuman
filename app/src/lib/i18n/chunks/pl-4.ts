@@ -243,10 +243,8 @@ const pl4: TranslationMap = {
   'pages.settings.features.screenAwarenessDesc':
     'Uprawnienia, monitorowanie i sesje przechwytywania ekranu',
   'pages.settings.features.tools': 'Narzędzia',
-  'pages.settings.features.toolsDesc':
-    'Wybierz, z jakich możliwości OpenHuman może korzystać',
-  'pages.settings.featuresSection.description':
-    'Świadomość ekranu, komunikacja i narzędzia.',
+  'pages.settings.features.toolsDesc': 'Wybierz, z jakich możliwości OpenHuman może korzystać',
+  'pages.settings.featuresSection.description': 'Świadomość ekranu, komunikacja i narzędzia.',
   'pages.settings.featuresSection.title': 'Funkcje',
   // privacy
   'privacy.dataKind.credentials': 'Poświadczenia',
@@ -329,8 +327,7 @@ const pl4: TranslationMap = {
   'rewards.referralSection.statusCompleted': 'Zakończone',
   'rewards.referralSection.statusExpired': 'Wygasłe',
   'rewards.referralSection.statusJoined': 'Dołączył(a)',
-  'rewards.referralSection.subtitle':
-    'Zaproś znajomych do OpenHuman i zarabiajcie kredyty razem.',
+  'rewards.referralSection.subtitle': 'Zaproś znajomych do OpenHuman i zarabiajcie kredyty razem.',
   'rewards.referralSection.title': 'Zapraszaj znajomych, zarabiaj kredyty',
   'rewards.referralSection.totalEarned': 'Łącznie zarobione',
   'rewards.referralSection.yourCode': 'Twój kod',
@@ -339,8 +336,7 @@ const pl4: TranslationMap = {
   'settings.ai.addProvider': 'Zapisywanie…',
   'settings.ai.apiKeyFieldLabel': 'Klucz API',
   'settings.ai.apiKeyRequired': 'Wklej swój klucz API, aby kontynuować.',
-  'settings.ai.apiKeyStoredEncrypted':
-    'Klucz API przechowywany w postaci zaszyfrowanej',
+  'settings.ai.apiKeyStoredEncrypted': 'Klucz API przechowywany w postaci zaszyfrowanej',
   'settings.ai.apiKeysEncrypted': 'auth-profiles.json',
   'settings.ai.clearStoredKey': 'Wyczyść zapisany klucz',
   'settings.ai.connectProvider': 'Połącz dostawcę',
@@ -349,8 +345,7 @@ const pl4: TranslationMap = {
   'settings.ai.discard': 'Odrzuć',
   'settings.ai.editProvider': 'Edytuj dostawcę',
   'settings.ai.llmProviders': 'Dostawcy LLM',
-  'settings.ai.llmProvidersDesc':
-    'Skonfiguruj dostawców chmurowych i lokalnych modeli językowych.',
+  'settings.ai.llmProvidersDesc': 'Skonfiguruj dostawców chmurowych i lokalnych modeli językowych.',
   'settings.ai.localOllama': 'Lokalny (Ollama)',
   'settings.ai.modelLabel': 'Model',
   'settings.ai.noCustomProviders': 'Brak własnych dostawców',
@@ -402,14 +397,12 @@ const pl4: TranslationMap = {
     'Brak zaakceptowanych uzupełnień. Akceptuj sugestie Tabem, aby rozpocząć personalizację.',
   'settings.autocomplete.completionStyle.overlayTtl': 'TTL nakładki (ms)',
   'settings.autocomplete.completionStyle.personalizationHistory': 'Historia personalizacji',
-  'settings.autocomplete.completionStyle.styleExamples':
-    'Przykłady stylu (jeden w wierszu)',
+  'settings.autocomplete.completionStyle.styleExamples': 'Przykłady stylu (jeden w wierszu)',
   'settings.autocomplete.completionStyle.styleInstructions': 'Instrukcje stylu',
   // settings.billing.autoRecharge
   'settings.billing.autoRecharge.addAmount': 'Dodaj tę kwotę',
   'settings.billing.autoRecharge.addCard': 'Dodaj kartę',
-  'settings.billing.autoRecharge.amountHint':
-    'Minimalna kwota doładowania to równowartość 5 USD.',
+  'settings.billing.autoRecharge.amountHint': 'Minimalna kwota doładowania to równowartość 5 USD.',
   'settings.billing.autoRecharge.defaultCard': 'Karta domyślna',
   'settings.billing.autoRecharge.lastRechargeFailed': 'Ostatnie doładowanie nie powiodło się',
   'settings.billing.autoRecharge.lastRecharged': 'Ostatnio doładowano',
@@ -444,8 +437,7 @@ const pl4: TranslationMap = {
   // settings.billing.payAsYouGo
   'settings.billing.payAsYouGo.available': 'Dostępne',
   'settings.billing.payAsYouGo.chargeCustomAmount': 'Otwieranie…',
-  'settings.billing.payAsYouGo.chooseTopUpDesc':
-    'Wybierz kwotę doładowania lub wprowadź własną.',
+  'settings.billing.payAsYouGo.chooseTopUpDesc': 'Wybierz kwotę doładowania lub wprowadź własną.',
   'settings.billing.payAsYouGo.chooseTopUpTitle': 'Wybierz kwotę doładowania',
   'settings.billing.payAsYouGo.creditBalanceDesc':
     'Twoje aktualne saldo kredytów dostępne do użycia.',

@@ -50,7 +50,8 @@ const pl2: TranslationMap = {
     'Zmiany subskrypcji, metody płatności, kredyty i faktury są teraz zarządzane w TinyHumans w sieci.',
   'settings.billing.backToSettings': 'Powrót do ustawień',
   'settings.billing.openingBrowser': 'Otwieranie przeglądarki...',
-  'settings.billing.browserNotOpen': 'Jeśli przeglądarka się nie otworzyła, użyj przycisku powyżej.',
+  'settings.billing.browserNotOpen':
+    'Jeśli przeglądarka się nie otworzyła, użyj przycisku powyżej.',
   'settings.billing.browserOpenFailed':
     'Nie udało się otworzyć przeglądarki automatycznie. Użyj przycisku powyżej.',
   // settings.tools
@@ -146,8 +147,7 @@ const pl2: TranslationMap = {
   'mnemonic.securingData': 'Zabezpieczanie Twoich danych...',
   'mnemonic.saveRecoveryPhrase': 'Zapisz frazę odzyskiwania',
   'mnemonic.userNotLoaded': 'Użytkownik nie wczytany. Zaloguj się ponownie lub odśwież stronę.',
-  'mnemonic.invalidPhrase':
-    'Nieprawidłowa fraza odzyskiwania. Sprawdź słowa i spróbuj ponownie.',
+  'mnemonic.invalidPhrase': 'Nieprawidłowa fraza odzyskiwania. Sprawdź słowa i spróbuj ponownie.',
   'mnemonic.somethingWentWrong': 'Coś poszło nie tak. Spróbuj ponownie.',
   // team
   'team.failedToCreate': 'Nie udało się utworzyć zespołu',
@@ -184,8 +184,7 @@ const pl2: TranslationMap = {
   // voice
   'voice.title': 'Dyktowanie głosowe',
   'voice.settings': 'Ustawienia głosu',
-  'voice.settingsDesc':
-    'Przytrzymaj skrót, aby dyktować i wstawiać tekst do aktywnego pola.',
+  'voice.settingsDesc': 'Przytrzymaj skrót, aby dyktować i wstawiać tekst do aktywnego pola.',
   'voice.hotkey': 'Skrót klawiszowy',
   'voice.activationMode': 'Tryb aktywacji',
   'voice.tapToToggle': 'Dotknij, aby przełączyć',
@@ -218,7 +217,8 @@ const pl2: TranslationMap = {
   'autocomplete.style.formal': 'Formalny',
   'autocomplete.style.casual': 'Swobodny',
   'autocomplete.style.custom': 'Własny',
-  'autocomplete.disabledApps': 'Wyłączone aplikacje (jeden identyfikator pakietu/aplikacji w wierszu)',
+  'autocomplete.disabledApps':
+    'Wyłączone aplikacje (jeden identyfikator pakietu/aplikacji w wierszu)',
   'autocomplete.saveSettings': 'Zapisz ustawienia',
   'autocomplete.saving': 'Zapisywanie…',
   'autocomplete.runtime': 'Środowisko',
@@ -424,8 +424,7 @@ const pl2: TranslationMap = {
   'insights.opinions': 'Opinie',
   // devOptions menu (#2225)
   'devOptions.menuAi': 'Konfiguracja AI',
-  'devOptions.menuAiDesc':
-    'Dostawcy chmurowi, lokalne modele Ollama i trasowanie per workload',
+  'devOptions.menuAiDesc': 'Dostawcy chmurowi, lokalne modele Ollama i trasowanie per workload',
   'devOptions.menuScreenAware': 'Świadomość ekranu',
   'devOptions.menuScreenAwareDesc':
     'Uprawnienia do przechwytywania ekranu, polityka monitorowania i kontrola sesji',
@@ -436,8 +435,7 @@ const pl2: TranslationMap = {
   'devOptions.menuToolsDesc':
     'Włącz lub wyłącz możliwości, z których OpenHuman może korzystać w Twoim imieniu',
   'devOptions.menuAgentChat': 'Czat z agentem',
-  'devOptions.menuAgentChatDesc':
-    'Testuj rozmowę z agentem z nadpisaniem modelu i temperatury',
+  'devOptions.menuAgentChatDesc': 'Testuj rozmowę z agentem z nadpisaniem modelu i temperatury',
   'devOptions.menuCronJobs': 'Zadania cron',
   'devOptions.menuCronJobsDesc':
     'Przeglądaj i konfiguruj zaplanowane zadania dla umiejętności runtime',
@@ -448,8 +446,7 @@ const pl2: TranslationMap = {
   'devOptions.menuWebhooksDebugDesc':
     'Sprawdź rejestracje webhooków w runtime i logi przechwyconych żądań',
   'devOptions.menuIntelligence': 'Inteligencja',
-  'devOptions.menuIntelligenceDesc':
-    'Przestrzeń pamięci, silnik podświadomości, sny i ustawienia',
+  'devOptions.menuIntelligenceDesc': 'Przestrzeń pamięci, silnik podświadomości, sny i ustawienia',
   'devOptions.menuNotificationRouting': 'Trasowanie powiadomień',
   'devOptions.menuNotificationRoutingDesc':
     'Punktacja ważności AI i eskalacja przez orkiestrator dla alertów integracji',

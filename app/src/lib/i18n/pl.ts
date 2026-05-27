@@ -17,7 +17,8 @@ const pl: TranslationMap = {
   'skills.composio.noApiKeyDescription':
     'W trybie lokalnym używany jest Twój własny klucz API Composio. Otwórz Ustawienia → Zaawansowane → Composio, aby dodać klucz, zanim podłączysz tutaj integracje.',
   'skills.composio.noApiKeyCta': 'Otwórz ustawienia',
-  'channels.localManagedUnavailable': 'Kanały zarządzane są niedostępne dla użytkowników lokalnych.',
+  'channels.localManagedUnavailable':
+    'Kanały zarządzane są niedostępne dla użytkowników lokalnych.',
   'rewards.localUnavailable':
     'Logowanie lokalne nie zbiera nagród, voucherów ani środków z poleceń. Wyloguj się i zaloguj kontem OpenHuman, jeśli zależy Ci na nagrodach.',
   'rewards.localUnavailableCta': 'Otwórz ustawienia konta',

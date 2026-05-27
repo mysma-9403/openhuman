@@ -41,8 +41,7 @@ const pl5: TranslationMap = {
   'settings.composio.saving': 'Zapisywanie…',
   'settings.composio.switching': 'Przełączanie…',
   // settings.cron
-  'settings.cron.jobs.desc':
-    'Zadania cykliczne uruchamiane przez harmonogram rdzenia.',
+  'settings.cron.jobs.desc': 'Zadania cykliczne uruchamiane przez harmonogram rdzenia.',
   'settings.cron.jobs.empty': 'Nie znaleziono zadań cron rdzenia.',
   'settings.cron.jobs.lastStatus': 'Ostatni status',
   'settings.cron.jobs.loading': 'Wczytywanie zadań cron...',
@@ -63,8 +62,7 @@ const pl5: TranslationMap = {
   'settings.localModel.deviceCapability.appliedTier': 'Zastosowany poziom',
   'settings.localModel.deviceCapability.applying': 'Stosowanie',
   'settings.localModel.deviceCapability.cores': '{count}',
-  'settings.localModel.deviceCapability.couldNotLoadPresets':
-    'Nie udało się wczytać presetów',
+  'settings.localModel.deviceCapability.couldNotLoadPresets': 'Nie udało się wczytać presetów',
   'settings.localModel.deviceCapability.cpu': 'CPU',
   'settings.localModel.deviceCapability.customModelIds': 'Własne ID modeli',
   'settings.localModel.deviceCapability.detected': 'Wykryto',
@@ -74,8 +72,7 @@ const pl5: TranslationMap = {
   'settings.localModel.deviceCapability.downloadingModels': '(pobieranie modeli)',
   'settings.localModel.deviceCapability.downloadingSetupDesc':
     'Pobieranie instalatora OllamaSetup (~2 GB) i rozpakowywanie. Pierwsza instalacja może potrwać minutę.',
-  'settings.localModel.deviceCapability.failedToApplyPreset':
-    'Nie udało się zastosować presetu',
+  'settings.localModel.deviceCapability.failedToApplyPreset': 'Nie udało się zastosować presetu',
   'settings.localModel.deviceCapability.gpu': 'GPU',
   'settings.localModel.deviceCapability.installFailed': 'Instalacja Ollama nie powiodła się',
   'settings.localModel.deviceCapability.installFailedDesc':
@@ -86,8 +83,7 @@ const pl5: TranslationMap = {
   'settings.localModel.deviceCapability.installOllamaFirst':
     'Najpierw uruchom Ollamę, aby użyć tego poziomu',
   'settings.localModel.deviceCapability.installingOllama': 'Instalowanie Ollama',
-  'settings.localModel.deviceCapability.loadingDeviceInfo':
-    'Wczytywanie informacji o urządzeniu',
+  'settings.localModel.deviceCapability.loadingDeviceInfo': 'Wczytywanie informacji o urządzeniu',
   'settings.localModel.deviceCapability.localAiDisabled':
     'Lokalne AI wyłączone — używana jest rezerwa chmurowa.',
   'settings.localModel.deviceCapability.modelTier': 'Poziom modelu',
@@ -99,12 +95,10 @@ const pl5: TranslationMap = {
   'settings.localModel.deviceCapability.retrying': 'Ponawianie…',
   'settings.localModel.deviceCapability.starting': 'Uruchamianie…',
   // settings.localModel.download
-  'settings.localModel.download.audioPathPlaceholder':
-    'Bezwzględna ścieżka do pliku audio',
+  'settings.localModel.download.audioPathPlaceholder': 'Bezwzględna ścieżka do pliku audio',
   'settings.localModel.download.capabilityAssets': 'Zasoby możliwości',
   'settings.localModel.download.downloading': 'Pobieranie...',
-  'settings.localModel.download.embeddingPlaceholder':
-    'Jeden ciąg wejściowy w wierszu...',
+  'settings.localModel.download.embeddingPlaceholder': 'Jeden ciąg wejściowy w wierszu...',
   'settings.localModel.download.noThinkMode': 'Tryb bez myślenia',
   'settings.localModel.download.promptPlaceholder':
     'Wpisz dowolny prompt i uruchom go na modelu lokalnym...',
@@ -129,8 +123,7 @@ const pl5: TranslationMap = {
   'settings.localModel.download.ttsPlaceholder': 'Wprowadź tekst do syntezy...',
   'settings.localModel.download.visionImagePlaceholder':
     'Jedno odniesienie do obrazu w wierszu (data URI, URL lub marker lokalnej ścieżki)',
-  'settings.localModel.download.visionPromptPlaceholder':
-    'Wprowadź prompt dla modelu wizji...',
+  'settings.localModel.download.visionPromptPlaceholder': 'Wprowadź prompt dla modelu wizji...',
   // settings.localModel.status
   'settings.localModel.status.allChecksPassed': 'Wszystkie testy zaliczone',
   'settings.localModel.status.artifact': 'Artefakt',
@@ -140,8 +133,7 @@ const pl5: TranslationMap = {
   'settings.localModel.status.checking': 'Sprawdzanie...',
   'settings.localModel.status.checkingOllama': 'Sprawdzanie Ollama',
   'settings.localModel.status.customLocation': 'Własna lokalizacja',
-  'settings.localModel.status.customLocationDesc':
-    'Wskaż ręcznie ścieżkę do binarki Ollama.',
+  'settings.localModel.status.customLocationDesc': 'Wskaż ręcznie ścieżkę do binarki Ollama.',
   'settings.localModel.status.diagnosticsHint':
     'Kliknij „Uruchom diagnostykę”, aby zweryfikować, że Ollama działa i modele są zainstalowane.',
   'settings.localModel.status.downloadingUnknown': 'Pobieranie (rozmiar nieznany)',
@@ -172,8 +164,7 @@ const pl5: TranslationMap = {
   'settings.localModel.status.retryBootstrap': 'Ponów inicjalizację',
   'settings.localModel.status.runDiagnostics': 'Sprawdzanie...',
   'settings.localModel.status.running': 'Działa',
-  'settings.localModel.status.runningExternalProcess':
-    'Działa przez zewnętrzny proces',
+  'settings.localModel.status.runningExternalProcess': 'Działa przez zewnętrzny proces',
   'settings.localModel.status.runtimeStatus': 'Stan środowiska',
   'settings.localModel.status.server': 'Serwer',
   'settings.localModel.status.setPath': 'Ustawianie...',
@@ -222,15 +213,13 @@ const pl5: TranslationMap = {
   'settings.developerMenu.composeioTriggers.title': 'Wyzwalacze ComposeIO',
   'settings.developerMenu.composeioTriggers.desc':
     'Przeglądaj historię i archiwum wyzwalaczy ComposeIO',
-  'settings.developerMenu.composioRouting.title':
-    'Trasowanie Composio (tryb bezpośredni)',
+  'settings.developerMenu.composioRouting.title': 'Trasowanie Composio (tryb bezpośredni)',
   'settings.developerMenu.composioRouting.desc':
     'Użyj własnego klucza API Composio i kieruj wywołania bezpośrednio do backend.composio.dev',
   'settings.developerMenu.integrationTriggers.title': 'Wyzwalacze integracji',
   'settings.developerMenu.integrationTriggers.desc':
     'Konfiguruj ustawienia klasyfikacji AI dla wyzwalaczy integracji Composio',
-  'settings.appearance.menuDesc':
-    'Wybierz jasny, ciemny lub dopasowany do systemu motyw',
+  'settings.appearance.menuDesc': 'Wybierz jasny, ciemny lub dopasowany do systemu motyw',
   // settings.agentAccess
   'settings.agentAccess.title': 'Dostęp agenta do systemu',
   'settings.agentAccess.menuDesc':
@@ -268,8 +257,7 @@ const pl5: TranslationMap = {
   'settings.agentAccess.accessLevelLabel': 'Poziom dostępu',
   'settings.agentAccess.add': 'Dodaj',
   'settings.agentAccess.saving': 'Zapisywanie…',
-  'settings.agentAccess.changesApply':
-    'Zmiany zostaną zastosowane w następnej wiadomości.',
+  'settings.agentAccess.changesApply': 'Zmiany zostaną zastosowane w następnej wiadomości.',
   // settings.mascot
   'settings.mascot.active': 'Aktywny',
   'settings.mascot.characterDesc': 'Wybierz charakter maskotki OpenHuman.',
@@ -328,11 +316,9 @@ const pl5: TranslationMap = {
   'settings.memoryWindow.title': 'Okno pamięci długoterminowej',
   // settings.screenIntel
   'settings.screenIntel.permissions.accessibility': 'Dostępność',
-  'settings.screenIntel.permissions.grantHint':
-    'System otworzy okno żądania uprawnień.',
+  'settings.screenIntel.permissions.grantHint': 'System otworzy okno żądania uprawnień.',
   'settings.screenIntel.permissions.inputMonitoring': 'Monitorowanie wejścia',
-  'settings.screenIntel.permissions.macosAppliesPrivacy':
-    'macOS stosuje politykę prywatności do:',
+  'settings.screenIntel.permissions.macosAppliesPrivacy': 'macOS stosuje politykę prywatności do:',
   'settings.screenIntel.permissions.openInputMonitoring': 'Żądanie…',
   'settings.screenIntel.permissions.refreshStatus': 'Odświeżanie…',
   'settings.screenIntel.permissions.refreshing': 'Odświeżanie…',
@@ -395,8 +381,7 @@ const pl5: TranslationMap = {
   'skills.meetingBots.couldNotStartTitle': 'Nie udało się uruchomić OpenHuman',
   'skills.meetingBots.displayName': 'Wyświetlana nazwa',
   'skills.meetingBots.failedToStart': 'Nie udało się uruchomić OpenHuman.',
-  'skills.meetingBots.joiningMessage':
-    'Powinien pojawić się jako uczestnik w ciągu kilku sekund.',
+  'skills.meetingBots.joiningMessage': 'Powinien pojawić się jako uczestnik w ciągu kilku sekund.',
   'skills.meetingBots.joiningTitle': 'OpenHuman dołącza do spotkania',
   'skills.meetingBots.meetingLink': 'Link spotkania',
   'skills.meetingBots.modalAriaLabel': 'Wyślij OpenHuman na spotkanie',
@@ -428,25 +413,21 @@ const pl5: TranslationMap = {
   'skills.setup.autocomplete.stepEnable': 'Włącz uzupełnienia wierszowe',
   'skills.setup.autocomplete.stepSuccess': 'Gotowe',
   'skills.setup.autocomplete.stylePreset': 'Preset stylu',
-  'skills.setup.autocomplete.stylePresetValue':
-    'Zrównoważony (konfigurowalny później)',
+  'skills.setup.autocomplete.stylePresetValue': 'Zrównoważony (konfigurowalny później)',
   'skills.setup.autocomplete.title': 'Autouzupełnianie tekstu',
   // skills.setup.screenIntel
-  'skills.setup.screenIntel.activeDesc':
-    'Inteligencja ekranu działa. Wybrane okna są obserwowane.',
+  'skills.setup.screenIntel.activeDesc': 'Inteligencja ekranu działa. Wybrane okna są obserwowane.',
   'skills.setup.screenIntel.activeTitle': 'Inteligencja ekranu jest włączona',
   'skills.setup.screenIntel.advancedSettings': 'Ustawienia zaawansowane',
   'skills.setup.screenIntel.allGranted': 'Wszystkie uprawnienia przyznane',
   'skills.setup.screenIntel.captureMode': 'Tryb przechwytywania',
-  'skills.setup.screenIntel.captureModeValue':
-    'Wszystkie okna (konfigurowalne później)',
+  'skills.setup.screenIntel.captureModeValue': 'Wszystkie okna (konfigurowalne później)',
   'skills.setup.screenIntel.deniedHint':
     'Po przyznaniu uprawnień w Ustawieniach systemowych kliknij poniżej, aby zrestartować i odświeżyć zmiany.',
   'skills.setup.screenIntel.enableBtn': 'Włączanie...',
   'skills.setup.screenIntel.enableDesc':
     's na Twoim ekranie i dostarczają użytecznego kontekstu agentowi',
-  'skills.setup.screenIntel.enableError':
-    'Nie udało się włączyć inteligencji ekranu',
+  'skills.setup.screenIntel.enableError': 'Nie udało się włączyć inteligencji ekranu',
   'skills.setup.screenIntel.enabling': 'Włączanie...',
   'skills.setup.screenIntel.grant': 'Otwieranie...',
   'skills.setup.screenIntel.granted': 'Przyznano',
@@ -456,8 +437,7 @@ const pl5: TranslationMap = {
   'skills.setup.screenIntel.permAccessibility': 'Dostępność',
   'skills.setup.screenIntel.permInputMonitoring': 'Monitorowanie wejścia',
   'skills.setup.screenIntel.permScreenRecording': 'Nagrywanie ekranu',
-  'skills.setup.screenIntel.permissionsDesc':
-    'Inteligencja ekranu wymaga uprawnień systemowych:',
+  'skills.setup.screenIntel.permissionsDesc': 'Inteligencja ekranu wymaga uprawnień systemowych:',
   'skills.setup.screenIntel.refreshStatus': 'Odśwież status',
   'skills.setup.screenIntel.restartRefresh': 'Restartowanie...',
   'skills.setup.screenIntel.restarting': 'Restartowanie...',
@@ -473,8 +453,7 @@ const pl5: TranslationMap = {
   'skills.setup.voice.activeTitle': 'Inteligencja głosowa jest aktywna',
   'skills.setup.voice.customizeSettings': 'Dostosuj ustawienia',
   'skills.setup.voice.downloadSttBtn': 'Pobierz model STT',
-  'skills.setup.voice.enableDesc':
-    'Włącz dyktowanie głosowe i odpowiedzi głosowe.',
+  'skills.setup.voice.enableDesc': 'Włącz dyktowanie głosowe i odpowiedzi głosowe.',
   'skills.setup.voice.hotkey': 'Skrót klawiszowy',
   'skills.setup.voice.startBtn': 'Uruchamianie...',
   'skills.setup.voice.startError': 'Nie udało się uruchomić serwera głosowego',
@@ -496,8 +475,7 @@ const pl5: TranslationMap = {
   'skills.uninstall.uninstallBtn': 'Odinstaluj',
   'skills.uninstall.uninstalling': 'Odinstalowywanie…',
   // upsell
-  'upsell.global.limitMessage':
-    'Podnieś plan lub doładuj kredyty, aby kontynuować',
+  'upsell.global.limitMessage': 'Podnieś plan lub doładuj kredyty, aby kontynuować',
   'upsell.global.limitTitle': 'Ty',
   'upsell.global.nearLimitMessage':
     'Wykorzystano {pct}% limitu użycia. Podnieś plan, aby zwiększyć limity.',
@@ -552,8 +530,7 @@ const pl5: TranslationMap = {
   'composio.triggers.loading': 'Wczytywanie…',
   'conversations.taskKanban.todo': 'Do zrobienia',
   'settings.composio.loading': 'Wczytywanie…',
-  'settings.mascot.noCharactersAvailable':
-    'Nie ma jeszcze dostępnych postaci OpenHuman',
+  'settings.mascot.noCharactersAvailable': 'Nie ma jeszcze dostępnych postaci OpenHuman',
   'skills.uninstall.confirmTitle': 'Odinstalować {name}?',
   'conversations.taskKanban.blocked': 'Zablokowane',
   'conversations.taskKanban.done': 'Zrobione',
@@ -574,8 +551,7 @@ const pl5: TranslationMap = {
   'settings.appearance.modeLight': 'Jasny',
   'settings.appearance.modeLightDesc': 'Jasne powierzchnie, ciemny tekst.',
   'settings.appearance.modeDark': 'Ciemny',
-  'settings.appearance.modeDarkDesc':
-    'Przyciemnione powierzchnie, łatwiejsze dla oczu po zmroku.',
+  'settings.appearance.modeDarkDesc': 'Przyciemnione powierzchnie, łatwiejsze dla oczu po zmroku.',
   'settings.appearance.modeSystem': 'Dopasuj do systemu',
   'settings.appearance.modeSystemDesc':
     'Postępuj zgodnie z ustawieniem wyglądu Twojego systemu operacyjnego.',
@@ -604,8 +580,7 @@ const pl5: TranslationMap = {
   'settings.developerMenu.mcpServer.desc':
     'Skonfiguruj zewnętrznych klientów MCP do połączenia z OpenHumanem',
   'settings.developerMenu.autonomy.title': 'Autonomia agenta',
-  'settings.developerMenu.autonomy.desc':
-    'Limity szybkości akcji narzędzi i progi bezpieczeństwa',
+  'settings.developerMenu.autonomy.desc': 'Limity szybkości akcji narzędzi i progi bezpieczeństwa',
   // settings.mcpServer
   'settings.mcpServer.title': 'Serwer MCP',
   'settings.mcpServer.toolsSectionTitle': 'Dostępne narzędzia',
@@ -619,8 +594,7 @@ const pl5: TranslationMap = {
   'settings.mcpServer.openConfigFile': 'Otwórz plik konfiguracyjny',
   'settings.mcpServer.binaryPathNotFound':
     'Nie znaleziono pliku binarnego OpenHuman. Jeśli uruchamiasz ze źródeł, zbuduj: cargo build --bin openhuman-core',
-  'settings.mcpServer.openConfigError':
-    'Nie udało się otworzyć pliku konfiguracyjnego',
+  'settings.mcpServer.openConfigError': 'Nie udało się otworzyć pliku konfiguracyjnego',
   'settings.mcpServer.clientClaudeDesktop': 'Claude Desktop',
   'settings.mcpServer.clientCursor': 'Cursor',
   'settings.mcpServer.clientCodex': 'Codex',
@@ -638,8 +612,7 @@ const pl5: TranslationMap = {
   'settings.persona.displayNameLabel': 'Wyświetlana nazwa',
   'settings.persona.displayNamePlaceholder': 'np. Nova',
   'settings.persona.descriptionLabel': 'Opis',
-  'settings.persona.descriptionPlaceholder':
-    'np. Spokojny, zwięzły asystent dla mojego zespołu.',
+  'settings.persona.descriptionPlaceholder': 'np. Spokojny, zwięzły asystent dla mojego zespołu.',
   'settings.persona.soul.heading': 'Osobowość (SOUL.md)',
   'settings.persona.soul.desc':
     'Prompt osobowości, którym asystent kieruje się w każdej rozmowie. Edycje są zapisywane w Twojej przestrzeni roboczej i wchodzą w życie w następnej odpowiedzi.',
@@ -679,8 +652,7 @@ const pl5: TranslationMap = {
     'Wskaż lokalny folder; pliki są dzielone na fragmenty i zwierciadłowo odzwierciedlane w pamięci.',
   // calls (extras)
   'calls.title': 'Rozmowy',
-  'calls.comingSoonBody':
-    'Rozmowy wspomagane przez AI są już wkrótce. Pozostań w kontakcie.',
+  'calls.comingSoonBody': 'Rozmowy wspomagane przez AI są już wkrótce. Pozostań w kontakcie.',
   // art / dev / composio expired
   'art.rotatingTetrahedronAria': 'Obracający się odwrócony statek tetraedryczny',
   'devOptions.sentryDisabled': '(brak ID — Sentry wyłączone w tej kompilacji)',
@@ -695,8 +667,7 @@ const pl5: TranslationMap = {
   'settings.ai.plannerSummary':
     'Planner: {sourceEvents} zdarzeń źródłowych, {sent} wysłanych, {deduped} zdeduplikowanych.',
   'settings.ai.routeLabel': 'trasa: {route}',
-  'settings.ai.latestSpend':
-    'Ostatni wydatek: {amount} o {time} ({action})',
+  'settings.ai.latestSpend': 'Ostatni wydatek: {amount} o {time} ({action})',
   'settings.ai.topActions': 'Najczęstsze akcje',
   'settings.ai.noSpendRows': 'Brak załadowanych wierszy wydatków.',
   'settings.ai.topHours': 'Najczęstsze godziny',
@@ -715,13 +686,11 @@ const pl5: TranslationMap = {
   'settings.autocomplete.debug.acceptedPrefix': 'Zaakceptowano: {value}',
   'settings.autocomplete.debug.acceptFailed': 'Nie udało się zaakceptować sugestii',
   'settings.autocomplete.debug.alreadyRunning': 'Autouzupełnianie już działa.',
-  'settings.autocomplete.debug.clearHistoryFailed':
-    'Nie udało się wyczyścić historii',
+  'settings.autocomplete.debug.clearHistoryFailed': 'Nie udało się wyczyścić historii',
   'settings.autocomplete.debug.didNotStart': 'Autouzupełnianie nie wystartowało.',
   'settings.autocomplete.debug.disabledInSettings':
     'Autouzupełnianie jest wyłączone w ustawieniach. Włącz je i zapisz najpierw.',
-  'settings.autocomplete.debug.fetchSuggestionFailed':
-    'Nie udało się pobrać bieżącej sugestii',
+  'settings.autocomplete.debug.fetchSuggestionFailed': 'Nie udało się pobrać bieżącej sugestii',
   'settings.autocomplete.debug.inspectFocusedElementFailed':
     'Nie udało się zbadać aktywnego elementu',
   'settings.autocomplete.debug.loadSettingsFailed':
@@ -732,18 +701,15 @@ const pl5: TranslationMap = {
     'Nie udało się odświeżyć statusu autouzupełniania',
   'settings.autocomplete.debug.saveAdvancedSettingsFailed':
     'Nie udało się zapisać ustawień zaawansowanych',
-  'settings.autocomplete.debug.startFailed':
-    'Nie udało się uruchomić autouzupełniania',
-  'settings.autocomplete.debug.stopFailed':
-    'Nie udało się zatrzymać autouzupełniania',
+  'settings.autocomplete.debug.startFailed': 'Nie udało się uruchomić autouzupełniania',
+  'settings.autocomplete.debug.stopFailed': 'Nie udało się zatrzymać autouzupełniania',
   'settings.autocomplete.debug.suggestionPrefix': 'Sugestia: {value}',
   'settings.autocomplete.shared.none': 'Brak',
   'settings.autocomplete.shared.notApplicable': 'nd.',
   'settings.autocomplete.shared.unknown': 'Nieznane',
   // settings.billing.autoRecharge (more)
   'settings.billing.autoRecharge.expires': 'Wygasa {date}',
-  'settings.billing.autoRecharge.spentThisWeek':
-    'Wykorzystano ${spent} z ${limit} w tym tygodniu',
+  'settings.billing.autoRecharge.spentThisWeek': 'Wykorzystano ${spent} z ${limit} w tym tygodniu',
   // settings.localModel.deviceCapability (extras)
   'settings.localModel.deviceCapability.disabledLowercase': 'wyłączone',
   'settings.localModel.deviceCapability.presetDetails':
@@ -780,11 +746,9 @@ const pl5: TranslationMap = {
   'settings.localModel.status.notAvailable': 'nd.',
   'settings.mascot.customGifPlaceholder': 'https://example.com/avatar.gif',
   'settings.mascot.loadDetailError': 'Nie udało się wczytać maskotki.',
-  'settings.mascot.loadLibraryError':
-    'Nie udało się wczytać biblioteki maskotek.',
+  'settings.mascot.loadLibraryError': 'Nie udało się wczytać biblioteki maskotek.',
   'settings.mascot.voice.customPlaceholder': 'np. 21m00Tcm4TlvDq8ikWAM',
-  'settings.mascot.voice.previewText':
-    'Cześć, jestem Twoim asystentem. To jest podgląd głosu.',
+  'settings.mascot.voice.previewText': 'Cześć, jestem Twoim asystentem. To jest podgląd głosu.',
   // skills (channel icons / composio / create extras / install errors)
   'skills.channelIcon.discord': 'Discord',
   'skills.channelIcon.imessage': 'iMessage',
@@ -792,10 +756,8 @@ const pl5: TranslationMap = {
   'skills.channelIcon.web': 'Sieć',
   'skills.channelIcon.yuanbao': 'Yuanbao',
   'skills.composio.poweredBy': 'Napędzane przez Composio',
-  'skills.composio.staleStatusTitle':
-    'Połączenia pokazują nieaktualny status',
-  'skills.create.allowedToolsHelp':
-    'Renderowane do nagłówka frontmatter SKILL.md jako',
+  'skills.composio.staleStatusTitle': 'Połączenia pokazują nieaktualny status',
+  'skills.create.allowedToolsHelp': 'Renderowane do nagłówka frontmatter SKILL.md jako',
   'skills.create.allowedToolsPlaceholder': 'node_exec, fetch',
   'skills.create.licensePlaceholder': 'MIT',
   'skills.create.tagsPlaceholder': 'handel, badania',
@@ -811,10 +773,8 @@ const pl5: TranslationMap = {
   'skills.install.errors.fetchTooLargeHint':
     'SKILL.md musi mieć poniżej 1 MiB. Podziel dołączone zasoby na pliki `references/` lub `scripts/` zamiast wstawiać je inline.',
   'skills.install.errors.fetchTooLargeTitle': 'SKILL.md zbyt duży',
-  'skills.install.errors.genericHint':
-    'Backend zwrócił błąd. Surowa wiadomość pokazana poniżej.',
-  'skills.install.errors.genericTitle':
-    'Nie udało się zainstalować umiejętności',
+  'skills.install.errors.genericHint': 'Backend zwrócił błąd. Surowa wiadomość pokazana poniżej.',
+  'skills.install.errors.genericTitle': 'Nie udało się zainstalować umiejętności',
   'skills.install.errors.invalidSkillHint':
     'Frontmatter musi być poprawnym YAML-em z niepustymi polami `name` i `description`, zakończonym `---`.',
   'skills.install.errors.invalidSkillTitle': 'SKILL.md nie został sparsowany',
@@ -828,27 +788,23 @@ const pl5: TranslationMap = {
     'Katalog umiejętności w przestrzeni roboczej nie był zapisywalny. Sprawdź uprawnienia systemu plików dla `<workspace>/.openhuman/skills/`.',
   'skills.install.errors.writeFailedTitle': 'Nie udało się zapisać SKILL.md',
   'skills.install.fetchingPrefix': 'Pobieranie',
-  'skills.install.fetchingSuffix':
-    'może to potrwać do skonfigurowanego limitu czasu.',
+  'skills.install.fetchingSuffix': 'może to potrwać do skonfigurowanego limitu czasu.',
   'skills.install.subtitleMiddle': 'przez HTTPS i instaluje pod',
   'skills.install.subtitlePrefix': 'Pobiera pojedynczy',
-  'skills.install.subtitleSuffix':
-    'tylko HTTPS; prywatne i loopback hosty są zablokowane.',
+  'skills.install.subtitleSuffix': 'tylko HTTPS; prywatne i loopback hosty są zablokowane.',
   'skills.install.successDiscovered': 'Odkryto {count} nowych umiejętności.',
   'skills.install.successNoNewIds':
     'Umiejętność zainstalowana, ale nie pojawiły się nowe ID — katalog może już zawierać umiejętność z tym samym slugiem.',
   'skills.install.timeoutHelp':
     'Domyślnie 60 sekund. Wartości spoza zakresu 1-600 są ograniczane po stronie serwera.',
-  'skills.install.timeoutInvalid':
-    'Musi być liczbą całkowitą między 1 a 600.',
+  'skills.install.timeoutInvalid': 'Musi być liczbą całkowitą między 1 a 600.',
   'skills.install.timeoutPlaceholder': '60',
   'skills.install.urlHelpMiddle': 'plik.',
   'skills.install.urlHelpPrefix': 'Bezpośredni link do',
   'skills.install.urlHelpSuffix': 'URL-e przepisują się na',
   'skills.install.urlInvalidPrefix': 'URL musi być poprawnie sformułowanym',
   'skills.install.urlInvalidSuffix': 'linkiem.',
-  'skills.install.urlPlaceholder':
-    'https://raw.githubusercontent.com/owner/repo/main/SKILL.md',
+  'skills.install.urlPlaceholder': 'https://raw.githubusercontent.com/owner/repo/main/SKILL.md',
   'skills.meetingBots.platformComingSoon': 'Obsługa {label} jest już wkrótce.',
   'skills.meetingBots.platformHints.gmeet': 'meet.google.com/abc-defg-hij',
   'skills.meetingBots.platformHints.teams': 'teams.microsoft.com/...',
@@ -857,8 +813,7 @@ const pl5: TranslationMap = {
   'skills.meetingBots.platforms.teams': 'Microsoft Teams',
   'skills.meetingBots.platforms.zoom': 'Zoom',
   'skills.meetingBots.soonSuffix': 'wkrótce',
-  'skills.setup.screenIntel.permissionPathLabel':
-    'macOS stosuje politykę prywatności do:',
+  'skills.setup.screenIntel.permissionPathLabel': 'macOS stosuje politykę prywatności do:',
 };
 
 export default pl5;

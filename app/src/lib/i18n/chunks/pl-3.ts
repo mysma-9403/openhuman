@@ -195,8 +195,7 @@ const pl3: TranslationMap = {
   'bootCheck.unreachablePrefix': 'Nie udało się połączyć:',
   'bootCheck.checkingCore': 'Budzenie środowiska…',
   'bootCheck.cannotReach': 'Nie można połączyć się ze środowiskiem',
-  'bootCheck.cannotReachDesc':
-    'Nie udało się połączyć z Twoim środowiskiem. Spróbować innego?',
+  'bootCheck.cannotReachDesc': 'Nie udało się połączyć z Twoim środowiskiem. Spróbować innego?',
   'bootCheck.switchMode': 'Wybierz inne środowisko',
   'bootCheck.quit': 'Zakończ',
   'bootCheck.legacyDetected': 'Wykryto starsze środowisko w tle',
@@ -353,8 +352,7 @@ const pl3: TranslationMap = {
   'app.openhumanLink.accounts.continueWith': 'Kontynuuj z logowaniem {label}',
   'app.openhumanLink.accounts.done': 'Gotowe',
   'app.openhumanLink.accounts.intro': 'Podłącz konta, których używasz na co dzień.',
-  'app.openhumanLink.accounts.webviewNote':
-    'Każde konto otwiera się we własnym oknie webview.',
+  'app.openhumanLink.accounts.webviewNote': 'Każde konto otwiera się we własnym oknie webview.',
   'app.openhumanLink.billing.openDashboard': 'Otwórz panel',
   'app.openhumanLink.billing.stayOnTrial': 'Zostań w wersji próbnej',
   'app.openhumanLink.billing.trialCredit': 'Kredyt próbny',
@@ -362,7 +360,8 @@ const pl3: TranslationMap = {
     'Korzystasz z bezpłatnego okresu próbnego. Doładuj, aby kontynuować.',
   'app.openhumanLink.defaultBody':
     'Jeszcze nie gotowe w popupie. Otwórz pełną stronę ustawień, gdy będziesz potrzebować.',
-  'app.openhumanLink.discord.intro': 'Dołącz do społeczności, dziel się opiniami i bądź na bieżąco.',
+  'app.openhumanLink.discord.intro':
+    'Dołącz do społeczności, dziel się opiniami i bądź na bieżąco.',
   'app.openhumanLink.discord.openInvite': 'Otwórz zaproszenie',
   'app.openhumanLink.discord.perk1': 'Pomoc bezpośrednio od twórców',
   'app.openhumanLink.discord.perk2': 'Wczesny dostęp do nowych funkcji',
@@ -373,16 +372,12 @@ const pl3: TranslationMap = {
   'app.openhumanLink.maybeLater': 'Może później',
   'app.openhumanLink.notifications.asking': 'Pytanie systemu operacyjnego…',
   'app.openhumanLink.notifications.blocked': 'Zablokowane',
-  'app.openhumanLink.notifications.blockedStep1':
-    'Otwórz Ustawienia systemowe → Powiadomienia.',
-  'app.openhumanLink.notifications.blockedStep2':
-    'Znajdź OpenHuman na liście aplikacji.',
-  'app.openhumanLink.notifications.blockedStep3':
-    'Włącz „Zezwalaj na powiadomienia” i wróć tutaj.',
+  'app.openhumanLink.notifications.blockedStep1': 'Otwórz Ustawienia systemowe → Powiadomienia.',
+  'app.openhumanLink.notifications.blockedStep2': 'Znajdź OpenHuman na liście aplikacji.',
+  'app.openhumanLink.notifications.blockedStep3': 'Włącz „Zezwalaj na powiadomienia” i wróć tutaj.',
   'app.openhumanLink.notifications.intro':
     'Włącz powiadomienia, aby otrzymywać alerty od agenta i kanałów.',
-  'app.openhumanLink.notifications.promptHint':
-    'Twój system zapyta o zgodę za chwilę.',
+  'app.openhumanLink.notifications.promptHint': 'Twój system zapyta o zgodę za chwilę.',
   'app.openhumanLink.notifications.retry': 'Ponów powiadomienie testowe',
   'app.openhumanLink.notifications.send': 'Wyślij powiadomienie testowe',
   'app.openhumanLink.notifications.sendFailed': 'Nie udało się wysłać: {error}',
@@ -417,8 +412,7 @@ const pl3: TranslationMap = {
   'app.update.progress.installing': 'Instalowanie nowej wersji…',
   'app.update.progress.restarting': 'Uruchamianie aplikacji ponownie…',
   'app.update.progress.working': '{percent}%',
-  'app.update.restartNote':
-    'Restart zamknie wszystkie aktywne sesje czatu i wątki.',
+  'app.update.restartNote': 'Restart zamknie wszystkie aktywne sesje czatu i wątki.',
   'app.update.restartNow': 'Zrestartuj teraz',
   'app.update.versionReady': 'Wersja {newVersion} jest gotowa do instalacji.',
   // channels.discord
@@ -428,8 +422,7 @@ const pl3: TranslationMap = {
   'channels.discord.linkTokenInstruction': '{token}',
   'channels.discord.linkTokenLabel': 'Etykieta tokenu powiązania',
   'channels.discord.linkTokenOnce': 'Token jednorazowego powiązania',
-  'channels.discord.picker.allPermissionsOk':
-    'Bot ma wszystkie wymagane uprawnienia w tym kanale.',
+  'channels.discord.picker.allPermissionsOk': 'Bot ma wszystkie wymagane uprawnienia w tym kanale.',
   'channels.discord.picker.botNotInServers': 'Bot nie jest na serwerach',
   'channels.discord.picker.category': 'Kategoria',
   'channels.discord.picker.channel': 'Kanał',
@@ -458,15 +451,13 @@ const pl3: TranslationMap = {
   'chat.approval.deciding': 'Przetwarzanie…',
   'chat.approval.deny': 'Odrzuć',
   'chat.approval.error': 'Nie udało się zapisać decyzji — spróbuj ponownie.',
-  'chat.approval.fallback':
-    'Agent chce wykonać akcję wymagającą Twojej zgody.',
+  'chat.approval.fallback': 'Agent chce wykonać akcję wymagającą Twojej zgody.',
   'chat.approval.title': 'Wymagana zgoda',
   'chat.approval.tool': 'Narzędzie:',
   // channel displayNames + descriptions
   'channels.discord.displayName': 'Discord',
   'channels.discord.description': 'Wysyłaj i odbieraj wiadomości przez Discord.',
-  'channels.discord.authMode.bot_token.description':
-    'Podaj własny token bota Discord.',
+  'channels.discord.authMode.bot_token.description': 'Podaj własny token bota Discord.',
   'channels.discord.authMode.oauth.description':
     'Zainstaluj bota OpenHuman na swoim serwerze Discord przez OAuth.',
   'channels.discord.authMode.managed_dm.description':
@@ -474,8 +465,7 @@ const pl3: TranslationMap = {
   'channels.discord.fields.bot_token.label': 'Token bota',
   'channels.discord.fields.bot_token.placeholder': 'Twój token bota Discord',
   'channels.discord.fields.guild_id.label': 'ID serwera (gildii)',
-  'channels.discord.fields.guild_id.placeholder':
-    'Opcjonalne: ogranicz do konkretnego serwera',
+  'channels.discord.fields.guild_id.placeholder': 'Opcjonalne: ogranicz do konkretnego serwera',
   'channels.telegram.displayName': 'Telegram',
   'channels.telegram.description': 'Wysyłaj i odbieraj wiadomości przez Telegram.',
   'channels.telegram.authMode.managed_dm.description':
@@ -483,8 +473,7 @@ const pl3: TranslationMap = {
   'channels.telegram.authMode.bot_token.description':
     'Podaj własny token bota Telegram z @BotFather.',
   'channels.telegram.fields.bot_token.label': 'Token bota',
-  'channels.telegram.fields.bot_token.placeholder':
-    '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11',
+  'channels.telegram.fields.bot_token.placeholder': '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11',
   'channels.telegram.fields.allowed_users.label': 'Dozwoleni użytkownicy',
   'channels.telegram.fields.allowed_users.placeholder':
     'Oddzielone przecinkami nazwy użytkowników Telegrama',

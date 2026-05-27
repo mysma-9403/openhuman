@@ -171,7 +171,8 @@ const pl1: TranslationMap = {
   'memory.title': 'Pamięć',
   'memory.search': 'Szukaj w pamięci...',
   'memory.noResults': 'Nie znaleziono wspomnień',
-  'memory.empty': 'Brak wspomnień. Wspomnienia powstają automatycznie podczas korzystania z aplikacji.',
+  'memory.empty':
+    'Brak wspomnień. Wspomnienia powstają automatycznie podczas korzystania z aplikacji.',
   'memory.tab.memory': 'Pamięć',
   'memory.tab.subconscious': 'Podświadomość',
   'memory.tab.dreams': 'Marzenia senne',
@@ -212,7 +213,8 @@ const pl1: TranslationMap = {
   'channels.configure': 'Skonfiguruj kanał',
   'channels.setup': 'Konfiguracja',
   'channels.noChannels': 'Brak skonfigurowanych kanałów',
-  'channels.localManagedUnavailable': 'Kanały zarządzane są niedostępne dla użytkowników lokalnych.',
+  'channels.localManagedUnavailable':
+    'Kanały zarządzane są niedostępne dla użytkowników lokalnych.',
   'channels.addChannel': 'Dodaj kanał',
   'channels.status.connected': 'Połączony',
   'channels.status.disconnected': 'Rozłączony',
@@ -280,7 +282,8 @@ const pl1: TranslationMap = {
   'team.manageTitle': 'Zarządzaj zespołem {name}',
   'team.planCreated': 'Plan {plan} • Utworzono {date}',
   'team.confirmDelete': 'Czy na pewno usunąć {name}?',
-  'team.deleteWarning': 'Tej operacji nie można cofnąć. Wszystkie dane zespołu zostaną trwale usunięte.',
+  'team.deleteWarning':
+    'Tej operacji nie można cofnąć. Wszystkie dane zespołu zostaną trwale usunięte.',
   'team.refreshingMembers': 'Odświeżanie członków...',
   'team.loadingMembers': 'Ładowanie członków...',
   'team.memberCount': '{count} członek',
@@ -329,7 +332,8 @@ const pl1: TranslationMap = {
   'onboarding.runtimeChoice.cloud.f1': 'OAuth i routing modeli pośredniczone przez backend',
   'onboarding.runtimeChoice.cloud.f2': 'Kompresja tokenów, aby wydłużyć Twój limit',
   'onboarding.runtimeChoice.cloud.f3': 'Jedna subskrypcja, każdy model w komplecie',
-  'onboarding.runtimeChoice.cloud.f4': 'Brak kluczy modeli, wyszukiwarki i Composio do utrzymywania',
+  'onboarding.runtimeChoice.cloud.f4':
+    'Brak kluczy modeli, wyszukiwarki i Composio do utrzymywania',
   'onboarding.runtimeChoice.cloud.f5': 'Lokalne drzewo pamięci, zarządzane usługi sieciowe',
   'onboarding.runtimeChoice.custom.title': 'Niestandardowo',
   'onboarding.runtimeChoice.custom.tagline':
@@ -350,7 +354,8 @@ const pl1: TranslationMap = {
   'onboarding.apiKeys.openaiPlaceholder': 'sk-...',
   'onboarding.apiKeys.anthropicLabel': 'Klucz API Anthropic',
   'onboarding.apiKeys.anthropicPlaceholder': 'sk-ant-...',
-  'onboarding.apiKeys.saveError': 'Nie udało się zapisać tego klucza. Sprawdź go i spróbuj ponownie.',
+  'onboarding.apiKeys.saveError':
+    'Nie udało się zapisać tego klucza. Sprawdź go i spróbuj ponownie.',
   'onboarding.apiKeys.skipForNow': 'Pomiń na razie',
   'onboarding.apiKeys.continue': 'Zapisz i kontynuuj',
   'onboarding.apiKeys.saving': 'Zapisywanie…',
@@ -414,7 +419,8 @@ const pl1: TranslationMap = {
     'Przeglądaj, eksportuj lub czyść pamięć samodzielnie. Skonfiguruj w Ustawieniach › Pamięć.',
   'onboarding.skipForNow': 'Pomiń na razie',
   'onboarding.localAI.continueWithCloud': 'Kontynuuj z chmurą',
-  'onboarding.localAI.useLocalAnyway': 'Użyj lokalnego AI mimo to (niezalecane dla Twojego urządzenia)',
+  'onboarding.localAI.useLocalAnyway':
+    'Użyj lokalnego AI mimo to (niezalecane dla Twojego urządzenia)',
   'onboarding.localAI.useLocalInstead': 'Użyj lokalnego AI (połącz Ollama teraz)',
   'onboarding.localAI.setupIssue': 'Konfiguracja lokalnego AI napotkała problem',
   // Clear data
@@ -428,7 +434,8 @@ const pl1: TranslationMap = {
   'clearData.clearing': 'Czyszczenie danych aplikacji...',
   'clearData.failed': 'Nie udało się wyczyścić danych i wylogować. Spróbuj ponownie.',
   'clearData.failedLogout': 'Nie udało się wylogować. Spróbuj ponownie.',
-  'clearData.failedPersist': 'Nie udało się wyczyścić utrwalonego stanu aplikacji. Spróbuj ponownie.',
+  'clearData.failedPersist':
+    'Nie udało się wyczyścić utrwalonego stanu aplikacji. Spróbuj ponownie.',
   // Mnemonic
   'mnemonic.title': 'Fraza odzyskiwania',
   'mnemonic.warning': 'Zapisz te słowa w kolejności i przechowuj je w bezpiecznym miejscu.',
@@ -444,7 +451,8 @@ const pl1: TranslationMap = {
   'privacy.empty': 'Nie wykryto żadnych zewnętrznych transferów danych.',
   'privacy.whatLeavesComputer': 'Co opuszcza Twój komputer',
   'privacy.loading': 'Ładowanie szczegółów prywatności...',
-  'privacy.loadError': 'Nie udało się załadować listy prywatności. Kontrolki analityki poniżej nadal działają.',
+  'privacy.loadError':
+    'Nie udało się załadować listy prywatności. Kontrolki analityki poniżej nadal działają.',
   'privacy.noCapabilities': 'Żadna funkcja obecnie nie ujawnia ruchu danych.',
   'privacy.sentTo': 'Wysłano do',
   'privacy.leavesDevice': 'Opuszcza urządzenie',
@@ -492,7 +500,8 @@ const pl1: TranslationMap = {
   'settings.about.checking': 'Sprawdzanie...',
   'settings.about.checkForUpdates': 'Sprawdź aktualizacje',
   'settings.about.releases': 'Wydania',
-  'settings.about.releasesDesc': 'Przeglądaj notatki o wydaniach i wcześniejsze buildy na GitHubie.',
+  'settings.about.releasesDesc':
+    'Przeglądaj notatki o wydaniach i wcześniejsze buildy na GitHubie.',
   'settings.about.openReleases': 'Otwórz wydania na GitHubie',
   'settings.about.connection': 'Połączenie',
   'settings.about.connectionMode': 'Tryb',
@@ -530,7 +539,8 @@ const pl1: TranslationMap = {
   'devices.revoke': 'Unieważnij',
   'devices.revokeAria': 'Unieważnij {label}',
   'devices.confirmRevokeTitle': 'Unieważnić urządzenie?',
-  'devices.confirmRevokeBody': '{label} nie będzie już mogło się łączyć. Tej operacji nie można cofnąć.',
+  'devices.confirmRevokeBody':
+    '{label} nie będzie już mogło się łączyć. Tej operacji nie można cofnąć.',
   'devices.loadFailed': 'Nie udało się załadować urządzeń: {message}',
   'devices.pairModal.title': 'Sparuj iPhone',
   'devices.pairModal.loading': 'Generowanie kodu parowania…',
@@ -577,8 +587,10 @@ const pl1: TranslationMap = {
   'iosPair.step.openDesktop': 'Otwórz OpenHuman na komputerze',
   'iosPair.step.openSettings': 'Przejdź do Ustawienia > Urządzenia',
   'iosPair.step.showQr': 'Kliknij „Sparuj telefon”, aby pokazać kod QR',
-  'iosPair.error.camera': 'Skanowanie kamerą nieudane. Sprawdź uprawnienia do kamery i spróbuj ponownie.',
-  'iosPair.error.invalidQr': 'Nieprawidłowy kod QR. Upewnij się, że skanujesz kod parowania OpenHuman.',
+  'iosPair.error.camera':
+    'Skanowanie kamerą nieudane. Sprawdź uprawnienia do kamery i spróbuj ponownie.',
+  'iosPair.error.invalidQr':
+    'Nieprawidłowy kod QR. Upewnij się, że skanujesz kod parowania OpenHuman.',
   'iosPair.error.unreachableDesktop':
     'Nie udało się dotrzeć do komputera. Upewnij się, że oba urządzenia są online i spróbuj ponownie.',
   'iosPair.error.connectionFailed':
@@ -612,7 +624,8 @@ const pl1: TranslationMap = {
   'voice.providers.cloudWhisperProxy': 'Chmura (proxy Whisper)',
   'voice.providers.localWhisper': 'Whisper lokalnie',
   'voice.providers.installRequired': ' (wymagana instalacja)',
-  'voice.providers.whisperInstalledTitle': 'Whisper jest zainstalowany. Kliknij, aby zainstalować ponownie.',
+  'voice.providers.whisperInstalledTitle':
+    'Whisper jest zainstalowany. Kliknij, aby zainstalować ponownie.',
   'voice.providers.whisperDownloadTitle':
     'Pobierz whisper.cpp i model GGML do przestrzeni roboczej.',
   'voice.providers.installed': 'Zainstalowano',
@@ -627,7 +640,8 @@ const pl1: TranslationMap = {
   'voice.providers.ttsProvider': 'Dostawca tekstu na mowę',
   'voice.providers.cloudElevenLabsProxy': 'Chmura (proxy ElevenLabs)',
   'voice.providers.localPiper': 'Piper lokalnie',
-  'voice.providers.piperInstalledTitle': 'Piper jest zainstalowany. Kliknij, aby zainstalować ponownie.',
+  'voice.providers.piperInstalledTitle':
+    'Piper jest zainstalowany. Kliknij, aby zainstalować ponownie.',
   'voice.providers.piperDownloadTitle':
     'Pobierz Piper i głos en_US-lessac-medium do przestrzeni roboczej.',
   'voice.providers.piperVoice': 'Głos Piper',
@@ -726,7 +740,8 @@ const pl1: TranslationMap = {
   'screenAwareness.debug.refreshing': 'Odświeżanie…',
   'screenAwareness.debug.noSummaries': 'Brak podsumowań.',
   'screenAwareness.debug.unknownApp': 'Nieznana aplikacja',
-  'screenAwareness.debug.macosOnly': 'Świadomość ekranu V1 jest obecnie obsługiwana tylko na macOS.',
+  'screenAwareness.debug.macosOnly':
+    'Świadomość ekranu V1 jest obecnie obsługiwana tylko na macOS.',
   // MCP
   'mcp.alphaBadge': 'Alpha',
   'mcp.alphaBannerText':
@@ -780,7 +795,8 @@ const pl1: TranslationMap = {
   'mcp.configAssistant.applySuggested': 'Zastosuj sugerowane wartości',
   'mcp.configAssistant.reinstallHint': 'Aby je zastosować, zainstaluj ponownie z tymi wartościami.',
   'mcp.configAssistant.thinking': 'Myślę...',
-  'mcp.configAssistant.inputPlaceholder': 'Zadaj pytanie (Enter aby wysłać, Shift+Enter nowa linia)',
+  'mcp.configAssistant.inputPlaceholder':
+    'Zadaj pytanie (Enter aby wysłać, Shift+Enter nowa linia)',
   'mcp.configAssistant.send': 'Wyślij',
   'mcp.configAssistant.failedResponse': 'Nie udało się uzyskać odpowiedzi',
   'mcp.setup.secretDialog.title': 'Konfiguracja MCP — wpisz sekret',
@@ -799,7 +815,8 @@ const pl1: TranslationMap = {
     'Przechowywane zaszyfrowane w lokalnej tabeli sekretów MCP. Nigdy nie są logowane ani wysyłane do modelu.',
   // Vault
   'vault.title': 'Skarbce wiedzy (Eksperymentalne)',
-  'vault.description': 'Wskaż lokalny folder; pliki zostaną podzielone i odzwierciedlone w pamięci.',
+  'vault.description':
+    'Wskaż lokalny folder; pliki zostaną podzielone i odzwierciedlone w pamięci.',
   'vault.add': 'Dodaj skarbiec',
   'vault.added': 'Skarbiec dodany',
   'vault.createdMessage': 'Utworzono „{name}”. Kliknij {sync}, aby zaindeksować.',
@@ -859,22 +876,23 @@ const pl1: TranslationMap = {
   'settings.heartbeat.title': 'Heartbeat i pętle',
   'settings.heartbeat.desc': 'Steruj częstotliwością harmonogramu tła i podglądaj mapę pętli.',
   'settings.ledgerUsage.title': 'Księga zużycia',
-  'settings.ledgerUsage.desc': 'Ostatnie wydatki kredytów, matematyka budżetu i budżet odczytów API w tle.',
+  'settings.ledgerUsage.desc':
+    'Ostatnie wydatki kredytów, matematyka budżetu i budżet odczytów API w tle.',
   'settings.search.title': 'Wyszukiwarka',
   'settings.search.menuDesc':
     'Użyj domyślnie wyszukiwarki zarządzanej przez OpenHuman lub podłącz własnego dostawcę z kluczem API.',
   'settings.search.description':
     'Wybierz wyszukiwarkę używaną przez agenta. Zarządzana korzysta z backendu OpenHuman (bez konfiguracji). Parallel i Brave działają bezpośrednio z Twojego urządzenia, używając Twojego klucza API.',
   'settings.search.engineManagedLabel': 'OpenHuman zarządzane',
-  'settings.search.engineManagedDesc':
-    'Domyślnie. Przez backend OpenHuman — bez klucza API.',
+  'settings.search.engineManagedDesc': 'Domyślnie. Przez backend OpenHuman — bez klucza API.',
   'settings.search.localManagedUnavailable':
     'Wyszukiwarka zarządzana przez OpenHuman jest niedostępna dla użytkowników lokalnych. Dodaj własny klucz API Parallel lub Brave, aby włączyć wyszukiwanie w sieci.',
   'settings.search.engineParallelLabel': 'Parallel',
   'settings.search.engineParallelDesc':
     'Bezpośrednie API Parallel: szukaj, wyciąg, czat, badania, wzbogacenie, narzędzia datasetowe.',
   'settings.search.engineBraveLabel': 'Brave Search',
-  'settings.search.engineBraveDesc': 'Bezpośrednie API Brave Search: web, wiadomości, obrazy i wideo.',
+  'settings.search.engineBraveDesc':
+    'Bezpośrednie API Brave Search: web, wiadomości, obrazy i wideo.',
   'settings.search.statusConfigured': 'Skonfigurowano',
   'settings.search.statusNeedsKey': 'Wymaga klucza API',
   'settings.search.fallbackToManaged':
@@ -958,7 +976,8 @@ const pl1: TranslationMap = {
     'Przenieś pamięć i notatki z innego lokalnego asystenta do tej przestrzeni roboczej. Zacznij od Podglądu, aby zobaczyć, co dokładnie się zmieni, potem Zastosuj, aby skopiować dane. Twoja obecna pamięć jest najpierw archiwizowana.',
   'migration.vendorLabel': 'Dostawca źródłowy',
   'migration.sourceLabel': 'Ścieżka źródłowej przestrzeni roboczej (opcjonalne)',
-  'migration.sourcePlaceholder': 'Zostaw puste, aby wykryć automatycznie (np. ~/.openclaw/workspace)',
+  'migration.sourcePlaceholder':
+    'Zostaw puste, aby wykryć automatycznie (np. ~/.openclaw/workspace)',
   'migration.sourceHint':
     'Domyślnie używa standardowej lokalizacji dostawcy, gdy puste. Wpisz konkretną ścieżkę, jeśli przeniosłeś przestrzeń roboczą.',
   'migration.previewAction': 'Podgląd',
@@ -993,7 +1012,8 @@ const pl1: TranslationMap = {
   'settings.notifications.doNotDisturb': 'Tryb Nie przeszkadzać',
   'settings.notifications.doNotDisturbDesc': 'Wstrzymaj wszystkie powiadomienia na określony czas',
   'settings.notifications.channelControls': 'Sterowanie per kanał',
-  'settings.notifications.channelControlsDesc': 'Skonfiguruj preferencje powiadomień dla każdego kanału',
+  'settings.notifications.channelControlsDesc':
+    'Skonfiguruj preferencje powiadomień dla każdego kanału',
   'settings.notifications.tabs.preferences': 'Preferencje',
   'settings.notifications.tabs.routing': 'Routing',
   // Settings features
@@ -1044,13 +1064,15 @@ const pl1: TranslationMap = {
   'notifications.routing.level.acknowledge': 'Potwierdź',
   'notifications.routing.level.acknowledgeDesc': 'Niski priorytet — widoczne w centrum powiadomień',
   'notifications.routing.level.react': 'Reaguj',
-  'notifications.routing.level.reactDesc': 'Średni priorytet — uruchamia ukierunkowaną odpowiedź agenta',
+  'notifications.routing.level.reactDesc':
+    'Średni priorytet — uruchamia ukierunkowaną odpowiedź agenta',
   'notifications.routing.level.escalate': 'Eskaluj',
   'notifications.routing.level.escalateDesc': 'Wysoki priorytet — przekierowane do orchestratora',
   'notifications.routing.perProvider': 'Routing per dostawca',
   'notifications.routing.threshold': 'Próg',
   'notifications.routing.routeToOrchestrator': 'Kieruj do orchestratora',
-  'notifications.routing.loadSettingsError': 'Nie udało się załadować ustawień. Otwórz panel ponownie.',
+  'notifications.routing.loadSettingsError':
+    'Nie udało się załadować ustawień. Otwórz panel ponownie.',
   // Settings billing inference budget
   'settings.billing.inferenceBudget.title': 'Budżet inferencji',
   'settings.billing.inferenceBudget.noRecurringPlanBudget': 'Brak cyklicznego budżetu planu',
@@ -1061,7 +1083,8 @@ const pl1: TranslationMap = {
   'settings.billing.inferenceBudget.cycleEndsOn': 'Cykl kończy się {date}',
   'settings.billing.inferenceBudget.exhaustedDesc':
     'Subskrypcyjne zużycie zostało wyczerpane. Doładuj kredyty, aby korzystać dalej bez czekania na nowy cykl.',
-  'settings.billing.inferenceBudget.discountVsPayg': 'O {pct}% taniej za wywołanie niż w pay-as-you-go.',
+  'settings.billing.inferenceBudget.discountVsPayg':
+    'O {pct}% taniej za wywołanie niż w pay-as-you-go.',
   'settings.billing.inferenceBudget.cycleSpend': 'Wydatki w cyklu',
   'settings.billing.inferenceBudget.totalAmount': '{amount} łącznie',
   'settings.billing.inferenceBudget.inference': 'Inferencja',
