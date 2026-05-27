@@ -210,13 +210,13 @@ impl ConversationStore {
     /// known-empty state. The JSONL files remain the source of truth, so
     /// a rebuild after a process crash is always safe.
     fn populate_index_unlocked(&self, idx: &mut InvertedIndex) -> Result<(), String> {
-        let threads = match self.list_threads_unlocked() {
-            Ok(ts) => ts,
-            // No threads file yet (fresh workspace) — leave the index
-            // empty. Any other error propagates.
-            Err(_) if !self.root_dir().exists() => return Ok(()),
-            Err(err) => return Err(err),
-        };
+        // `list_threads_unlocked` already handles a fresh workspace:
+        // `ensure_root` creates the directory + threads log if missing, and
+        // `read_jsonl` returns an empty Vec for an empty file. Anything that
+        // still bubbles up here is a real filesystem/setup failure and must
+        // propagate — silently returning Ok would mask it and make search
+        // appear to return zero results for an undiagnosed reason.
+        let threads = self.list_threads_unlocked()?;
         for thread in threads {
             let path = self.thread_messages_path(&thread.id);
             if !path.exists() {
@@ -226,7 +226,7 @@ impl ConversationStore {
                 Ok(m) => m,
                 Err(err) => {
                     tracing::warn!(
-                        "[conversations] index build skipped unreadable file path={} error={}",
+                        "{LOG_PREFIX} index build skipped unreadable file path={} error={}",
                         path.display(),
                         err
                     );

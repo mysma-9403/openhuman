@@ -28,14 +28,26 @@
 //!
 //! ## Normalization pipeline
 //!
-//! 1. **NFKC** — unifies compatibility characters (half/full-width CJK
-//!    variants, Arabic presentation forms, ligatures).
-//! 2. **Lowercase** — Unicode-aware case folding for cross-alphabet
-//!    case insensitivity.
-//! 3. **Strip combining marks** — uses `canonical_combining_class` to
+//! Implemented in `normalize()` as a single iterator chain. The order
+//! matters — strip-marks must run on the decomposed form, lowercase must
+//! run on stripped code points, and the final NFKC re-compose unifies
+//! compatibility variants for byte-stable indexing/querying:
+//!
+//! 1. **NFKD** — decompose so combining marks become standalone code points
+//!    (Polish ą → `a` + ̨, Arabic kataba+harakat → base letters + marks).
+//! 2. **Strip combining marks** — uses `canonical_combining_class` to
 //!    drop diacritics across all scripts (Polish ą→a, ć→c; Arabic harakat;
 //!    Hebrew niqqud; combining tone marks; etc.) without needing
 //!    per-language tables.
+//! 3. **Lowercase** — Unicode-aware case folding for cross-alphabet
+//!    case insensitivity.
+//! 4. **NFKC** — re-compose to canonical form (and unify compatibility
+//!    characters: half/full-width CJK variants, Arabic presentation forms,
+//!    ligatures) so byte equality lines up at lookup time.
+//! 5. **Non-decomposing fold** (`fold_non_decomposing`) — small per-letter
+//!    table for decorated letters NFKD leaves untouched (Polish ł, German
+//!    ß, Norwegian ø, Icelandic þ/ð, Latin æ/œ, Turkish ı, Croatian đ,
+//!    Maltese ħ, Sami ŋ).
 
 use unicode_normalization::char::canonical_combining_class;
 use unicode_normalization::UnicodeNormalization;
