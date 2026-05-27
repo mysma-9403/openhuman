@@ -128,18 +128,25 @@ jobs:
     if: inputs.run_rust_core
     name: Rust Core Tests (Windows — secrets ACL)
     runs-on: windows-latest
-    # Bumped from 20 → 30 because the cold-cache `cargo test --no-run` step
-    # on Windows for the full `openhuman` crate is genuinely slower than the
-    # Linux equivalent and started hitting the 20-min cap after the
-    # inverted-index work landed (more LOC + `unicode-normalization` dep).
-    # The Linux core-tests job (which actually runs the whole suite, not just
-    # `security::secrets`) was at ~17m44s on the same PR — same compile, faster
-    # runner. The test filter here is narrow; what's slow is the compile.
+    # Bumped from 20 → 30 because the cold-cache compile of the full
+    # `openhuman` crate on Windows is genuinely slower than the Linux
+    # equivalent and started hitting the 20-min cap after the inverted-index
+    # work landed (more LOC + `unicode-normalization` dep). The Linux
+    # core-tests job (which actually runs the whole suite, not just
+    # `security::secrets`) was at ~17m44s on the same PR — same compile,
+    # faster runner. The test filter here is narrow; what's slow is the compile.
     timeout-minutes: 30
     env:
       CARGO_INCREMENTAL: '0'
-      SCCACHE_GHA_ENABLED: 'true'
-      RUSTC_WRAPPER: sccache
+      # sccache is intentionally NOT enabled on this Windows job. The GHA-backed
+      # sccache server intermittently drops its TCP connection to rustc mid-link
+      # on Windows under heavy parallel compile (`os error 10054` —
+      # "connection forcibly closed by the remote host"). When this fires, the
+      # whole compile fails, the cancel-aware wrapper tears the run down, and
+      # the job is reported failed even though the source builds cleanly. The
+      # Linux jobs do not hit this and keep sccache. Swatinem/rust-cache below
+      # still keeps `target/` warm between runs, so the loss is only the
+      # cross-PR object cache, not the per-run incremental cache.
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -154,8 +161,6 @@ jobs:
           workspaces: . -> target
           cache-on-failure: true
           key: core-windows
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Run Windows-specific secrets tests
         # Runs the full security::secrets suite including all #[cfg(windows)]
         # tests: self-repair ACL path (OPENHUMAN-TAURI-GN), domain-qualified
