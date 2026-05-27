@@ -128,11 +128,9 @@ jobs:
     if: inputs.run_rust_core
     name: Rust Core Tests (Windows — secrets ACL)
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       CARGO_INCREMENTAL: '0'
-      SCCACHE_GHA_ENABLED: 'true'
-      RUSTC_WRAPPER: sccache
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -147,8 +145,6 @@ jobs:
           workspaces: . -> target
           cache-on-failure: true
           key: core-windows
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Run Windows-specific secrets tests
         # Runs the full security::secrets suite including all #[cfg(windows)]
         # tests: self-repair ACL path (OPENHUMAN-TAURI-GN), domain-qualified
