@@ -128,25 +128,11 @@ jobs:
     if: inputs.run_rust_core
     name: Rust Core Tests (Windows — secrets ACL)
     runs-on: windows-latest
-    # Bumped from 20 → 30 because the cold-cache compile of the full
-    # `openhuman` crate on Windows is genuinely slower than the Linux
-    # equivalent and started hitting the 20-min cap after the inverted-index
-    # work landed (more LOC + `unicode-normalization` dep). The Linux
-    # core-tests job (which actually runs the whole suite, not just
-    # `security::secrets`) was at ~17m44s on the same PR — same compile,
-    # faster runner. The test filter here is narrow; what's slow is the compile.
-    timeout-minutes: 30
+    timeout-minutes: 35
     env:
       CARGO_INCREMENTAL: '0'
-      # sccache is intentionally NOT enabled on this Windows job. The GHA-backed
-      # sccache server intermittently drops its TCP connection to rustc mid-link
-      # on Windows under heavy parallel compile (`os error 10054` —
-      # "connection forcibly closed by the remote host"). When this fires, the
-      # whole compile fails, the cancel-aware wrapper tears the run down, and
-      # the job is reported failed even though the source builds cleanly. The
-      # Linux jobs do not hit this and keep sccache. Swatinem/rust-cache below
-      # still keeps `target/` warm between runs, so the loss is only the
-      # cross-PR object cache, not the per-run incremental cache.
+      SCCACHE_GHA_ENABLED: 'true'
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -161,11 +147,19 @@ jobs:
           workspaces: . -> target
           cache-on-failure: true
           key: core-windows
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Run Windows-specific secrets tests
-        # Runs the full security::secrets suite including all #[cfg(windows)]
-        # tests: self-repair ACL path (OPENHUMAN-TAURI-GN), domain-qualified
-        # icacls username, is_permission_error, repair_windows_acl.
-        run: bash scripts/ci-cancel-aware.sh cargo test -p openhuman -- security::secrets --nocapture
+        # Runs the keyring::encrypted_store suite (keyring::encrypted_store::tests),
+        # which contains the #[cfg(windows)] tests:
+        #   - self_repair_recovers_from_locked_key_file (OPENHUMAN-TAURI-GN)
+        #   - self_repair_does_not_trigger_for_corrupt_file
+        #   - is_permission_error_* (access denied, not-found, raw OS error 5)
+        #   - qualify_windows_username_* (local, domain, case, empty env vars)
+        # Note: repair_windows_acl is a helper fn, not a test.
+        # security/secrets.rs is a one-line re-export with no tests of its own;
+        # the old filter (-- security::secrets) silently matched nothing.
+        run: bash scripts/ci-cancel-aware.sh cargo test -p openhuman -- keyring::encrypted_store --nocapture
 
   rust-tauri-tests:
     if: inputs.run_rust_tauri
