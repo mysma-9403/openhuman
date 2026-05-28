@@ -113,16 +113,17 @@ const REFUSAL_PHRASES: &[&str] = &[
 /// quality even though they clear [`MIN_CHARS`], because they carry no
 /// answer for the user. Matched against the *entire* trimmed response
 /// via [`str::eq_ignore_ascii_case`] — no allocation.
+///
+/// Every entry here must be at least [`MIN_CHARS`] bytes long; shorter
+/// tokens (e.g. `"ok."`, `"no."`, `"hmm."`) are already flagged as low
+/// quality by the length gate in [`is_low_quality`] before this list is
+/// even consulted, so listing them here would be dead config and is
+/// guarded against by [`tests::empty_noise_tokens_all_clear_min_chars`].
 const EMPTY_NOISE_TOKENS: &[&str] = &[
     "okay.",
     "okay!",
     "sure.",
     "sure!",
-    "yes.",
-    "no.",
-    "hmm.",
-    "ok.",
-    "ok!",
     "right.",
     "noted.",
     "got it.",
@@ -386,5 +387,26 @@ mod tests {
         // production at the first call site.
         let dfa = &*REFUSAL_DFA;
         assert_eq!(dfa.patterns_len(), REFUSAL_PHRASES.len());
+    }
+
+    // ---------- dead-config guard ----------
+
+    #[test]
+    fn empty_noise_tokens_all_clear_min_chars() {
+        // Any EMPTY_NOISE_TOKENS entry shorter than MIN_CHARS is dead
+        // config: the length gate in `is_low_quality` returns `true`
+        // before `is_empty_noise` is ever consulted, so the token is
+        // unreachable. Removing or adding tokens is fine — adding a
+        // short one without intending to is a bug, and this test
+        // catches it at CI time instead of letting it ship as silent
+        // dead config.
+        for token in EMPTY_NOISE_TOKENS {
+            assert!(
+                token.len() >= MIN_CHARS,
+                "EMPTY_NOISE_TOKENS entry {token:?} is shorter than MIN_CHARS={MIN_CHARS}; \
+                 it would be unreachable behind the length gate. Either lengthen the token, \
+                 lower MIN_CHARS, or drop the entry."
+            );
+        }
     }
 }
