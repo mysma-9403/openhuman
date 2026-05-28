@@ -364,17 +364,20 @@ fn analyze_prompt(input: &str) -> (PromptInjectionVerdict, f32, Vec<PromptInject
         });
     }
 
-    // Match all rules in two batched DFA passes (lowered + collapsed) instead
-    // of N×variants independent `is_match` calls. The third normalized variant
-    // (`compact` — whitespace stripped) is intentionally NOT scanned here:
-    // every detection-rule pattern uses `\s+` between tokens and so cannot
-    // match a string with all whitespace removed. Scanning it was wasted work.
-    // (`compact` is still used downstream by `has_instruction_override`, which
-    // does a literal `contains` lookup, not a regex match.)
+    // Match all rules in three batched DFA passes (one per normalized variant)
+    // instead of N×variants independent `is_match` calls. The `compact`
+    // (whitespace-stripped) variant is required: not every pattern relies on
+    // `\s+` between tokens — `override.role_hijack` has a single-token
+    // `jailbreak` branch, and `exfiltrate.secrets` has several
+    // (`secret`, `token`, `password`, `credentials?`, `jwt`, `bearer`, plus
+    // `api\s*key` whose `\s*` matches zero spaces). Without the compact
+    // scan, spacing-obfuscated attacks (`j a i l b r e a k`, `j w t`)
+    // would silently stop contributing to score/reasons.
     let lowered_hits = DETECTION_RULE_SET.matches(&normalized.lowered);
     let collapsed_hits = DETECTION_RULE_SET.matches(&normalized.collapsed);
+    let compact_hits = DETECTION_RULE_SET.matches(&normalized.compact);
     for (idx, rule) in DETECTION_RULES.iter().enumerate() {
-        if lowered_hits.matched(idx) || collapsed_hits.matched(idx) {
+        if lowered_hits.matched(idx) || collapsed_hits.matched(idx) || compact_hits.matched(idx) {
             score += rule.score;
             reasons.push(PromptInjectionReason {
                 code: rule.code.to_string(),
