@@ -208,7 +208,15 @@ pub struct SecurityPolicy {
     /// init happens lazily on the first async call site without blocking
     /// constructors. Fallback (raw `workspace_dir` if canonicalize fails)
     /// matches the previous inline behavior exactly.
-    pub(crate) canonical_workspace: Arc<OnceCell<PathBuf>>,
+    ///
+    /// Visibility is `pub` to match every other field on the struct: external
+    /// crates (Cargo examples, downstream consumers) construct
+    /// `SecurityPolicy` with the `..SecurityPolicy::default()` functional-update
+    /// spread, and Rust requires every field of the target struct to be
+    /// visible to the caller in that syntax — even fields supplied by the
+    /// default. `pub(crate)` was an over-tight first cut that broke
+    /// `examples/mouse_smoke.rs` with E0451.
+    pub canonical_workspace: Arc<OnceCell<PathBuf>>,
 }
 
 impl Default for SecurityPolicy {
