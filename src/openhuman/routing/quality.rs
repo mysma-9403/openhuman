@@ -76,7 +76,13 @@ const REFUSAL_PHRASES: &[&str] = &[
     "i am unable to",
     "i'm not able to",
     "i am not able to",
-    "i'm afraid i can",
+    // `"i'm afraid i can"` by itself is over-broad — it would also
+    // match legitimately constrained-but-non-refusing responses such
+    // as `"I'm afraid I can only give you three results."`. Pin to
+    // the explicit-refusal continuations the surrounding patterns
+    // target.
+    "i'm afraid i can't",
+    "i'm afraid i cannot",
     // Capability disclaimers
     "i don't have the ability",
     "i do not have the ability",
@@ -289,6 +295,11 @@ mod tests {
         assert!(is_low_quality("I'm not able to access that file."));
         assert!(is_low_quality("I am not able to fetch live data."));
         assert!(is_low_quality("I'm afraid I can't disclose that."));
+        // The tighter `"i'm afraid i can't"` / `"i'm afraid i cannot"`
+        // form must still catch the explicit-refusal cases above
+        // without flagging legitimately constrained-but-not-refusing
+        // responses — see `i_am_afraid_pattern_does_not_flag_constrained_but_not_refusing`.
+        assert!(is_low_quality("I'm afraid I cannot proceed."));
         // Capability disclaimers.
         assert!(is_low_quality("I don't have access to the internet."));
         assert!(is_low_quality("I do not have the ability to execute code."));
@@ -387,6 +398,28 @@ mod tests {
         // production at the first call site.
         let dfa = &*REFUSAL_DFA;
         assert_eq!(dfa.patterns_len(), REFUSAL_PHRASES.len());
+    }
+
+    // ---------- false-positive guard for over-broad patterns ----------
+
+    #[test]
+    fn i_am_afraid_pattern_does_not_flag_constrained_but_not_refusing() {
+        // `"I'm afraid I can only give you three results."` is a
+        // legitimately constrained-but-not-refusing answer. The
+        // earlier broader `"i'm afraid i can"` phrase would have
+        // matched this and triggered a remote fallback unnecessarily.
+        // The tightened `"i'm afraid i can't"` / `"i'm afraid i cannot"`
+        // pair must catch only the explicit-refusal continuations.
+        assert!(!is_low_quality(
+            "I'm afraid I can only give you three results."
+        ));
+        assert!(!is_low_quality(
+            "I'm afraid I can offer you a partial summary at best."
+        ));
+
+        // Sanity: the explicit-refusal continuations must still fire.
+        assert!(is_low_quality("I'm afraid I can't help with that."));
+        assert!(is_low_quality("I'm afraid I cannot share that."));
     }
 
     // ---------- dead-config guard ----------
