@@ -525,20 +525,14 @@ pub fn get_summary_embeddings_for_signature_batch(
                 // diagnostics to the per-row path. `Ok(None)` from the
                 // decoder is dropped: the map only carries materialised
                 // vectors, exactly mirroring the existing per-row
-                // contract.
+                // contract. Length / dim-mismatch / negative-dim /
+                // non-multiple-of-4 are already enforced inside
+                // `decode_signature_blob` itself — no extra check here,
+                // matching the chunks side which delegates the same way
+                // to `embedding_from_blob`.
                 if let Some(v) =
                     decode_signature_blob(blob, dim, &format!("summary_id={summary_id}"))?
                 {
-                    // Length sanity check — same as per-row path so a
-                    // corrupted row fails loudly with the same error
-                    // shape rather than silently joining a bad vector
-                    // into the rerank.
-                    if v.len() != dim as usize {
-                        anyhow::bail!(
-                            "summary embedding dimension mismatch: dim column says {dim}, blob contains {} floats",
-                            v.len()
-                        );
-                    }
                     out.insert(summary_id, v);
                 }
             }
