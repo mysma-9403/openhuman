@@ -398,4 +398,3 @@ pub fn get_chunk_embeddings_batch(
     let signature = tree_active_signature(config);
     get_chunk_embeddings_for_signature_batch(config, chunk_ids, &signature)
 }
-

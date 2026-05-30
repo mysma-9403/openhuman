@@ -288,7 +288,6 @@ fn list_stale_buffers_orders_by_age() {
     assert_eq!(only_oldest[0].tree_id, "tree-1");
 }
 
-
 // ── get_summaries_batch ────────────────────────────────────────────────
 //
 // Same shape as `chunks::store::get_chunks_batch` /
