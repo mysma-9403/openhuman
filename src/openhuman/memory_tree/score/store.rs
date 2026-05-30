@@ -193,6 +193,11 @@ pub fn get_scores_batch(config: &Config, chunk_ids: &[String]) -> Result<HashMap
     if chunk_ids.is_empty() {
         return Ok(HashMap::new());
     }
+    log::debug!(
+        "[memory_tree::score] get_scores_batch: n={} windows={}",
+        chunk_ids.len(),
+        chunk_ids.len().div_ceil(MAX_FETCH_BATCH)
+    );
     with_connection(config, |conn| {
         let mut out: HashMap<String, f32> = HashMap::with_capacity(chunk_ids.len());
         for window in chunk_ids.chunks(MAX_FETCH_BATCH) {
@@ -217,6 +222,11 @@ pub fn get_scores_batch(config: &Config, chunk_ids: &[String]) -> Result<HashMap
                 out.insert(chunk_id, total);
             }
         }
+        log::debug!(
+            "[memory_tree::score] get_scores_batch: matched {}/{} ids",
+            out.len(),
+            chunk_ids.len()
+        );
         Ok(out)
     })
 }

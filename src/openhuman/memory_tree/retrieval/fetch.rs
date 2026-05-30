@@ -64,10 +64,11 @@ pub async fn fetch_leaves(config: &Config, chunk_ids: &[String]) -> Result<Vec<R
         // own on-disk file, so batching there would mean concurrent file
         // opens, not a single round-trip — left untouched.
         let mut out: Vec<RetrievalHit> = Vec::with_capacity(ids.len());
-        for id in &ids {
+        for (idx, id) in ids.iter().enumerate() {
             let Some(chunk) = chunk_by_id.get(id) else {
                 log::debug!(
-                    "[retrieval::fetch] chunk not found — skipping (1 of {} requested)",
+                    "[retrieval::fetch] chunk not found at index {}/{} — skipping",
+                    idx + 1,
                     ids.len()
                 );
                 continue;
