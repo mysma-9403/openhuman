@@ -25,7 +25,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
@@ -569,6 +569,11 @@ pub fn get_chunks_batch(config: &Config, chunk_ids: &[String]) -> Result<HashMap
     if chunk_ids.is_empty() {
         return Ok(HashMap::new());
     }
+    log::debug!(
+        "[memory::chunk_store] get_chunks_batch: n={} windows={}",
+        chunk_ids.len(),
+        chunk_ids.len().div_ceil(MAX_FETCH_BATCH)
+    );
     with_connection(config, |conn| {
         let mut out: HashMap<String, Chunk> = HashMap::with_capacity(chunk_ids.len());
         for window in chunk_ids.chunks(MAX_FETCH_BATCH) {
@@ -596,6 +601,11 @@ pub fn get_chunks_batch(config: &Config, chunk_ids: &[String]) -> Result<HashMap
                 out.insert(chunk.id.clone(), chunk);
             }
         }
+        log::debug!(
+            "[memory::chunk_store] get_chunks_batch: matched {}/{} ids",
+            out.len(),
+            chunk_ids.len()
+        );
         Ok(out)
     })
 }
