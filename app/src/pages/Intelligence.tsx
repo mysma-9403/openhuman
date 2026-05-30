@@ -5,6 +5,8 @@ import DiagramViewerTab from '../components/intelligence/DiagramViewerTab';
 import GraphCentralityTab from '../components/intelligence/GraphCentralityTab';
 import IntelligenceSubconsciousTab from '../components/intelligence/IntelligenceSubconsciousTab';
 import IntelligenceTasksTab from '../components/intelligence/IntelligenceTasksTab';
+import MemoryFreshnessTab from '../components/intelligence/MemoryFreshnessTab';
+import MemoryTimelineTab from '../components/intelligence/MemoryTimelineTab';
 import { MemoryWorkspace } from '../components/intelligence/MemoryWorkspace';
 import { ToastContainer } from '../components/intelligence/Toast';
 import PillTabBar from '../components/PillTabBar';
@@ -18,8 +20,17 @@ import type {
   ConfirmationModal as ConfirmationModalType,
   ToastNotification,
 } from '../types/intelligence';
+import AgentWorkflows from './AgentWorkflows';
 
-type IntelligenceTab = 'memory' | 'subconscious' | 'tasks' | 'diagram' | 'centrality';
+type IntelligenceTab =
+  | 'memory'
+  | 'subconscious'
+  | 'tasks'
+  | 'workflows'
+  | 'diagram'
+  | 'centrality'
+  | 'freshness'
+  | 'timeline';
 
 export default function Intelligence() {
   const { t } = useT();
@@ -92,8 +103,15 @@ export default function Intelligence() {
       { id: 'tasks', label: t('memory.tab.tasks'), description: t('memory.tab.tasksDescription') },
       { id: 'memory', label: t('memory.tab.memory') },
       { id: 'subconscious', label: t('memory.tab.subconscious') },
+      {
+        id: 'workflows',
+        label: t('memory.tab.workflows'),
+        description: t('memory.tab.workflowsDescription'),
+      },
       { id: 'diagram', label: t('memory.tab.diagram') },
       { id: 'centrality', label: t('memory.tab.centrality') },
+      { id: 'freshness', label: t('memory.tab.freshness') },
+      { id: 'timeline', label: t('memory.tab.timeline') },
     ];
   const activeTabDef = tabs.find(tab => tab.id === activeTab);
 
@@ -179,9 +197,15 @@ export default function Intelligence() {
 
             {activeTab === 'tasks' && <IntelligenceTasksTab />}
 
+            {activeTab === 'workflows' && <AgentWorkflows />}
+
             {activeTab === 'diagram' && <DiagramViewerTab />}
 
             {activeTab === 'centrality' && <GraphCentralityTab />}
+
+            {activeTab === 'freshness' && <MemoryFreshnessTab />}
+
+            {activeTab === 'timeline' && <MemoryTimelineTab />}
           </div>
         </div>
       </div>
