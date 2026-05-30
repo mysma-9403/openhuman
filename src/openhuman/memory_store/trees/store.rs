@@ -131,9 +131,18 @@ pub fn get_trees_batch(config: &Config, tree_ids: &[String]) -> Result<HashMap<S
     if tree_ids.is_empty() {
         return Ok(HashMap::new());
     }
+    log::debug!(
+        "[tree::store] get_trees_batch: ids={} max_batch={TREES_MAX_FETCH_BATCH}",
+        tree_ids.len()
+    );
     with_connection(config, |conn| {
         let mut out: HashMap<String, Tree> = HashMap::with_capacity(tree_ids.len());
         for window in tree_ids.chunks(TREES_MAX_FETCH_BATCH) {
+            // SAFETY (SQL injection): only the *count* of placeholders is
+            // interpolated into the query string — `?1,?2,…` are numbered
+            // bind slots, never the id values. Every id is bound via typed
+            // `rusqlite::ToSql` params below; nothing user-controlled is
+            // ever formatted into `sql`. Do NOT inline id values here.
             let placeholders = (1..=window.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
@@ -155,6 +164,11 @@ pub fn get_trees_batch(config: &Config, tree_ids: &[String]) -> Result<HashMap<S
                 out.insert(t.id.clone(), t);
             }
         }
+        log::debug!(
+            "[tree::store] get_trees_batch: requested={} found={}",
+            tree_ids.len(),
+            out.len()
+        );
         Ok(out)
     })
 }
