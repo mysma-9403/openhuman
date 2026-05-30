@@ -1219,6 +1219,18 @@ pub(super) const CAPABILITIES: &[Capability] = &[
         privacy: DERIVED_TO_BACKEND,
     },
     Capability {
+        id: "automation.agent_workflows",
+        name: "Agent Workflows",
+        domain: "automation",
+        category: CapabilityCategory::Automation,
+        description: "Define phase-keyed workflows (WORKFLOW.md) that inject rules, run \
+                      gated scripts, scope visible tools, and surface working-directory \
+                      context across a task's lifecycle (pick-up, close, directory entry).",
+        how_to: "Workflows",
+        status: CapabilityStatus::Beta,
+        privacy: None,
+    },
+    Capability {
         id: "automation.view_cron_jobs",
         name: "View Cron Jobs",
         domain: "automation",
@@ -1426,6 +1438,18 @@ pub(super) const CAPABILITIES: &[Capability] = &[
                       remove it any time under Settings → Agent OS access to be prompted again. \
                       Policy still blocks forbidden paths and high-risk commands regardless.",
         how_to: "Click \"Always allow\" on an approval prompt; manage the list in Settings → Agent OS access.",
+        status: CapabilityStatus::Stable,
+        privacy: None,
+    },
+    Capability {
+        id: "security.approval_history",
+        name: "Approval History",
+        domain: "security",
+        category: CapabilityCategory::Settings,
+        description: "Review a read-only audit trail of past tool-approval decisions \
+                      (Approve once / Always allow / Deny), newest first. Summaries are \
+                      scrubbed of chat content and arguments are shown as redacted shape only.",
+        how_to: "Settings → Agent OS access → View approval history",
         status: CapabilityStatus::Stable,
         privacy: None,
     },
