@@ -228,7 +228,7 @@ fn walk_with_embeddings(
         //    ids stay silently absent from the map (same `Ok(None)`
         //    contract as the per-row `get_summary`); those ids are then
         //    tried as chunks below.
-        let summary_by_id = get_summaries_batch(config, &current_level)?;
+        let mut summary_by_id = get_summaries_batch(config, &current_level)?;
 
         // 2) Distinct tree_ids referenced by this level's summaries —
         //    dedup is purely to avoid redundant DB params (the per-id
@@ -262,7 +262,7 @@ fn walk_with_embeddings(
             .filter(|id| !summary_by_id.contains_key(*id))
             .cloned()
             .collect();
-        let chunk_by_id = get_chunks_batch(config, &chunk_ids)?;
+        let mut chunk_by_id = get_chunks_batch(config, &chunk_ids)?;
         // `get_chunk_embeddings_batch` returns only present ids
         // (mirroring per-row `get_chunk_embedding` returning
         // `Ok(None)` for legacy rows without an embedding row);
@@ -283,8 +283,7 @@ fn walk_with_embeddings(
             Vec::new()
         };
         for id in &current_level {
-            if let Some(summary) = summary_by_id.get(id) {
-                let mut summary = summary.clone();
+            if let Some(mut summary) = summary_by_id.remove(id) {
                 let scope = tree_by_id
                     .get(&summary.tree_id)
                     .map(|t| t.scope.clone())
@@ -310,8 +309,7 @@ fn walk_with_embeddings(
                 }
                 continue;
             }
-            if let Some(chunk) = chunk_by_id.get(id) {
-                let mut chunk = chunk.clone();
+            if let Some(mut chunk) = chunk_by_id.remove(id) {
                 // Missing embedding → None (legacy row); identical to
                 // the per-row `get_chunk_embedding(...) Ok(None)` arm.
                 let emb = emb_by_id.get(id).cloned();
@@ -509,9 +507,9 @@ mod tests {
 
     // ── Regression: BFS (not DFS) traversal ──────────────────────────
     //
-    // `walk_with_embeddings` uses a `VecDeque` frontier with `pop_front` +
-    // `push_back` (FIFO) — flagged on PR #831 CodeRabbit review after the
-    // original `Vec::pop()` implementation was DFS.
+    // `walk_with_embeddings` walks level-by-level (all nodes at depth N
+    // before any at depth N+1) — originally flagged on PR #831 CodeRabbit
+    // review after the initial `Vec::pop()` implementation was DFS.
     //
     // A single-level tree can't distinguish the two (both produce the same
     // output). We need a 2-level tree where BFS yields
