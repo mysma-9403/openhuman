@@ -34,6 +34,12 @@ use crate::openhuman::memory_tree::retrieval::types::{
 use crate::openhuman::memory_tree::score::embed::{build_embedder_from_config, cosine_similarity};
 use crate::openhuman::memory_tree::tree::store;
 
+/// Upper-bound estimate of how many children a summary node fans out to,
+/// used only to pre-size the next-level BFS frontier. Over-estimating wastes
+/// a little transient capacity; under-estimating costs a realloc — neither is
+/// load-bearing for correctness.
+const EXPECTED_CHILD_FANOUT: usize = 10;
+
 /// Walk the summary hierarchy down one step (or more if `max_depth > 1`)
 /// and return the hydrated child hits. Children at level 1 are raw chunks;
 /// deeper children are summaries.
@@ -229,11 +235,15 @@ fn walk_with_embeddings(
         //    walk below routes each summary to its own scope via the
         //    map). Insertion-order preserving for deterministic logs.
         let distinct_tree_ids: Vec<String> = {
-            let mut seen: HashSet<String> = HashSet::new();
+            // `seen` borrows the tree_id slices straight out of
+            // `summary_by_id` (which outlives this block) — dedup costs no
+            // allocation; only the surviving distinct ids are cloned into
+            // `out` for `get_trees_batch`.
+            let mut seen: HashSet<&str> = HashSet::new();
             let mut out: Vec<String> = Vec::new();
             for id in &current_level {
                 if let Some(s) = summary_by_id.get(id) {
-                    if seen.insert(s.tree_id.clone()) {
+                    if seen.insert(s.tree_id.as_str()) {
                         out.push(s.tree_id.clone());
                     }
                 }
@@ -263,7 +273,15 @@ fn walk_with_embeddings(
         //    level. Per-id HashMap lookups (keyed by id, not by
         //    enumerate() position over the input slice — otherwise a
         //    sibling could shadow another's scope or chunk body).
-        let mut next_level: Vec<String> = Vec::new();
+        // Pre-size against expected fan-out so the per-level child
+        // accumulation avoids repeated reallocs. Only the non-final depths
+        // extend `next_level` (see the `depth < max_depth` guard below), so
+        // skip the reservation at the last depth where it would stay empty.
+        let mut next_level: Vec<String> = if depth < max_depth {
+            Vec::with_capacity(current_level.len() * EXPECTED_CHILD_FANOUT)
+        } else {
+            Vec::new()
+        };
         for id in &current_level {
             if let Some(summary) = summary_by_id.get(id) {
                 let mut summary = summary.clone();
