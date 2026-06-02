@@ -134,10 +134,13 @@ pub async fn ingest_session_transcript(
     // the stream only carries already-built futures with concrete lifetimes.
     // Stable correlation fields for the per-item failure logs below. `&str`
     // is `Copy`, so each `async move` closure copies these in (same as it
-    // already does for `memory`) without moving `thread_id` / `path_display`,
-    // which are still needed by the summary log after the persist stage.
+    // already does for `memory`) without moving `thread_id` / `basename`,
+    // which are still needed after the persist stage. Use the transcript
+    // *basename* (not the full path) and avoid logging transcript-derived
+    // content (e.g. reflection theme) so failure logs can't leak the user's
+    // home directory or conversational PII.
     let thread_label = thread_id.as_deref().unwrap_or("-");
-    let path_label = path_display.as_str();
+    let transcript_label = basename.as_str();
 
     let candidate_futs: Vec<_> = kept
         .iter()
@@ -146,7 +149,7 @@ pub async fn ingest_session_transcript(
                 Ok(()) => 1usize,
                 Err(err) => {
                     log::warn!(
-                        "[transcript_ingest] failed to persist candidate kind={:?} importance={:?} thread={thread_label} path={path_label}: {err}",
+                        "[transcript_ingest] failed to persist candidate kind={:?} importance={:?} thread={thread_label} transcript={transcript_label}: {err}",
                         candidate.kind,
                         candidate.importance
                     );
@@ -167,8 +170,7 @@ pub async fn ingest_session_transcript(
                 Ok(()) => 1usize,
                 Err(err) => {
                     log::warn!(
-                        "[transcript_ingest] failed to persist reflection theme={:?} importance={:?} thread={thread_label} path={path_label}: {err}",
-                        reflection.theme,
+                        "[transcript_ingest] failed to persist reflection importance={:?} thread={thread_label} transcript={transcript_label}: {err}",
                         reflection.importance
                     );
                     0usize
