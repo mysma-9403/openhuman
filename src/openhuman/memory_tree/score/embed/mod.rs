@@ -76,6 +76,11 @@ pub trait Embedder: Send + Sync {
     ///
     /// The returned vector always has `texts.len()` elements.
     async fn embed_batch(&self, texts: &[&str]) -> Vec<Result<Vec<f32>>> {
+        log::debug!(
+            "[memory_tree::embed::{}] embed_batch:enter sequential texts={}",
+            self.name(),
+            texts.len()
+        );
         let mut out = Vec::with_capacity(texts.len());
         for text in texts {
             out.push(self.embed(text).await);
@@ -117,14 +122,24 @@ pub(crate) async fn embed_batch_via_provider(
     if texts.is_empty() {
         return Vec::new();
     }
+    log::debug!(
+        "[memory_tree::embed::{label}] embed_batch:enter texts={}",
+        texts.len()
+    );
     match inner.embed(texts).await {
-        Ok(vectors) if vectors.len() == texts.len() => vectors
-            .into_iter()
-            .map(|v| check_embed_dim(v, label))
-            .collect(),
+        Ok(vectors) if vectors.len() == texts.len() => {
+            log::debug!(
+                "[memory_tree::embed::{label}] embed_batch:success collapsed {} texts into one provider call",
+                texts.len()
+            );
+            vectors
+                .into_iter()
+                .map(|v| check_embed_dim(v, label))
+                .collect()
+        }
         Ok(vectors) => {
             log::warn!(
-                "[memory_tree::embed::{label}] batch returned {} vectors for {} texts; \
+                "[memory_tree::embed::{label}] embed_batch:fallback batch returned {} vectors for {} texts; \
                  falling back to per-text embedding",
                 vectors.len(),
                 texts.len()
@@ -133,7 +148,7 @@ pub(crate) async fn embed_batch_via_provider(
         }
         Err(e) => {
             log::warn!(
-                "[memory_tree::embed::{label}] batch embed failed ({e:#}); \
+                "[memory_tree::embed::{label}] embed_batch:fallback batch embed failed ({e:#}); \
                  falling back to per-text embedding"
             );
             embed_each_via_provider(inner, label, texts).await

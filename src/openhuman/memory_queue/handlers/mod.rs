@@ -726,7 +726,7 @@ async fn reembed_collect(
     label: &str,
     read_body: impl Fn(&Config, &str) -> Result<String>,
     mark_skipped: impl Fn(&Config, &str, &str, &str),
-) -> Vec<(String, Vec<f32>)> {
+) -> Result<Vec<(String, Vec<f32>)>> {
     // Phase A: read bodies; persistently tombstone read failures so an
     // unreadable row is attempted at most once per signature.
     let mut readable: Vec<(&String, String)> = Vec::with_capacity(ids.len());
@@ -742,7 +742,7 @@ async fn reembed_collect(
         }
     }
     if readable.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Phase B: one batched embed call. Scope `texts` so its borrow on
@@ -753,15 +753,15 @@ async fn reembed_collect(
     };
     if results.len() != readable.len() {
         // `embed_batch`'s contract is one result per input position. A
-        // violation means we can't attribute results to ids — skip the whole
-        // batch WITHOUT tombstoning so a later batch retries these rows.
-        log::error!(
-            "[memory::jobs] reembed_backfill: {label} embed_batch returned {} results for {} texts; \
-             skipping batch without tombstoning (sig={active_sig})",
+        // violation means we can't attribute results to ids. Returning an
+        // empty Vec here would make the handler write nothing yet still
+        // `Defer`, re-selecting the same ids forever — a non-converging
+        // chain. Surface it as an error so the chain terminates instead.
+        anyhow::bail!(
+            "reembed_backfill: {label} embed_batch returned {} results for {} texts (sig={active_sig})",
             results.len(),
             readable.len()
         );
-        return Vec::new();
     }
 
     // Phase C: classify per position exactly as the legacy loop did.
@@ -783,7 +783,7 @@ async fn reembed_collect(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 async fn handle_reembed_backfill(config: &Config, job: &Job) -> Result<JobOutcome> {
@@ -912,7 +912,7 @@ async fn handle_reembed_backfill(config: &Config, job: &Job) -> Result<JobOutcom
         content_read::read_chunk_body,
         try_mark_chunk_reembed_skipped,
     )
-    .await;
+    .await?;
     let summary_vecs = reembed_collect(
         config,
         embedder.as_ref(),
@@ -922,7 +922,7 @@ async fn handle_reembed_backfill(config: &Config, job: &Job) -> Result<JobOutcom
         content_read::read_summary_body,
         try_mark_summary_reembed_skipped,
     )
-    .await;
+    .await?;
 
     // Phase 3 (one short tx): persist all collected vectors to the sidecar.
     chunk_store::with_connection(config, |conn| {
