@@ -814,6 +814,48 @@ async fn prepare_messages_rejects_relative_file_marker_under_untrusted_channel_c
 }
 
 #[tokio::test]
+async fn prepare_messages_preserves_image_order_under_concurrent_fetch() {
+    // Regression guard for the bounded-concurrent reference normalization:
+    // `buffered` must yield results in input order so the rebuilt message
+    // lines its [IMAGE:…] markers back up with the original positions.
+    // Using more images than REF_FETCH_CONCURRENCY exercises the
+    // wrap-around case where later futures finish before earlier ones.
+    let temp = tempfile::tempdir().unwrap();
+    let png_sig = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+
+    let mut markers = String::from("gallery");
+    let mut expected = Vec::new();
+    for i in 0..5u8 {
+        let path = temp.path().join(format!("img{i}.png"));
+        // Distinct trailing byte → distinct base64 per image, so an
+        // out-of-order assembly would be detectable.
+        let mut bytes = png_sig.to_vec();
+        bytes.push(i);
+        std::fs::write(&path, &bytes).unwrap();
+        markers.push_str(&format!(" [IMAGE:{}]", path.display()));
+        expected.push(format!("data:image/png;base64,{}", STANDARD.encode(&bytes)));
+    }
+
+    let config = MultimodalConfig {
+        max_images: 6,
+        max_image_size_mb: 5,
+        allow_remote_fetch: false,
+    };
+
+    let messages = vec![ChatMessage::user(markers)];
+    let prepared =
+        prepare_messages_for_provider(&messages, &config, &MultimodalFileConfig::default())
+            .await
+            .unwrap();
+
+    let (_cleaned, refs) = parse_image_markers(&prepared.messages[0].content);
+    assert_eq!(
+        refs, expected,
+        "normalized image refs must preserve input order through bounded concurrency"
+    );
+}
+
+#[tokio::test]
 async fn prepare_messages_under_untrusted_channel_config_passes_plain_text_through() {
     // Sanity: text with no [FILE:…] markers must still go through
     // unchanged. The hardening only rejects file-marker smuggling, not

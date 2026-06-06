@@ -4,6 +4,7 @@ use crate::openhuman::config::{
 use crate::openhuman::inference::provider::ChatMessage;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use flate2::read::GzDecoder;
+use futures::stream::StreamExt;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -27,6 +28,16 @@ const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
 /// `data:` URIs. Inline `application/gzip` data URIs are decompressed before
 /// validation when they carry an `original_mime=...` parameter.
 const FILE_MARKER_PREFIX: &str = "[FILE:";
+
+/// How many attachment references within a single user message are
+/// resolved concurrently. Each remote reference is an independent HTTP
+/// fetch (or local-disk read), so a message carrying several remote
+/// image/file URLs would otherwise download them strictly serially and
+/// stall the chat turn for the sum of every fetch. Bounding the fan-out
+/// keeps a misbehaving message from opening an unbounded number of
+/// sockets against a single host. `1` reference (the common case) costs
+/// nothing extra — the stream simply drives a single future.
+const REF_FETCH_CONCURRENCY: usize = 4;
 
 /// Hard upper bound on how long [`pdf_extract::extract_text_from_mem`]
 /// may run before the worker is abandoned and the file degrades to a
@@ -336,29 +347,49 @@ pub async fn prepare_messages_for_provider(
             continue;
         }
 
-        let mut normalized_image_refs = Vec::with_capacity(image_refs.len());
-        for reference in image_refs {
-            let data_uri = normalize_image_reference(
-                &reference,
-                image_config,
-                max_image_bytes,
-                &remote_client,
-            )
-            .await?;
-            normalized_image_refs.push(data_uri);
+        // Resolve each reference concurrently (bounded). `buffered` yields
+        // results in input order, so the assembled vectors line up with the
+        // original markers exactly as the serial loop produced them, and the
+        // first error by index is the one surfaced — matching the old `?`
+        // short-circuit semantics.
+        // Materialize the futures into a `Vec` before `buffered` — handing
+        // `stream::iter` a lazy `Map` adaptor trips the "implementation of
+        // Send is not general enough" HRTB error (the borrow lifetime can't
+        // be generalized inside the adaptor).
+        let image_futs: Vec<_> = image_refs
+            .iter()
+            .map(|reference| {
+                normalize_image_reference(reference, image_config, max_image_bytes, &remote_client)
+            })
+            .collect();
+        let image_results: Vec<anyhow::Result<String>> = futures::stream::iter(image_futs)
+            .buffered(REF_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+        let mut normalized_image_refs = Vec::with_capacity(image_results.len());
+        for result in image_results {
+            normalized_image_refs.push(result?);
         }
 
-        let mut file_payloads = Vec::with_capacity(file_refs.len());
-        for reference in file_refs {
-            let payload = normalize_file_reference(
-                &reference,
-                file_config,
-                max_file_bytes,
-                max_extracted_text_chars,
-                &remote_client,
-            )
-            .await?;
-            file_payloads.push(payload);
+        let file_futs: Vec<_> = file_refs
+            .iter()
+            .map(|reference| {
+                normalize_file_reference(
+                    reference,
+                    file_config,
+                    max_file_bytes,
+                    max_extracted_text_chars,
+                    &remote_client,
+                )
+            })
+            .collect();
+        let file_results: Vec<anyhow::Result<_>> = futures::stream::iter(file_futs)
+            .buffered(REF_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+        let mut file_payloads = Vec::with_capacity(file_results.len());
+        for result in file_results {
+            file_payloads.push(result?);
         }
 
         let content =
