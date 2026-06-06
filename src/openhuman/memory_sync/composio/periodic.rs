@@ -387,13 +387,21 @@ pub(crate) async fn run_one_tick() -> Result<(), String> {
     // old `.find()` "first match wins" semantics. Non-fatal: an empty map just
     // means we sync without caps, exactly as the per-connection lookup did on
     // failure.
-    let caps_by_connection = index_caps_by_connection(
-        crate::openhuman::memory_sources::list_enabled_by_kind(
-            crate::openhuman::memory_sources::SourceKind::Composio,
-        )
-        .await
-        .unwrap_or_default(),
-    );
+    let composio_sources = match crate::openhuman::memory_sources::list_enabled_by_kind(
+        crate::openhuman::memory_sources::SourceKind::Composio,
+    )
+    .await
+    {
+        Ok(sources) => sources,
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "[composio:periodic] memory_sources registry read failed; proceeding without caps"
+            );
+            Vec::new()
+        }
+    };
+    let caps_by_connection = index_caps_by_connection(composio_sources);
 
     let mut considered = 0usize;
     let mut fired = 0usize;
