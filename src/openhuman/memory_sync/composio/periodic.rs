@@ -378,6 +378,23 @@ pub(crate) async fn run_one_tick() -> Result<(), String> {
     let audit_index = index_last_success_by_connection(&read_audit_log(&config));
     let now = Utc::now();
 
+    // Per-source caps (max_items / sync_depth_days) live in the memory_sources
+    // registry. Read the registry **once per tick** and index it by
+    // connection_id, instead of re-reading the whole registry and linearly
+    // scanning it inside the per-connection loop below — that was an N+1 over a
+    // process-global store read (one read + O(sources) scan for every active
+    // connection). `or_insert` keeps the first matching entry, preserving the
+    // old `.find()` "first match wins" semantics. Non-fatal: an empty map just
+    // means we sync without caps, exactly as the per-connection lookup did on
+    // failure.
+    let caps_by_connection = index_caps_by_connection(
+        crate::openhuman::memory_sources::list_enabled_by_kind(
+            crate::openhuman::memory_sources::SourceKind::Composio,
+        )
+        .await
+        .unwrap_or_default(),
+    );
+
     let mut considered = 0usize;
     let mut fired = 0usize;
     for conn in resp.connections {
@@ -425,20 +442,12 @@ pub(crate) async fn run_one_tick() -> Result<(), String> {
             continue;
         }
 
-        // Look up per-source caps from the memory_sources registry.
-        // Non-fatal: if the lookup fails we proceed without caps.
-        let (src_max_items, src_sync_depth_days) = {
-            let registry_sources = crate::openhuman::memory_sources::list_enabled_by_kind(
-                crate::openhuman::memory_sources::SourceKind::Composio,
-            )
-            .await
-            .unwrap_or_default();
-            registry_sources
-                .iter()
-                .find(|s| s.connection_id.as_deref() == Some(conn.id.as_str()))
-                .map(|s| (s.max_items, s.sync_depth_days))
-                .unwrap_or((None, None))
-        };
+        // Per-source caps were read once before the loop (see
+        // `caps_by_connection`); just index by connection_id here.
+        let (src_max_items, src_sync_depth_days) = caps_by_connection
+            .get(conn.id.as_str())
+            .copied()
+            .unwrap_or((None, None));
 
         tracing::debug!(
             toolkit = %toolkit,
@@ -562,11 +571,88 @@ fn build_periodic_audit_entry(
     }
 }
 
+/// Index memory-source caps by `connection_id` for O(1) lookup inside the
+/// per-connection sync loop.
+///
+/// Built once per tick from a single `list_enabled_by_kind` read instead of
+/// re-reading + linearly scanning the registry per connection (the previous
+/// N+1). `or_insert` keeps the **first** entry for a given connection_id,
+/// matching the old `.find()` "first match wins" behaviour; entries without a
+/// `connection_id` are dropped (they can never match a Composio connection).
+fn index_caps_by_connection(
+    sources: Vec<crate::openhuman::memory_sources::MemorySourceEntry>,
+) -> HashMap<String, (Option<u32>, Option<u32>)> {
+    let mut map: HashMap<String, (Option<u32>, Option<u32>)> = HashMap::new();
+    for source in sources {
+        if let Some(cid) = source.connection_id {
+            map.entry(cid)
+                .or_insert((source.max_items, source.sync_depth_days));
+        }
+    }
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::openhuman::config::TEST_ENV_LOCK as ENV_LOCK;
     use tempfile::tempdir;
+
+    fn composio_source(
+        id: &str,
+        connection_id: Option<&str>,
+        max_items: Option<u32>,
+        sync_depth_days: Option<u32>,
+    ) -> crate::openhuman::memory_sources::MemorySourceEntry {
+        let mut value = serde_json::json!({
+            "id": id,
+            "kind": "composio",
+            "label": id,
+            "toolkit": "gmail",
+        });
+        if let Some(cid) = connection_id {
+            value["connection_id"] = serde_json::json!(cid);
+        }
+        if let Some(mi) = max_items {
+            value["max_items"] = serde_json::json!(mi);
+        }
+        if let Some(sd) = sync_depth_days {
+            value["sync_depth_days"] = serde_json::json!(sd);
+        }
+        serde_json::from_value(value).expect("valid MemorySourceEntry")
+    }
+
+    #[test]
+    fn index_caps_maps_each_connection_to_its_caps() {
+        let map = index_caps_by_connection(vec![
+            composio_source("s1", Some("conn-a"), Some(5), Some(30)),
+            composio_source("s2", Some("conn-b"), None, Some(7)),
+        ]);
+        assert_eq!(map.get("conn-a").copied(), Some((Some(5), Some(30))));
+        assert_eq!(map.get("conn-b").copied(), Some((None, Some(7))));
+        assert_eq!(map.get("conn-missing").copied(), None);
+    }
+
+    #[test]
+    fn index_caps_first_match_wins_for_duplicate_connection() {
+        // Two entries share a connection_id — the first one must win, matching
+        // the old `.find()` semantics the hoist replaced.
+        let map = index_caps_by_connection(vec![
+            composio_source("first", Some("dup"), Some(10), None),
+            composio_source("second", Some("dup"), Some(99), Some(99)),
+        ]);
+        assert_eq!(map.get("dup").copied(), Some((Some(10), None)));
+    }
+
+    #[test]
+    fn index_caps_drops_entries_without_connection_id() {
+        let map = index_caps_by_connection(vec![
+            composio_source("no-conn", None, Some(3), Some(3)),
+            composio_source("ok", Some("conn-x"), Some(1), None),
+        ]);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("conn-x"));
+    }
 
     #[test]
     fn tick_seconds_is_sane_default() {
