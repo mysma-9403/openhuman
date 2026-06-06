@@ -185,14 +185,22 @@ where
     Fut: std::future::Future<Output = Option<bool>>,
 {
     if let Some(hit) = cache.get(Instant::now(), ttl) {
+        tracing::debug!(exhausted = hit, "[team] budget probe cache hit");
         return hit;
     }
     match fetch().await {
         Some(exhausted) => {
+            tracing::debug!(
+                exhausted,
+                "[team] budget probe cache miss; caching fresh probe"
+            );
             cache.put(Instant::now(), exhausted);
             exhausted
         }
-        None => false,
+        None => {
+            tracing::debug!("[team] budget probe failed; deferring to backend gate (not cached)");
+            false
+        }
     }
 }
 
