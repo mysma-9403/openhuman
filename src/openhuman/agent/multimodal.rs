@@ -272,6 +272,18 @@ pub fn contains_file_markers(messages: &[ChatMessage]) -> bool {
     count_file_markers(messages) > 0
 }
 
+/// Resolve every `[IMAGE:…]`/`[FILE:…]` marker in the user messages into
+/// inline content the provider can consume (base64 data URIs for images,
+/// extracted text or inlined references for files).
+///
+/// Enforces the per-turn image/file count limits up front, then normalizes
+/// each reference — local-disk read, `data:` decode, or gated remote
+/// `http(s)` fetch — applying the configured size/MIME/remote-fetch and
+/// untrusted-channel guards. References within a message are resolved with a
+/// bounded-concurrent fan-out ([`REF_FETCH_CONCURRENCY`]); results keep input
+/// order and the first error by index is surfaced, matching a serial
+/// short-circuit. Returns the rewritten messages plus whether any
+/// images/files were present.
 pub async fn prepare_messages_for_provider(
     messages: &[ChatMessage],
     image_config: &MultimodalConfig,
