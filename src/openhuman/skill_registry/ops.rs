@@ -132,6 +132,13 @@ async fn collect_catalogs(
     fetcher: &(dyn CatalogFetcher + Sync),
     enabled: &[&RegistrySource],
 ) -> (Vec<CatalogEntry>, Vec<String>) {
+    let source_ids: Vec<&str> = enabled.iter().map(|s| s.id.as_str()).collect();
+    tracing::debug!(
+        source_ids = ?source_ids,
+        concurrency = CATALOG_FETCH_CONCURRENCY,
+        "[skill_registry] collect_catalogs: fan-out start"
+    );
+
     // Materialize the per-source futures into a `Vec` before `stream::iter` — a
     // lazy `Map` adaptor trips the "implementation of `Send` is not general
     // enough" HRTB error.
@@ -168,6 +175,11 @@ async fn collect_catalogs(
             }
         }
     }
+    tracing::debug!(
+        total_count = all_entries.len(),
+        error_count = errors.len(),
+        "[skill_registry] collect_catalogs: fan-out complete"
+    );
     (all_entries, errors)
 }
 
