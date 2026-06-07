@@ -398,14 +398,31 @@ async fn collect_calendar_meetings_with(
         now,
         interval_minutes,
     );
-    collect_calendar_events_buffered(
+    tracing::debug!(
+        executor = executor.kind_label(),
+        selected = selected.len(),
+        calendar_connection_limit,
+        meeting_lookahead_minutes,
+        interval_minutes,
+        concurrency = CALENDAR_FANOUT_CONCURRENCY,
+        now = %now,
+        end_window = %end_window,
+        "[heartbeat:planner] calendar fan-out start"
+    );
+    let events = collect_calendar_events_buffered(
         executor,
         &selected,
         meeting_lookahead_minutes,
         now,
         end_window,
     )
-    .await
+    .await;
+    tracing::debug!(
+        selected = selected.len(),
+        events = events.len(),
+        "[heartbeat:planner] calendar fan-out complete"
+    );
+    events
 }
 
 pub(crate) fn extract_calendar_events(
