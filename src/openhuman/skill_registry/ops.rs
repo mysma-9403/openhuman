@@ -1,5 +1,7 @@
 //! Business logic for the skill registry: fetch catalogs, search, and install.
 
+use async_trait::async_trait;
+use futures::stream::StreamExt;
 use serde::Deserialize;
 
 use super::store;
@@ -7,6 +9,13 @@ use super::types::{CatalogEntry, RegistryKind, RegistrySource};
 
 const MAX_CATALOG_BYTES: usize = 5 * 1024 * 1024;
 const FETCH_TIMEOUT_SECS: u64 = 30;
+
+/// Bound on how many registry sources are fetched concurrently.
+///
+/// The enabled-source set is tiny (3 bundled defaults + any custom), so this
+/// only needs to be large enough to overlap the typical handful of GitHub raw
+/// round-trips without opening an unbounded number of sockets.
+const CATALOG_FETCH_CONCURRENCY: usize = 4;
 
 /// Default registry sources shipped with the app.
 pub fn default_sources() -> Vec<RegistrySource> {
@@ -95,6 +104,73 @@ pub fn remove_source(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Narrow seam over the concrete `reqwest`-backed catalog fetch so the
+/// multi-source fan-out can be unit-tested with a fake fetcher (no network).
+#[async_trait]
+trait CatalogFetcher {
+    async fn fetch(&self, source: &RegistrySource) -> Result<Vec<CatalogEntry>, String>;
+}
+
+/// Real fetcher: one HTTP GET + parse per source via `fetch_source_catalog`.
+struct HttpCatalogFetcher {
+    client: reqwest::Client,
+}
+
+#[async_trait]
+impl CatalogFetcher for HttpCatalogFetcher {
+    async fn fetch(&self, source: &RegistrySource) -> Result<Vec<CatalogEntry>, String> {
+        fetch_source_catalog(&self.client, source).await
+    }
+}
+
+/// Fetch every enabled source with bounded concurrency, preserving the exact
+/// serial-loop result: `buffered(K)` yields per-source results in input order,
+/// so the accumulated entries and the diagnostic `errors` list are identical to
+/// the old one-at-a-time loop — only the wall-clock latency drops (from the sum
+/// of all fetches to roughly `ceil(N / K)` round-trips).
+async fn collect_catalogs(
+    fetcher: &(dyn CatalogFetcher + Sync),
+    enabled: &[&RegistrySource],
+) -> (Vec<CatalogEntry>, Vec<String>) {
+    // Materialize the per-source futures into a `Vec` before `stream::iter` — a
+    // lazy `Map` adaptor trips the "implementation of `Send` is not general
+    // enough" HRTB error.
+    let fetch_futs: Vec<_> = enabled
+        .iter()
+        .map(|source| async move { (source.id.clone(), fetcher.fetch(source).await) })
+        .collect();
+
+    let results: Vec<(String, Result<Vec<CatalogEntry>, String>)> =
+        futures::stream::iter(fetch_futs)
+            .buffered(CATALOG_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+
+    let mut all_entries: Vec<CatalogEntry> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for (source_id, result) in results {
+        match result {
+            Ok(entries) => {
+                tracing::debug!(
+                    source = %source_id,
+                    count = entries.len(),
+                    "[skill_registry] fetched catalog"
+                );
+                all_entries.extend(entries);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    source = %source_id,
+                    error = %e,
+                    "[skill_registry] failed to fetch catalog"
+                );
+                errors.push(format!("{source_id}: {e}"));
+            }
+        }
+    }
+    (all_entries, errors)
+}
+
 /// Fetch the full catalog from all enabled sources, using cache when fresh.
 pub async fn browse_catalog(force_refresh: bool) -> Result<Vec<CatalogEntry>, String> {
     if !force_refresh {
@@ -121,29 +197,8 @@ pub async fn browse_catalog(force_refresh: bool) -> Result<Vec<CatalogEntry>, St
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
 
-    let mut all_entries: Vec<CatalogEntry> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-
-    for source in &enabled {
-        match fetch_source_catalog(&client, source).await {
-            Ok(entries) => {
-                tracing::debug!(
-                    source = %source.id,
-                    count = entries.len(),
-                    "[skill_registry] fetched catalog"
-                );
-                all_entries.extend(entries);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    source = %source.id,
-                    error = %e,
-                    "[skill_registry] failed to fetch catalog"
-                );
-                errors.push(format!("{}: {e}", source.id));
-            }
-        }
-    }
+    let fetcher = HttpCatalogFetcher { client };
+    let (mut all_entries, errors) = collect_catalogs(&fetcher, &enabled).await;
 
     all_entries.sort_by(|a, b| {
         b.stars
@@ -363,4 +418,143 @@ struct RawIndexEntry {
     star_count: Option<u32>,
     updated_at: Option<String>,
     last_updated: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn source(id: &str) -> RegistrySource {
+        RegistrySource {
+            id: id.to_string(),
+            name: id.to_string(),
+            url: format!("https://example.test/{id}.json"),
+            kind: RegistryKind::GithubIndex,
+            enabled: true,
+        }
+    }
+
+    fn entry(id: &str, source_id: &str) -> CatalogEntry {
+        CatalogEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: String::new(),
+            format: "openhuman".to_string(),
+            author: None,
+            version: None,
+            tags: Vec::new(),
+            download_url: format!("https://example.test/{id}.md"),
+            source_id: source_id.to_string(),
+            stars: None,
+            updated_at: None,
+        }
+    }
+
+    /// Fake fetcher returning canned per-source results, tracking the observed
+    /// max in-flight concurrency so a test can assert the fan-out really overlaps.
+    struct FakeFetcher {
+        responses: HashMap<String, Result<Vec<CatalogEntry>, String>>,
+        inflight: Arc<AtomicUsize>,
+        max_inflight: Arc<AtomicUsize>,
+        delay_ms: u64,
+    }
+
+    impl FakeFetcher {
+        fn new(delay_ms: u64) -> Self {
+            Self {
+                responses: HashMap::new(),
+                inflight: Arc::new(AtomicUsize::new(0)),
+                max_inflight: Arc::new(AtomicUsize::new(0)),
+                delay_ms,
+            }
+        }
+
+        fn with(mut self, id: &str, result: Result<Vec<CatalogEntry>, String>) -> Self {
+            self.responses.insert(id.to_string(), result);
+            self
+        }
+    }
+
+    #[async_trait]
+    impl CatalogFetcher for FakeFetcher {
+        async fn fetch(&self, source: &RegistrySource) -> Result<Vec<CatalogEntry>, String> {
+            let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_inflight.fetch_max(now, Ordering::SeqCst);
+            if self.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            }
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            self.responses
+                .get(&source.id)
+                .cloned()
+                .unwrap_or_else(|| Err("no canned response".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_catalogs_preserves_source_order() {
+        let sources: Vec<RegistrySource> = (1..=5).map(|n| source(&format!("src-{n}"))).collect();
+        let enabled: Vec<&RegistrySource> = sources.iter().collect();
+
+        let mut fetcher = FakeFetcher::new(0);
+        for n in 1..=5 {
+            let id = format!("src-{n}");
+            fetcher = fetcher.with(&id, Ok(vec![entry(&format!("evt-{n}"), &id)]));
+        }
+
+        let (entries, errors) = collect_catalogs(&fetcher, &enabled).await;
+        let ids: Vec<String> = entries.into_iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec!["evt-1", "evt-2", "evt-3", "evt-4", "evt-5"],
+            "buffered fan-out must preserve per-source input order"
+        );
+        assert!(errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_catalogs_runs_sources_concurrently() {
+        let sources: Vec<RegistrySource> = (1..=4).map(|n| source(&format!("src-{n}"))).collect();
+        let enabled: Vec<&RegistrySource> = sources.iter().collect();
+
+        let mut fetcher = FakeFetcher::new(30);
+        for n in 1..=4 {
+            let id = format!("src-{n}");
+            fetcher = fetcher.with(&id, Ok(vec![entry(&format!("evt-{n}"), &id)]));
+        }
+        let max_inflight = fetcher.max_inflight.clone();
+
+        let (entries, _errors) = collect_catalogs(&fetcher, &enabled).await;
+        assert_eq!(entries.len(), 4);
+        assert!(
+            max_inflight.load(Ordering::SeqCst) > 1,
+            "fan-out must overlap fetches (observed max in-flight = {})",
+            max_inflight.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_catalogs_isolates_failed_source() {
+        let sources = vec![source("src-1"), source("src-2"), source("src-3")];
+        let enabled: Vec<&RegistrySource> = sources.iter().collect();
+
+        // Middle source errors — it must drop out without poisoning the
+        // surviving two, and surface in the diagnostic `errors` list.
+        let fetcher = FakeFetcher::new(0)
+            .with("src-1", Ok(vec![entry("evt-1", "src-1")]))
+            .with("src-2", Err("boom".to_string()))
+            .with("src-3", Ok(vec![entry("evt-3", "src-3")]));
+
+        let (entries, errors) = collect_catalogs(&fetcher, &enabled).await;
+        let ids: Vec<String> = entries.into_iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec!["evt-1", "evt-3"],
+            "a failed source contributes no entries while order is preserved"
+        );
+        assert_eq!(errors, vec!["src-2: boom".to_string()]);
+    }
 }
