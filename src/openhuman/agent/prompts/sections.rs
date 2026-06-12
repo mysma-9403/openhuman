@@ -606,6 +606,20 @@ impl PromptSection for DateTimeSection {
             now.format("%Z"),
             now.format("%:z"),
         );
+        // #3602: ground spoken time-relative statements in the clock above.
+        // The exact local time is already rendered here, yet agents would
+        // still guess the time of day ("good morning" at 20:00). This binds
+        // greetings and relative-time phrasing to the timestamp with no tool
+        // call — zero added latency — and sits right under the time block so
+        // the two are read together. Always rendered (not tool-gated): it only
+        // asks the agent to read what's already in front of it.
+        out.push_str(
+            "\n\n> Before any time-relative statement to the user — greetings \
+             (\"good morning/afternoon/evening\"), \"today/tonight/tomorrow\", \
+             \"earlier/just now\", relative ages — read the date & time above \
+             and match it. The exact local time is right here, so never guess \
+             the time of day: a \"good morning\" at 20:00 local is a bug.",
+        );
         // Time-discipline rule, gated on the agent actually having the
         // `resolve_time` tool. LLMs are unreliable at epoch arithmetic — a
         // real incident had an agent compute "24h ago" ~10 months off, then

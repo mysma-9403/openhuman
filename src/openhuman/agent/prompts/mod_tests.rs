@@ -222,18 +222,26 @@ fn datetime_section_includes_timestamp_and_timezone() {
     assert!(rendered.starts_with("## Current Date & Time\n\n"));
 
     let payload = rendered.trim_start_matches("## Current Date & Time\n\n");
-    assert!(payload.chars().any(|c| c.is_ascii_digit()));
-    assert!(payload.contains(" ("));
-    assert!(payload.ends_with(')'));
+    // The timestamp is the first line; the #3602 grounding rule follows it.
+    let stamp = payload.lines().next().unwrap();
+    assert!(stamp.chars().any(|c| c.is_ascii_digit()));
+    assert!(stamp.contains(" ("));
+    assert!(stamp.ends_with(')'));
     // IANA zone is included so agents can reason about the host's
     // timezone without parsing a locale-dependent abbreviation. Either
     // a slashed zone (`America/Los_Angeles`) or the `UTC` fallback for
     // hosts where `iana-time-zone` can't resolve one.
     assert!(
-        payload.contains('/') || payload.contains(" UTC "),
-        "rendered payload missing IANA timezone: {payload}"
+        stamp.contains('/') || stamp.contains(" UTC "),
+        "rendered payload missing IANA timezone: {stamp}"
     );
-    assert!(payload.contains("UTC"), "missing UTC offset: {payload}");
+    assert!(stamp.contains("UTC"), "missing UTC offset: {stamp}");
+    // #3602: the spoken-time grounding rule always ships under the clock so
+    // greetings are bound to the rendered time, not guessed.
+    assert!(
+        payload.contains("Before any time-relative statement") && payload.contains("never guess"),
+        "datetime section must carry the #3602 spoken-time grounding rule; got:\n{payload}"
+    );
 }
 
 #[test]
