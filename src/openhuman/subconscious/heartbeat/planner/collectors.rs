@@ -249,7 +249,28 @@ async fn fetch_calendar_events_for_connection(
         .execute("GOOGLECALENDAR_EVENTS_LIST", arguments)
         .await
     {
-        Ok(resp) => extract_calendar_events(&resp.data, &toolkit, &conn.id, now, end_window),
+        // Composio encodes provider-side failures in `successful`/`error` while
+        // still returning `Ok(_)` (the repo-wide `if !resp.successful` convention),
+        // so an unsuccessful list must take the same warn + empty path as a
+        // transport `Err` — otherwise an error payload falls through to
+        // `extract_calendar_events`, losing the diagnostic and risking stale data.
+        Ok(resp) if resp.successful => {
+            extract_calendar_events(&resp.data, &toolkit, &conn.id, now, end_window)
+        }
+        Ok(resp) => {
+            tracing::warn!(
+                target: "composio",
+                toolkit = %toolkit,
+                connection_id = %conn.id,
+                kind = executor.kind_label(),
+                error = %resp
+                    .error
+                    .as_deref()
+                    .unwrap_or("calendar execute returned unsuccessful=false"),
+                "[heartbeat:planner] GOOGLECALENDAR_EVENTS_LIST failed"
+            );
+            Vec::new()
+        }
         Err(error) => {
             tracing::warn!(
                 target: "composio",
@@ -727,6 +748,10 @@ mod tests {
     /// per-call delay and an observed-max-concurrency probe.
     struct FakeExecutor {
         responses: std::collections::HashMap<String, Result<serde_json::Value, String>>,
+        /// Connections whose execute returns `Ok(successful=false)` carrying the
+        /// given would-be-event payload — models a provider-side failure that
+        /// still arrives as `Ok(_)`.
+        unsuccessful: std::collections::HashMap<String, serde_json::Value>,
         inflight: Arc<AtomicUsize>,
         max_inflight: Arc<AtomicUsize>,
         delay_ms: u64,
@@ -736,6 +761,7 @@ mod tests {
         fn new(delay_ms: u64) -> Self {
             Self {
                 responses: std::collections::HashMap::new(),
+                unsuccessful: std::collections::HashMap::new(),
                 inflight: Arc::new(AtomicUsize::new(0)),
                 max_inflight: Arc::new(AtomicUsize::new(0)),
                 delay_ms,
@@ -744,6 +770,13 @@ mod tests {
 
         fn with(mut self, conn_id: &str, resp: Result<serde_json::Value, String>) -> Self {
             self.responses.insert(conn_id.to_string(), resp);
+            self
+        }
+
+        /// Register a connection that returns `Ok` but with `successful=false`,
+        /// carrying `data` that *would* parse to an event if it were extracted.
+        fn with_unsuccessful(mut self, conn_id: &str, data: serde_json::Value) -> Self {
+            self.unsuccessful.insert(conn_id.to_string(), data);
             self
         }
     }
@@ -772,6 +805,15 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            if let Some(data) = self.unsuccessful.get(&conn_id) {
+                return Ok(ComposioExecuteResponse {
+                    data: data.clone(),
+                    successful: false,
+                    error: Some("provider rejected the request".to_string()),
+                    cost_usd: 0.0,
+                    markdown_formatted: None,
+                });
+            }
             match self.responses.get(&conn_id) {
                 Some(Ok(data)) => Ok(ComposioExecuteResponse {
                     data: data.clone(),
@@ -867,6 +909,33 @@ mod tests {
             titles,
             vec!["evt-1", "evt-3"],
             "a failed connection contributes no events while order is preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn calendar_fanout_drops_unsuccessful_response() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let end_window = now + Duration::minutes(120);
+        let start = now + Duration::minutes(30);
+
+        let conns = vec![
+            conn("cal-1", "googlecalendar", "ACTIVE"),
+            conn("cal-2", "googlecalendar", "ACTIVE"),
+        ];
+
+        // cal-2 returns Ok(successful=false) carrying a payload that *would*
+        // parse to an event — proving the unsuccessful path warns + drops it
+        // instead of falling through to `extract_calendar_events`.
+        let exec = FakeExecutor::new(0)
+            .with("cal-1", Ok(in_window_event("evt-1", start)))
+            .with_unsuccessful("cal-2", in_window_event("evt-2-must-not-appear", start));
+
+        let events = collect_calendar_events_buffered(&exec, &conns, 120, now, end_window).await;
+        let titles: Vec<String> = events.into_iter().map(|e| e.title).collect();
+        assert_eq!(
+            titles,
+            vec!["evt-1"],
+            "an Ok(successful=false) response must contribute no events, not its error payload"
         );
     }
 
