@@ -418,6 +418,7 @@ async fn collect_calendar_meetings_with(
     )
     .await;
     tracing::debug!(
+        executor = executor.kind_label(),
         selected = selected.len(),
         events = events.len(),
         "[heartbeat:planner] calendar fan-out complete"
