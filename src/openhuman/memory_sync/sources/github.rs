@@ -179,6 +179,13 @@ pub async fn run_github_sync(
     // batches[i].
     let batches: Vec<_> = batches.into_iter().collect();
     let concurrency = summarise_concurrency(config.workload_uses_local("memory"));
+    tracing::debug!(
+        source_id = %source_id,
+        tree_id = %tree.id,
+        batch_count = batches.len(),
+        concurrency,
+        "[memory_sync:github] starting concurrent summarise phase"
+    );
     let summarise_futs: Vec<_> = batches
         .iter()
         .enumerate()
@@ -211,6 +218,12 @@ pub async fn run_github_sync(
         .buffered(concurrency)
         .collect()
         .await;
+    tracing::debug!(
+        source_id = %source_id,
+        tree_id = %tree.id,
+        outputs = outputs.len(),
+        "[memory_sync:github] concurrent summarise phase complete"
+    );
 
     // ── Phase 2: fold cost + ingest in batch order (serial) ──
     for (batch_idx, ((batch_inputs, batch_labels, batch_basenames), output)) in
