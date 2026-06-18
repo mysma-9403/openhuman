@@ -10,6 +10,7 @@ describe('normalizeRewardsSnapshot', () => {
       discord: {
         linked: true,
         discordId: 'discord-123',
+        username: 'cooluser',
         inviteUrl: 'https://discord.gg/openhuman',
         membershipStatus: 'member',
       },
@@ -45,6 +46,7 @@ describe('normalizeRewardsSnapshot', () => {
     });
 
     expect(snapshot.discord.membershipStatus).toBe('member');
+    expect(snapshot.discord.username).toBe('cooluser');
     expect(snapshot.summary.plan).toBe('PRO');
     expect(snapshot.metrics.currentStreakDays).toBe(7);
     expect(snapshot.achievements[0].discordRoleStatus).toBe('assigned');
@@ -60,6 +62,7 @@ describe('normalizeRewardsSnapshot', () => {
     });
 
     expect(snapshot.discord.membershipStatus).toBe('unavailable');
+    expect(snapshot.discord.username).toBeNull();
     expect(snapshot.summary.plan).toBe('FREE');
     expect(snapshot.summary.unlockedCount).toBe(2);
     expect(snapshot.achievements[0].discordRoleStatus).toBe('unavailable');

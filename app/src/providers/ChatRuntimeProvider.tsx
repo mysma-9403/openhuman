@@ -23,6 +23,7 @@ import { store } from '../store';
 import {
   appendSubagentStreamDelta,
   clearInferenceStatusForThread,
+  clearParallelRequest,
   clearPendingApprovalForThread,
   clearStreamingAssistantForThread,
   endInferenceTurn,
@@ -31,6 +32,7 @@ import {
   recordSubagentTranscriptTool,
   resolveSubagentTranscriptTool,
   setInferenceStatusForThread,
+  setParallelStream,
   setPendingApprovalForThread,
   setStreamingAssistantForThread,
   setTaskBoardForThread,
@@ -45,6 +47,7 @@ import { useAppDispatch, useAppSelector } from '../store/hooks';
 import { selectSocketStatus } from '../store/socketSelectors';
 import {
   addInferenceResponse,
+  clearThreadInferenceActive,
   createNewThread,
   generateThreadTitleIfNeeded,
   setActiveThread,
@@ -61,6 +64,34 @@ const SEGMENT_DELIVERY_TTL_MS = 5 * 60 * 1000;
 const MAX_SEGMENT_DELIVERIES = 100;
 
 type SegmentDelivery = { segments: Map<number, string>; createdAt: number; lastSeenAt: number };
+
+type ThreadSliceState = ReturnType<typeof store.getState>['thread'];
+
+/**
+ * Whether a thread should be treated as occupied for proactive delivery — a
+ * thread is only a valid target when it is provably "fresh" (holds no
+ * messages). We check the in-memory message cache and the persisted
+ * `messageCount` snapshot, so a thread that already has a conversation
+ * server-side (but whose messages aren't loaded into the cache yet) is still
+ * treated as occupied and never reused.
+ *
+ * Crucially, *unknown* thread metadata counts as occupied: when only a
+ * rehydrated `selectedThreadId` is present (e.g. before `loadThreads`
+ * resolves, or after caches were reset while selection was preserved),
+ * `state.threads.find` returns `undefined`. Treating that as fresh would let
+ * a proactive event append into a conversation we simply haven't loaded yet.
+ * We fail closed and open a new thread instead. See #3713.
+ */
+function threadHasMessages(state: ThreadSliceState, threadId: string): boolean {
+  const cached = state.messagesByThreadId[threadId];
+  if (cached && cached.length > 0) return true;
+  if (threadId === state.selectedThreadId && state.messages.length > 0) return true;
+  const thread = state.threads.find(t => t.id === threadId);
+  // Unknown metadata → fail closed (occupied) rather than risk interrupting an
+  // unloaded conversation.
+  if (!thread) return true;
+  return thread.messageCount > 0;
+}
 
 function rtLog(message: string, fields?: Record<string, string | number | null | undefined>) {
   if (IS_PROD) return;
@@ -259,12 +290,18 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
       }
 
       const state = store.getState().thread;
-      // Resolution priority: selected > active (in-flight inference) > first thread.
-      // `activeThreadId` tracks the currently running inference thread.
-      const targetFromState =
-        state.selectedThreadId ?? state.activeThreadId ?? state.threads[0]?.id ?? null;
-      if (targetFromState) {
-        return targetFromState;
+      // Reuse an existing thread for proactive delivery ONLY when it is
+      // fresh (no messages). Injecting a morning brief / subconscious
+      // update into a thread that already holds a conversation interrupts
+      // the active chat flow (#3713). Candidate priority is selected >
+      // first thread; if the candidate already has messages we fall
+      // through and open a dedicated new thread instead. An in-flight
+      // inference thread always has at least the user's message, so it is
+      // never considered fresh — that is why `activeThreadIds` is no
+      // longer used as a target here.
+      const candidateThreadId = state.selectedThreadId ?? state.threads[0]?.id ?? null;
+      if (candidateThreadId && !threadHasMessages(state, candidateThreadId)) {
+        return candidateThreadId;
       }
 
       if (proactiveThreadCreationPromiseRef.current) {
@@ -319,7 +356,7 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
       });
       refetchSnapshot();
       dispatch(endInferenceTurn({ threadId: event.thread_id }));
-      dispatch(setActiveThread(null));
+      dispatch(clearThreadInferenceActive(event.thread_id));
     };
 
     rtLog('subscribe_chat_events', { socket: socketStatus });
@@ -535,6 +572,12 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
                     iterations: event.subagent?.iterations ?? entry.subagent.iterations,
                     elapsedMs: event.subagent?.elapsed_ms ?? entry.subagent.elapsedMs,
                     outputChars: event.subagent?.output_chars ?? entry.subagent.outputChars,
+                    // Worktree isolation metadata (#3376) — present only for
+                    // workers that ran with `isolation = "worktree"`. Drives the
+                    // inline worktree row's open/diff/remove affordances.
+                    worktreePath: event.subagent?.worktree_path ?? entry.subagent.worktreePath,
+                    changedFiles: event.subagent?.changed_files ?? entry.subagent.changedFiles,
+                    isDirty: event.subagent?.dirty_status ?? entry.subagent.isDirty,
                   }
                 : entry.subagent,
             });
@@ -695,6 +738,22 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
       },
       onTextDelta: event => {
         const cr = store.getState().chatRuntime;
+        // A parallel (forked) turn streams into its own lane so it doesn't
+        // clobber the primary turn's stream on the same thread.
+        if (cr.parallelRequestThreads[event.request_id] !== undefined) {
+          const prev = cr.parallelStreamsByThread[event.thread_id]?.[event.request_id];
+          dispatch(
+            setParallelStream({
+              threadId: event.thread_id,
+              streaming: {
+                requestId: event.request_id,
+                content: `${prev?.content ?? ''}${event.delta}`,
+                thinking: prev?.thinking ?? '',
+              },
+            })
+          );
+          return;
+        }
         const existing = cr.streamingAssistantByThread[event.thread_id];
         let streaming: StreamingAssistantState;
         if (existing && existing.requestId !== event.request_id) {
@@ -710,6 +769,20 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
       },
       onThinkingDelta: event => {
         const cr = store.getState().chatRuntime;
+        if (cr.parallelRequestThreads[event.request_id] !== undefined) {
+          const prev = cr.parallelStreamsByThread[event.thread_id]?.[event.request_id];
+          dispatch(
+            setParallelStream({
+              threadId: event.thread_id,
+              streaming: {
+                requestId: event.request_id,
+                content: prev?.content ?? '',
+                thinking: `${prev?.thinking ?? ''}${event.delta}`,
+              },
+            })
+          );
+          return;
+        }
         const existing = cr.streamingAssistantByThread[event.thread_id];
         let streaming: StreamingAssistantState;
         if (existing && existing.requestId !== event.request_id) {
@@ -878,6 +951,52 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
           output_tokens: event.total_output_tokens,
         });
 
+        // Parallel (forked) turn: resolve only its own lane. The primary turn's
+        // stream / status / lifecycle / active marker may still be running, so
+        // we must NOT clear them here. Segmented parallel turns already
+        // persisted via `onSegment` (keyed by thread+request); a single-bubble
+        // parallel turn persists its full response now.
+        if (
+          event.request_id !== undefined &&
+          store.getState().chatRuntime.parallelRequestThreads[event.request_id] !== undefined
+        ) {
+          const parallelRequestId = event.request_id;
+          dispatch(
+            recordChatTurnUsage({
+              inputTokens: event.total_input_tokens,
+              outputTokens: event.total_output_tokens,
+            })
+          );
+          if (!event.segment_total && event.full_response.length > 0) {
+            void (async () => {
+              try {
+                await dispatch(
+                  addInferenceResponse({
+                    content: event.full_response,
+                    threadId: event.thread_id,
+                    extraMetadata: chatDoneExtraMetadata(event),
+                  })
+                ).unwrap();
+                void dispatch(
+                  generateThreadTitleIfNeeded({
+                    threadId: event.thread_id,
+                    assistantMessage: event.full_response,
+                  })
+                );
+              } catch (error) {
+                rtLog('parallel_chat_done_append_failed', {
+                  thread: event.thread_id,
+                  request: event.request_id,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
+            })();
+          }
+          dispatch(clearParallelRequest({ requestId: parallelRequestId }));
+          requestUsageRefresh();
+          return;
+        }
+
         const deliveryKey = segmentDeliveryKey(event.thread_id, event.request_id);
         const segmentDelivery = takeSegmentDelivery(segmentDeliveriesRef.current, deliveryKey);
         const completeSegmentDelivery = hasCompleteSegmentDelivery(event, segmentDelivery);
@@ -983,6 +1102,28 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
           err: event.error_type,
         });
 
+        // Parallel (forked) turn error: resolve only its lane, leaving the
+        // primary turn untouched. Surface a non-cancellation error as a message
+        // so the failed branch is visible.
+        if (
+          event.request_id !== undefined &&
+          store.getState().chatRuntime.parallelRequestThreads[event.request_id] !== undefined
+        ) {
+          deleteSegmentDelivery(
+            segmentDeliveriesRef.current,
+            segmentDeliveryKey(event.thread_id, event.request_id)
+          );
+          if (event.error_type !== 'cancelled') {
+            const errorContent = event.message || USER_FACING_AGENT_ERROR_MESSAGE;
+            void dispatch(
+              addInferenceResponse({ content: errorContent, threadId: event.thread_id })
+            );
+            requestUsageRefresh();
+          }
+          dispatch(clearParallelRequest({ requestId: event.request_id }));
+          return;
+        }
+
         deleteSegmentDelivery(
           segmentDeliveriesRef.current,
           segmentDeliveryKey(event.thread_id, event.request_id)
@@ -1026,7 +1167,7 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
         }
 
         dispatch(endInferenceTurn({ threadId: event.thread_id }));
-        dispatch(setActiveThread(null));
+        dispatch(clearThreadInferenceActive(event.thread_id));
       },
     });
 
@@ -1055,12 +1196,12 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
     const state = store.getState();
     const lifecycles = state.chatRuntime.inferenceTurnLifecycleByThread;
     const threadIds = Object.keys(lifecycles);
-    const activeThreadId = state.thread.activeThreadId;
-    if (threadIds.length === 0 && !activeThreadId) return;
+    const activeThreadIds = Object.keys(state.thread.activeThreadIds);
+    if (threadIds.length === 0 && activeThreadIds.length === 0) return;
     rtLog('socket_disconnect_reconcile', {
       socket: socketStatus,
       inFlight: threadIds.length,
-      active: activeThreadId,
+      active: activeThreadIds.length,
     });
     for (const threadId of threadIds) {
       dispatch(clearInferenceStatusForThread({ threadId }));
@@ -1069,7 +1210,9 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
       dispatch(clearPendingApprovalForThread({ threadId }));
       dispatch(endInferenceTurn({ threadId }));
     }
-    if (activeThreadId) {
+    // A disconnect kills every in-flight turn on the dead session, so clear all
+    // active markers (setActiveThread(null) clears the whole set).
+    if (activeThreadIds.length > 0) {
       dispatch(setActiveThread(null));
     }
   }, [socketStatus, dispatch]);

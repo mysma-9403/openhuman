@@ -116,6 +116,7 @@ export function normalizeRewardsSnapshot(payload: unknown): RewardsSnapshot {
     discord: {
       linked: rawDiscord.linked === true,
       discordId: asStringOrNull(rawDiscord.discordId),
+      username: asStringOrNull(rawDiscord.username),
       inviteUrl: asStringOrNull(rawDiscord.inviteUrl),
       membershipStatus:
         rawDiscord.membershipStatus === 'member' ||

@@ -3,19 +3,28 @@
  * branch (line 248) added by PR #2095's dark-mode pass so the diff
  * coverage gate has the touched line covered.
  */
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { RewardsSnapshot } from '../../../types/rewards';
 
-vi.mock('../../../utils/openUrl', () => ({ openUrl: vi.fn() }));
+const { openUrl, callCoreRpc, setOAuthReturnRoute } = vi.hoisted(() => ({
+  openUrl: vi.fn(),
+  callCoreRpc: vi.fn(),
+  setOAuthReturnRoute: vi.fn(),
+}));
+
+vi.mock('../../../utils/openUrl', () => ({ openUrl }));
+vi.mock('../../../services/coreRpcClient', () => ({ callCoreRpc }));
+vi.mock('../../../utils/oauthReturnRoute', () => ({ setOAuthReturnRoute }));
 
 function buildSnapshot(): RewardsSnapshot {
   return {
     discord: {
       linked: true,
       discordId: 'discord-1',
+      username: 'cooluser',
       inviteUrl: 'https://discord.gg/example',
       membershipStatus: 'member',
     },
@@ -75,5 +84,93 @@ describe('RewardsCommunityTab — role card branches', () => {
     // line 248 (ring-primary-100 for unlocked, ring-black/[0.04] for locked).
     expect(screen.getByText('Pioneer')).toBeInTheDocument();
     expect(screen.getByText('Veteran')).toBeInTheDocument();
+  });
+});
+
+describe('RewardsCommunityTab — Connect Discord', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function notLinkedSnapshot(): RewardsSnapshot {
+    const snapshot = buildSnapshot();
+    return {
+      ...snapshot,
+      discord: {
+        linked: false,
+        discordId: null,
+        username: null,
+        inviteUrl: 'https://discord.gg/example',
+        membershipStatus: 'not_linked',
+      },
+    };
+  }
+
+  it('starts the OAuth flow and opens the consent URL on connect', async () => {
+    callCoreRpc.mockResolvedValueOnce({ result: { oauthUrl: 'https://discord.com/oauth' } });
+    const { default: RewardsCommunityTab } = await import('../RewardsCommunityTab');
+    render(
+      <MemoryRouter>
+        <RewardsCommunityTab error={null} isLoading={false} snapshot={notLinkedSnapshot()} />
+      </MemoryRouter>
+    );
+
+    fireEvent.click(screen.getByTestId('rewards-connect-discord'));
+
+    await waitFor(() => expect(openUrl).toHaveBeenCalledWith('https://discord.com/oauth'));
+    // Return route is persisted only after the consent URL launches.
+    await waitFor(() => expect(setOAuthReturnRoute).toHaveBeenCalledWith('/rewards'));
+    expect(callCoreRpc).toHaveBeenCalledWith({
+      method: 'openhuman.auth.oauth_connect',
+      params: { provider: 'discord' },
+    });
+  });
+
+  it('surfaces an error when the RPC returns no oauthUrl', async () => {
+    callCoreRpc.mockResolvedValueOnce({ result: {} });
+    const { default: RewardsCommunityTab } = await import('../RewardsCommunityTab');
+    render(
+      <MemoryRouter>
+        <RewardsCommunityTab error={null} isLoading={false} snapshot={notLinkedSnapshot()} />
+      </MemoryRouter>
+    );
+
+    fireEvent.click(screen.getByTestId('rewards-connect-discord'));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('rewards-connect-discord-error')).toBeInTheDocument()
+    );
+    expect(openUrl).not.toHaveBeenCalled();
+  });
+
+  it('surfaces an error when the connect RPC rejects', async () => {
+    callCoreRpc.mockRejectedValueOnce(new Error('rpc down'));
+    const { default: RewardsCommunityTab } = await import('../RewardsCommunityTab');
+    render(
+      <MemoryRouter>
+        <RewardsCommunityTab error={null} isLoading={false} snapshot={notLinkedSnapshot()} />
+      </MemoryRouter>
+    );
+
+    fireEvent.click(screen.getByTestId('rewards-connect-discord'));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('rewards-connect-discord-error')).toBeInTheDocument()
+    );
+    // A failed initiation must not persist any return route (it's only set after launch).
+    expect(setOAuthReturnRoute).not.toHaveBeenCalled();
+  });
+
+  it('renders the connected username pill and footer when linked', async () => {
+    const { default: RewardsCommunityTab } = await import('../RewardsCommunityTab');
+    render(
+      <MemoryRouter>
+        <RewardsCommunityTab error={null} isLoading={false} snapshot={buildSnapshot()} />
+      </MemoryRouter>
+    );
+
+    expect(screen.getByTestId('rewards-discord-connected')).toHaveTextContent('cooluser');
+    expect(screen.getByTestId('rewards-discord-username')).toHaveTextContent('cooluser');
+    expect(screen.queryByTestId('rewards-connect-discord')).not.toBeInTheDocument();
   });
 });

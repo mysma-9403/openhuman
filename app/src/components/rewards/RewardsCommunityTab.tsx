@@ -1,9 +1,14 @@
-import { useNavigate } from 'react-router-dom';
+import createDebug from 'debug';
+import { useCallback, useState } from 'react';
 
 import { useT } from '../../lib/i18n/I18nContext';
+import { callCoreRpc } from '../../services/coreRpcClient';
 import type { RewardsAchievement, RewardsSnapshot } from '../../types/rewards';
 import { DISCORD_INVITE_URL } from '../../utils/links';
+import { setOAuthReturnRoute } from '../../utils/oauthReturnRoute';
 import { openUrl } from '../../utils/openUrl';
+
+const log = createDebug('rewards:discord');
 
 // discordMembershipLabel is now inlined into JSX to access t()
 
@@ -85,7 +90,7 @@ export default function RewardsCommunityTab({
   snapshot,
 }: RewardsCommunityTabProps) {
   const { t } = useT();
-  const navigate = useNavigate();
+  const [connectState, setConnectState] = useState<'idle' | 'connecting' | 'error'>('idle');
   const rewardRoles: RewardsAchievement[] = snapshot?.achievements ?? [];
   const unlocked =
     snapshot?.summary.unlockedCount ?? rewardRoles.filter(role => role.unlocked).length;
@@ -96,6 +101,34 @@ export default function RewardsCommunityTab({
     rewardRoles.length > 0 ? rewardRoles.slice(0, 8) : new Array(4).fill(null);
   const ringCircumference = 2 * Math.PI * 24;
   const ringOffset = ringCircumference - (progressPercent / 100) * ringCircumference;
+  const discordLinked = snapshot?.discord.linked ?? false;
+  const discordUsername = snapshot?.discord.username ?? null;
+
+  const handleConnectDiscord = useCallback(async () => {
+    log('connect discord requested');
+    setConnectState('connecting');
+    try {
+      const response = await callCoreRpc<{ result: { oauthUrl?: string } }>({
+        method: 'openhuman.auth.oauth_connect',
+        params: { provider: 'discord' },
+      });
+      const oauthUrl = response.result?.oauthUrl;
+      if (!oauthUrl) {
+        throw new Error('missing oauthUrl in oauth_connect response');
+      }
+      log('opening discord oauth consent url');
+      await openUrl(oauthUrl);
+      // Persist the return route only after the consent URL actually launched, so a failed
+      // initiation never leaves a stale route that could misroute a later OAuth success.
+      setOAuthReturnRoute('/rewards');
+      // Reset so the button is usable again if the user cancels; once the snapshot
+      // refetches with discord.linked the connected state takes over.
+      setConnectState('idle');
+    } catch (err) {
+      log('connect discord failed error=%s', err instanceof Error ? err.message : String(err));
+      setConnectState('error');
+    }
+  }, []);
   return (
     <>
       <section className="relative overflow-hidden rounded-[1.25rem] bg-gradient-to-br from-[#004ad0] to-[#2b64f1] p-6 text-white shadow-[0_20px_40px_rgba(25,28,30,0.08)]">
@@ -109,24 +142,43 @@ export default function RewardsCommunityTab({
             </p>
           </div>
           <div className="flex flex-col gap-2 sm:flex-row">
-            <button
-              onClick={() => navigate('/skills')}
-              className="inline-flex items-center justify-center gap-2 rounded-xl bg-white dark:bg-neutral-900 px-4 py-3 text-sm font-semibold text-primary-700 dark:text-primary-300 shadow-lg transition-transform active:scale-[0.98]">
-              <svg
-                className="w-4 h-4"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-                aria-hidden="true">
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M13.828 10.172a4 4 0 0 0-5.656 0l-1 1a4 4 0 0 0 5.656 5.656l.586-.586m-3.242-2.828a4 4 0 0 0 5.656 0l1-1a4 4 0 1 0-5.656-5.656l-.586.586"
-                />
-              </svg>
-              {t('rewards.community.connectDiscord')}
-            </button>
+            {discordLinked ? (
+              <div
+                data-testid="rewards-discord-connected"
+                className="inline-flex items-center justify-center gap-2 rounded-xl bg-white/15 px-4 py-3 text-sm font-semibold text-white">
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
+                </svg>
+                {discordUsername
+                  ? t('rewards.community.discordConnectedAs').replace('{username}', discordUsername)
+                  : t('rewards.community.discordConnected')}
+              </div>
+            ) : (
+              <button
+                onClick={() => {
+                  void handleConnectDiscord();
+                }}
+                disabled={connectState === 'connecting'}
+                data-testid="rewards-connect-discord"
+                className="inline-flex items-center justify-center gap-2 rounded-xl bg-white dark:bg-neutral-900 px-4 py-3 text-sm font-semibold text-primary-700 dark:text-primary-300 shadow-lg transition-transform active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-70">
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                  aria-hidden="true">
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M13.828 10.172a4 4 0 0 0-5.656 0l-1 1a4 4 0 0 0 5.656 5.656l.586-.586m-3.242-2.828a4 4 0 0 0 5.656 0l1-1a4 4 0 1 0-5.656-5.656l-.586.586"
+                  />
+                </svg>
+                {connectState === 'connecting'
+                  ? t('rewards.community.connectingDiscord')
+                  : t('rewards.community.connectDiscord')}
+              </button>
+            )}
             <button
               onClick={() => {
                 void openUrl(inviteUrl);
@@ -138,6 +190,14 @@ export default function RewardsCommunityTab({
               {t('rewards.community.joinDiscord')}
             </button>
           </div>
+          {connectState === 'error' ? (
+            <p
+              role="alert"
+              data-testid="rewards-connect-discord-error"
+              className="text-xs font-medium text-white/90">
+              {t('rewards.community.connectDiscordError')}
+            </p>
+          ) : null}
         </div>
         <div className="absolute -right-10 -top-10 h-32 w-32 rounded-full bg-white/10 blur-2xl" />
         <div className="absolute -bottom-10 -left-8 h-24 w-24 rounded-full bg-white/15 blur-xl" />
@@ -315,6 +375,16 @@ export default function RewardsCommunityTab({
                       : t('rewards.community.discordStatusUnavailable')}
             </span>
           </div>
+          {discordLinked && discordUsername ? (
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <span>{t('rewards.community.discordAccount')}</span>
+              <span
+                data-testid="rewards-discord-username"
+                className="font-semibold text-stone-900 dark:text-neutral-100">
+                {discordUsername}
+              </span>
+            </div>
+          ) : null}
           <div className="mt-3 flex items-center justify-between gap-3">
             <span>{t('rewards.community.currentStreak')}</span>
             <span className="font-semibold text-stone-900 dark:text-neutral-100">

@@ -5,9 +5,11 @@
 import { combineReducers, configureStore } from '@reduxjs/toolkit';
 import { render, type RenderOptions } from '@testing-library/react';
 import type { PropsWithChildren, ReactElement } from 'react';
+import { createPortal } from 'react-dom';
 import { Provider } from 'react-redux';
 import { MemoryRouter } from 'react-router-dom';
 
+import { SidebarSlotOutlet, SidebarSlotProvider } from '../components/layout/shell/SidebarSlot';
 import { getCoreStateSnapshot } from '../lib/coreState/store';
 import { CoreStateContext } from '../providers/coreStateContext';
 import backendMeetReducer from '../store/backendMeetSlice';
@@ -15,6 +17,7 @@ import channelConnectionsReducer from '../store/channelConnectionsSlice';
 import companionReducer from '../store/companionSlice';
 import connectivityReducer from '../store/connectivitySlice';
 import coreModeReducer from '../store/coreModeSlice';
+import layoutReducer from '../store/layoutSlice';
 import localeReducer from '../store/localeSlice';
 import mascotReducer from '../store/mascotSlice';
 import personaReducer from '../store/personaSlice';
@@ -39,6 +42,7 @@ const testRootReducer = combineReducers({
   companion: companionReducer,
   connectivity: connectivityReducer,
   coreMode: coreModeReducer,
+  layout: layoutReducer,
   locale: localeReducer,
   mascot: mascotReducer,
   persona: personaReducer,
@@ -91,7 +95,17 @@ export function renderWithProviders(
     return (
       <Provider store={store}>
         <CoreStateContext.Provider value={coreStateStub}>
-          <MemoryRouter initialEntries={initialEntries}>{children}</MemoryRouter>
+          <MemoryRouter initialEntries={initialEntries}>
+            {/* Provide the root sidebar slot so pages that project their nav via
+                SidebarContent (Settings/Brain/Connections/Chat) render it. The
+                outlet is portaled to document.body so it doesn't become the
+                render container's firstChild (which would break tests asserting
+                a null/empty render); `screen` queries still find projected content. */}
+            <SidebarSlotProvider>
+              {createPortal(<SidebarSlotOutlet />, document.body)}
+              {children}
+            </SidebarSlotProvider>
+          </MemoryRouter>
         </CoreStateContext.Provider>
       </Provider>
     );
