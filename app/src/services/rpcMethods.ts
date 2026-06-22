@@ -28,14 +28,27 @@ export const CORE_RPC_METHODS = {
   configWorkspaceOnboardingFlagExists: 'openhuman.config_workspace_onboarding_flag_exists',
   configWorkspaceOnboardingFlagSet: 'openhuman.config_workspace_onboarding_flag_set',
   corePing: 'core.ping',
+  inferenceAgentChat: 'openhuman.inference_agent_chat',
+  inferenceAgentChatSimple: 'openhuman.inference_agent_chat_simple',
   inferenceApplyPreset: 'openhuman.inference_apply_preset',
+  inferenceAssetsStatus: 'openhuman.inference_assets_status',
   inferenceDiagnostics: 'openhuman.inference_diagnostics',
   inferenceDeviceProfile: 'openhuman.inference_device_profile',
+  inferenceDownloadAsset: 'openhuman.inference_download_asset',
+  inferenceDownloadsProgress: 'openhuman.inference_downloads_progress',
   inferenceGetClientConfig: 'openhuman.inference_get_client_config',
+  inferenceInstallPiper: 'openhuman.inference_install_piper',
+  inferenceInstallWhisper: 'openhuman.inference_install_whisper',
   inferenceListModels: 'openhuman.inference_list_models',
+  inferencePiperInstallStatus: 'openhuman.inference_piper_install_status',
   inferencePresets: 'openhuman.inference_presets',
+  inferenceTestConnection: 'openhuman.inference_test_connection',
+  inferenceTranscribe: 'openhuman.inference_transcribe',
+  inferenceTranscribeBytes: 'openhuman.inference_transcribe_bytes',
+  inferenceTts: 'openhuman.inference_tts',
   inferenceUpdateLocalSettings: 'openhuman.inference_update_local_settings',
   inferenceUpdateModelSettings: 'openhuman.inference_update_model_settings',
+  inferenceWhisperInstallStatus: 'openhuman.inference_whisper_install_status',
   providersListModels: 'openhuman.inference_list_models',
   screenIntelligenceStatus: 'openhuman.screen_intelligence_status',
   embeddingsGetSettings: 'openhuman.embeddings_get_settings',
@@ -44,6 +57,7 @@ export const CORE_RPC_METHODS = {
   embeddingsClearApiKey: 'openhuman.embeddings_clear_api_key',
   embeddingsEmbed: 'openhuman.embeddings_embed',
   embeddingsTestConnection: 'openhuman.embeddings_test_connection',
+  channelsList: 'openhuman.channels_list',
   mcpClientsInstalledList: 'openhuman.mcp_clients_installed_list',
   mcpClientsToolCall: 'openhuman.mcp_clients_tool_call',
   healthSnapshot: 'openhuman.health_snapshot',
@@ -53,9 +67,12 @@ export const CORE_RPC_METHODS = {
 export type CoreRpcMethod = (typeof CORE_RPC_METHODS)[keyof typeof CORE_RPC_METHODS];
 
 export const LEGACY_METHOD_ALIASES: Record<string, CoreRpcMethod> = {
+  // #3565: old desktop clients used dotted namespace/function channel calls.
+  'channels.list': CORE_RPC_METHODS.channelsList,
   // MCP clients — old method names that appeared in Sentry (CORE-RUST-DR/DS/DT/DV/DW).
   // See src/core/legacy_aliases.rs for the Rust-side mirror of this table.
   'mcp_clients.list': CORE_RPC_METHODS.mcpClientsInstalledList,
+  'openhuman.channels.list': CORE_RPC_METHODS.channelsList,
   'openhuman.mcp_clients_list': CORE_RPC_METHODS.mcpClientsInstalledList,
   'openhuman.mcp_list': CORE_RPC_METHODS.mcpClientsInstalledList,
   'openhuman.mcp_servers_list': CORE_RPC_METHODS.mcpClientsInstalledList,
@@ -81,13 +98,34 @@ export const LEGACY_METHOD_ALIASES: Record<string, CoreRpcMethod> = {
   'openhuman.workspace_onboarding_flag_exists':
     CORE_RPC_METHODS.configWorkspaceOnboardingFlagExists,
   'openhuman.workspace_onboarding_flag_set': CORE_RPC_METHODS.configWorkspaceOnboardingFlagSet,
+  'openhuman.local_ai_agent_chat': CORE_RPC_METHODS.inferenceAgentChat,
+  'openhuman.local_ai_agent_chat_simple': CORE_RPC_METHODS.inferenceAgentChatSimple,
   'openhuman.local_ai_apply_preset': CORE_RPC_METHODS.inferenceApplyPreset,
+  'openhuman.local_ai_assets_status': CORE_RPC_METHODS.inferenceAssetsStatus,
   'openhuman.local_ai_device_profile': CORE_RPC_METHODS.inferenceDeviceProfile,
   'openhuman.local_ai_diagnostics': CORE_RPC_METHODS.inferenceDiagnostics,
+  'openhuman.local_ai_download_asset': CORE_RPC_METHODS.inferenceDownloadAsset,
+  'openhuman.local_ai_downloads_progress': CORE_RPC_METHODS.inferenceDownloadsProgress,
+  'openhuman.local_ai_install_piper': CORE_RPC_METHODS.inferenceInstallPiper,
+  'openhuman.local_ai_install_whisper': CORE_RPC_METHODS.inferenceInstallWhisper,
+  'openhuman.local_ai_piper_install_status': CORE_RPC_METHODS.inferencePiperInstallStatus,
   'openhuman.local_ai_presets': CORE_RPC_METHODS.inferencePresets,
+  'openhuman.local_ai_test_connection': CORE_RPC_METHODS.inferenceTestConnection,
+  'openhuman.local_ai_transcribe': CORE_RPC_METHODS.inferenceTranscribe,
+  'openhuman.local_ai_transcribe_bytes': CORE_RPC_METHODS.inferenceTranscribeBytes,
+  'openhuman.local_ai_tts': CORE_RPC_METHODS.inferenceTts,
+  'openhuman.local_ai_whisper_install_status': CORE_RPC_METHODS.inferenceWhisperInstallStatus,
   'openhuman.providers_list_models': CORE_RPC_METHODS.inferenceListModels,
   'openhuman.inference_embed': CORE_RPC_METHODS.embeddingsEmbed,
   health_snapshot: CORE_RPC_METHODS.healthSnapshot,
+  // Dotted / bare health probes from older clients and SDK callers (#3566,
+  // Sentry CORE-2C). No distinct status/get handler exists — the snapshot
+  // already carries the health verdict — so all four alias to the snapshot.
+  // Keep in sync with src/core/legacy_aliases.rs (drift guard enforces it).
+  health: CORE_RPC_METHODS.healthSnapshot,
+  'health.get': CORE_RPC_METHODS.healthSnapshot,
+  'health.snapshot': CORE_RPC_METHODS.healthSnapshot,
+  'health.status': CORE_RPC_METHODS.healthSnapshot,
   // `openhuman.system_info` was used by older clients / SDK callers before the
   // method was namespaced as `openhuman.health_system_info`.
   // Sentry CORE-RUST-G0 — https://sentry.tinyhumans.ai/organizations/tinyhumans/issues/6340/

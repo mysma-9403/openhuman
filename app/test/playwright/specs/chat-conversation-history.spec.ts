@@ -134,9 +134,10 @@ test.describe('Chat Conversation History', () => {
     await createNewThread(page);
 
     await sendMessage(page, FIRST_PROMPT);
-    await expect(
-      page.locator('div.bg-stone-200').filter({ hasText: FIRST_RESPONSE }).first()
-    ).toBeVisible({ timeout: 20_000 });
+    // The assistant bubble's Tailwind class carries an opacity modifier
+    // (`bg-stone-200/80`), which is a single class token — a plain `.bg-stone-200`
+    // selector can't match it. Assert on the rendered response text instead.
+    await expect(page.getByText(FIRST_RESPONSE).first()).toBeVisible({ timeout: 20_000 });
 
     await resetMock();
     await setMockBehavior(
@@ -151,6 +152,9 @@ test.describe('Chat Conversation History', () => {
     await sendMessage(page, SECOND_PROMPT);
     await expect(page.getByText(TURN_TWO_CANARY)).toBeVisible({ timeout: 30_000 });
 
+    // One chat-completion POST for the second turn: the orchestrator no longer
+    // eagerly spawns the memory agent before the turn (memory is on-demand now),
+    // so there is a single LLM call rather than the prior memory+main pair.
     const llmLog = await expect
       .poll(async () => {
         const log = await requests();

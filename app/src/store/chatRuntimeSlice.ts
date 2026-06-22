@@ -14,7 +14,12 @@ import { resetUserScopedState } from './resetActions';
 
 const turnStateLog = debug('chatRuntime.turnState');
 
-export type ToolTimelineEntryStatus = 'running' | 'success' | 'error' | 'awaiting_user';
+export type ToolTimelineEntryStatus =
+  | 'running'
+  | 'success'
+  | 'error'
+  | 'awaiting_user'
+  | 'cancelled';
 
 export interface InferenceStatus {
   phase: 'thinking' | 'tool_use' | 'subagent';
@@ -91,6 +96,25 @@ export interface SubagentActivity {
    * tool sequence. Absent on legacy/test rows that predate streaming.
    */
   transcript?: SubagentTranscriptItem[];
+  /**
+   * Absolute path to this worker's isolated `git worktree` checkout, when it
+   * ran with `isolation = "worktree"` (#3376). `undefined` for non-isolated
+   * (read-only or shared-workspace) workers. Scaffold-only: the open/diff/
+   * remove action buttons that consume this land in a follow-up PR.
+   */
+  worktreePath?: string;
+  /**
+   * Files (relative to the worktree root) this worker changed, collected from
+   * `git status` after the run. Drives the future diff/overlap UI. Absent or
+   * empty for non-isolated workers and clean worktrees.
+   */
+  changedFiles?: string[];
+  /**
+   * `true` when the worker's worktree had uncommitted changes after the run.
+   * A dirty worktree must not be auto-removed — the cleanup UI will require an
+   * explicit user choice. `undefined` for non-isolated workers.
+   */
+  isDirty?: boolean;
 }
 
 /**
@@ -170,6 +194,8 @@ export interface SessionTokenUsage {
   outputTokens: number;
   turns: number;
   lastUpdated: number;
+  lastTurnInputTokens: number;
+  lastTurnOutputTokens: number;
 }
 
 /**
@@ -223,8 +249,13 @@ export interface ArtifactSnapshot {
   updatedAt: number;
 }
 
-/** Queue behavior when a turn is already in flight for a thread. */
-export type QueueMode = 'interrupt' | 'steer' | 'followup' | 'collect';
+/**
+ * Queue behavior when a turn is already in flight for a thread.
+ * `parallel` runs an independent concurrent (forked) turn on the same thread
+ * instead of interrupting/queueing — its stream is tracked separately (see
+ * `parallelStreamsByThread`) so it renders as its own interleaved branch.
+ */
+export type QueueMode = 'interrupt' | 'steer' | 'followup' | 'collect' | 'parallel';
 
 /**
  * Per-thread UI state for an in-flight agent turn (socket events while the user
@@ -235,6 +266,21 @@ export type QueueMode = 'interrupt' | 'steer' | 'followup' | 'collect';
 interface ChatRuntimeState {
   inferenceStatusByThread: Record<string, InferenceStatus>;
   streamingAssistantByThread: Record<string, StreamingAssistantState>;
+  /**
+   * Live streams for concurrent PARALLEL (forked) turns on a thread, nested
+   * `threadId -> requestId -> stream`. A separate lane from
+   * `streamingAssistantByThread` (the single primary stream) so two same-thread
+   * turns don't clobber each other — each renders as its own interleaved
+   * branch bubble. Populated only for turns sent with `queueMode: 'parallel'`.
+   */
+  parallelStreamsByThread: Record<string, Record<string, StreamingAssistantState>>;
+  /**
+   * Maps a parallel turn's `requestId -> threadId`. Lets socket event handlers
+   * recognise a forked turn's events (and find its thread) so they route to the
+   * parallel lane instead of the primary stream. Entries are added on send and
+   * removed on that turn's `chat_done` / `chat_error`.
+   */
+  parallelRequestThreads: Record<string, string>;
   toolTimelineByThread: Record<string, ToolTimelineEntry[]>;
   taskBoardByThread: Record<string, TaskBoard>;
   inferenceTurnLifecycleByThread: Record<string, InferenceTurnLifecycle>;
@@ -262,12 +308,21 @@ export interface QueueStatus {
 const initialState: ChatRuntimeState = {
   inferenceStatusByThread: {},
   streamingAssistantByThread: {},
+  parallelStreamsByThread: {},
+  parallelRequestThreads: {},
   toolTimelineByThread: {},
   taskBoardByThread: {},
   inferenceTurnLifecycleByThread: {},
   pendingApprovalByThread: {},
   artifactsByThread: {},
-  sessionTokenUsage: { inputTokens: 0, outputTokens: 0, turns: 0, lastUpdated: 0 },
+  sessionTokenUsage: {
+    inputTokens: 0,
+    outputTokens: 0,
+    turns: 0,
+    lastUpdated: 0,
+    lastTurnInputTokens: 0,
+    lastTurnOutputTokens: 0,
+  },
   queueStatusByThread: {},
 };
 
@@ -350,8 +405,9 @@ function timelineStatusFromRun(status: AgentRun['status']): ToolTimelineEntrySta
   switch (status) {
     case 'completed':
       return 'success';
-    case 'failed':
     case 'cancelled':
+      return 'cancelled';
+    case 'failed':
     case 'interrupted':
       return 'error';
     case 'awaiting_user':
@@ -421,6 +477,40 @@ const chatRuntimeSlice = createSlice({
     clearStreamingAssistantForThread: (state, action: PayloadAction<{ threadId: string }>) => {
       delete state.streamingAssistantByThread[action.payload.threadId];
     },
+    /**
+     * Register a parallel (forked) turn so its socket events route to the
+     * parallel lane. Called when a `queueMode: 'parallel'` send is accepted.
+     */
+    registerParallelRequest: (
+      state,
+      action: PayloadAction<{ threadId: string; requestId: string }>
+    ) => {
+      state.parallelRequestThreads[action.payload.requestId] = action.payload.threadId;
+    },
+    /** Upsert the live stream for a parallel (forked) turn, keyed by requestId. */
+    setParallelStream: (
+      state,
+      action: PayloadAction<{ threadId: string; streaming: StreamingAssistantState }>
+    ) => {
+      const { threadId, streaming } = action.payload;
+      (state.parallelStreamsByThread[threadId] ??= {})[streaming.requestId] = streaming;
+    },
+    /**
+     * Tear down a parallel turn's lane state on its terminal event
+     * (chat_done / chat_error). Removes the stream and the request→thread entry.
+     */
+    clearParallelRequest: (state, action: PayloadAction<{ requestId: string }>) => {
+      const { requestId } = action.payload;
+      const threadId = state.parallelRequestThreads[requestId];
+      delete state.parallelRequestThreads[requestId];
+      if (threadId === undefined) return;
+      const streams = state.parallelStreamsByThread[threadId];
+      if (!streams) return;
+      delete streams[requestId];
+      if (Object.keys(streams).length === 0) {
+        delete state.parallelStreamsByThread[threadId];
+      }
+    },
     setToolTimelineForThread: (
       state,
       action: PayloadAction<{ threadId: string; entries: ToolTimelineEntry[] }>
@@ -429,6 +519,19 @@ const chatRuntimeSlice = createSlice({
     },
     clearToolTimelineForThread: (state, action: PayloadAction<{ threadId: string }>) => {
       delete state.toolTimelineByThread[action.payload.threadId];
+    },
+    /**
+     * Optimistically mark a detached background sub-agent as cancelled after the
+     * user confirms a cancel via `openhuman.subagent_cancel`. The aborted run
+     * emits no terminal socket event, so without this the row would keep showing
+     * "running" forever. Located by the subagent's stable `taskId`.
+     */
+    markSubagentCancelled: (state, action: PayloadAction<{ threadId: string; taskId: string }>) => {
+      const { threadId, taskId } = action.payload;
+      const entry = state.toolTimelineByThread[threadId]?.find(e => e.subagent?.taskId === taskId);
+      if (!entry) return;
+      entry.status = 'cancelled';
+      if (entry.subagent) entry.subagent.status = 'cancelled';
     },
     /**
      * Append a streamed `subagent_text_delta` / `subagent_thinking_delta`
@@ -674,6 +777,15 @@ const chatRuntimeSlice = createSlice({
     clearRuntimeForThread: (state, action: PayloadAction<{ threadId: string }>) => {
       delete state.inferenceStatusByThread[action.payload.threadId];
       delete state.streamingAssistantByThread[action.payload.threadId];
+      // Drop any parallel (forked) streams for this thread and their
+      // request→thread mappings — a hard per-thread reset covers every branch.
+      const parallelStreams = state.parallelStreamsByThread[action.payload.threadId];
+      if (parallelStreams) {
+        for (const requestId of Object.keys(parallelStreams)) {
+          delete state.parallelRequestThreads[requestId];
+        }
+        delete state.parallelStreamsByThread[action.payload.threadId];
+      }
       delete state.toolTimelineByThread[action.payload.threadId];
       delete state.taskBoardByThread[action.payload.threadId];
       delete state.inferenceTurnLifecycleByThread[action.payload.threadId];
@@ -688,6 +800,8 @@ const chatRuntimeSlice = createSlice({
     clearAllChatRuntime: state => {
       state.inferenceStatusByThread = {};
       state.streamingAssistantByThread = {};
+      state.parallelStreamsByThread = {};
+      state.parallelRequestThreads = {};
       state.toolTimelineByThread = {};
       state.taskBoardByThread = {};
       state.inferenceTurnLifecycleByThread = {};
@@ -699,13 +813,28 @@ const chatRuntimeSlice = createSlice({
       state,
       action: PayloadAction<{ inputTokens: number; outputTokens: number }>
     ) => {
-      state.sessionTokenUsage.inputTokens += Math.max(0, action.payload.inputTokens);
-      state.sessionTokenUsage.outputTokens += Math.max(0, action.payload.outputTokens);
+      const inTok = Number.isFinite(action.payload.inputTokens)
+        ? Math.max(0, action.payload.inputTokens)
+        : 0;
+      const outTok = Number.isFinite(action.payload.outputTokens)
+        ? Math.max(0, action.payload.outputTokens)
+        : 0;
+      state.sessionTokenUsage.inputTokens += inTok;
+      state.sessionTokenUsage.outputTokens += outTok;
       state.sessionTokenUsage.turns += 1;
       state.sessionTokenUsage.lastUpdated = Date.now();
+      state.sessionTokenUsage.lastTurnInputTokens = inTok;
+      state.sessionTokenUsage.lastTurnOutputTokens = outTok;
     },
     resetSessionTokenUsage: state => {
-      state.sessionTokenUsage = { inputTokens: 0, outputTokens: 0, turns: 0, lastUpdated: 0 };
+      state.sessionTokenUsage = {
+        inputTokens: 0,
+        outputTokens: 0,
+        turns: 0,
+        lastUpdated: 0,
+        lastTurnInputTokens: 0,
+        lastTurnOutputTokens: 0,
+      };
     },
     /**
      * Apply a persisted [TurnState] snapshot from the Rust core to the
@@ -794,8 +923,12 @@ export const {
   clearInferenceStatusForThread,
   setStreamingAssistantForThread,
   clearStreamingAssistantForThread,
+  registerParallelRequest,
+  setParallelStream,
+  clearParallelRequest,
   setToolTimelineForThread,
   clearToolTimelineForThread,
+  markSubagentCancelled,
   appendSubagentStreamDelta,
   recordSubagentTranscriptTool,
   resolveSubagentTranscriptTool,

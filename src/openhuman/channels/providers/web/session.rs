@@ -1,14 +1,22 @@
 use serde_json::json;
 use std::collections::HashSet;
 
-use crate::openhuman::agent::profiles::{AgentProfile, DEFAULT_PROFILE_ID};
 use crate::openhuman::agent::Agent;
 use crate::openhuman::config::Config;
+use crate::openhuman::profiles::{AgentProfile, DEFAULT_PROFILE_ID};
 
 use super::types::SessionCacheFingerprint;
 
 pub(super) fn autonomy_signature(config: &Config) -> String {
     serde_json::to_string(&config.autonomy).unwrap_or_default()
+}
+
+/// Signature of `config.model_registry` for the session-cache fingerprint.
+/// Captures every per-model `vision` flag so toggling one in Settings forces a
+/// rebuild (picking up the new build-time `model_vision`). Mirrors
+/// [`autonomy_signature`].
+pub(super) fn model_registry_signature(config: &Config) -> String {
+    serde_json::to_string(&config.model_registry).unwrap_or_default()
 }
 
 pub(super) fn pick_target_agent_id(_config: &Config, profile: &AgentProfile) -> String {
@@ -96,6 +104,7 @@ pub(super) fn build_session_agent(
         target_agent_id,
         reflection_chunks,
         composed_suffix,
+        Some(profile),
     );
 
     agent_result
@@ -129,34 +138,12 @@ pub(super) fn build_session_agent(
 }
 
 fn load_reflection_chunks_for_thread(
-    workspace_dir: &std::path::Path,
-    thread_id: &str,
+    _workspace_dir: &std::path::Path,
+    _thread_id: &str,
 ) -> Option<Vec<crate::openhuman::subconscious::SourceChunk>> {
-    let messages = crate::openhuman::memory_conversations::get_messages(
-        workspace_dir.to_path_buf(),
-        thread_id,
-    )
-    .ok()?;
-    let first = messages.first()?;
-    let origin = first
-        .extra_metadata
-        .get("origin")
-        .and_then(|v| v.as_str())?;
-    if origin != "subconscious_reflection" {
-        return None;
-    }
-    let reflection_id = first
-        .extra_metadata
-        .get("reflection_id")
-        .and_then(|v| v.as_str())?
-        .to_string();
-    let reflection =
-        crate::openhuman::subconscious::store::with_connection(workspace_dir, |conn| {
-            crate::openhuman::subconscious::reflection_store::get_reflection(conn, &reflection_id)
-        })
-        .ok()
-        .flatten()?;
-    Some(reflection.source_chunks)
+    // Reflection store has been removed. Existing threads spawned from
+    // reflections no longer receive memory-context injection.
+    None
 }
 
 pub(crate) fn locale_reply_directive(locale: &str) -> Option<String> {
@@ -198,6 +185,7 @@ pub(super) fn build_session_fingerprint(
     temperature: Option<f64>,
     target_agent_id: String,
     provider_role: &str,
+    profile: &AgentProfile,
 ) -> SessionCacheFingerprint {
     SessionCacheFingerprint {
         model_override,
@@ -208,5 +196,9 @@ pub(super) fn build_session_fingerprint(
         ),
         target_agent_id,
         autonomy_signature: autonomy_signature(config),
+        model_registry_signature: model_registry_signature(config),
+        // Any change to the resolved profile (id, allowlists, soul, …) changes
+        // this string and forces a session-agent rebuild — see the field doc.
+        profile_signature: crate::openhuman::profiles::profile_signature(profile),
     }
 }

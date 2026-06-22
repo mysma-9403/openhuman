@@ -11,11 +11,7 @@ test.describe('Skill discovery (UI + core RPC)', () => {
   test('lands the user on a logged-in shell', async ({ page }) => {
     await waitForAppReady(page);
     const text = await page.locator('#root').innerText();
-    expect(
-      ['Ask your assistant anything', 'Your device is connected'].some(marker =>
-        text.includes(marker)
-      )
-    ).toBe(true);
+    expect(['New Conversation', 'Threads'].some(marker => text.includes(marker))).toBe(true);
   });
 
   test('core.ping responds over the same JSON-RPC URL the UI uses', async () => {
@@ -24,15 +20,16 @@ test.describe('Skill discovery (UI + core RPC)', () => {
   });
 
   test('skills UI surface shows installed tools', async ({ page }) => {
-    await page.goto('/#/skills');
+    // /skills redirects to /connections (Phase 2 rename)
+    await page.goto('/#/connections');
     await waitForAppReady(page);
 
     const hash = await page.evaluate(() => window.location.hash);
-    expect(String(hash)).toContain('/skills');
+    expect(String(hash)).toContain('/connections');
 
     const text = await page.locator('#root').innerText();
     expect(
-      ['Composio Integrations', 'Channels', 'Gmail', 'Notion', 'GitHub'].some(marker =>
+      ['Composio Integrations', 'Composio', 'Channels', 'Gmail', 'Notion', 'GitHub'].some(marker =>
         text.includes(marker)
       )
     ).toBe(true);

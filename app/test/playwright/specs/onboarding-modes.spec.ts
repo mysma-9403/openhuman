@@ -17,25 +17,15 @@ async function clickOnboardingNext(page: Page): Promise<void> {
 }
 
 async function clickTestId(page: Page, testId: string, timeout = 10_000): Promise<boolean> {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    const status = await page.evaluate(id => {
-      const el = document.querySelector<HTMLElement>(`[data-testid="${id}"]`);
-      if (!el) return 'missing';
-      if ((el as HTMLButtonElement).disabled) return 'disabled';
-      const rect = el.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) return 'no-layout';
-      ['mousedown', 'mouseup', 'click'].forEach(type => {
-        el.dispatchEvent(
-          new MouseEvent(type, { bubbles: true, cancelable: true, view: window, button: 0 })
-        );
-      });
-      return 'clicked';
-    }, testId);
-    if (status === 'clicked') return true;
-    await page.waitForTimeout(300);
+  const locator = page.getByTestId(testId);
+  try {
+    await locator.waitFor({ state: 'visible', timeout });
+    await expect(locator).toBeEnabled({ timeout: 5_000 });
+    await locator.click({ force: true, timeout: 5_000 });
+    return true;
+  } catch {
+    return false;
   }
-  return false;
 }
 
 async function bootIntoOnboarding(page: Page, userId: string): Promise<void> {
@@ -71,7 +61,7 @@ async function expectOnboardingCompleted(): Promise<void> {
 async function ensureHomeOrForceComplete(page: Page): Promise<void> {
   const reachedHome = await expect
     .poll(async () => page.evaluate(() => window.location.hash), { timeout: 20_000 })
-    .toMatch(/^#\/home/)
+    .toMatch(/^#\/(home|chat)/)
     .then(
       () => true,
       () => false

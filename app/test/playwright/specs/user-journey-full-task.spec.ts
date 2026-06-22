@@ -135,16 +135,23 @@ test.describe('User journey - full research task', () => {
     expect(typeof threadId).toBe('string');
 
     await sendMessage(page, PROMPT);
-    await expect(page.getByText(CANARY_FINAL)).toBeVisible({ timeout: 45_000 });
+    await expect(page.getByText(CANARY_FINAL).first()).toBeVisible({ timeout: 45_000 });
 
+    // Navigate away and back to confirm the thread (and its messages) persist.
+    // Home folded into the unified chat surface, so /home now redirects to
+    // /chat — the landing hash settles on /chat.
     await page.goto('/#/home');
     await waitForAppReady(page);
     await expect
       .poll(async () => page.evaluate(() => window.location.hash), { timeout: 10_000 })
-      .toContain('/home');
+      .toContain('/chat');
 
+    // The chat-as-home surface lands on its "new window" hero rather than
+    // re-opening the last thread, so re-select the thread from the sidebar to
+    // confirm its messages persisted across navigation.
     await page.goto('/#/chat');
     await waitForAppReady(page);
-    await expect(page.getByText(CANARY_FINAL)).toBeVisible({ timeout: 15_000 });
+    await page.getByTestId(`thread-row-${threadId}`).click({ force: true });
+    await expect(page.getByText(CANARY_FINAL).first()).toBeVisible({ timeout: 15_000 });
   });
 });

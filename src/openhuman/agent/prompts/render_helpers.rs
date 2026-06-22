@@ -56,6 +56,14 @@ pub fn render_safety() -> String {
         .expect("SafetySection::build is infallible")
 }
 
+/// Render the canonical grounding / anti-hallucination contract
+/// ([`GROUNDING_BODY`]). Dynamic `agents/<id>/prompt.rs` builders call this
+/// so they inherit the exact same anti-fabrication floor as the static
+/// section chain — single source of truth, no drift.
+pub fn render_grounding() -> &'static str {
+    GROUNDING_BODY
+}
+
 // `render_skills` and `render_connected_integrations` helpers are
 // gone — `## Available Skills` lives in `integrations_agent/prompt.rs`, and
 // the connected-integrations / delegation-guide blocks each live in
@@ -74,12 +82,52 @@ pub fn render_runtime(ctx: &PromptContext<'_>) -> Result<String> {
     RuntimeSection.build(ctx)
 }
 
-/// Render the `## Current Date & Time` block. Intentionally **not**
-/// included in byte-stable sub-agent prompts (`for_subagent`) because
-/// injecting `Local::now()` defeats prefix caching. Exposed so full-
-/// assembly main-agent builders can opt in.
+/// Render the `## Current Date & Time` block: the static time-discipline
+/// *rules* (greeting/clock grounding + the gated `resolve_time` rule). The
+/// concrete "now" is **not** here — it rides the user message per turn via
+/// [`current_datetime_line`] so it stays fresh and keeps this section
+/// byte-stable for prefix caching (#3602).
 pub fn render_datetime(ctx: &PromptContext<'_>) -> Result<String> {
     DateTimeSection.build(ctx)
+}
+
+/// Canonical one-line "now" stamp, injected per turn alongside the user
+/// message by both the main session loop (`session::turn`) and the
+/// sub-agent runner so every flow reports the current time identically
+/// (#3602). Local time + IANA zone + `%Z`/offset + weekday, so the model
+/// can localize greetings and date math without a tool call.
+///
+/// Deliberately lives on the *user message*, never the cached
+/// system-prompt prefix: `Local::now()` is volatile, so freezing it into
+/// the prefix both busts the KV cache and goes stale across a long-lived
+/// session. The static grounding *rule* that tells the model to read this
+/// line lives in [`DateTimeSection`] / [`render_datetime`].
+pub fn current_datetime_line() -> String {
+    // When the host resolves an IANA zone, stamp local time + that zone. When
+    // it can't (CI, stripped containers), fall back to true UTC — formatting
+    // `Utc::now()` so the time, offset, and zone label all agree rather than
+    // pairing a "UTC" label with a local clock/offset.
+    match iana_time_zone::get_timezone() {
+        Ok(iana) => {
+            let now = chrono::Local::now();
+            format!(
+                "Current Date & Time: {} {} ({}, UTC{}), {}",
+                now.format("%Y-%m-%d %H:%M:%S"),
+                iana,
+                now.format("%Z"),
+                now.format("%:z"),
+                now.format("%A"),
+            )
+        }
+        Err(_) => {
+            let now = chrono::Utc::now();
+            format!(
+                "Current Date & Time: {} UTC (UTC, UTC+00:00), {}",
+                now.format("%Y-%m-%d %H:%M:%S"),
+                now.format("%A"),
+            )
+        }
+    }
 }
 
 /// Render the `## User` identity block. Empty when
@@ -378,6 +426,13 @@ pub fn render_subagent_system_prompt_with_format(
         );
     }
 
+    // 3b'. Grounding / anti-hallucination contract. Always emitted (like the
+    //      static chain): every spawned sub-agent gets the same floor.
+    //      Sourced from the shared `GROUNDING_BODY` const so this narrow
+    //      renderer can never drift from `GroundingSection`.
+    out.push_str(GROUNDING_BODY);
+    out.push_str("\n\n");
+
     // 3c/3d. `## Available Skills` and `## Connected Integrations`
     //        are no longer emitted here. Each agent that needs them
     //        renders its own block in its `prompt.rs` (integrations_agent
@@ -640,7 +695,7 @@ pub fn default_workspace_file_content(filename: &str) -> &'static str {
 /// manufacture a full context when they only need the static text.
 fn empty_prompt_context_for_static_sections() -> PromptContext<'static> {
     static EMPTY_TOOLS: &[PromptTool<'static>] = &[];
-    static EMPTY_SKILLS: &[crate::openhuman::workflows::Workflow] = &[];
+    static EMPTY_WORKFLOWS: &[crate::openhuman::workflows::Workflow] = &[];
     static EMPTY_INTEGRATIONS: &[ConnectedIntegration] = &[];
     // SAFETY: the &HashSet reference must outlive the returned context;
     // a leaked OnceLock-style allocation gives us a permanent 'static
@@ -652,7 +707,7 @@ fn empty_prompt_context_for_static_sections() -> PromptContext<'static> {
         model_name: "",
         agent_id: "",
         tools: EMPTY_TOOLS,
-        skills: EMPTY_SKILLS,
+        workflows: EMPTY_WORKFLOWS,
         dispatcher_instructions: "",
         learned: LearnedContextData::default(),
         visible_tool_names: visible,

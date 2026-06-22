@@ -2,6 +2,7 @@
 //! `build_session_agent_inner` constructor.
 
 use super::helpers::prefetch_tool_memory_rules_blocking;
+use super::should_synthesize_delegation_tools;
 use crate::openhuman::agent::dispatcher::{
     NativeToolDispatcher, PFormatToolDispatcher, XmlToolDispatcher,
 };
@@ -141,7 +142,15 @@ impl Agent {
                 .unwrap_or(config.default_temperature)
         );
 
-        Self::build_session_agent_inner(config, agent_id, target_def.as_ref(), None, None, false)
+        Self::build_session_agent_inner(
+            config,
+            agent_id,
+            target_def.as_ref(),
+            None,
+            None,
+            false,
+            None,
+        )
     }
 
     /// Same as [`Self::from_config_for_agent`] but also appends a
@@ -174,6 +183,7 @@ impl Agent {
             Some(reflection_chunks),
             None,
             false,
+            None,
         )
     }
 
@@ -185,6 +195,7 @@ impl Agent {
         agent_id: &str,
         reflection_chunks: Option<Vec<crate::openhuman::subconscious::SourceChunk>>,
         profile_prompt_suffix: Option<String>,
+        profile: Option<&crate::openhuman::profiles::AgentProfile>,
     ) -> Result<Self> {
         let target_def: Option<crate::openhuman::agent::harness::definition::AgentDefinition> =
             match AgentDefinitionRegistry::global() {
@@ -217,6 +228,7 @@ impl Agent {
             reflection_chunks,
             profile_prompt_suffix,
             false,
+            profile,
         )
     }
 
@@ -241,6 +253,7 @@ impl Agent {
             None,
             Some(prompt_suffix),
             true,
+            None,
         )?;
         let safe_name: String = juror_name
             .chars()
@@ -281,6 +294,7 @@ impl Agent {
     /// the subconscious LLM cited when it produced the spawning
     /// reflection (#623). Empty / `None` is the default for normal chat
     /// threads — the section is omitted entirely.
+    #[allow(clippy::too_many_arguments)]
     fn build_session_agent_inner(
         config: &Config,
         agent_id: &str,
@@ -288,7 +302,19 @@ impl Agent {
         reflection_chunks: Option<Vec<crate::openhuman::subconscious::SourceChunk>>,
         profile_prompt_suffix: Option<String>,
         read_only_tools_only: bool,
+        profile: Option<&crate::openhuman::profiles::AgentProfile>,
     ) -> Result<Self> {
+        if let Some(p) = profile {
+            tracing::debug!(
+                profile_id = %p.id,
+                include_agent_conversations = p.include_agent_conversations,
+                allowed_tools = p.allowed_tools.as_ref().map_or(0, |t| t.len()),
+                allowed_skills = p.allowed_skills.as_ref().map_or(0, |s| s.len()),
+                allowed_mcp_servers = p.allowed_mcp_servers.as_ref().map_or(0, |m| m.len()),
+                memory_sources = p.memory_sources.as_ref().map_or(0, |s| s.len()),
+                "[profiles] applying per-profile session gate"
+            );
+        }
         let runtime: Arc<dyn host_runtime::RuntimeAdapter> =
             Arc::from(host_runtime::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::from_config(
@@ -316,6 +342,13 @@ impl Agent {
             &config.workspace_dir,
         )?);
 
+        // Per-profile skill (workflow) + MCP-server allowlists. `None` = all.
+        let profile_skill_allowlist: Option<std::collections::HashSet<String>> = profile
+            .and_then(|p| p.allowed_skills.clone())
+            .map(|v| v.into_iter().collect());
+        let profile_mcp_allowlist: Option<Vec<String>> =
+            profile.and_then(|p| p.allowed_mcp_servers.clone());
+
         let mut tools = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -327,6 +360,8 @@ impl Agent {
             &config.action_dir,
             &config.agents,
             config,
+            profile_skill_allowlist.as_ref(),
+            profile_mcp_allowlist.as_deref(),
         );
 
         // Filter tools by user preference stored in app state.
@@ -437,6 +472,15 @@ impl Agent {
             );
             model_name = pinned_model.to_string();
         }
+
+        // Resolve the user-configured vision flag for the (now-final) model while
+        // the full `Config` / `model_registry` is in scope — the turn engine only
+        // sees `MultimodalConfig`. Stored on the session and surfaced to the image
+        // gate via the `current_model_vision` task-local (covers custom/BYOK models
+        // the provider can't introspect). Computed with `&model_name` since it's
+        // moved into the builder below.
+        let model_vision =
+            crate::openhuman::inference::model_context::model_supports_vision(&model_name, config);
 
         // Dispatcher selection is deferred until after the tool list is
         // finalised (orchestrator tools are appended below). We capture
@@ -585,7 +629,7 @@ impl Agent {
                 suffix.chars().count()
             );
             prompt_builder = prompt_builder.add_section(Box::new(
-                crate::openhuman::agent::profiles::AgentProfilePromptSection::new(suffix),
+                crate::openhuman::profiles::AgentProfilePromptSection::new(suffix),
             ));
         }
 
@@ -706,6 +750,26 @@ impl Agent {
         // and then paying a repair pass on turn 1 just to recover the real
         // delegation surface.
         let prewarmed_integrations = crate::openhuman::composio::cached_active_integrations(config);
+        // Per-profile connector gate: scope the connected-integration view to the
+        // active profile's `composio_integrations` allowlist (None = all). This
+        // governs both the system-prompt "connected integrations" surface and the
+        // agent's `connected_integrations` field below, so a profile only ever
+        // sees the toolkits it was granted.
+        let prewarmed_integrations = match (
+            prewarmed_integrations,
+            profile.and_then(|p| p.composio_integrations.as_deref()),
+        ) {
+            (Some(list), Some(allow)) => {
+                let filtered = crate::openhuman::profiles::filter_integrations(&list, Some(allow));
+                tracing::debug!(
+                    before = list.len(),
+                    after = filtered.len(),
+                    "[profiles] composio connectors scoped to profile allowlist"
+                );
+                Some(filtered)
+            }
+            (other, _) => other,
+        };
         let prewarmed_integrations_slice = prewarmed_integrations.as_deref().unwrap_or(&[]);
 
         // Resolve the per-agent delegation tool set and visible-tool
@@ -740,11 +804,15 @@ impl Agent {
             crate::openhuman::agent::harness::definition::AgentDefinitionRegistry::global(),
         ) {
             (Some(def), Some(reg)) => {
-                let synthed = tools::orchestrator_tools::collect_orchestrator_tools(
-                    def,
-                    reg,
-                    prewarmed_integrations_slice,
-                );
+                let synthed = if should_synthesize_delegation_tools(def) {
+                    tools::orchestrator_tools::collect_orchestrator_tools(
+                        def,
+                        reg,
+                        prewarmed_integrations_slice,
+                    )
+                } else {
+                    Vec::new()
+                };
                 let filter: Option<std::collections::HashSet<String>> = match &def.tools {
                     ToolScope::Named(names) => {
                         let mut set: std::collections::HashSet<String> =
@@ -797,13 +865,41 @@ impl Agent {
         // contract (empty == no filter) stays intact: an empty set
         // means "no filter" for both legacy callers and the new
         // agent-scoped path.
-        let visible: std::collections::HashSet<String> = match filter_from_scope {
+        let mut visible: std::collections::HashSet<String> = match filter_from_scope {
             Some(set) => set,
             None => delegation_tools
                 .iter()
                 .map(|t| t.name().to_string())
                 .collect(),
         };
+        // Compaction applies to every agent's tool output, so the CCR recovery
+        // tool must be a *real* member of any non-empty allowlist — this is the
+        // single source of truth that the policy session, advertised specs, and
+        // the run-time visible-name gate all consume, so adding it here makes a
+        // `retrieve_tool_output("…")` footer actionable for Named-scope agents
+        // (e.g. the orchestrator's curated list). An empty set already means
+        // "no filter", so it needs nothing. Added BEFORE the disallow filter
+        // below so an agent that explicitly disallows it still has it removed.
+        super::ensure_recovery_tool_visible(&mut visible);
+
+        if let Some(def) = target_def {
+            if !def.disallowed_tools.is_empty() {
+                match &def.tools {
+                    ToolScope::Wildcard => {
+                        visible = tools
+                            .iter()
+                            .map(|t| t.name().to_string())
+                            .chain(delegation_tools.iter().map(|t| t.name().to_string()))
+                            .filter(|name| !definition_disallows_tool(&def.disallowed_tools, name))
+                            .collect();
+                    }
+                    ToolScope::Named(_) => {
+                        visible
+                            .retain(|name| !definition_disallows_tool(&def.disallowed_tools, name));
+                    }
+                }
+            }
+        }
 
         // Phase 4 (#566): add the MemoryAccessSection bias instruction only
         // when at least one retrieval tool is actually loaded AND survives
@@ -937,6 +1033,9 @@ impl Agent {
         // `true` default (omit) for both files.
         let effective_omit_profile = target_def.map(|def| def.omit_profile).unwrap_or(true);
         let effective_omit_memory_md = target_def.map(|def| def.omit_memory_md).unwrap_or(true);
+        let effective_trigger_memory_agent = target_def
+            .map(|def| def.trigger_memory_agent)
+            .unwrap_or_default();
 
         // Stamp the resolved agent definition id onto the Agent via the
         // builder. Without this call, `agent_definition_name` falls
@@ -1033,16 +1132,23 @@ impl Agent {
                             .resolved_memory_limits()
                             .max_memory_context_chars,
                     )
-                    .with_workspace_dir(config.workspace_dir.clone()),
+                    .with_workspace_dir(config.workspace_dir.clone())
+                    // Per-profile memory gate: when the active profile opts out
+                    // of agent-conversation recall, suppress the prior-chat and
+                    // cross-chat blocks. Defaults to on for None / unset.
+                    .with_agent_conversations(
+                        profile.map_or(true, |p| p.include_agent_conversations),
+                    ),
             ))
             .prompt_builder(prompt_builder)
             .config(config.agent.clone())
             .context_config(config.context.clone())
             .model_name(model_name)
+            .model_vision(model_vision)
             .temperature(effective_temperature)
             .workspace_dir(config.workspace_dir.clone())
             .action_dir(config.action_dir.clone())
-            .skills(crate::openhuman::workflows::load_workflow_metadata(
+            .workflows(crate::openhuman::workflows::load_workflow_metadata(
                 &config.workspace_dir,
             ))
             .auto_save(config.memory.auto_save)
@@ -1051,7 +1157,8 @@ impl Agent {
             .explicit_preferences_enabled(config.learning.explicit_preferences_enabled)
             .agent_definition_name(agent_id.to_string())
             .omit_profile(effective_omit_profile)
-            .omit_memory_md(effective_omit_memory_md);
+            .omit_memory_md(effective_omit_memory_md)
+            .trigger_memory_agent(effective_trigger_memory_agent);
         if let Some(ps) = payload_summarizer {
             builder = builder.payload_summarizer(ps);
         }
@@ -1067,4 +1174,14 @@ impl Agent {
         agent.synthesized_tool_names = synthesized_tool_names;
         Ok(agent)
     }
+}
+
+fn definition_disallows_tool(disallowed: &[String], name: &str) -> bool {
+    disallowed.iter().any(|entry| {
+        if let Some(prefix) = entry.strip_suffix('*') {
+            name.starts_with(prefix)
+        } else {
+            entry == name
+        }
+    })
 }

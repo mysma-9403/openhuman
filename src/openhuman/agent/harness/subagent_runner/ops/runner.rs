@@ -102,17 +102,36 @@ pub async fn run_subagent(
 
         // Install the sub-agent's declared `sandbox_mode` as the active
         // task-local for every tool invocation inside this run.
+        //
+        // When the worker opted into git-worktree isolation, also install
+        // its isolated checkout path as the `action_dir` override so acting
+        // tools (shell, git) operate inside that worktree instead of the
+        // shared `Config.action_dir`. When `worktree_action_dir` is `None`
+        // (the default / non-isolated path), no override scope is entered and
+        // behaviour is unchanged.
+        let worktree_action_dir = options.worktree_action_dir.clone();
+        if let Some(ref wt_dir) = worktree_action_dir {
+            tracing::debug!(
+                agent_id = %definition.id,
+                task_id = %task_id,
+                worktree = %wt_dir.display(),
+                "[subagent_runner] installing worktree action_dir override"
+            );
+        }
         let mut outcome = with_spawn_depth(attempted_depth, async {
             with_file_state_agent_id(task_id.clone(), async {
                 with_current_sandbox_mode(definition.sandbox_mode, async {
-                    Box::pin(run_typed_mode(
-                        definition,
-                        task_prompt,
-                        &options,
-                        &parent,
-                        &task_id,
-                    ))
-                    .await
+                    let run = run_typed_mode(definition, task_prompt, &options, &parent, &task_id);
+                    match worktree_action_dir {
+                        Some(wt_dir) => {
+                            crate::openhuman::agent::harness::with_action_dir_override(
+                                wt_dir,
+                                Box::pin(run),
+                            )
+                            .await
+                        }
+                        None => Box::pin(run).await,
+                    }
                 })
                 .await
             })
@@ -274,16 +293,14 @@ async fn run_typed_mode(
 
     // ── Force-include extra_tools ──────────────────────────────────────
     if !definition.extra_tools.is_empty() {
-        let disallow_set: std::collections::HashSet<&str> = definition
-            .disallowed_tools
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
         for (i, tool) in parent.all_tools.iter().enumerate() {
             let name = tool.name();
             if definition.extra_tools.iter().any(|n| n == name)
                 && !allowed_indices.contains(&i)
-                && !disallow_set.contains(name)
+                && !super::super::tool_prep::disallowed_tool_matches(
+                    &definition.disallowed_tools,
+                    name,
+                )
                 && !is_subagent_spawn_tool(name)
             {
                 allowed_indices.push(i);
@@ -387,6 +404,7 @@ async fn run_typed_mode(
                     tools: fresh_actions,
                     gated_tools: cached_integration.gated_tools.clone(),
                     connected: cached_integration.connected,
+                    connections: cached_integration.connections.clone(),
                     non_active_status: cached_integration.non_active_status.clone(),
                 };
                 let integration = &integration;
@@ -562,7 +580,7 @@ async fn run_typed_mode(
         model_name: &model,
         agent_id: &definition.id,
         tools: &prompt_tools,
-        skills: &parent.skills,
+        workflows: &parent.workflows,
         dispatcher_instructions: &dispatcher_instructions,
         learned: crate::openhuman::context::prompt::LearnedContextData::default(),
         visible_tool_names: &visible_tool_names,
@@ -604,12 +622,10 @@ async fn run_typed_mode(
     let system_prompt = append_subagent_role_contract(system_prompt, &definition.id);
 
     // ── Build the user message (with optional context prefix) ──────────
-    let now = chrono::Local::now();
-    let now_str = format!(
-        "Current Date & Time: {} ({})",
-        now.format("%Y-%m-%d %H:%M:%S"),
-        now.format("%Z")
-    );
+    // Shared one-line stamp (#3602) so sub-agents report time in the same
+    // format as the main agent. Lives on the user message because sub-agent
+    // system prompts are byte-stable for prefix caching.
+    let now_str = crate::openhuman::agent::prompts::current_datetime_line();
 
     let mut context_parts: Vec<&str> = Vec::new();
     if !definition.omit_memory_context {
@@ -644,6 +660,20 @@ async fn run_typed_mode(
         };
 
     // ── Run the inner tool-call loop ───────────────────────────────────
+    // Resolve the sub-agent model's user-configured vision flag; defaults to
+    // `false` when config can't be loaded. Combined with the provider capability
+    // at the gate, this lets a flagged custom/BYOK sub-agent model forward images.
+    let model_vision = crate::openhuman::config::Config::load_or_init()
+        .await
+        .ok()
+        .map(|cfg| crate::openhuman::inference::model_context::model_supports_vision(&model, &cfg))
+        .unwrap_or(false);
+    tracing::debug!(
+        target: "subagent_runner",
+        model = %model,
+        model_vision,
+        "[subagent_runner] resolved sub-agent model vision capability"
+    );
     let (output, iterations, _agg_usage, early_exit_tool) = Box::pin(run_inner_loop(
         subagent_provider.as_ref(),
         &mut history,
@@ -653,6 +683,7 @@ async fn run_typed_mode(
         allowed_names,
         lazy_resolver,
         &model,
+        model_vision,
         temperature,
         definition.effective_max_iterations(),
         task_id,
@@ -661,6 +692,7 @@ async fn run_typed_mode(
         handoff_cache.as_deref(),
         parent,
         definition.iteration_policy == IterationPolicy::Extended,
+        options.run_queue.clone(),
     ))
     .await?;
 

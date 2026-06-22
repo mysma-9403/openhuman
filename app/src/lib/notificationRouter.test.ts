@@ -41,12 +41,20 @@ describe('resolveIntegrationRoute', () => {
     expect(resolveIntegrationRoute(n)).toBe('/chat?account=abc');
   });
 
-  it.each(['gmail', 'slack', 'whatsapp', 'wechat', 'telegram', 'discord', 'linkedin'])(
-    'routes %s provider to /chat',
-    provider => {
-      expect(resolveIntegrationRoute(makeIntegration({ provider }))).toBe('/chat');
-    }
-  );
+  it.each([
+    'gmail',
+    'slack',
+    'whatsapp',
+    'wechat',
+    'telegram',
+    'discord',
+    'linkedin',
+    'outlook',
+    'instagram',
+    'twitter',
+  ])('routes %s provider to /chat', provider => {
+    expect(resolveIntegrationRoute(makeIntegration({ provider }))).toBe('/chat');
+  });
 
   it('falls back to /notifications for unknown providers', () => {
     expect(resolveIntegrationRoute(makeIntegration({ provider: 'unknown-app' }))).toBe(
@@ -78,8 +86,8 @@ describe('resolveSystemRoute', () => {
     expect(resolveSystemRoute(makeSystem({ category: 'agents' }))).toBe('/chat');
   });
 
-  it('routes skills category to /skills', () => {
-    expect(resolveSystemRoute(makeSystem({ category: 'skills' }))).toBe('/skills');
+  it('routes skills category to /connections (Phase 2 rename)', () => {
+    expect(resolveSystemRoute(makeSystem({ category: 'skills' }))).toBe('/connections');
   });
 
   it('routes system category to /home', () => {

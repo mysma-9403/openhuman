@@ -22,41 +22,51 @@ const USER_ID = 'e2e-navigation-smoothness';
 const ROUTE_TIMEOUT = 10_000;
 
 // Routes to visit, with optional text markers that confirm the panel loaded.
+// Phase 2/3/6 IA revamp:
+//   /skills → /connections (back-compat redirect); use canonical route here
+//   /intelligence → /activity (back-compat redirect); use canonical route here
+//   /channels → /connections?tab=messaging (redirect)
+//   /human → /chat (Phase 6 redirect)
 interface RouteCheck {
   hash: string;
   markers: string[];
 }
 
 const ROUTES: RouteCheck[] = [
-  { hash: '/chat', markers: ['Threads', 'Chat', 'Message', 'New thread'] },
-  { hash: '/skills', markers: ['Skills', 'Skill', 'Install', 'Browse'] },
+  // Chat composer header: "New" thread button, agent-profile "Reasoning" pill.
+  { hash: '/chat', markers: ['New', 'Chat', 'Message', 'Reasoning', 'Your assistant is ready'] },
+  // Connections page (was /skills) — tabs: Apps, Messaging, Tools, Explorer
+  { hash: '/connections', markers: ['Apps', 'Messaging', 'Tools', 'Connections'] },
+  // /home redirects to /chat (AppRoutes.tsx Phase 6); markers cover both old
+  // Home.tsx CTA text and the new chat new-window hero status copy.
   {
     hash: '/home',
     markers: [
-      'Good morning',
-      'Good afternoon',
-      'Good evening',
-      'Message OpenHuman',
-      'Test',
-      'Upgrade',
+      'Ask your assistant anything',
+      'Your device is connected',
+      'Your assistant is ready',
+      'Home',
+      'Chat',
     ],
   },
-  { hash: '/channels', markers: ['Channels', 'Channel', 'Connect', 'Add', 'Gmail', 'Telegram'] },
   {
     hash: '/notifications',
     markers: ['Notifications', 'Alerts', 'Notification', 'No notifications'],
   },
   { hash: '/rewards', markers: ['Rewards', 'Referral', 'Credits', 'Earn', 'Invite'] },
   { hash: '/settings', markers: ['Settings', 'Account', 'Billing', 'Advanced'] },
+  // Brain page (the old /activity & /intelligence pages were retired; the
+  // Subconscious surface and memory live here now). Tabs: Graph, Memory,
+  // Sources, Subconscious, Sync.
+  { hash: '/brain', markers: ['Graph', 'Memory', 'Subconscious', 'Sources'] },
   {
     hash: '/home',
     markers: [
-      'Good morning',
-      'Good afternoon',
-      'Good evening',
-      'Message OpenHuman',
-      'Test',
-      'Upgrade',
+      'Ask your assistant anything',
+      'Your device is connected',
+      'Your assistant is ready',
+      'Home',
+      'Chat',
     ],
   },
 ];
@@ -109,7 +119,7 @@ describe('Navigation smoothness', () => {
     console.log(`${LOG_PREFIX} Teardown complete`);
   });
 
-  it('N1.1 — all 8 major routes render without error within timing budget', async () => {
+  it('N1.1 — all major routes render without error within timing budget', async () => {
     console.log(`${LOG_PREFIX} N1.1: first pass — normal navigation`);
     for (const route of ROUTES) {
       console.log(`${LOG_PREFIX} N1.1: navigating to ${route.hash}`);
@@ -139,14 +149,16 @@ describe('Navigation smoothness', () => {
     console.log(`${LOG_PREFIX} N1.2: passed — rapid cycle complete`);
   });
 
-  it('N1.3 — final state is /home with correct content', async () => {
+  it('N1.3 — final state is /home (or /chat redirect) with correct content', async () => {
     console.log(`${LOG_PREFIX} N1.3: navigating to /home for final check`);
     await navigateViaHash('/home');
     const homeText = await waitForHomePage(ROUTE_TIMEOUT);
     expect(homeText).toBeTruthy();
 
+    // AppRoutes.tsx redirects /home → /chat, so the settled hash is #/chat.
+    // Accept either form to keep the test resilient across routing changes.
     const hash = await browser.execute(() => window.location.hash);
-    expect(hash).toMatch(/^#\/home/);
-    console.log(`${LOG_PREFIX} N1.3: passed — on /home, content: "${homeText}"`);
+    expect(hash).toMatch(/^#\/(home|chat)(\/|$)/);
+    console.log(`${LOG_PREFIX} N1.3: passed — on ${hash}, content: "${homeText}"`);
   });
 });
