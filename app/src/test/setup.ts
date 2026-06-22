@@ -8,7 +8,7 @@
  * - Resets rate limiter module-level state between tests
  */
 import '@testing-library/jest-dom/vitest';
-import { cleanup } from '@testing-library/react';
+import { cleanup, configure } from '@testing-library/react';
 import type React from 'react';
 import { afterAll, afterEach, beforeEach, vi } from 'vitest';
 
@@ -19,6 +19,18 @@ import {
   startMockServer,
   stopMockServer,
 } from '../../../scripts/mock-api-core.mjs';
+
+// The full Vitest run is executed under v8 coverage instrumentation with a
+// single worker (see test/vitest.config.ts), which makes individual renders
+// markedly slower than an isolated, un-instrumented file run. Testing Library's
+// default 1000ms async-utility timeout is too tight in that environment, so
+// `findBy*`/`waitFor` assertions in render-heavy suites (e.g. the workflow
+// orchestration tab) flake intermittently — and which test trips first is
+// non-deterministic. Raising the global async-util budget removes that whole
+// class of false timeouts without masking real failures: `waitFor`/`findBy`
+// still resolve the instant their condition is met, this only widens the
+// ceiling before they give up (well within the 30s testTimeout).
+configure({ asyncUtilTimeout: 5000 });
 
 const DEFAULT_TEST_MOCK_API_PORT = 5005;
 
@@ -84,6 +96,24 @@ function ensureStorage(name: 'localStorage' | 'sessionStorage') {
 ensureStorage('localStorage');
 ensureStorage('sessionStorage');
 
+// Polyfill window.matchMedia — used by Rive (@rive-app/react-webgl2) and
+// some media-query hooks; not implemented in jsdom.
+if (typeof window.matchMedia === 'undefined') {
+  Object.defineProperty(window, 'matchMedia', {
+    writable: true,
+    value: vi.fn((query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })),
+  });
+}
+
 // Polyfill ResizeObserver for cmdk/Radix components in jsdom
 if (typeof globalThis.ResizeObserver === 'undefined') {
   globalThis.ResizeObserver = class ResizeObserver {
@@ -112,7 +142,10 @@ if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) {
 // Mock Tauri APIs (not available in test env)
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(), isTauri: vi.fn(() => false) }));
 
-vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(), emit: vi.fn() }));
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn().mockResolvedValue(vi.fn()),
+  emit: vi.fn(),
+}));
 
 vi.mock('@tauri-apps/plugin-deep-link', () => ({ onOpenUrl: vi.fn(), getCurrent: vi.fn() }));
 
@@ -144,7 +177,16 @@ vi.mock('../utils/tauriCommands', () => ({
     }),
   openhumanGetMeetSettings: vi
     .fn()
-    .mockResolvedValue({ result: { auto_orchestrator_handoff: false }, logs: [] }),
+    .mockResolvedValue({
+      result: {
+        auto_orchestrator_handoff: false,
+        auto_join_policy: 'ask_each_time',
+        auto_summarize_policy: 'ask',
+        listen_only_default: true,
+        ingest_backend_transcripts: false,
+      },
+      logs: [],
+    }),
   exchangeToken: vi.fn(),
   invoke: vi.fn(),
 }));
@@ -159,7 +201,7 @@ vi.mock('../utils/config', () => ({
   E2E_DEFAULT_CORE_MODE: '',
   E2E_RESTART_APP_AS_RELOAD: false,
   DEV_FORCE_ONBOARDING: false,
-  CHAT_ATTACHMENTS_ENABLED: false,
+  CHAT_ATTACHMENTS_ENABLED: true,
   SKILLS_GITHUB_REPO: 'test/skills',
   GA_MEASUREMENT_ID: undefined,
   OPENPANEL_API_URL: 'https://panel.tinyhumans.ai/api',
@@ -238,9 +280,14 @@ vi.mock('@sentry/react', () => ({
   setUser: vi.fn(),
 }));
 
-// Silence console during tests to keep output clean
+// Silence console during tests to keep output clean. `debug`/`info` are
+// included because error-path diagnostics across the app (e.g. VoicePanel
+// "voice settings load failed", threadSlice "title refresh failed") use
+// `console.debug`, which otherwise floods the test output with expected noise.
 if (!process.env.DEBUG_TESTS) {
   vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'info').mockImplementation(() => {});
+  vi.spyOn(console, 'debug').mockImplementation(() => {});
   vi.spyOn(console, 'warn').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
 }

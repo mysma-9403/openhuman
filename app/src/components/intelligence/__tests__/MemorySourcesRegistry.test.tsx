@@ -2,12 +2,20 @@
  * Unit tests for MemorySourcesRegistry — All In button, gear/settings panel,
  * per-kind field visibility, Save, and existing toggle behaviour.
  */
-import { fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { Provider } from 'react-redux';
+import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as service from '../../../services/memorySourcesService';
+import { getCoreStateSnapshot } from '../../../lib/coreState/store';
+import { CoreStateContext, type CoreStateContextValue } from '../../../providers/coreStateContext';
 import type { MemorySourceEntry } from '../../../services/memorySourcesService';
-import { renderWithProviders } from '../../../test/test-utils';
+import { createTestStore, renderWithProviders } from '../../../test/test-utils';
+import {
+  openhumanGetMemorySyncSettings,
+  openhumanUpdateMemorySyncSettings,
+} from '../../../utils/tauriCommands/config';
 import { MemorySourcesRegistry } from '../MemorySourcesRegistry';
 
 // Mock the entire service so we don't hit RPC
@@ -31,10 +39,33 @@ vi.mock('../../../utils/tauriCommands/memoryTree', () => ({
   memoryTreeFlushSource: vi.fn().mockResolvedValue({ seals_fired: 0 }),
 }));
 
+// Mock the memory-sync schedule config RPCs (#3302).
+vi.mock('../../../utils/tauriCommands/config', () => ({
+  openhumanGetMemorySyncSettings: vi.fn(),
+  openhumanUpdateMemorySyncSettings: vi.fn(),
+}));
+
 const mockedList = vi.mocked(service.listMemorySources);
 const mockedStatus = vi.mocked(service.memorySourcesStatusList);
 const mockedUpdate = vi.mocked(service.updateMemorySource);
 const mockedApplyAllIn = vi.mocked(service.applyAllIn);
+const mockedGetSync = vi.mocked(openhumanGetMemorySyncSettings);
+const mockedUpdateSync = vi.mocked(openhumanUpdateMemorySyncSettings);
+
+function syncSettings(overrides: Record<string, unknown> = {}) {
+  return {
+    result: {
+      sync_interval_secs: null,
+      selected_secs: 86_400,
+      is_manual: false,
+      is_default: true,
+      default_secs: 86_400,
+      presets: [14_400, 43_200, 86_400],
+      ...overrides,
+    },
+    logs: [],
+  };
+}
 
 function makeSource(overrides: Partial<MemorySourceEntry> = {}): MemorySourceEntry {
   return {
@@ -61,6 +92,9 @@ function setup(sources: MemorySourceEntry[] = [makeSource()]) {
 describe('MemorySourcesRegistry', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Default: schedule RPCs succeed with the unset/default 24h view.
+    mockedGetSync.mockResolvedValue(syncSettings());
+    mockedUpdateSync.mockResolvedValue(syncSettings());
   });
 
   // -------------------------------------------------------------------------
@@ -318,5 +352,145 @@ describe('MemorySourcesRegistry', () => {
     await waitFor(() => {
       expect(onToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
     });
+  });
+
+  // -------------------------------------------------------------------------
+  // Memory sync schedule (#3302)
+  // -------------------------------------------------------------------------
+  it('renders the sync schedule with the default 24h cadence highlighted', async () => {
+    setup();
+    const schedule = await screen.findByTestId('memory-sync-schedule');
+    // Default view highlights the 24h preset.
+    const preset24h = within(schedule).getByTestId('memory-sync-preset-86400');
+    expect(preset24h).toHaveAttribute('aria-checked', 'true');
+    // Manual is offered and not selected.
+    const manual = within(schedule).getByTestId('memory-sync-preset-0');
+    expect(manual).toHaveAttribute('aria-checked', 'false');
+    // The summary shows the current cadence.
+    expect(within(schedule).getByTestId('memory-sync-current')).toHaveTextContent('Every 24h');
+  });
+
+  it('shows "Last synced …" from the newest source chunk timestamp', async () => {
+    mockedList.mockResolvedValue([makeSource()]);
+    mockedStatus.mockResolvedValue([
+      {
+        source_id: 'src_1',
+        chunks_synced: 5,
+        chunks_pending: 0,
+        last_chunk_at_ms: Date.now() - 2 * 60 * 60 * 1000,
+        freshness: 'recent',
+      },
+    ]);
+    renderWithProviders(<MemorySourcesRegistry pollIntervalMs={0} />);
+    const schedule = await screen.findByTestId('memory-sync-schedule');
+    await waitFor(() => {
+      expect(schedule).toHaveTextContent(/Last synced/i);
+      expect(schedule).toHaveTextContent(/2h ago/i);
+    });
+  });
+
+  it('selecting a preset calls update with the cadence in seconds', async () => {
+    setup();
+    const schedule = await screen.findByTestId('memory-sync-schedule');
+
+    mockedUpdateSync.mockResolvedValue(
+      syncSettings({ sync_interval_secs: 14_400, selected_secs: 14_400, is_default: false })
+    );
+    fireEvent.click(within(schedule).getByTestId('memory-sync-preset-14400'));
+
+    await waitFor(() => {
+      expect(mockedUpdateSync).toHaveBeenCalledWith({ sync_interval_secs: 14_400 });
+    });
+    await waitFor(() => {
+      expect(within(schedule).getByTestId('memory-sync-current')).toHaveTextContent('Every 4h');
+    });
+  });
+
+  it('selecting Manual sends sync_interval_secs = 0 and shows Manual only', async () => {
+    setup();
+    const schedule = await screen.findByTestId('memory-sync-schedule');
+
+    mockedUpdateSync.mockResolvedValue(
+      syncSettings({ sync_interval_secs: 0, selected_secs: 0, is_manual: true, is_default: false })
+    );
+    fireEvent.click(within(schedule).getByTestId('memory-sync-preset-0'));
+
+    await waitFor(() => {
+      expect(mockedUpdateSync).toHaveBeenCalledWith({ sync_interval_secs: 0 });
+    });
+    await waitFor(() => {
+      expect(within(schedule).getByTestId('memory-sync-current')).toHaveTextContent('Manual only');
+    });
+  });
+
+  it('schedule update failure shows an error toast', async () => {
+    const { onToast } = setup();
+    const schedule = await screen.findByTestId('memory-sync-schedule');
+
+    mockedUpdateSync.mockRejectedValue(new Error('RPC down'));
+    fireEvent.click(within(schedule).getByTestId('memory-sync-preset-14400'));
+
+    await waitFor(() => {
+      expect(onToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Refetch when the session becomes authenticated (#3449)
+  //
+  // After a page reload the registry can mount before CoreStateProvider has
+  // restored the session. The first fetch then runs against a not-yet-ready
+  // core; sources must reappear as soon as auth flips true, without waiting
+  // for the next background poll.
+  // -------------------------------------------------------------------------
+  it('refetches sources when the session transitions to authenticated', async () => {
+    mockedList.mockResolvedValue([makeSource({ label: 'Reloaded Repo' })]);
+    mockedStatus.mockResolvedValue([]);
+
+    const coreState = (isAuthenticated: boolean): CoreStateContextValue =>
+      ({
+        ...getCoreStateSnapshot(),
+        snapshot: {
+          ...getCoreStateSnapshot().snapshot,
+          auth: {
+            isAuthenticated,
+            userId: isAuthenticated ? 'u1' : null,
+            user: null,
+            profileId: null,
+          },
+        },
+        refresh: async () => {},
+        refreshTeams: async () => {},
+        refreshTeamMembers: async () => {},
+        refreshTeamInvites: async () => {},
+        setAnalyticsEnabled: async () => {},
+        setMeetAutoOrchestratorHandoff: async () => {},
+        setOnboardingCompletedFlag: async () => {},
+        setEncryptionKey: async () => {},
+        patchSnapshot: () => {},
+        setOnboardingTasks: async () => {},
+        storeSessionToken: async () => {},
+        clearSession: async () => {},
+      }) as CoreStateContextValue;
+
+    const store = createTestStore();
+    const tree = (isAuthenticated: boolean) => (
+      <Provider store={store}>
+        <CoreStateContext.Provider value={coreState(isAuthenticated)}>
+          <MemoryRouter>
+            {/* pollIntervalMs=0 disables the background poll, so the only way
+                the second fetch can fire is the auth transition. */}
+            <MemorySourcesRegistry pollIntervalMs={0} />
+          </MemoryRouter>
+        </CoreStateContext.Provider>
+      </Provider>
+    );
+
+    const { rerender } = render(tree(false));
+    await waitFor(() => expect(mockedList).toHaveBeenCalledTimes(1));
+
+    rerender(tree(true));
+    await waitFor(() => expect(mockedList).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('Reloaded Repo')).toBeInTheDocument();
   });
 });

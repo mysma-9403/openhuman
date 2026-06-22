@@ -99,9 +99,12 @@ export interface ChatErrorEvent {
     | 'cancelled'
     | 'rate_limited'
     | 'auth_error'
+    | 'session_expired'
     | 'provider_error'
     | 'context_overflow'
     | 'model_unavailable'
+    | 'payload_too_large'
+    | 'provider_request_rejected'
     | 'budget_exhausted';
   round: number | null;
 }
@@ -251,6 +254,16 @@ export interface SubagentProgressDetail {
   worker_thread_id?: string;
   /** Human-readable display name from the agent registry. */
   display_name?: string;
+  /**
+   * Absolute path to the worker's isolated `git worktree` checkout (on
+   * `subagent_completed`, when the worker ran with `isolation = "worktree"`).
+   * Drives the inline worktree row's open/diff/remove actions (#3376).
+   */
+  worktree_path?: string;
+  /** Files (relative to the worktree root) the worker changed (on `subagent_completed`). */
+  changed_files?: string[];
+  /** Whether the worker's worktree had uncommitted changes (on `subagent_completed`). */
+  dirty_status?: boolean;
 }
 
 /** Extended payload for `subagent_spawned`. */
@@ -942,7 +955,7 @@ export function subscribeChatEvents(listeners: ChatEventListeners): () => void {
   };
 }
 
-export type QueueMode = 'interrupt' | 'steer' | 'followup' | 'collect';
+export type QueueMode = 'interrupt' | 'steer' | 'followup' | 'collect' | 'parallel';
 
 export interface ChatSendParams {
   threadId: string;
@@ -956,6 +969,21 @@ export interface ChatSendParams {
    * working unchanged.
    */
   locale?: string | null;
+  /**
+   * When `true`, the core will synthesize the agent reply via TTS and
+   * stream audio back (push-to-talk reply flow).
+   */
+  speakReply?: boolean;
+  /**
+   * Originating input source — e.g. `'ptt'` for push-to-talk, `'keyboard'`
+   * for typed input. Forwarded to the core for analytics / routing.
+   */
+  source?: string;
+  /**
+   * PTT session ID — ties the chat turn to a specific push-to-talk recording
+   * session so the core can correlate audio and text events.
+   */
+  sessionId?: number;
   /**
    * Queue mode for concurrent messages. When a turn is already in
    * flight: `steer` injects at the next iteration boundary, `followup`
@@ -971,15 +999,19 @@ export interface ChatSendParams {
  * The Rust core spawns the agent loop asynchronously and streams events
  * (tool_call, tool_result, chat_done, chat_error) back over the socket
  * connection using the `client_id` (socket ID) for routing.
+ *
+ * Returns the turn's `request_id` (from the RPC ack) when the core provides
+ * one — used by `parallel` sends to register the forked turn's stream lane.
+ * `undefined` if the ack carried no id.
  */
-export async function chatSend(params: ChatSendParams): Promise<void> {
+export async function chatSend(params: ChatSendParams): Promise<string | undefined> {
   const socket = socketService.getSocket();
   const clientId = socket?.id;
   if (!clientId) {
     throw new Error('Socket not connected — no client ID for event routing');
   }
 
-  await callCoreRpc({
+  const result = await callCoreRpc({
     method: 'openhuman.channel_web_chat',
     params: {
       client_id: clientId,
@@ -988,9 +1020,15 @@ export async function chatSend(params: ChatSendParams): Promise<void> {
       model_override: params.model ?? undefined,
       profile_id: params.profileId ?? undefined,
       locale: params.locale ?? undefined,
+      speak_reply: params.speakReply ?? undefined,
+      source: params.source ?? undefined,
+      session_id: params.sessionId ?? undefined,
       queue_mode: params.queueMode ?? undefined,
     },
   });
+
+  const requestId = (result as { request_id?: unknown } | null)?.request_id;
+  return typeof requestId === 'string' ? requestId : undefined;
 }
 
 /**

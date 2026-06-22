@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -59,10 +59,13 @@ const LOCK_TIMEOUT_MS: u64 = STALE_LOCK_AGE_MS + 5_000;
 
 /// Retry budget for the JSON write + rename in `write_persisted_locked`.
 /// Same shape as the lock-create call at the bottom of `acquire_lock` (which
-/// is what closed Sentry OPENHUMAN-TAURI-H1 / H8 in #1641 / #2085). 6 attempts
-/// at base 100ms doubles up to ~6.3s worst-case before surfacing. Sized to
-/// stay well inside `LOCK_TIMEOUT_MS` so concurrent acquire_lock callers
-/// never time out behind a single retry-loop owner.
+/// is what closed Sentry OPENHUMAN-TAURI-H1 / H8 in #1641 / #2085). With
+/// `attempts = 6`, `retry_with_backoff` issues at most 6 calls and sleeps
+/// 5 times between them (last failure breaks without sleeping):
+/// `100+200+400+800+1600 ≈ 3.1s per stage`, so the write and rename stages
+/// together sit at `≈6.2s` worst case. Sized to stay well inside
+/// `LOCK_TIMEOUT_MS = 35_000` so concurrent acquire_lock callers never time
+/// out behind a single retry-loop owner.
 const PERSIST_RETRY_ATTEMPTS: u32 = 6;
 const PERSIST_RETRY_BASE_MS: u64 = 100;
 
@@ -214,13 +217,29 @@ pub struct AuthProfilesStore {
     /// Whether the OS keychain is available on this machine.
     /// Cached at construction time to avoid repeated probes.
     use_keychain: bool,
-    /// `#[cfg(test)]` failure injection — when non-zero, the next retryable
-    /// FS call inside `write_persisted_locked` consumes one count and returns
-    /// a `__TEST_TRANSIENT__` error so the `is_transient_fs_error` classifier
-    /// treats it as retryable (`src/openhuman/util.rs:618`). Production
+    /// `#[cfg(test)]` failure injection for the **write** stage of
+    /// `write_persisted_locked`. When non-zero, the next call inside the
+    /// `fs::write(tmp)` retry loop consumes one count and returns a
+    /// `__TEST_TRANSIENT__` error so `is_transient_fs_error` treats it as
+    /// retryable (`src/openhuman/util.rs:618`). Production binaries never
+    /// see this field.
+    #[cfg(test)]
+    force_transient_failures_write: Arc<AtomicUsize>,
+    /// `#[cfg(test)]` failure injection for the **rename** stage of
+    /// `write_persisted_locked`. Separate counter from the write stage so a
+    /// test can exercise the rename retry loop without first having to drain
+    /// failures through the write stage (see PR #3364 review feedback —
+    /// the headline retry path was line-covered but not behaviour-covered
+    /// before this split).
+    #[cfg(test)]
+    force_transient_failures_rename: Arc<AtomicUsize>,
+    /// `#[cfg(test)]` failure injection — when set, the next `acquire_lock`
+    /// call consumes the flag and returns a synthetic `StorageFull`
+    /// lock-create failure, exercising the lock-free read-only fallback in
+    /// [`AuthProfilesStore::load`] (Sentry TAURI-RUST-4SZ). Production
     /// binaries never see this field.
     #[cfg(test)]
-    force_transient_failures: Arc<AtomicUsize>,
+    force_lock_unwritable: Arc<AtomicBool>,
 }
 
 impl AuthProfilesStore {
@@ -263,7 +282,11 @@ impl AuthProfilesStore {
             user_id,
             use_keychain,
             #[cfg(test)]
-            force_transient_failures: Arc::new(AtomicUsize::new(0)),
+            force_transient_failures_write: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            force_transient_failures_rename: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            force_lock_unwritable: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -356,8 +379,28 @@ impl AuthProfilesStore {
     }
 
     pub fn load(&self) -> Result<AuthProfilesData> {
-        let _lock = self.acquire_lock()?;
-        self.load_locked()
+        match self.acquire_lock() {
+            Ok(_lock) => self.load_locked(),
+            Err(e) if is_lock_create_unwritable_fs(&e) => {
+                // RCA Sentry TAURI-RUST-4SZ: a full / read-only filesystem
+                // can't create the exclusive lock file, but the store already
+                // exists and writers publish via atomic tmp+rename, so a
+                // lock-free read is still consistent. The read path is the
+                // hot caller here (`app_state_snapshot` polls it every tick),
+                // so failing it strands the UI AND floods Sentry once per
+                // poll. Degrade to a lock-free read-only load instead — the
+                // user keeps their session view, and because no error is
+                // produced the noise stops at the source rather than being
+                // suppressed downstream. Opportunistic migrations are skipped
+                // (they couldn't persist on a full disk anyway).
+                log::warn!(
+                    "[auth] auth-profile lock could not be created ({e}); \
+                     serving lock-free read-only load (likely disk full / read-only FS)"
+                );
+                self.load_unlocked_readonly()
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn upsert_profile(&self, mut profile: AuthProfile, set_active: bool) -> Result<()> {
@@ -446,6 +489,28 @@ impl AuthProfilesStore {
     }
 
     fn load_locked(&self) -> Result<AuthProfilesData> {
+        self.load_resolved(true)
+    }
+
+    /// Lock-free read-only load used as the [`AuthProfilesStore::load`]
+    /// fallback when the exclusive lock can't be created because the
+    /// filesystem won't accept the lock file (disk full / read-only mount —
+    /// Sentry TAURI-RUST-4SZ). Safe without the lock because writers publish
+    /// the store atomically (tmp + `fs::rename`), so a bare read always sees
+    /// a complete file. Skips the opportunistic migration / dropped-profile
+    /// rewrite that `load_locked` performs — that write needs both the lock
+    /// and a writable disk, and this path runs precisely when neither holds.
+    fn load_unlocked_readonly(&self) -> Result<AuthProfilesData> {
+        self.load_resolved(false)
+    }
+
+    /// Shared read + in-memory resolution worker. Reads the persisted store,
+    /// resolves/migrates secrets and drops unrecoverable profiles in memory,
+    /// and — only when `persist` is true — writes back any resulting cleanup.
+    /// The returned `AuthProfilesData` reflects the in-memory cleanup either
+    /// way, so the lock-free read path (`persist = false`) still returns a
+    /// correct, fully-resolved view without touching disk.
+    fn load_resolved(&self, persist: bool) -> Result<AuthProfilesData> {
         let mut persisted = self.read_persisted_locked()?;
         // `migrated` tracks enc: → enc2: XOR-cipher upgrades (original behavior).
         let mut migrated = false;
@@ -752,6 +817,9 @@ impl AuthProfilesStore {
         // any `active_profiles` pointers that referenced them, so the
         // next read returns a clean "no active session" state.
         if !dropped_ids.is_empty() {
+            // Always apply the cleanup to the in-memory view so the returned
+            // data is correct even on the lock-free read path; the on-disk
+            // rewrite below is what's gated by `persist`.
             for id in &dropped_ids {
                 persisted.profiles.remove(id);
             }
@@ -765,8 +833,13 @@ impl AuthProfilesStore {
                 dropped_ids.len(),
                 self.path.display(),
             );
-            self.write_persisted_locked(&persisted)?;
-        } else if migrated || keychain_migrated {
+        }
+        // Persist opportunistic cleanup / migrations only on the locked write
+        // path. The lock-free read-only fallback (`persist = false`, used when
+        // the disk can't accept the lock file) intentionally skips this — the
+        // write would fail on a full disk anyway, and the in-memory view above
+        // is already correct.
+        if persist && (!dropped_ids.is_empty() || migrated || keychain_migrated) {
             self.write_persisted_locked(&persisted)?;
         }
 
@@ -966,7 +1039,7 @@ impl AuthProfilesStore {
             PERSIST_RETRY_ATTEMPTS,
             PERSIST_RETRY_BASE_MS,
             || {
-                self.consume_test_transient_failure()?;
+                self.consume_test_transient_failure_write()?;
                 fs::write(&tmp_path, &json).context("write auth profile tmp")
             },
         )
@@ -977,12 +1050,12 @@ impl AuthProfilesStore {
             )
         })?;
 
-        retry_with_backoff(
+        let rename_result = retry_with_backoff(
             "replace auth profile store",
             PERSIST_RETRY_ATTEMPTS,
             PERSIST_RETRY_BASE_MS,
             || {
-                self.consume_test_transient_failure()?;
+                self.consume_test_transient_failure_rename()?;
                 fs::rename(&tmp_path, &self.path).context("rename auth profile tmp -> store")
             },
         )
@@ -991,45 +1064,87 @@ impl AuthProfilesStore {
                 "Failed to replace auth profile store at {}",
                 self.path.display()
             )
-        })?;
+        });
 
-        Ok(())
+        if rename_result.is_err() {
+            // Best-effort orphan cleanup: `tmp_path` is `…tmp.{pid}.{nanos}`
+            // — unique per call — so a permanently-failing rename otherwise
+            // leaks one tmp file per `app_state_snapshot` poll (~2s cadence)
+            // under sustained Windows AV / Search-Indexer holds. Cleaning
+            // here keeps the directory tidy; the cleanup itself can fail
+            // (the same AV that blocked the rename may block the unlink),
+            // which is why we deliberately drop the result.
+            let _ = fs::remove_file(&tmp_path);
+        }
+
+        rename_result
     }
 
-    /// Consume one test-injected transient FS failure if any are queued.
-    /// No-op in production builds.
+    /// Consume one test-injected transient FS failure for the **write**
+    /// stage if any are queued. No-op in production builds.
     #[cfg(test)]
-    fn consume_test_transient_failure(&self) -> Result<()> {
-        let remaining = self.force_transient_failures.load(Ordering::SeqCst);
-        if remaining == 0 {
-            return Ok(());
-        }
-        self.force_transient_failures.fetch_sub(1, Ordering::SeqCst);
-        Err(anyhow::anyhow!(
-            "__TEST_TRANSIENT__ injected transient FS failure"
-        ))
+    fn consume_test_transient_failure_write(&self) -> Result<()> {
+        consume_one(&self.force_transient_failures_write)
+    }
+
+    /// Consume one test-injected transient FS failure for the **rename**
+    /// stage if any are queued. No-op in production builds.
+    #[cfg(test)]
+    fn consume_test_transient_failure_rename(&self) -> Result<()> {
+        consume_one(&self.force_transient_failures_rename)
     }
 
     #[cfg(not(test))]
     #[inline(always)]
-    fn consume_test_transient_failure(&self) -> Result<()> {
+    fn consume_test_transient_failure_write(&self) -> Result<()> {
         Ok(())
     }
 
-    /// Queue `n` test-only forced transient FS failures. The next `n`
-    /// retryable calls inside `write_persisted_locked` return a
-    /// `__TEST_TRANSIENT__` error before the underlying FS op runs; the
-    /// retry helper treats them as retryable.
-    #[cfg(test)]
-    pub(super) fn force_next_transient_failures(&self, n: usize) {
-        self.force_transient_failures.store(n, Ordering::SeqCst);
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn consume_test_transient_failure_rename(&self) -> Result<()> {
+        Ok(())
     }
 
-    /// Test introspection: how many forced transient failures are still
-    /// queued. Lets tests verify the retry helper drained the queue.
+    /// Queue `n` test-only forced transient FS failures for the write
+    /// stage. The next `n` calls inside the `fs::write(tmp)` retry loop
+    /// return a `__TEST_TRANSIENT__` error before the underlying FS op
+    /// runs; the retry helper treats them as retryable.
     #[cfg(test)]
-    pub(super) fn remaining_forced_failures(&self) -> usize {
-        self.force_transient_failures.load(Ordering::SeqCst)
+    pub(super) fn force_next_write_failures(&self, n: usize) {
+        self.force_transient_failures_write
+            .store(n, Ordering::SeqCst);
+    }
+
+    /// Queue `n` test-only forced transient FS failures for the rename
+    /// stage. Separate from the write counter so tests can exercise the
+    /// rename retry loop in isolation (PR #3364 review feedback).
+    #[cfg(test)]
+    pub(super) fn force_next_rename_failures(&self, n: usize) {
+        self.force_transient_failures_rename
+            .store(n, Ordering::SeqCst);
+    }
+
+    /// Test introspection: how many forced write-stage failures are still
+    /// queued.
+    #[cfg(test)]
+    pub(super) fn remaining_forced_write_failures(&self) -> usize {
+        self.force_transient_failures_write.load(Ordering::SeqCst)
+    }
+
+    /// Test introspection: how many forced rename-stage failures are still
+    /// queued.
+    #[cfg(test)]
+    pub(super) fn remaining_forced_rename_failures(&self) -> usize {
+        self.force_transient_failures_rename.load(Ordering::SeqCst)
+    }
+
+    /// Queue a single test-only forced `StorageFull` lock-create failure. The
+    /// next `acquire_lock` returns the synthetic disk-full error so tests can
+    /// drive the lock-free read-only fallback in [`AuthProfilesStore::load`].
+    #[cfg(test)]
+    pub(super) fn force_next_lock_unwritable(&self) {
+        self.force_lock_unwritable.store(true, Ordering::SeqCst);
     }
 
     fn encrypt_optional(&self, value: Option<&str>) -> Result<Option<String>> {
@@ -1050,6 +1165,16 @@ impl AuthProfilesStore {
     }
 
     fn acquire_lock(&self) -> Result<AuthProfileLockGuard> {
+        // Test-only: simulate a full / read-only filesystem that can't create
+        // the lock file, to drive the read-only fallback in `load`.
+        #[cfg(test)]
+        if self.force_lock_unwritable.swap(false, Ordering::SeqCst) {
+            let io = std::io::Error::from(std::io::ErrorKind::StorageFull);
+            return Err(annotate_lock_create_failure(
+                anyhow::Error::new(io).context("open lock file"),
+            ));
+        }
+
         if let Some(parent) = self.lock_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| "Failed to create auth profile lock directory".to_string())?;
@@ -1287,6 +1412,27 @@ impl AuthProfilesStore {
 /// of [`AuthProfilesStore::acquire_lock`] so unit tests can drive the
 /// formatting directly without depending on filesystem permissions (CI runs
 /// as root and bypasses `chmod 0500`).
+/// True when a lock-create failure was caused by the filesystem refusing to
+/// accept the lock file itself — disk full (`StorageFull`, POSIX `ENOSPC` /
+/// Windows `ERROR_DISK_FULL`) or a read-only mount (`ReadOnlyFilesystem`,
+/// `EROFS`). These are exactly the conditions where the **read** path can
+/// safely skip the exclusive lock: the store already exists, writers publish
+/// atomically, and the failing operation is the *creation of a new lock file*,
+/// not the read. Lock *contention* (`AlreadyExists` / the busy-wait timeout)
+/// and every other error deliberately do NOT match — those still propagate so
+/// genuine problems stay visible. See [`AuthProfilesStore::load`].
+fn is_lock_create_unwritable_fs(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::StorageFull | std::io::ErrorKind::ReadOnlyFilesystem
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn annotate_lock_create_failure(err: anyhow::Error) -> anyhow::Error {
     let io = err.chain().find_map(|c| c.downcast_ref::<std::io::Error>());
     let kind = io.map(|ioe| ioe.kind());
@@ -1407,6 +1553,21 @@ fn default_schema_version() -> u32 {
 
 fn default_now_rfc3339() -> String {
     Utc::now().to_rfc3339()
+}
+
+/// Decrement an `AtomicUsize` failure-injection counter by one if it is
+/// non-zero, returning a `__TEST_TRANSIENT__` error so `is_transient_fs_error`
+/// classifies the failure as retryable. Used by both per-stage consumers in
+/// `write_persisted_locked` (test-only).
+#[cfg(test)]
+fn consume_one(counter: &AtomicUsize) -> Result<()> {
+    if counter.load(Ordering::SeqCst) == 0 {
+        return Ok(());
+    }
+    counter.fetch_sub(1, Ordering::SeqCst);
+    Err(anyhow::anyhow!(
+        "__TEST_TRANSIENT__ injected transient FS failure"
+    ))
 }
 
 fn parse_profile_kind(value: &str) -> Result<AuthProfileKind> {

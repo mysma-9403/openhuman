@@ -6,6 +6,16 @@
 
 use crate::openhuman::config::rpc as config_rpc;
 use crate::openhuman::memory_sources::types::{MemorySourceEntry, SourceKind};
+use std::sync::OnceLock;
+
+static MEMORY_SOURCES_WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+pub(crate) async fn memory_sources_write_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    MEMORY_SOURCES_WRITE_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
 
 /// Conservative default sync caps for a Composio toolkit, keyed by toolkit slug.
 ///
@@ -50,6 +60,7 @@ pub async fn get_source(id: &str) -> Result<Option<MemorySourceEntry>, String> {
 
 pub async fn add_source(entry: MemorySourceEntry) -> Result<MemorySourceEntry, String> {
     entry.validate()?;
+    let _guard = memory_sources_write_guard().await;
     let mut config = config_rpc::load_config_with_timeout().await?;
 
     if config.memory_sources.iter().any(|s| s.id == entry.id) {
@@ -75,6 +86,7 @@ pub async fn update_source(
     id: &str,
     patch: MemorySourcePatch,
 ) -> Result<MemorySourceEntry, String> {
+    let _guard = memory_sources_write_guard().await;
     let mut config = config_rpc::load_config_with_timeout().await?;
 
     let entry = config
@@ -159,6 +171,7 @@ pub async fn update_source(
 }
 
 pub async fn remove_source(id: &str) -> Result<bool, String> {
+    let _guard = memory_sources_write_guard().await;
     let mut config = config_rpc::load_config_with_timeout().await?;
     let before = config.memory_sources.len();
     config.memory_sources.retain(|s| s.id != id);
@@ -182,6 +195,7 @@ pub async fn remove_source(id: &str) -> Result<bool, String> {
 /// connection-delete flow doesn't have, so this is the connection-keyed
 /// counterpart. Returns the number of entries removed (0 if none matched).
 pub async fn remove_composio_source_by_connection_id(connection_id: &str) -> Result<usize, String> {
+    let _guard = memory_sources_write_guard().await;
     let mut config = config_rpc::load_config_with_timeout().await?;
     let before = config.memory_sources.len();
     config.memory_sources.retain(|s| {
@@ -204,31 +218,26 @@ pub async fn remove_composio_source_by_connection_id(connection_id: &str) -> Res
     Ok(removed)
 }
 
-/// Upsert a composio source — used by the auto-registration path.
-/// If a source with the same `connection_id` already exists, updates
-/// the label; otherwise inserts a new entry.
-pub async fn upsert_composio_source(
+/// Apply a single composio upsert to an in-memory source list.
+///
+/// If a source with the same `connection_id` already exists, updates its label
+/// and returns a clone of the updated entry with `was_insert = false`;
+/// otherwise pushes a new entry (with conservative per-toolkit defaults) and
+/// returns it with `was_insert = true`.
+///
+/// Pure (no I/O) so the single-call path, the batch path, and unit tests all
+/// share one find-or-push predicate and cannot drift.
+fn upsert_composio_entry_in_place(
+    sources: &mut Vec<MemorySourceEntry>,
     toolkit: &str,
     connection_id: &str,
     label: &str,
-) -> Result<MemorySourceEntry, String> {
-    let mut config = config_rpc::load_config_with_timeout().await?;
-
-    if let Some(existing) = config.memory_sources.iter_mut().find(|s| {
+) -> (MemorySourceEntry, bool) {
+    if let Some(existing) = sources.iter_mut().find(|s| {
         s.kind == SourceKind::Composio && s.connection_id.as_deref() == Some(connection_id)
     }) {
         existing.label = label.to_string();
-        let updated = existing.clone();
-        config
-            .save()
-            .await
-            .map_err(|e| format!("failed to save config: {e:#}"))?;
-        tracing::debug!(
-            connection_id = %connection_id,
-            toolkit = %toolkit,
-            "[memory_sources] upserted composio source (update)"
-        );
-        return Ok(updated);
+        return (existing.clone(), false);
     }
 
     let (default_max_items, default_sync_depth_days) = memory_sync_defaults_for_toolkit(toolkit);
@@ -262,19 +271,100 @@ pub async fn upsert_composio_source(
         max_cost_per_sync_usd: None,
         sync_depth_days: default_sync_depth_days,
     };
-    config.memory_sources.push(entry.clone());
+    sources.push(entry.clone());
+    (entry, true)
+}
+
+/// Upsert a composio source — used by the auto-registration path.
+/// If a source with the same `connection_id` already exists, updates
+/// the label; otherwise inserts a new entry.
+pub async fn upsert_composio_source(
+    toolkit: &str,
+    connection_id: &str,
+    label: &str,
+) -> Result<MemorySourceEntry, String> {
+    let _guard = memory_sources_write_guard().await;
+    let mut config = config_rpc::load_config_with_timeout().await?;
+
+    let (entry, was_insert) =
+        upsert_composio_entry_in_place(&mut config.memory_sources, toolkit, connection_id, label);
+
+    config
+        .save()
+        .await
+        .map_err(|e| format!("failed to save config: {e:#}"))?;
+
+    if was_insert {
+        tracing::info!(
+            connection_id = %connection_id,
+            toolkit = %toolkit,
+            "[memory_sources] upserted composio source (insert)"
+        );
+    } else {
+        tracing::debug!(
+            connection_id = %connection_id,
+            toolkit = %toolkit,
+            "[memory_sources] upserted composio source (update)"
+        );
+    }
+
+    Ok(entry)
+}
+
+/// Target for a batch composio upsert: `(toolkit, connection_id, label)`.
+pub type ComposioUpsertTarget = (String, String, String);
+
+/// Batch-upsert many composio sources with a **single** config load + save.
+///
+/// The per-call [`upsert_composio_source`] does its own load-modify-save, so
+/// calling it in a loop costs `2N` config I/O round-trips and — worse — cannot
+/// be parallelised safely (concurrent calls each load the same snapshot and
+/// their saves clobber each other). This batch path loads the config once,
+/// applies every upsert in-memory via the shared [`upsert_composio_entry_in_place`]
+/// predicate, and saves once. Returns the number of targets applied.
+///
+/// Targets are applied in order; a later target sharing a `connection_id` with
+/// an earlier one updates the same (already inserted/updated) entry's label,
+/// matching the sequential single-call semantics.
+pub async fn upsert_composio_sources_batch(
+    targets: &[ComposioUpsertTarget],
+) -> Result<u32, String> {
+    if targets.is_empty() {
+        return Ok(0);
+    }
+
+    let _guard = memory_sources_write_guard().await;
+    let mut config = config_rpc::load_config_with_timeout().await?;
+
+    let mut inserted = 0u32;
+    let mut updated = 0u32;
+    for (toolkit, connection_id, label) in targets {
+        let (_entry, was_insert) = upsert_composio_entry_in_place(
+            &mut config.memory_sources,
+            toolkit,
+            connection_id,
+            label,
+        );
+        if was_insert {
+            inserted += 1;
+        } else {
+            updated += 1;
+        }
+    }
+
     config
         .save()
         .await
         .map_err(|e| format!("failed to save config: {e:#}"))?;
 
     tracing::info!(
-        connection_id = %connection_id,
-        toolkit = %toolkit,
-        "[memory_sources] upserted composio source (insert)"
+        targets = targets.len(),
+        inserted,
+        updated,
+        "[memory_sources] batch-upserted composio sources (single save)"
     );
 
-    Ok(entry)
+    Ok(inserted + updated)
 }
 
 /// Partial update payload for a source entry.
@@ -332,6 +422,7 @@ pub struct MemorySourcePatch {
 ///
 /// Saves config once after all mutations and returns the updated entries.
 pub async fn apply_all_in() -> Result<Vec<MemorySourceEntry>, String> {
+    let _guard = memory_sources_write_guard().await;
     let mut config = config_rpc::load_config_with_timeout().await?;
 
     tracing::info!(
@@ -410,6 +501,55 @@ mod tests {
             (Some(30), Some(14))
         );
         assert_eq!(memory_sync_defaults_for_toolkit(""), (Some(30), Some(14)));
+    }
+
+    #[test]
+    fn in_place_upsert_inserts_new_entry_with_toolkit_defaults() {
+        let mut sources: Vec<MemorySourceEntry> = vec![];
+        let (entry, was_insert) =
+            upsert_composio_entry_in_place(&mut sources, "gmail", "conn_a", "Gmail · conn_a");
+        assert!(was_insert, "first upsert for a connection must insert");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(entry.kind, SourceKind::Composio);
+        assert_eq!(entry.connection_id.as_deref(), Some("conn_a"));
+        assert_eq!(entry.toolkit.as_deref(), Some("gmail"));
+        assert_eq!(entry.label, "Gmail · conn_a");
+        assert!(entry.enabled);
+        // Conservative gmail defaults are applied on insert.
+        assert_eq!(entry.max_items, Some(100));
+        assert_eq!(entry.sync_depth_days, Some(30));
+    }
+
+    #[test]
+    fn in_place_upsert_updates_label_only_for_existing_connection() {
+        let mut sources: Vec<MemorySourceEntry> = vec![];
+        upsert_composio_entry_in_place(&mut sources, "gmail", "conn_a", "old label");
+        // User-customised a cap after the initial insert.
+        sources[0].max_items = Some(7);
+
+        let (entry, was_insert) =
+            upsert_composio_entry_in_place(&mut sources, "gmail", "conn_a", "new label");
+        assert!(!was_insert, "second upsert for same connection must update");
+        assert_eq!(sources.len(), 1, "must not duplicate the entry");
+        assert_eq!(entry.label, "new label");
+        assert_eq!(
+            entry.max_items,
+            Some(7),
+            "update must not clobber user-set caps"
+        );
+    }
+
+    #[test]
+    fn in_place_upsert_keeps_distinct_connections_separate() {
+        let mut sources: Vec<MemorySourceEntry> = vec![];
+        upsert_composio_entry_in_place(&mut sources, "gmail", "conn_a", "A");
+        upsert_composio_entry_in_place(&mut sources, "gmail", "conn_b", "B");
+        assert_eq!(sources.len(), 2);
+        let ids: Vec<_> = sources
+            .iter()
+            .filter_map(|s| s.connection_id.as_deref())
+            .collect();
+        assert!(ids.contains(&"conn_a") && ids.contains(&"conn_b"));
     }
 
     #[test]

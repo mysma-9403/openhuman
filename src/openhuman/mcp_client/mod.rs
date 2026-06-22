@@ -37,12 +37,15 @@
 mod client;
 mod registry;
 pub mod sanitize;
+pub mod setup_agent;
+#[cfg(test)]
+mod setup_agent_integration_test;
 mod stdio;
 
 pub use client::{
     redact_endpoint, AuthorizationServerMetadata, McpAuthChallenge, McpAuthorizationContext,
     McpHttpClient, McpInitializeResult, McpRemoteTool, McpServerToolResult, McpSseEvent,
-    ProtectedResourceMetadata,
+    McpUnauthorizedError, ProtectedResourceMetadata,
 };
 pub(crate) use registry::apply_safety_filter;
 pub use registry::{McpRegistrySource, McpServerDefinition, McpServerRegistry, McpTransportClient};

@@ -669,8 +669,10 @@ fn config_schema_helpers_cover_provider_voice_agent_and_channel_defaults() {
     migrate_legacy_fields(&mut minimax_legacy);
     assert_eq!(minimax_legacy.slug, "minimax");
     assert_eq!(minimax_legacy.label, "MiniMax");
-    assert_eq!(minimax_legacy.endpoint, "https://api.minimax.io/anthropic");
-    assert_eq!(minimax_legacy.auth_style, AuthStyle::Anthropic);
+    // MiniMax uses its OpenAI-compatible /v1 surface + Bearer (TAURI-RUST-8X3);
+    // the legacy `type=minimax` migration fills from the corrected catalog.
+    assert_eq!(minimax_legacy.endpoint, "https://api.minimax.io/v1");
+    assert_eq!(minimax_legacy.auth_style, AuthStyle::Bearer);
     assert_eq!(AuthStyle::OpenhumanJwt.as_str(), "openhuman_jwt");
     assert_eq!(AuthStyle::Anthropic.as_str(), "anthropic");
     assert_eq!(AuthStyle::None.as_str(), "none");
@@ -2794,6 +2796,7 @@ async fn worker_a_controller_schemas_are_fully_exposed() {
                 "openhuman.config_get_data_paths",
                 "openhuman.config_get_dictation_settings",
                 "openhuman.config_get_meet_settings",
+                "openhuman.config_get_memory_sync_settings",
                 "openhuman.config_get_onboarding_completed",
                 "openhuman.config_get_runtime_flags",
                 "openhuman.config_get_sandbox_settings",
@@ -2814,6 +2817,7 @@ async fn worker_a_controller_schemas_are_fully_exposed() {
                 "openhuman.config_update_local_ai_settings",
                 "openhuman.config_update_meet_settings",
                 "openhuman.config_update_memory_settings",
+                "openhuman.config_update_memory_sync_settings",
                 "openhuman.config_update_model_settings",
                 "openhuman.config_update_runtime_settings",
                 "openhuman.config_update_sandbox_settings",
@@ -2863,8 +2867,10 @@ async fn worker_a_controller_schemas_are_fully_exposed() {
                 "openhuman.memory_sources_list_items",
                 "openhuman.memory_sources_monthly_cost_summary",
                 "openhuman.memory_sources_read_item",
+                "openhuman.memory_sources_reconcile",
                 "openhuman.memory_sources_remove",
                 "openhuman.memory_sources_status_list",
+                "openhuman.memory_sources_supported_toolkits",
                 "openhuman.memory_sources_sync",
                 "openhuman.memory_sources_sync_audit_log",
                 "openhuman.memory_sources_update",

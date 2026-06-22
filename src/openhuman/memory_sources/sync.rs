@@ -66,6 +66,7 @@ pub async fn sync_source(source: MemorySourceEntry, config: Config) -> Result<()
         Some(kind_str),
         Some(&source_id),
         Some(format!("sync requested for {} source", kind_str)),
+        Some(&source_id),
     );
 
     tokio::spawn(async move {
@@ -96,6 +97,7 @@ pub async fn sync_source(source: MemorySourceEntry, config: Config) -> Result<()
                 SourceKind::Composio => {
                     sync_composio(&source, config.clone(), &mut composio_usage).await
                 }
+                SourceKind::Conversation => sync_items_individually(&source, &config).await,
                 SourceKind::GithubRepo => {
                     // GitHub path writes its own detailed audit entry
                     // with token breakdowns; skip the dispatcher-level
@@ -131,6 +133,7 @@ pub async fn sync_source(source: MemorySourceEntry, config: Config) -> Result<()
                         Some(source.kind.as_str()),
                         Some(&source.id),
                         Some(format!("ingested {items} item(s)")),
+                        Some(&source.id),
                     );
 
                     // Write audit entry (GitHub writes its own with
@@ -168,6 +171,19 @@ pub async fn sync_source(source: MemorySourceEntry, config: Config) -> Result<()
                     // Auto-rebuild: if raw files exist but the tree has
                     // no summaries, build the tree now.
                     check_and_rebuild_tree(&source, &config).await;
+
+                    // Auto-snapshot: capture post-sync state for diff tracking.
+                    if let Err(e) = crate::openhuman::memory_diff::ops::auto_snapshot_after_sync(
+                        &source, &config,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            source_id = %source.id,
+                            error = %e,
+                            "[memory_sources:sync] auto-snapshot failed (non-fatal)"
+                        );
+                    }
                 }
                 Err(error) => {
                     // Audit failed syncs too.
@@ -199,12 +215,29 @@ pub async fn sync_source(source: MemorySourceEntry, config: Config) -> Result<()
                         },
                     );
 
+                    // Report internal failures to Sentry; known-expected
+                    // conditions (auth/network/rate-limit/missing config) are
+                    // classified by `expected_error_kind` and logged-not-reported
+                    // so we surface real bugs without Sentry-spamming routine
+                    // user/config errors (#3295). The reason is still shown to
+                    // the user via the Failed stage event regardless.
+                    crate::core::observability::report_error_or_expected(
+                        &error,
+                        "memory_sources",
+                        "sync",
+                        &[
+                            ("source_id", source.id.as_str()),
+                            ("kind", source.kind.as_str()),
+                        ],
+                    );
+
                     emit_sync_stage(
                         MemorySyncTrigger::Manual,
                         MemorySyncStage::Failed,
                         Some(source.kind.as_str()),
                         Some(&source.id),
                         Some(error.clone()),
+                        Some(&source.id),
                     );
                     tracing::warn!(
                         source_id = %source.id,
@@ -251,6 +284,7 @@ async fn sync_composio(
         Some("composio"),
         Some(&source.id),
         Some(format!("delegating to composio sync for {connection_id}")),
+        Some(&source.id),
     );
 
     match composio::run_connection_sync(config, connection_id, SyncReason::Manual).await {
@@ -278,6 +312,7 @@ async fn sync_items_individually(
         Some(source.kind.as_str()),
         Some(&source.id),
         Some("listing items".to_string()),
+        Some(&source.id),
     );
 
     let items = reader.list_items(source, config).await?;
@@ -293,6 +328,7 @@ async fn sync_items_individually(
         Some(source.kind.as_str()),
         Some(&source.id),
         Some(format!("{total} item(s) discovered")),
+        Some(&source.id),
     );
 
     let ingested = Arc::new(AtomicUsize::new(0));
@@ -370,6 +406,7 @@ async fn sync_items_individually(
                         Some(&kind_str),
                         Some(&source_id),
                         Some(format!("{done}/{total} processed ({new} new)")),
+                        Some(&source_id),
                     );
                 }
             }
@@ -379,24 +416,27 @@ async fn sync_items_individually(
     Ok(ingested.load(Ordering::Relaxed))
 }
 
-/// Derive the tree scope(s) for a source and rebuild from raw if needed.
-async fn check_and_rebuild_tree(source: &MemorySourceEntry, config: &Config) {
+/// Derive the tree scope(s) for a source and reconcile any raw files that
+/// are not yet covered by tree summaries (incremental — see
+/// `memory_sync::sources::rebuild`).
+pub(crate) async fn check_and_rebuild_tree(source: &MemorySourceEntry, config: &Config) {
     use crate::openhuman::memory_sync::sources::rebuild::{needs_rebuild, rebuild_tree_from_raw};
 
     let scopes = derive_scopes(source, config);
     for scope in scopes {
-        if !needs_rebuild(config, &scope) {
+        if !needs_rebuild(config, &scope.tree_scope, &scope.archive_source_id) {
             continue;
         }
         tracing::info!(
             source_id = %source.id,
-            scope = %scope,
-            "[memory_sources:sync] auto-rebuilding tree from raw"
+            scope = %scope.tree_scope,
+            archive = %scope.archive_source_id,
+            "[memory_sources:sync] reconciling uncovered raw files into tree"
         );
-        match rebuild_tree_from_raw(config, &scope).await {
+        match rebuild_tree_from_raw(config, &scope.tree_scope, &scope.archive_source_id).await {
             Ok(outcome) => {
                 tracing::info!(
-                    scope = %scope,
+                    scope = %scope.tree_scope,
                     files = outcome.files_read,
                     batches = outcome.batches,
                     cost = %format!(
@@ -404,39 +444,58 @@ async fn check_and_rebuild_tree(source: &MemorySourceEntry, config: &Config) {
                         outcome.actual_charged_usd.unwrap_or(outcome.estimated_cost_usd)
                     ),
                     cost_is_actual = outcome.actual_charged_usd.is_some(),
-                    "[memory_sources:sync] rebuild complete"
+                    "[memory_sources:sync] reconcile complete"
                 );
             }
             Err(e) => {
                 tracing::warn!(
-                    scope = %scope,
+                    scope = %scope.tree_scope,
                     error = %format!("{e:#}"),
-                    "[memory_sources:sync] rebuild failed"
+                    "[memory_sources:sync] reconcile failed"
                 );
             }
         }
     }
 }
 
-/// Derive the tree scope string(s) that a source maps to.
-fn derive_scopes(source: &MemorySourceEntry, config: &Config) -> Vec<String> {
+/// A source's tree scope paired with its raw-archive source id. The two
+/// slugify to DIFFERENT directories for GitHub (`github:owner/repo` vs
+/// `github.com/owner/repo`) — conflating them makes reconcile scan an
+/// empty directory while the real archive sits uncovered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SourceScope {
+    /// Tree registry key, e.g. `"github:owner/repo"`.
+    pub tree_scope: String,
+    /// Raw-archive id whose slug names `raw/<slug>/`, e.g.
+    /// `"github.com/owner/repo"`. Equal to `tree_scope` for sources that
+    /// archive under their scope (gmail).
+    pub archive_source_id: String,
+}
+
+/// Derive the tree scope(s) + raw-archive id(s) that a source maps to.
+pub(crate) fn derive_scopes(source: &MemorySourceEntry, config: &Config) -> Vec<SourceScope> {
     use crate::openhuman::memory_sources::readers::github;
-    use crate::openhuman::memory_store::content::raw::slug_account_email;
 
     match source.kind {
         SourceKind::GithubRepo => {
-            // GitHub sync already builds its own tree — but check anyway.
-            source
-                .url
-                .as_deref()
-                .and_then(github::repo_chunk_scope)
-                .into_iter()
-                .collect()
+            let Some(url) = source.url.as_deref() else {
+                return Vec::new();
+            };
+            match (
+                github::repo_chunk_scope(url),
+                github::repo_archive_source_id(url),
+            ) {
+                (Some(tree_scope), Some(archive_source_id)) => vec![SourceScope {
+                    tree_scope,
+                    archive_source_id,
+                }],
+                _ => Vec::new(),
+            }
         }
         SourceKind::Composio => {
             // Composio sources scope by toolkit + connection email.
-            // Gmail: "gmail:<slug_account_email>"
-            // Others: "composio:<toolkit>:<connection_id>"
+            // Gmail: "gmail:<slug_account_email>" — archive dir shares
+            // the scope. Others: no raw archive to reconcile yet.
             let toolkit = source.toolkit.as_deref().unwrap_or("unknown");
             match toolkit {
                 "gmail" | "GMAIL" => {
@@ -458,10 +517,15 @@ fn derive_scopes(source: &MemorySourceEntry, config: &Config) -> Vec<String> {
                                 let source_md = e.path().join("_source.md");
                                 let content = std::fs::read_to_string(&source_md).ok()?;
                                 content.lines().find(|l| l.starts_with("scope:")).map(|l| {
-                                    l.trim_start_matches("scope:")
+                                    let scope = l
+                                        .trim_start_matches("scope:")
                                         .trim()
                                         .trim_matches('"')
-                                        .to_string()
+                                        .to_string();
+                                    SourceScope {
+                                        tree_scope: scope.clone(),
+                                        archive_source_id: scope,
+                                    }
                                 })
                             })
                             .collect()

@@ -25,6 +25,21 @@
 //! - [`DomainEvent::ChannelMessageReceived`]
 //! - [`DomainEvent::ChannelMessageProcessed`]
 
+/// Voice-domain events.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub enum VoiceEvent {
+    /// A PTT session committed a transcript to a thread. Carries only
+    /// length/timing — never the raw text, per the PII-safe logging rule.
+    PttTranscriptCommitted {
+        thread_id: String,
+        session_id: u64,
+        text_len: usize,
+        held_ms: u64,
+        finalized_by_watchdog: bool,
+    },
+}
+
 /// Top-level domain event. Non-exhaustive so new variants can be added
 /// without breaking existing match arms.
 #[non_exhaustive]
@@ -200,12 +215,24 @@ pub enum DomainEvent {
     ///
     /// Emitted by the `memory` domain so the frontend can surface progress
     /// across request → fetch → store → queue → ingest → complete.
+    ///
+    /// `source_id` is the originating memory-source id (from
+    /// `memory_sources`) when the event can be attributed to a specific
+    /// source row. The frontend prefers this over `connection_id` for
+    /// per-row indicator matching (see RC#2, issue #3295). Set to `None`
+    /// when the event originates from a non-memory-source sync path (e.g. a
+    /// channel-provider ingest) — `connection_id` remains unchanged for
+    /// those callers.
     MemorySyncStageChanged {
         trigger: String,
         stage: String,
         provider: Option<String>,
         connection_id: Option<String>,
         detail: Option<String>,
+        /// Originating memory-source id for frontend per-row indicator
+        /// matching. `None` when the event is not attributable to a
+        /// specific `MemorySourceEntry`.
+        source_id: Option<String>,
     },
     /// A memory ingestion job started running on the local extraction LLM.
     /// Ingestion is singleton — this fires once, then a matching
@@ -223,6 +250,25 @@ pub enum DomainEvent {
         success: bool,
         elapsed_ms: u64,
         queue_depth: usize,
+    },
+
+    // ── Memory Diff ─────────────────────────────────────────────────────
+    /// A snapshot of a memory source's chunk state was captured.
+    MemoryDiffSnapshotTaken {
+        snapshot_id: String,
+        source_id: String,
+        source_kind: String,
+        item_count: usize,
+        trigger: String,
+    },
+    /// A diff was computed between two snapshots.
+    MemoryDiffComputed {
+        source_id: String,
+        from_snapshot_id: Option<String>,
+        to_snapshot_id: String,
+        added: usize,
+        removed: usize,
+        modified: usize,
     },
 
     // ── Channels ────────────────────────────────────────────────────────
@@ -342,6 +388,11 @@ pub enum DomainEvent {
         success: bool,
         elapsed_ms: u64,
     },
+    /// The set of installed skills/workflows changed (install / uninstall /
+    /// create). Lets a live agent session refresh its `## Installed Skills`
+    /// catalogue mid-conversation instead of waiting for a restart. `reason`
+    /// is a short tag for logs (e.g. `"install"`, `"uninstall"`, `"create"`).
+    WorkflowsChanged { reason: String },
 
     // ── Tools ───────────────────────────────────────────────────────────
     /// A tool execution started.
@@ -884,6 +935,10 @@ pub enum DomainEvent {
     /// never to Sentry or the UI verbatim.
     SessionExpired { source: String, reason: String },
 
+    // ── Voice ────────────────────────────────────────────────────────────
+    /// A voice domain event (PTT, transcription lifecycle, etc.).
+    Voice(VoiceEvent),
+
     // ── Task sources ─────────────────────────────────────────────────────
     /// A task source completed a fetch pass.
     TaskSourceFetched {
@@ -930,28 +985,114 @@ pub enum DomainEvent {
 
     // ── Backend Meet Bot ──────────────────────────────────────────────
     /// Backend gmeet bot successfully joined the meeting.
-    BackendMeetJoined { meet_url: String },
+    BackendMeetJoined {
+        meet_url: String,
+        correlation_id: Option<String>,
+    },
     /// Backend gmeet bot left the meeting.
-    BackendMeetLeft { reason: String },
+    BackendMeetLeft {
+        reason: String,
+        correlation_id: Option<String>,
+    },
     /// Backend gmeet bot produced a spoken reply.
     BackendMeetReply {
         transcript: String,
         reply: String,
         emotion: String,
+        correlation_id: Option<String>,
     },
     /// Backend gmeet bot needs the harness to execute a tool instruction.
     BackendMeetHarness {
         transcript: String,
         instruction: String,
         emotion: String,
+        correlation_id: Option<String>,
     },
     /// Backend gmeet bot sent the full meeting transcript on close.
     BackendMeetTranscript {
         turns: Vec<BackendMeetTurn>,
         duration_ms: u64,
+        correlation_id: Option<String>,
     },
     /// Backend gmeet bot emitted an error.
-    BackendMeetError { error: String },
+    BackendMeetError {
+        error: String,
+        correlation_id: Option<String>,
+    },
+    /// Backend gmeet bot detected a wake-phrase command from a participant.
+    BackendMeetInCallRequest {
+        correlation_id: Option<String>,
+        speaker: String,
+        command_text: String,
+        recent_transcript: Vec<BackendMeetTurn>,
+        timestamp_ms: u64,
+    },
+    /// Core asked the backend bot to speak into the call (`bot:speak`).
+    /// Published for observability after the Socket.IO emit succeeds.
+    BackendMeetSpeak {
+        text: String,
+        correlation_id: Option<String>,
+    },
+    /// An approval was parked during a live-meeting orchestrator turn
+    /// (issue #3513). The meeting bus speaks the prompt into the call;
+    /// the decision arrives by voice ("Hey Tiny, approve") or the
+    /// standard thread approval card — first response wins.
+    InCallApprovalRequested {
+        request_id: String,
+        tool_name: String,
+        action_summary: String,
+        correlation_id: Option<String>,
+    },
+    /// A Google Calendar event with a Meet link was detected and the
+    /// auto-join policy is "ask" — the UI should prompt the user.
+    MeetAutoJoinPrompt {
+        meet_url: String,
+        event_title: String,
+    },
+    /// A new meeting session was created (Pending) after a calendar Meet
+    /// link was detected and the auto-join prompt was surfaced (issue #3507).
+    MeetingSessionCreated {
+        meeting_id: String,
+        meet_url: String,
+        title: String,
+        /// Origin of the session: "calendar" | "manual" | "api".
+        source: String,
+    },
+    /// Auto-join was triggered for a meeting — either policy == Always or the
+    /// user clicked a join action on the auto-join prompt (issue #3507).
+    MeetingAutoJoinTriggered {
+        meeting_id: String,
+        meet_url: String,
+        listen_only: bool,
+        correlation_id: String,
+    },
+    /// Reserved for PR-4: a post-meeting summary was generated from the
+    /// transcript (action items, key decisions, etc.).
+    MeetingSummaryGenerated {
+        thread_id: String,
+        correlation_id: Option<String>,
+        summary: String,
+    },
+    /// A JSON message arrived on a tinyplace WebSocket stream.
+    /// Published by the stream manager's recv loop. Carries the raw
+    /// server-sent JSON value (inbox item, conversation message, etc.)
+    /// so the Socket.IO bridge can forward it to the renderer.
+    TinyPlaceStreamMessage {
+        /// Stream identifier (e.g. `"inbox"`, `"conversation:abc123"`).
+        stream_id: String,
+        /// Stream kind for routing.
+        kind: String,
+        /// The raw JSON message from the tinyplace server.
+        message: serde_json::Value,
+    },
+    /// A tinyplace WebSocket stream changed lifecycle status.
+    /// Published by the stream manager on connect, disconnect, and failure.
+    TinyPlaceStreamStatusChanged {
+        /// Stream identifier.
+        stream_id: String,
+        /// New status: `"connecting"`, `"connected"`, `"disconnected"`, `"failed"`.
+        status: String,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -989,7 +1130,9 @@ impl DomainEvent {
             | Self::MemorySyncStageChanged { .. }
             | Self::MemoryIngestionStarted { .. }
             | Self::MemoryIngestionCompleted { .. }
-            | Self::DocumentCanonicalized { .. } => "memory",
+            | Self::DocumentCanonicalized { .. }
+            | Self::MemoryDiffSnapshotTaken { .. }
+            | Self::MemoryDiffComputed { .. } => "memory",
 
             Self::CacheRebuilt { .. } => "learning",
 
@@ -1009,7 +1152,8 @@ impl DomainEvent {
             Self::WorkflowLoaded { .. }
             | Self::WorkflowStopped { .. }
             | Self::WorkflowStartFailed { .. }
-            | Self::WorkflowExecuted { .. } => "workflow",
+            | Self::WorkflowExecuted { .. }
+            | Self::WorkflowsChanged { .. } => "workflow",
 
             Self::ToolExecutionStarted { .. } | Self::ToolExecutionCompleted { .. } => "tool",
 
@@ -1067,6 +1211,8 @@ impl DomainEvent {
 
             Self::TaskPlanAwaitingApproval { .. } | Self::TaskRunReclaimed { .. } => "agent",
 
+            Self::Voice(_) => "voice",
+
             Self::ApprovalRequested { .. }
             | Self::ApprovalDecided { .. }
             | Self::ApprovalGateOverrideIgnored { .. }
@@ -1088,7 +1234,18 @@ impl DomainEvent {
             | Self::BackendMeetReply { .. }
             | Self::BackendMeetHarness { .. }
             | Self::BackendMeetTranscript { .. }
-            | Self::BackendMeetError { .. } => "agent_meetings",
+            | Self::BackendMeetError { .. }
+            | Self::BackendMeetInCallRequest { .. }
+            | Self::BackendMeetSpeak { .. }
+            | Self::InCallApprovalRequested { .. }
+            | Self::MeetAutoJoinPrompt { .. }
+            | Self::MeetingSessionCreated { .. }
+            | Self::MeetingAutoJoinTriggered { .. }
+            | Self::MeetingSummaryGenerated { .. } => "agent_meetings",
+
+            Self::TinyPlaceStreamMessage { .. } | Self::TinyPlaceStreamStatusChanged { .. } => {
+                "tinyplace"
+            }
         }
     }
 
@@ -1119,6 +1276,8 @@ impl DomainEvent {
             Self::MemoryIngestionStarted { .. } => "MemoryIngestionStarted",
             Self::MemoryIngestionCompleted { .. } => "MemoryIngestionCompleted",
             Self::DocumentCanonicalized { .. } => "DocumentCanonicalized",
+            Self::MemoryDiffSnapshotTaken { .. } => "MemoryDiffSnapshotTaken",
+            Self::MemoryDiffComputed { .. } => "MemoryDiffComputed",
             Self::CacheRebuilt { .. } => "CacheRebuilt",
             Self::ChannelInboundMessage { .. } => "ChannelInboundMessage",
             Self::ChannelMessageReceived { .. } => "ChannelMessageReceived",
@@ -1135,6 +1294,7 @@ impl DomainEvent {
             Self::WorkflowStopped { .. } => "WorkflowStopped",
             Self::WorkflowStartFailed { .. } => "WorkflowStartFailed",
             Self::WorkflowExecuted { .. } => "WorkflowExecuted",
+            Self::WorkflowsChanged { .. } => "WorkflowsChanged",
             Self::ToolExecutionStarted { .. } => "ToolExecutionStarted",
             Self::ToolExecutionCompleted { .. } => "ToolExecutionCompleted",
             Self::WebhookIncomingRequest { .. } => "WebhookIncomingRequest",
@@ -1202,6 +1362,16 @@ impl DomainEvent {
             Self::BackendMeetHarness { .. } => "BackendMeetHarness",
             Self::BackendMeetTranscript { .. } => "BackendMeetTranscript",
             Self::BackendMeetError { .. } => "BackendMeetError",
+            Self::BackendMeetInCallRequest { .. } => "BackendMeetInCallRequest",
+            Self::BackendMeetSpeak { .. } => "BackendMeetSpeak",
+            Self::InCallApprovalRequested { .. } => "InCallApprovalRequested",
+            Self::MeetAutoJoinPrompt { .. } => "MeetAutoJoinPrompt",
+            Self::MeetingSessionCreated { .. } => "MeetingSessionCreated",
+            Self::MeetingAutoJoinTriggered { .. } => "MeetingAutoJoinTriggered",
+            Self::MeetingSummaryGenerated { .. } => "MeetingSummaryGenerated",
+            Self::TinyPlaceStreamMessage { .. } => "TinyPlaceStreamMessage",
+            Self::TinyPlaceStreamStatusChanged { .. } => "TinyPlaceStreamStatusChanged",
+            Self::Voice(_) => "Voice",
         }
     }
 

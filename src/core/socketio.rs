@@ -47,7 +47,7 @@ struct HandshakeAuth {
 /// A missing `Origin` header is treated as a native (non-browser) client
 /// and accepted — only the cross-origin browser-page case is the targeted
 /// bad actor here.
-fn origin_is_allowed(origin: Option<&str>) -> bool {
+pub(crate) fn origin_is_allowed(origin: Option<&str>) -> bool {
     let Some(origin) = origin else {
         return true; // native clients (CLI, Tauri shell) — no Origin header
     };
@@ -261,6 +261,22 @@ pub struct SubagentProgressDetail {
     /// consistent agent labels across timeline, sub-mascots, and drawer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Absolute path to the worker's isolated `git worktree` checkout
+    /// (on `subagent_completed`, when the worker ran with
+    /// `isolation = "worktree"`). Drives the inline worktree row's
+    /// open/diff/remove actions. `None` for non-isolated workers (#3376).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    /// Files (relative to the worktree root) the worker changed, snapshot
+    /// after the run (on `subagent_completed`). Absent for non-isolated
+    /// workers and clean worktrees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_files: Option<Vec<String>>,
+    /// Whether the worker's worktree had uncommitted changes after the run
+    /// (on `subagent_completed`). A dirty worktree must not be auto-removed —
+    /// the UI requires an explicit user decision. `None` for non-isolated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dirty_status: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -438,6 +454,7 @@ pub fn attach_socketio() -> (socketioxide::layer::SocketIoLayer, SocketIo) {
                         payload.profile_id,
                         payload.locale,
                         payload.queue_mode,
+                        crate::openhuman::channels::providers::web::ChatRequestMetadata::default(),
                     )
                     .await
                     {
@@ -556,6 +573,7 @@ pub fn spawn_web_channel_bridge(io: SocketIo) {
     let io_mcp_setup = io.clone();
     let io_memory_sync = io.clone();
     let io_agent_meetings = io.clone();
+    let io_tinyplace = io.clone();
 
     // 2. Dictation hotkey events → broadcast to all connected clients.
     tokio::spawn(async move {
@@ -868,6 +886,7 @@ pub fn spawn_web_channel_bridge(io: SocketIo) {
                     provider,
                     connection_id,
                     detail,
+                    source_id,
                 } => {
                     let payload = serde_json::json!({
                         "trigger": trigger,
@@ -875,6 +894,10 @@ pub fn spawn_web_channel_bridge(io: SocketIo) {
                         "provider": provider,
                         "connection_id": connection_id,
                         "detail": detail,
+                        // source_id is the memory-source row id for frontend per-row
+                        // indicator matching (RC#2, issue #3295). connection_id is
+                        // preserved unchanged for downstream consumers.
+                        "source_id": source_id,
                     });
                     let _ = io_memory_sync.emit("memory:sync_stage", &payload);
                 }
@@ -962,13 +985,20 @@ pub fn spawn_web_channel_bridge(io: SocketIo) {
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
             match event {
-                crate::core::event_bus::DomainEvent::BackendMeetJoined { meet_url } => {
-                    let payload = serde_json::json!({ "meet_url": meet_url });
+                crate::core::event_bus::DomainEvent::BackendMeetJoined {
+                    meet_url,
+                    correlation_id,
+                } => {
+                    let payload = serde_json::json!({ "meet_url": meet_url, "correlation_id": correlation_id });
                     log::debug!("[socketio] broadcast agent_meetings:joined");
                     let _ = io_agent_meetings.emit("agent_meetings:joined", &payload);
                 }
-                crate::core::event_bus::DomainEvent::BackendMeetLeft { reason } => {
-                    let payload = serde_json::json!({ "reason": reason });
+                crate::core::event_bus::DomainEvent::BackendMeetLeft {
+                    reason,
+                    correlation_id,
+                } => {
+                    let payload =
+                        serde_json::json!({ "reason": reason, "correlation_id": correlation_id });
                     log::debug!("[socketio] broadcast agent_meetings:left reason={}", reason);
                     let _ = io_agent_meetings.emit("agent_meetings:left", &payload);
                 }
@@ -976,11 +1006,13 @@ pub fn spawn_web_channel_bridge(io: SocketIo) {
                     transcript,
                     reply,
                     emotion,
+                    correlation_id,
                 } => {
                     let payload = serde_json::json!({
                         "transcript": transcript,
                         "reply": reply,
                         "emotion": emotion,
+                        "correlation_id": correlation_id,
                     });
                     log::debug!(
                         "[socketio] broadcast agent_meetings:reply reply_len={}",
@@ -992,11 +1024,13 @@ pub fn spawn_web_channel_bridge(io: SocketIo) {
                     transcript,
                     instruction,
                     emotion,
+                    correlation_id,
                 } => {
                     let payload = serde_json::json!({
                         "transcript": transcript,
                         "instruction": instruction,
                         "emotion": emotion,
+                        "correlation_id": correlation_id,
                     });
                     log::debug!(
                         "[socketio] broadcast agent_meetings:harness instruction_len={}",
@@ -1007,10 +1041,12 @@ pub fn spawn_web_channel_bridge(io: SocketIo) {
                 crate::core::event_bus::DomainEvent::BackendMeetTranscript {
                     turns,
                     duration_ms,
+                    correlation_id,
                 } => {
                     let payload = serde_json::json!({
                         "turns": turns,
                         "duration_ms": duration_ms,
+                        "correlation_id": correlation_id,
                     });
                     log::debug!(
                         "[socketio] broadcast agent_meetings:transcript turns={} duration_ms={}",
@@ -1019,8 +1055,12 @@ pub fn spawn_web_channel_bridge(io: SocketIo) {
                     );
                     let _ = io_agent_meetings.emit("agent_meetings:transcript", &payload);
                 }
-                crate::core::event_bus::DomainEvent::BackendMeetError { error } => {
-                    let payload = serde_json::json!({ "error": error });
+                crate::core::event_bus::DomainEvent::BackendMeetError {
+                    error,
+                    correlation_id,
+                } => {
+                    let payload =
+                        serde_json::json!({ "error": error, "correlation_id": correlation_id });
                     log::debug!("[socketio] broadcast agent_meetings:error");
                     let _ = io_agent_meetings.emit("agent_meetings:error", &payload);
                 }
@@ -1028,6 +1068,80 @@ pub fn spawn_web_channel_bridge(io: SocketIo) {
             }
         }
         log::debug!("[socketio] agent_meetings bridge stopped");
+    });
+
+    // 10. Tinyplace stream events → broadcast to all connected frontend sockets.
+    tokio::spawn(async move {
+        let bus = {
+            const RETRY_INTERVAL_MS: u64 = 250;
+            const MAX_WAIT_SECS: u64 = 30;
+            let max_attempts = (MAX_WAIT_SECS * 1000) / RETRY_INTERVAL_MS;
+            let mut attempts: u64 = 0;
+            loop {
+                if let Some(bus) = crate::core::event_bus::global() {
+                    break bus;
+                }
+                attempts += 1;
+                if attempts > max_attempts {
+                    log::warn!(
+                        "[socketio] event_bus not initialised after {}s — tinyplace bridge giving up",
+                        MAX_WAIT_SECS
+                    );
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(RETRY_INTERVAL_MS)).await;
+            }
+        };
+        let mut rx = bus.raw_receiver();
+        loop {
+            let event = match rx.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    log::warn!(
+                        "[socketio] dropped {} event_bus events due to lag (tinyplace bridge)",
+                        skipped
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            match event {
+                crate::core::event_bus::DomainEvent::TinyPlaceStreamMessage {
+                    stream_id,
+                    kind,
+                    message,
+                } => {
+                    let payload = json!({
+                        "stream_id": stream_id,
+                        "kind": kind,
+                        "message": message,
+                    });
+                    log::debug!(
+                        "[socketio] broadcast tinyplace:stream_message stream_id={} kind={}",
+                        stream_id,
+                        kind
+                    );
+                    let _ = io_tinyplace.emit("tinyplace:stream_message", &payload);
+                }
+                crate::core::event_bus::DomainEvent::TinyPlaceStreamStatusChanged {
+                    stream_id,
+                    status,
+                } => {
+                    let payload = json!({
+                        "stream_id": stream_id,
+                        "status": status,
+                    });
+                    log::debug!(
+                        "[socketio] broadcast tinyplace:stream_status stream_id={} status={}",
+                        stream_id,
+                        status
+                    );
+                    let _ = io_tinyplace.emit("tinyplace:stream_status", &payload);
+                }
+                _ => {}
+            }
+        }
+        log::debug!("[socketio] tinyplace stream bridge stopped");
     });
 }
 

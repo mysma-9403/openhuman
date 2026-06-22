@@ -332,6 +332,64 @@ fn tmp_config(tmp: &tempfile::TempDir) -> Config {
 }
 
 #[tokio::test]
+async fn apply_memory_sync_settings_stores_interval_and_view() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    // Pick the 4h preset.
+    let patch = MemorySyncSettingsPatch {
+        sync_interval_secs: Some(14_400),
+    };
+    let outcome = apply_memory_sync_settings(&mut cfg, patch)
+        .await
+        .expect("apply");
+    assert_eq!(cfg.memory_sync_interval_secs, Some(14_400));
+    assert_eq!(outcome.value["sync_interval_secs"], 14_400);
+    assert_eq!(outcome.value["selected_secs"], 14_400);
+    assert_eq!(outcome.value["is_manual"], false);
+    assert_eq!(outcome.value["is_default"], false);
+}
+
+#[tokio::test]
+async fn apply_memory_sync_settings_manual_only() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    let patch = MemorySyncSettingsPatch {
+        sync_interval_secs: Some(0),
+    };
+    let outcome = apply_memory_sync_settings(&mut cfg, patch)
+        .await
+        .expect("apply");
+    assert_eq!(cfg.memory_sync_interval_secs, Some(0));
+    assert_eq!(outcome.value["is_manual"], true);
+    assert_eq!(outcome.value["sync_interval_secs"], 0);
+}
+
+#[tokio::test]
+async fn apply_memory_sync_settings_reset_to_default() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    cfg.memory_sync_interval_secs = Some(43_200);
+
+    // Omitted field → None → reset to default.
+    let patch = MemorySyncSettingsPatch {
+        sync_interval_secs: None,
+    };
+    let outcome = apply_memory_sync_settings(&mut cfg, patch)
+        .await
+        .expect("apply");
+    assert_eq!(cfg.memory_sync_interval_secs, None);
+    assert_eq!(outcome.value["is_default"], true);
+    assert!(outcome.value["sync_interval_secs"].is_null());
+    // The UI still gets a concrete cadence to highlight (the 24h default).
+    assert_eq!(
+        outcome.value["selected_secs"],
+        crate::openhuman::config::DEFAULT_MEMORY_SYNC_INTERVAL_SECS
+    );
+}
+
+#[tokio::test]
 async fn apply_model_settings_updates_fields_and_persists_snapshot() {
     let tmp = tempdir().unwrap();
     let mut cfg = tmp_config(&tmp);
@@ -528,6 +586,77 @@ async fn apply_model_settings_replaces_model_routes_when_some_and_keeps_when_non
         .await
         .expect("clear");
     assert!(cfg.model_routes.is_empty());
+}
+
+#[tokio::test]
+async fn apply_model_settings_replaces_model_registry_when_some_and_keeps_when_none() {
+    // Per-model vision registry follows Some=replace / None=keep / empty=clear —
+    // this persists the "Supports vision" flag set in Settings → Advanced LLM.
+    use crate::openhuman::config::schema::ModelRegistryEntry;
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    let set = ModelSettingsPatch {
+        model_registry: Some(vec![ModelRegistryEntry {
+            id: "my-llava".into(),
+            provider: "openai".into(),
+            cost_per_1m_output: 0.0,
+            vision: true,
+        }]),
+        ..Default::default()
+    };
+    let _ = apply_model_settings(&mut cfg, set).await.expect("set");
+    assert_eq!(cfg.model_registry.len(), 1);
+    assert!(cfg
+        .model_registry
+        .iter()
+        .any(|e| e.id == "my-llava" && e.vision));
+
+    // None — leave registry alone.
+    let _ = apply_model_settings(
+        &mut cfg,
+        ModelSettingsPatch {
+            api_url: Some("https://x.test/v1".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("touch");
+    assert_eq!(cfg.model_registry.len(), 1);
+
+    // Empty vec — clear.
+    let _ = apply_model_settings(
+        &mut cfg,
+        ModelSettingsPatch {
+            model_registry: Some(vec![]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("clear");
+    assert!(cfg.model_registry.is_empty());
+}
+
+#[tokio::test]
+async fn apply_model_settings_trims_model_registry_ids() {
+    // `model_vision_enabled` matches the resolved id exactly, so persisted ids
+    // must be trimmed or stray whitespace would silently disable vision.
+    use crate::openhuman::config::schema::ModelRegistryEntry;
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    let set = ModelSettingsPatch {
+        model_registry: Some(vec![ModelRegistryEntry {
+            id: "  spaced-model  ".into(),
+            provider: "openai".into(),
+            cost_per_1m_output: 0.0,
+            vision: true,
+        }]),
+        ..Default::default()
+    };
+    let _ = apply_model_settings(&mut cfg, set).await.expect("set");
+    assert_eq!(cfg.model_registry.len(), 1);
+    assert_eq!(cfg.model_registry[0].id, "spaced-model");
 }
 
 #[tokio::test]
@@ -910,6 +1039,7 @@ async fn apply_meet_settings_updates_handoff_flag() {
         &mut cfg,
         MeetSettingsPatch {
             auto_orchestrator_handoff: Some(true),
+            ..Default::default()
         },
     )
     .await
@@ -920,6 +1050,7 @@ async fn apply_meet_settings_updates_handoff_flag() {
         &mut cfg,
         MeetSettingsPatch {
             auto_orchestrator_handoff: Some(false),
+            ..Default::default()
         },
     )
     .await
@@ -931,11 +1062,50 @@ async fn apply_meet_settings_updates_handoff_flag() {
         &mut cfg,
         MeetSettingsPatch {
             auto_orchestrator_handoff: None,
+            ..Default::default()
         },
     )
     .await
     .expect("apply noop");
     assert_eq!(prior, cfg.meet.auto_orchestrator_handoff);
+}
+
+#[tokio::test]
+async fn apply_meet_settings_updates_all_meeting_assistant_fields() {
+    use crate::openhuman::config::{AutoJoinPolicy, AutoSummarizePolicy};
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    // Defaults (issue #3511).
+    assert_eq!(cfg.meet.auto_join_policy, AutoJoinPolicy::AskEachTime);
+    assert_eq!(cfg.meet.auto_summarize_policy, AutoSummarizePolicy::Ask);
+    assert!(cfg.meet.listen_only_default);
+    assert!(!cfg.meet.ingest_backend_transcripts);
+
+    let _ = apply_meet_settings(
+        &mut cfg,
+        MeetSettingsPatch {
+            auto_join_policy: Some(AutoJoinPolicy::Always),
+            auto_summarize_policy: Some(AutoSummarizePolicy::Never),
+            listen_only_default: Some(false),
+            ingest_backend_transcripts: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("apply all fields");
+    assert_eq!(cfg.meet.auto_join_policy, AutoJoinPolicy::Always);
+    assert_eq!(cfg.meet.auto_summarize_policy, AutoSummarizePolicy::Never);
+    assert!(!cfg.meet.listen_only_default);
+    assert!(cfg.meet.ingest_backend_transcripts);
+
+    // No-op patch must leave the prior values untouched.
+    let _ = apply_meet_settings(&mut cfg, MeetSettingsPatch::default())
+        .await
+        .expect("apply noop");
+    assert_eq!(cfg.meet.auto_join_policy, AutoJoinPolicy::Always);
+    assert_eq!(cfg.meet.auto_summarize_policy, AutoSummarizePolicy::Never);
+    assert!(!cfg.meet.listen_only_default);
+    assert!(cfg.meet.ingest_backend_transcripts);
 }
 
 #[tokio::test]
@@ -1195,6 +1365,7 @@ async fn apply_model_settings_trims_and_clears_optional_provider_fields() {
         reasoning_provider: Some(" provider-reasoning ".into()),
         agentic_provider: Some(" provider-agentic ".into()),
         coding_provider: Some(" provider-coding ".into()),
+        vision_provider: Some(" provider-vision ".into()),
         memory_provider: Some(" provider-memory ".into()),
         embeddings_provider: Some(" provider-embed ".into()),
         heartbeat_provider: Some(" provider-heartbeat ".into()),
@@ -1215,6 +1386,7 @@ async fn apply_model_settings_trims_and_clears_optional_provider_fields() {
         Some("provider-reasoning")
     );
     assert_eq!(cfg.subconscious_provider.as_deref(), Some("provider-sub"));
+    assert_eq!(cfg.vision_provider.as_deref(), Some("provider-vision"));
 
     let clear = ModelSettingsPatch {
         inference_url: Some("   ".into()),
@@ -1222,6 +1394,7 @@ async fn apply_model_settings_trims_and_clears_optional_provider_fields() {
         reasoning_provider: Some(" ".into()),
         agentic_provider: Some(" ".into()),
         coding_provider: Some(" ".into()),
+        vision_provider: Some(" ".into()),
         memory_provider: Some(" ".into()),
         embeddings_provider: Some(" ".into()),
         heartbeat_provider: Some(" ".into()),
@@ -1237,6 +1410,7 @@ async fn apply_model_settings_trims_and_clears_optional_provider_fields() {
     assert!(cfg.reasoning_provider.is_none());
     assert!(cfg.agentic_provider.is_none());
     assert!(cfg.coding_provider.is_none());
+    assert!(cfg.vision_provider.is_none());
     assert!(cfg.memory_provider.is_none());
     assert!(cfg.embeddings_provider.is_none());
     assert!(cfg.heartbeat_provider.is_none());
@@ -1723,4 +1897,161 @@ async fn apply_agent_paths_env_set_reports_source_env() {
     unsafe {
         std::env::remove_var("OPENHUMAN_ACTION_DIR");
     }
+}
+
+// --- #3353 regression tests -------------------------------------------------
+
+#[test]
+fn expand_tilde_happy_path_uses_home() {
+    // `~/OpenHuman/projects` resolves to the home dir joined component-wise.
+    let expanded = expand_tilde("~/OpenHuman/projects");
+    let expected = dirs::home_dir()
+        .expect("home dir resolvable in test env")
+        .join("OpenHuman")
+        .join("projects");
+    assert_eq!(expanded, expected.to_string_lossy());
+}
+
+#[test]
+fn expand_tilde_without_prefix_is_unchanged() {
+    // Absolute paths and a bare `~` (no trailing slash) pass through verbatim.
+    assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+    assert_eq!(expand_tilde("~"), "~");
+    assert_eq!(expand_tilde("relative/path"), "relative/path");
+}
+
+#[cfg(windows)]
+#[test]
+fn expand_tilde_has_no_mixed_separators_on_windows() {
+    // The whole point of the component-wise build: the result must be a pure
+    // backslash path with no embedded forward slash, so CreateProcessW accepts
+    // it as a CWD instead of failing with ERROR_DIRECTORY (os error 267).
+    let expanded = expand_tilde("~/OpenHuman/projects");
+    assert!(
+        !expanded.contains('/'),
+        "expected no forward slashes on Windows, got: {expanded}"
+    );
+}
+
+#[test]
+fn redact_home_replaces_home_prefix_and_passes_through_others() {
+    let home = dirs::home_dir().expect("home dir resolvable in test env");
+
+    // A path under home is redacted to `~/...` — the username/home prefix is
+    // stripped but the diagnostic suffix is preserved.
+    let under_home = home.join("OpenHuman").join("projects");
+    let redacted = redact_home(&under_home);
+    assert!(
+        redacted.starts_with('~'),
+        "expected a `~`-prefixed path, got: {redacted}"
+    );
+    assert!(
+        !redacted.contains(&*home.to_string_lossy()),
+        "redacted path must not contain the raw home dir: {redacted}"
+    );
+    assert!(
+        redacted.contains("OpenHuman"),
+        "diagnostic suffix should be preserved: {redacted}"
+    );
+
+    // A path outside the home dir is returned unchanged.
+    let outside = std::path::Path::new("/var/lib/openhuman/action");
+    assert_eq!(redact_home(outside), "/var/lib/openhuman/action");
+}
+
+#[tokio::test]
+async fn ensure_agent_dirs_creates_missing_action_dir_and_trusted_root() {
+    use crate::openhuman::security::TrustedAccess;
+
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempdir().unwrap();
+    // Point the default projects home at the tempdir so the helper doesn't touch
+    // the real `~/OpenHuman/projects`.
+    let projects_dir = tmp.path().join("projects-home");
+    let prev_projects_dir = std::env::var_os("OPENHUMAN_PROJECTS_DIR");
+    unsafe {
+        std::env::set_var("OPENHUMAN_PROJECTS_DIR", &projects_dir);
+    }
+
+    let mut cfg = tmp_config(&tmp);
+    let action_dir = tmp.path().join("fresh-action-dir");
+    cfg.action_dir = action_dir.clone();
+    assert!(!action_dir.exists(), "precondition: action_dir is missing");
+
+    crate::openhuman::config::ensure_agent_dirs(&mut cfg).await;
+
+    // Both the action_dir and the projects home now exist.
+    assert!(action_dir.is_dir(), "action_dir should be created");
+    assert!(projects_dir.is_dir(), "projects home should be created");
+
+    // The projects home is registered exactly once as a ReadWrite trusted root.
+    let projects_path = projects_dir.to_string_lossy().to_string();
+    let matching: Vec<_> = cfg
+        .autonomy
+        .trusted_roots
+        .iter()
+        .filter(|r| r.path == projects_path)
+        .collect();
+    assert_eq!(matching.len(), 1, "trusted root registered exactly once");
+    assert!(matches!(matching[0].access, TrustedAccess::ReadWrite));
+
+    // Idempotent: a second call neither errors nor duplicates the trusted root.
+    crate::openhuman::config::ensure_agent_dirs(&mut cfg).await;
+    let count = cfg
+        .autonomy
+        .trusted_roots
+        .iter()
+        .filter(|r| r.path == projects_path)
+        .count();
+    assert_eq!(count, 1, "second call must not duplicate the trusted root");
+
+    // Restore the prior env state so later tests observe the real environment.
+    unsafe {
+        match prev_projects_dir {
+            Some(v) => std::env::set_var("OPENHUMAN_PROJECTS_DIR", v),
+            None => std::env::remove_var("OPENHUMAN_PROJECTS_DIR"),
+        }
+    }
+}
+
+#[test]
+fn ensure_usable_cwd_creates_missing_dir() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().join("not-yet-here");
+    assert!(!dir.exists());
+    crate::openhuman::config::ensure_usable_cwd(&dir).expect("missing dir is created");
+    assert!(dir.is_dir());
+}
+
+#[test]
+fn ensure_usable_cwd_rejects_a_file_with_descriptive_error() {
+    let tmp = tempdir().unwrap();
+    let file = tmp.path().join("a-file");
+    std::fs::write(&file, b"x").unwrap();
+    let err = crate::openhuman::config::ensure_usable_cwd(&file)
+        .expect_err("an existing file is not a usable working directory");
+    let msg = err.to_string();
+    assert!(msg.contains("not a directory"), "unexpected error: {msg}");
+    // The error names the offending path so the message is actionable.
+    assert!(
+        msg.contains(&file.to_string_lossy().to_string()),
+        "error should name the path: {msg}"
+    );
+}
+
+#[test]
+fn ensure_usable_cwd_errors_when_uncreatable() {
+    // A directory whose parent is an existing *file* can't be created; the
+    // helper must surface the descriptive, path-naming error rather than panic.
+    let tmp = tempdir().unwrap();
+    let parent_file = tmp.path().join("parent-file");
+    std::fs::write(&parent_file, b"x").unwrap();
+    let target = parent_file.join("child");
+    let err = crate::openhuman::config::ensure_usable_cwd(&target)
+        .expect_err("cannot create a dir under a file");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("could not be created"),
+        "unexpected error: {msg}"
+    );
 }

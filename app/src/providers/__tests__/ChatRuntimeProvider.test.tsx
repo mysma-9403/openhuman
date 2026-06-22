@@ -6,7 +6,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as chatService from '../../services/chatService';
 import { threadApi } from '../../services/api/threadApi';
 import { store } from '../../store';
-import { clearAllChatRuntime } from '../../store/chatRuntimeSlice';
+import {
+  clearAllChatRuntime,
+  registerParallelRequest,
+  resetSessionTokenUsage,
+} from '../../store/chatRuntimeSlice';
 import { setStatusForUser } from '../../store/socketSlice';
 import { clearAllThreads, loadThreads, setSelectedThread } from '../../store/threadSlice';
 import ChatRuntimeProvider, { findPendingDelegationContext } from '../ChatRuntimeProvider';
@@ -64,6 +68,10 @@ function resetRuntimeState() {
   // selection that clears ambient state.
   store.dispatch(clearAllThreads());
   store.dispatch(clearAllChatRuntime());
+  // `clearAllChatRuntime` intentionally preserves cumulative session token
+  // usage; reset it here so usage-recording tests stay isolated regardless of
+  // run order.
+  store.dispatch(resetSessionTokenUsage());
   store.dispatch(setStatusForUser({ userId: '__pending__', status: 'disconnected' }));
 }
 
@@ -300,6 +308,60 @@ describe('ChatRuntimeProvider — dedupe, proactive resolution, mid-turn invaria
       expect(row?.subagent?.transcript).toEqual([]);
     });
 
+    it('routes a parallel (forked) turn into its own lane, leaving the primary stream untouched', () => {
+      const listeners = renderProvider();
+
+      // Primary turn streams on the thread.
+      act(() => {
+        listeners.onTextDelta?.({
+          thread_id: 't-par',
+          request_id: 'primary',
+          round: 0,
+          delta: 'P',
+        });
+      });
+      // A parallel turn is registered and streams concurrently on the SAME thread.
+      act(() => {
+        store.dispatch(registerParallelRequest({ threadId: 't-par', requestId: 'branch' }));
+        listeners.onTextDelta?.({
+          thread_id: 't-par',
+          request_id: 'branch',
+          round: 0,
+          delta: 'B1',
+        });
+        listeners.onTextDelta?.({
+          thread_id: 't-par',
+          request_id: 'branch',
+          round: 0,
+          delta: 'B2',
+        });
+      });
+
+      const mid = store.getState().chatRuntime;
+      // Primary stream is not clobbered by the parallel branch.
+      expect(mid.streamingAssistantByThread['t-par']?.content).toBe('P');
+      expect(mid.parallelStreamsByThread['t-par']?.['branch']?.content).toBe('B1B2');
+
+      // The parallel turn's chat_done resolves ONLY its lane; the primary
+      // stream and its (still-running) state survive.
+      act(() => {
+        listeners.onDone?.({
+          thread_id: 't-par',
+          request_id: 'branch',
+          full_response: 'branch done',
+          rounds_used: 1,
+          total_input_tokens: 0,
+          total_output_tokens: 0,
+          segment_total: 0,
+        });
+      });
+
+      const after = store.getState().chatRuntime;
+      expect(after.parallelStreamsByThread['t-par']).toBeUndefined();
+      expect(after.parallelRequestThreads['branch']).toBeUndefined();
+      expect(after.streamingAssistantByThread['t-par']?.content).toBe('P');
+    });
+
     it('drops duplicate chat_done events with the same thread/request', async () => {
       const listeners = renderProvider();
 
@@ -359,10 +421,10 @@ describe('ChatRuntimeProvider — dedupe, proactive resolution, mid-turn invaria
   });
 
   describe('proactive thread resolution', () => {
-    it('reuses the selected thread when resolving a proactive: sender', async () => {
+    it('reuses the selected thread when it is fresh (no messages)', async () => {
       store.dispatch(
         loadThreads.fulfilled(
-          { threads: [{ id: 'visible-thread', title: 'x' }] as never, count: 1 },
+          { threads: [{ id: 'visible-thread', title: 'x', messageCount: 0 }] as never, count: 1 },
           'req-id',
           undefined
         )
@@ -378,13 +440,89 @@ describe('ChatRuntimeProvider — dedupe, proactive resolution, mid-turn invaria
         });
       });
 
-      // createNewThread must NOT be invoked when a visible thread already exists.
+      // createNewThread must NOT be invoked when a fresh visible thread exists.
       expect(threadApi.createNewThread).not.toHaveBeenCalled();
       await waitFor(() =>
         expect(threadApi.appendMessage).toHaveBeenCalledWith(
           'visible-thread',
           expect.objectContaining({ content: 'ping', sender: 'agent' })
         )
+      );
+    });
+
+    it('opens a new thread instead of interrupting a selected thread that has messages (#3713)', async () => {
+      vi.mocked(threadApi.createNewThread).mockResolvedValue({
+        id: 'fresh-thread',
+        title: 'new',
+      } as never);
+      vi.mocked(threadApi.getThreads).mockResolvedValue({
+        threads: [{ id: 'fresh-thread', title: 'new' }] as never,
+        count: 1,
+      });
+
+      // The user is mid-conversation: the selected thread already holds
+      // messages, so a proactive morning brief / subconscious update must
+      // NOT be injected into it.
+      store.dispatch(
+        loadThreads.fulfilled(
+          { threads: [{ id: 'busy-thread', title: 'chat', messageCount: 4 }] as never, count: 1 },
+          'req-id',
+          undefined
+        )
+      );
+      store.dispatch(setSelectedThread('busy-thread'));
+      const listeners = renderProvider();
+
+      await act(async () => {
+        listeners.onProactiveMessage?.({
+          thread_id: 'proactive:morning_briefing',
+          request_id: 'req-mb',
+          full_response: "good morning! here's your briefing",
+        });
+      });
+
+      // The active conversation must be left untouched; delivery goes to a
+      // dedicated new thread.
+      await waitFor(() => expect(threadApi.createNewThread).toHaveBeenCalledTimes(1));
+      expect(threadApi.appendMessage).toHaveBeenCalledWith(
+        'fresh-thread',
+        expect.objectContaining({ content: "good morning! here's your briefing" })
+      );
+      expect(threadApi.appendMessage).not.toHaveBeenCalledWith('busy-thread', expect.anything());
+    });
+
+    it('treats a selected thread with unknown metadata as occupied and opens a new thread', async () => {
+      vi.mocked(threadApi.createNewThread).mockResolvedValue({
+        id: 'fresh-thread',
+        title: 'new',
+      } as never);
+      vi.mocked(threadApi.getThreads).mockResolvedValue({
+        threads: [{ id: 'fresh-thread', title: 'new' }] as never,
+        count: 1,
+      });
+
+      // Only a rehydrated selection is present — the thread list hasn't loaded,
+      // so its message metadata is unknown. We must NOT assume it is fresh
+      // (it could already hold a server-side conversation). See #3713.
+      store.dispatch(setSelectedThread('rehydrated-thread'));
+      const listeners = renderProvider();
+
+      await act(async () => {
+        listeners.onProactiveMessage?.({
+          thread_id: 'proactive:morning_briefing',
+          request_id: 'req-unknown',
+          full_response: 'briefing',
+        });
+      });
+
+      await waitFor(() => expect(threadApi.createNewThread).toHaveBeenCalledTimes(1));
+      expect(threadApi.appendMessage).toHaveBeenCalledWith(
+        'fresh-thread',
+        expect.objectContaining({ content: 'briefing' })
+      );
+      expect(threadApi.appendMessage).not.toHaveBeenCalledWith(
+        'rehydrated-thread',
+        expect.anything()
       );
     });
 
@@ -992,7 +1130,7 @@ describe('ChatRuntimeProvider — dedupe, proactive resolution, mid-turn invaria
         );
       });
 
-      expect(store.getState().thread.activeThreadId).toBe(threadId);
+      expect(store.getState().thread.activeThreadIds[threadId]).toBe(true);
       expect(store.getState().chatRuntime.inferenceTurnLifecycleByThread[threadId]).toBe('started');
 
       await act(async () => {
@@ -1000,7 +1138,7 @@ describe('ChatRuntimeProvider — dedupe, proactive resolution, mid-turn invaria
       });
 
       await waitFor(() => {
-        expect(store.getState().thread.activeThreadId).toBeNull();
+        expect(store.getState().thread.activeThreadIds[threadId]).toBeUndefined();
         expect(
           store.getState().chatRuntime.inferenceTurnLifecycleByThread[threadId]
         ).toBeUndefined();
@@ -1031,7 +1169,7 @@ describe('ChatRuntimeProvider — dedupe, proactive resolution, mid-turn invaria
       });
 
       await waitFor(() => {
-        expect(store.getState().thread.activeThreadId).toBeNull();
+        expect(store.getState().thread.activeThreadIds[threadId]).toBeUndefined();
       });
       expect(store.getState().chatRuntime.streamingAssistantByThread[threadId]).toMatchObject({
         content: 'Hello there, partial',
@@ -1062,6 +1200,10 @@ describe('ChatRuntimeProvider — dedupe, proactive resolution, mid-turn invaria
       ['tool_error', 'A tool call failed during this request.'],
       ['provider_error', 'The AI provider returned an error.'],
       ['model_unavailable', 'The selected model is currently unavailable.'],
+      [
+        'payload_too_large',
+        'Your message or attachment is too large for this model. Shorten it or remove the attachment — or start a new thread.',
+      ],
     ] as const)('forwards server message for error_type %s', async (error_type, serverMessage) => {
       const listeners = renderProvider();
       const threadId = `t-${error_type}`;

@@ -568,6 +568,29 @@ fn env_overlay_autonomy_max_actions_per_hour_accepts_valid_u32() {
 }
 
 #[test]
+fn env_overlay_memory_sync_interval_parses_and_honours_zero() {
+    let mut cfg = Config::default();
+    assert!(cfg.memory_sync_interval_secs.is_none());
+
+    // A positive value is stored verbatim.
+    cfg.apply_env_overlay_with(&HashMapEnv::new().with(MEMORY_SYNC_INTERVAL_SECS_ENV_VAR, "14400"));
+    assert_eq!(cfg.memory_sync_interval_secs, Some(14_400));
+
+    // `0` is honoured as the "Manual only" sentinel (unlike the per-provider
+    // override which rejects it).
+    cfg.apply_env_overlay_with(&HashMapEnv::new().with(MEMORY_SYNC_INTERVAL_SECS_ENV_VAR, "0"));
+    assert_eq!(cfg.memory_sync_interval_secs, Some(0));
+
+    // A non-numeric value is ignored, leaving the previous value intact.
+    cfg.apply_env_overlay_with(&HashMapEnv::new().with(MEMORY_SYNC_INTERVAL_SECS_ENV_VAR, "nope"));
+    assert_eq!(cfg.memory_sync_interval_secs, Some(0));
+
+    // A blank value is ignored too.
+    cfg.apply_env_overlay_with(&HashMapEnv::new().with(MEMORY_SYNC_INTERVAL_SECS_ENV_VAR, "  "));
+    assert_eq!(cfg.memory_sync_interval_secs, Some(0));
+}
+
+#[test]
 fn env_overlay_output_language_accepts_non_empty_value() {
     let mut cfg = Config::default();
     assert!(cfg.output_language.is_none());
@@ -959,6 +982,30 @@ fn env_overlay_context_tool_result_budget_env_suppresses_legacy_migration() {
         cfg.context.tool_result_budget_bytes, default_budget,
         "env presence must suppress the legacy agent→context copy"
     );
+}
+
+#[test]
+fn env_overlay_compaction_default_on_and_kill_switch() {
+    // Default is on.
+    assert!(Config::default().context.compaction_enabled);
+
+    // `OPENHUMAN_COMPACTION=0` disables it.
+    let mut cfg = Config::default();
+    cfg.apply_env_overlay_with(&HashMapEnv::new().with("OPENHUMAN_COMPACTION", "0"));
+    assert!(!cfg.context.compaction_enabled);
+
+    // Truthy re-enables; the namespaced alias works too.
+    let mut cfg = Config::default();
+    cfg.context.compaction_enabled = false;
+    cfg.apply_env_overlay_with(
+        &HashMapEnv::new().with("OPENHUMAN_CONTEXT_COMPACTION_ENABLED", "on"),
+    );
+    assert!(cfg.context.compaction_enabled);
+
+    // Garbage is ignored (leaves the prior value untouched).
+    let mut cfg = Config::default();
+    cfg.apply_env_overlay_with(&HashMapEnv::new().with("OPENHUMAN_COMPACTION", "maybe"));
+    assert!(cfg.context.compaction_enabled);
 }
 
 #[test]

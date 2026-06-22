@@ -85,6 +85,7 @@ pub async fn run_github_sync(
         Some(kind_str),
         Some(source_id),
         Some("listing items".to_string()),
+        Some(source_id),
     );
 
     let reader = readers::reader_for(&SourceKind::GithubRepo);
@@ -114,6 +115,7 @@ pub async fn run_github_sync(
         Some(kind_str),
         Some(source_id),
         Some(format!("reading {total} items")),
+        Some(source_id),
     );
 
     let content_root = config.memory_tree_content_root();
@@ -159,6 +161,7 @@ pub async fn run_github_sync(
         Some(format!(
             "summarising {input_count} items in {batch_count} batch(es)"
         )),
+        Some(source_id),
     );
 
     // Token/charge accounting across the run. The estimate (`body.len() / 4`
@@ -222,7 +225,36 @@ pub async fn run_github_sync(
             child_basenames: batch_basenames,
         };
 
+        // `child_basenames` holds the raw-archive wikilink paths (rel path
+        // with `.md` stripped) — captured BEFORE ingest_summary moves the
+        // input. Re-suffix to recover the coverage-gate keys.
+        let batch_raw_rel_paths: Vec<String> = ingest_input
+            .child_basenames
+            .iter()
+            .flatten()
+            .map(|basename| format!("{basename}.md"))
+            .collect();
+
         let outcome = ingest_summary(config, &tree, ingest_input).await?;
+
+        // Record raw-archive coverage so the incremental reconcile
+        // (`memory_sync::sources::rebuild`) knows these files are
+        // summarised. Marked only after the summary landed: a crash in
+        // between re-summarises the batch (duplicate summary, acceptable)
+        // instead of silently losing coverage.
+        if !batch_raw_rel_paths.is_empty() {
+            if let Err(e) = crate::openhuman::memory_store::chunks::store::mark_raw_paths_ingested(
+                config,
+                &batch_raw_rel_paths,
+            ) {
+                tracing::warn!(
+                    source_id = %source_id,
+                    batch = batch_idx,
+                    error = %format!("{e:#}"),
+                    "[memory_sync:github] failed to record raw coverage — reconcile may re-summarise this batch"
+                );
+            }
+        }
 
         tracing::info!(
             source_id = %source_id,
@@ -230,7 +262,8 @@ pub async fn run_github_sync(
             summary_id = %outcome.summary_id,
             path = %outcome.content_path,
             sealed = outcome.sealed_ids.len(),
-            "[memory_sync:github] batch ingested"
+            covered_raw_files = batch_raw_rel_paths.len(),
+            "[memory_sync:github] batch ingested + coverage recorded"
         );
     }
 
@@ -288,6 +321,7 @@ pub async fn run_github_sync(
         Some(format!(
             "{input_count} items → {batch_count} summary(ies) ({audit_input_tokens} in / {audit_output_tokens} out tokens, ${display_cost:.4})"
         )),
+        Some(source_id),
     );
 
     Ok(SyncOutcome {
@@ -415,6 +449,7 @@ async fn read_items_buffered(
                 Some(kind_str),
                 Some(source_id),
                 Some(format!("{processed}/{total} read")),
+                Some(source_id),
             );
         }
     }

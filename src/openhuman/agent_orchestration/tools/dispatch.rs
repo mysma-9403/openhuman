@@ -34,7 +34,61 @@ pub(crate) async fn dispatch_subagent(
         }
     };
 
-    let parent_session = current_parent()
+    let parent_ctx = current_parent();
+    if let Some(ctx) = &parent_ctx {
+        if !ctx.allowed_subagent_ids.contains(&definition.id) {
+            log::warn!(
+                "[agent] blocked delegation via {}: parent={} requested={} allowed={:?}",
+                tool_name,
+                ctx.agent_definition_id,
+                definition.id,
+                ctx.allowed_subagent_ids
+            );
+            return Ok(ToolResult::error(format!(
+                "{tool_name}: agent '{}' is not in parent agent '{}' subagents.allowlist",
+                definition.id, ctx.agent_definition_id
+            )));
+        }
+    }
+
+    // ── Forward the current turn's attached image(s) to a vision sub-agent ──
+    // The orchestrator runs on a non-vision tier and keeps the user's image as a
+    // text placeholder (`[Image: … #att:<id>]`), so a delegated sub-agent would
+    // otherwise get a text-only task and report "no image". When the target
+    // sub-agent's model is vision-capable, prepend the placeholder(s) to its
+    // prompt so its own turn rehydrates the image from the on-disk sidecar.
+    let forwarded_prompt;
+    let prompt: &str = {
+        let images = crate::openhuman::agent::harness::turn_attachments_context::current_turn_image_placeholders();
+        let subagent_model = match model_override {
+            Some(m) => m.to_string(),
+            None => {
+                let parent_model = parent_ctx
+                    .as_ref()
+                    .map(|p| p.model_name.as_str())
+                    .unwrap_or("");
+                definition.model.resolve(parent_model)
+            }
+        };
+        if !images.is_empty()
+            && crate::openhuman::inference::provider::factory::oh_tier_supports_vision(
+                &subagent_model,
+            )
+        {
+            log::info!(
+                "[agent] forwarding {} image placeholder(s) to vision sub-agent '{}'",
+                images.len(),
+                agent_id
+            );
+            forwarded_prompt = format!("{}\n\n{}", images.join("\n"), prompt);
+            &forwarded_prompt
+        } else {
+            prompt
+        }
+    };
+
+    let parent_session = parent_ctx
+        .as_ref()
         .map(|p| p.session_id.clone())
         .unwrap_or_else(|| "standalone".into());
     let task_id = format!("sub-{}", uuid::Uuid::new_v4());
@@ -90,6 +144,8 @@ pub(crate) async fn dispatch_subagent(
         worker_thread_id: None,
         initial_history: None,
         checkpoint_dir: None,
+        worktree_action_dir: None,
+        run_queue: None,
     };
 
     match run_subagent(definition, prompt, options).await {

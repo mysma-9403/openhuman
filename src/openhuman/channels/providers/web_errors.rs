@@ -133,7 +133,8 @@ pub(crate) struct ClassifiedError {
     /// Stable token: `rate_limited`, `action_budget_exceeded`,
     /// `max_iterations`, `timeout`, `auth_error`, `budget_exhausted`,
     /// `provider_error`, `context_overflow`, `model_unavailable`,
-    /// `inference`.
+    /// `payload_too_large`, `provider_request_rejected`,
+    /// `capability_unsupported`, `empty_response`, `inference`.
     pub(crate) error_type: &'static str,
     /// User-facing copy (already includes provider detail block and the
     /// retry-after countdown sentence when available).
@@ -232,6 +233,13 @@ pub(crate) fn parse_retry_after_secs_from_str(err: &str) -> Option<u64> {
         "retry_after:",
         "retry-after ",
         "retry_after ",
+        // Managed backend (#870) emits the structured `retryAfter` field
+        // (camelCase). After lower-casing + quote-stripping above it
+        // collapses to `retryafter: 30` / `retryafter 30`, so the
+        // separator-bearing prefixes here let the same parser surface the
+        // structured field the spec asks us to prefer (F5).
+        "retryafter:",
+        "retryafter ",
     ] {
         if let Some(pos) = normalized.find(prefix) {
             let after = &normalized[pos + prefix.len()..];
@@ -290,6 +298,179 @@ pub(crate) fn is_action_budget_exhausted(err_lower: &str) -> bool {
         || err_lower.contains("action blocked: rate limit exceeded")
 }
 
+/// Classify a managed-backend error by its stable `errorCode` (#870).
+///
+/// Returns `Some` only when the flattened error string carries a *recognised*
+/// backend `errorCode`. Because an `errorCode` is present **only** when the
+/// error came through the managed backend, branching on it here lets us trust
+/// the backend's verdict (operator faults route to the calm "temporarily
+/// unavailable — we've been notified" copy, no user-blaming) instead of the
+/// substring heuristics, which are tuned for the BYO / direct-provider path
+/// (where no `errorCode` exists and "check your API key / model settings" is
+/// the correct, user-actionable copy). See [`classify_inference_error`] (F2).
+///
+/// `None` falls through to the substring ladder, covering both the BYO path
+/// (no code) and any future/unrecognised managed code we don't yet map.
+fn classify_by_backend_error_code(
+    err: &str,
+    provider: Option<String>,
+    fallback_available: Option<bool>,
+) -> Option<ClassifiedError> {
+    use crate::openhuman::inference::provider::{
+        body_flags_malformed, extract_backend_error_code, is_managed_backend_envelope,
+        BackendErrorCode,
+    };
+
+    // Managed-vs-BYO gate: an `errorCode` is only trustworthy on a
+    // managed-backend envelope. A BYO / direct-provider body that merely
+    // contains an `errorCode`-shaped field must fall through to the substring
+    // ladder (CodeRabbit), keeping its user-actionable copy intact.
+    if !is_managed_backend_envelope(err) {
+        return None;
+    }
+
+    let code = extract_backend_error_code(err)?;
+
+    // Verbose diagnostics on the new managed-code branch (per CLAUDE.md).
+    // Low-cardinality only — the raw `err` may carry a provider payload / PII
+    // and is logged at the caller, not here.
+    log::debug!(
+        "[chat-error][classify][errorCode] code={:?} provider={:?}",
+        code,
+        provider,
+    );
+
+    let classified = match code {
+        BackendErrorCode::RateLimited => {
+            let retry_secs = parse_retry_after_secs_from_str(err);
+            ClassifiedError {
+                error_type: "rate_limited",
+                message: format!(
+                    "Your AI provider is rate-limiting requests. You can retry in this thread.{}",
+                    retry_after_hint(retry_secs)
+                ),
+                source: "provider",
+                retryable: true,
+                retry_after_ms: retry_secs.map(|s| s.saturating_mul(1000)),
+                provider,
+                fallback_available,
+            }
+        }
+        BackendErrorCode::UserInsufficientCredits => ClassifiedError {
+            error_type: "budget_exhausted",
+            message: "You're out of credits. Top up, or switch to 'Use Your Own Models' \
+                 in Settings."
+                .to_string(),
+            source: "openhuman_billing",
+            retryable: false,
+            retry_after_ms: None,
+            provider,
+            fallback_available: None,
+        },
+        // Operator fault (our key/account/quota/5xx) OR operator registry /
+        // routing misconfig — NOT user-actionable. Both route to the same
+        // calm "we've been notified" copy; the backend already paged. We
+        // deliberately DROP the "check your API key" (F4) and "pick a
+        // different model" (F6) copy the BYO substring arms would emit.
+        BackendErrorCode::UpstreamUnavailable | BackendErrorCode::ModelUnavailable => {
+            ClassifiedError {
+                error_type: "provider_error",
+                message: "The AI service is temporarily unavailable — we've been notified. \
+                     Please try again shortly."
+                    .to_string(),
+                source: "provider",
+                retryable: true,
+                retry_after_ms: None,
+                provider,
+                fallback_available,
+            }
+        }
+        BackendErrorCode::PayloadTooLarge => ClassifiedError {
+            error_type: "payload_too_large",
+            message: "Your message or attachment is too large for this model. Shorten it \
+                 or remove the attachment — or start a new thread."
+                .to_string(),
+            source: "config",
+            retryable: false,
+            retry_after_ms: None,
+            provider,
+            fallback_available: None,
+        },
+        BackendErrorCode::ContextLengthExceeded => ClassifiedError {
+            error_type: "context_overflow",
+            message: "The conversation is too long. Please start a new chat.".to_string(),
+            source: "config",
+            retryable: false,
+            retry_after_ms: None,
+            provider,
+            fallback_available: None,
+        },
+        BackendErrorCode::BadRequest => {
+            // Same code, three shapes. FIRST: a tool-ordering rejection
+            // (`validateToolMessageOrdering` — an orphaned `role:'tool'` message
+            // with no matching assistant `tool_call`) is *poisoned history*, not
+            // a model/param problem. The de-poison guard in `run_task.rs` has
+            // already evicted the offending warm session by the time this copy
+            // is built, so the next turn cold-boots clean — tell the user
+            // exactly that (and mark retryable, because resending now works).
+            if is_malformed_tool_history_text(&err.to_lowercase()) {
+                ClassifiedError {
+                    error_type: "provider_request_rejected",
+                    message: malformed_history_user_message().to_string(),
+                    source: "provider",
+                    retryable: true,
+                    retry_after_ms: None,
+                    provider,
+                    fallback_available: None,
+                }
+            // Else two shapes (B8/F8): a backend-flagged *malformed*
+            // payload is a client bug (the request was built wrong — it pages
+            // Sentry at the FE layer, gated elsewhere), while a plain
+            // user-parameter rejection is a model/param mismatch the user can
+            // fix. The copy differs: don't tell the user to abandon the thread
+            // for a one-off malformation (only this turn failed).
+            } else if body_flags_malformed(err) {
+                ClassifiedError {
+                    error_type: "provider_request_rejected",
+                    message: "Something went wrong with this message. Try rephrasing it — \
+                         or start a new thread if it keeps happening."
+                        .to_string(),
+                    source: "provider",
+                    retryable: false,
+                    retry_after_ms: None,
+                    provider,
+                    fallback_available: None,
+                }
+            } else {
+                ClassifiedError {
+                    error_type: "provider_request_rejected",
+                    message: "The request was rejected — usually a model or parameter \
+                         mismatch. Try a different model in Settings → AI → LLM."
+                        .to_string(),
+                    source: "provider",
+                    retryable: false,
+                    retry_after_ms: None,
+                    provider,
+                    fallback_available: None,
+                }
+            }
+        }
+        BackendErrorCode::InternalError => ClassifiedError {
+            error_type: "inference",
+            // Backend already paged its own 500; the FE must not double-report
+            // (gated in the Sentry classifier) and the user just retries.
+            message: "Something went wrong — we've been notified. Please try again.".to_string(),
+            source: "provider",
+            retryable: true,
+            retry_after_ms: None,
+            provider,
+            fallback_available,
+        },
+    };
+
+    Some(classified)
+}
+
 pub(crate) fn classify_inference_error(err: &str) -> ClassifiedError {
     let lower = err.to_lowercase();
     let provider = extract_provider_name(err);
@@ -299,13 +480,57 @@ pub(crate) fn classify_inference_error(err: &str) -> ClassifiedError {
         None
     };
 
+    // F2: when the managed backend stamped a stable `errorCode` on the body,
+    // trust it and branch on it FIRST — ignoring the substring heuristics
+    // below, which are tuned for the BYO / direct-provider path (no
+    // `errorCode`). Only a recognised code short-circuits; an absent or
+    // unrecognised code falls through to the substring ladder unchanged, so
+    // the BYO "check your API key / model settings" copy stays intact.
+    if let Some(classified) =
+        classify_by_backend_error_code(err, provider.clone(), fallback_available)
+    {
+        log::debug!(
+            "[chat-error][classify] error_type={} source={} retryable={} provider={:?} (via errorCode)",
+            classified.error_type,
+            classified.source,
+            classified.retryable,
+            classified.provider,
+        );
+        return classified;
+    }
+
     // Order matters: the SecurityPolicy hourly cap and the
     // agent-loop max-iterations error both surface as strings that
     // contain "rate limit" / "iteration", so they MUST be checked
     // before the generic provider-429 branch — otherwise users see
     // a confusing "your AI provider is rate-limiting you" message
     // for limits OpenHuman itself enforced (issue #2364).
-    let classified = if is_action_budget_exhausted(&lower) {
+    let classified = if crate::core::observability::is_session_expired_message(err) {
+        // The OpenHuman app-session JWT expired (or the scheduler gate flagged
+        // signed-out / `SESSION_EXPIRED` sentinel). There is NO client-side
+        // refresh — recovery is an interactive re-auth only — so this is
+        // non-retryable and must route the user to sign-in. Checked FIRST so the
+        // `auth_error` arm below can't claim the backend's `401 "Invalid token"`
+        // envelope (it contains "401") and mislead managed-backend users with
+        // "check your API key". `is_session_expired_message` is conjunctively
+        // scoped to the OpenHuman/Embedding "Invalid token" envelopes + the
+        // `SESSION_EXPIRED` / "no backend session" / "session jwt required"
+        // sentinels, so a BYO provider's own 401 still falls through to
+        // `auth_error`.
+        ClassifiedError {
+            error_type: "session_expired",
+            message: "Your OpenHuman session expired while the app was idle. \
+                 Please sign in again to resume."
+                .to_string(),
+            source: "auth",
+            retryable: false,
+            retry_after_ms: None,
+            // OpenHuman's own session — provider name (if any leaked into the
+            // surrounding chain) is irrelevant to a sign-in prompt.
+            provider: None,
+            fallback_available: None,
+        }
+    } else if is_action_budget_exhausted(&lower) {
         ClassifiedError {
             error_type: "action_budget_exceeded",
             message: with_provider_detail(
@@ -542,6 +767,21 @@ pub(crate) fn classify_inference_error(err: &str) -> ClassifiedError {
             provider: None,
             fallback_available: None,
         }
+    } else if is_provider_request_rejected_text(&lower) && is_malformed_tool_history_text(&lower) {
+        // Same poisoned-history rejection as the managed `BAD_REQUEST` branch,
+        // but on a BYO/direct provider (e.g. OpenAI "messages with role 'tool'
+        // must be a response to a preceding message with 'tool_calls'"). The
+        // de-poison guard already evicted the warm session, so resending works.
+        // Checked BEFORE the generic 4xx arm so the actionable copy wins.
+        ClassifiedError {
+            error_type: "provider_request_rejected",
+            message: malformed_history_user_message().to_string(),
+            source: "provider",
+            retryable: true,
+            retry_after_ms: None,
+            provider,
+            fallback_available,
+        }
     } else if is_provider_request_rejected_text(&lower) {
         // A provider rejected the request with a 4xx that none of the
         // specific arms above claimed (generic 400 Bad Request, 404, 422).
@@ -562,6 +802,32 @@ pub(crate) fn classify_inference_error(err: &str) -> ClassifiedError {
             ),
             source: "provider",
             retryable: false,
+            retry_after_ms: None,
+            provider,
+            fallback_available,
+        }
+    } else if is_connection_dropped_text(&lower) {
+        // A transport-level drop with no provider status and no managed
+        // `errorCode`: a stale keep-alive socket reused after sleep/wake, a
+        // network change, or a RAW mid-stream SSE drop — the managed backend
+        // intentionally omits `errorCode` for raw upstream/network drops
+        // (backend `routes/inference.ts`), so those reach here as
+        // `"OpenHuman streaming API error: <body>"` with nothing to branch on.
+        // These previously fell to the generic catch-all ("Something went
+        // wrong"). The turn's history is NOT poisoned — the agent loop bails
+        // before committing the failed iteration (`engine/core.rs`) — so this is
+        // cleanly retryable and the warm session is kept. Placed LAST so every
+        // specific provider-status / 4xx arm claims its shape first; only an
+        // otherwise-unclassified transport error lands here.
+        ClassifiedError {
+            error_type: "network",
+            message: with_provider_detail(
+                "The connection to the AI service dropped mid-response — usually a \
+                 sleep/wake or network change. Please try again.",
+                err,
+            ),
+            source: "transport",
+            retryable: true,
             retry_after_ms: None,
             provider,
             fallback_available,
@@ -621,6 +887,59 @@ pub(crate) fn is_empty_provider_response_text(lower: &str) -> bool {
 /// reach this predicate.
 ///
 /// Caller passes the already-lowercased error string.
+/// User-facing copy for a poisoned-history 400 (orphaned tool message). The
+/// de-poison guard (`run_task.rs`) has already evicted the offending warm
+/// session by the time this is shown, so "send it again" is literally true.
+pub(crate) fn malformed_history_user_message() -> &'static str {
+    "We hit a temporary glitch in this conversation — we've cleared it. \
+     Please send your message again."
+}
+
+/// Detect a malformed tool-history rejection (orphaned / mismatched
+/// `role:'tool'` message). This is the *poisoned history* shape the de-poison
+/// guard recovers from — NOT a model/parameter mismatch — so it earns the
+/// "we cleared it, resend" copy instead of "try a different model".
+///
+/// Anchored on the managed backend's `validateToolMessageOrdering` strings
+/// (verified against tinyhumansai/backend `chatCompletions.ts` — "role 'tool' …
+/// matching tool_call", "does not match any tool_call from the preceding
+/// assistant message"), the raw upstream jinja variant ("tool role … no
+/// previous assistant message with a tool call"), and the equivalent BYO
+/// provider phrasings. Caller passes the already-lowercased error string.
+pub(crate) fn is_malformed_tool_history_text(lower: &str) -> bool {
+    let tool_role = lower.contains("role 'tool'") || lower.contains("tool role");
+    let about_tool_call = lower.contains("tool call") || lower.contains("tool_call");
+    (tool_role && about_tool_call)
+        || lower.contains("does not match any tool_call from the preceding assistant message")
+}
+
+/// Detect a transport-level connection drop with no provider status / managed
+/// `errorCode` — the residue that otherwise falls to the generic `inference`
+/// catch-all (issue #3714 bucket #1).
+///
+/// Anchored on the canonical reqwest/hyper shapes for a severed or never-opened
+/// connection (stale keep-alive reused after sleep/wake, network change, raw
+/// mid-stream SSE drop). Intentionally does NOT match `"timed out"` (the
+/// dedicated `timeout` arm owns that) nor any `4xx/5xx` status (those arms claim
+/// their shapes earlier). Caller passes the already-lowercased error string.
+pub(crate) fn is_connection_dropped_text(lower: &str) -> bool {
+    const DROP_MARKERS: &[&str] = &[
+        "connection closed before message completed", // hyper IncompleteMessage
+        "error reading a body from connection",
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "broken pipe",
+        "unexpected end of file",
+        "unexpected eof",
+        "error sending request",
+        "tcp connect error",
+        "dns error",
+        "failed to lookup address",
+    ];
+    DROP_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
 pub(crate) fn is_provider_request_rejected_text(lower: &str) -> bool {
     // Match only when the 4xx status appears inside a provider error envelope
     // (`<provider> API error (4xx …)`, emitted by

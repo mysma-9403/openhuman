@@ -44,7 +44,6 @@ use crate::openhuman::agent::progress::AgentProgress;
 use crate::openhuman::agent::tool_policy::ToolPolicy;
 use crate::openhuman::agent_tool_policy::ToolPolicySession;
 use crate::openhuman::context::ReductionOutcome;
-use crate::openhuman::inference::model_context::context_window_for_model;
 use crate::openhuman::inference::provider::{
     ChatMessage, ChatRequest, ConversationMessage, Provider, ProviderDelta, ToolCall, UsageInfo,
 };
@@ -79,6 +78,9 @@ fn persisted_tool_calls(
                 id,
                 name: c.name.clone(),
                 arguments: c.arguments.to_string(),
+                // Prompt-parsed calls carry no provider extra_content; the
+                // native (Gemini) path returns early above, preserving it.
+                extra_content: None,
             }
         })
         .collect()
@@ -97,6 +99,9 @@ pub(super) struct AgentToolSource {
     pub agent_definition_id: String,
     pub prefer_markdown: bool,
     pub budget_bytes: usize,
+    /// Stage 1a kill-switch. Constant for the session, so (unlike the tool
+    /// surface) it is set once at construction and never re-synced.
+    pub compaction_enabled: bool,
     pub artifact_store: Option<ToolResultArtifactStore>,
     pub should_send_specs: bool,
     pub advertised_specs: Vec<ToolSpec>,
@@ -139,6 +144,7 @@ impl ToolSource for AgentToolSource {
             agent_definition_id: &self.agent_definition_id,
             prefer_markdown: self.prefer_markdown,
             budget_bytes: self.budget_bytes,
+            compaction_enabled: self.compaction_enabled,
             artifact_store: self.artifact_store.as_ref(),
         };
         let (exec_result, record) =
@@ -178,6 +184,11 @@ pub(super) struct AgentObserver<'a> {
     pub agent: &'a mut Agent,
     pub artifact_store: Option<ToolResultArtifactStore>,
     pub effective_model: String,
+    /// Effective context window (tokens) for `effective_model`, resolved once
+    /// per turn via the provider so local providers (e.g. LM Studio) trim to
+    /// their *runtime-loaded* `n_ctx` rather than the model's trained maximum
+    /// (#3550 / Sentry TAURI-RUST-6V0). `None` → skip pre-dispatch trimming.
+    pub context_window: Option<u64>,
     pub cumulative_input: u64,
     pub cumulative_output: u64,
     pub cumulative_cached: u64,
@@ -243,7 +254,7 @@ impl TurnObserver for AgentObserver<'_> {
         }
 
         // Pre-dispatch token-budget trim on the typed history.
-        if let Some(context_window) = context_window_for_model(&self.effective_model) {
+        if let Some(context_window) = self.context_window {
             super::super::token_budget::trim_conversation_history_to_budget(
                 &mut self.agent.history,
                 context_window,
@@ -284,7 +295,7 @@ impl TurnObserver for AgentObserver<'_> {
         // Second-pass trim on the materialized provider messages (mirrors the
         // legacy `Agent::turn`, which trimmed both the typed history and the
         // built `ChatMessage` list).
-        if let Some(context_window) = context_window_for_model(&self.effective_model) {
+        if let Some(context_window) = self.context_window {
             super::super::token_budget::trim_chat_messages_to_budget(buf, context_window);
         }
         Ok(())
@@ -465,6 +476,7 @@ impl CheckpointStrategy for AgentCheckpoint {
                     messages: &messages,
                     tools: None,
                     stream: delta_tx_opt.as_ref(),
+                    max_tokens: None,
                 },
                 &self.model,
                 self.temperature,

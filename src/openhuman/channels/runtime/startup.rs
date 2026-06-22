@@ -87,8 +87,10 @@ pub async fn start_channels(mut config: Config) -> Result<()> {
     crate::openhuman::memory_conversations::register_conversation_persistence_subscriber(
         config.workspace_dir.clone(),
     );
-    crate::openhuman::memory::sync::register_sync_stage_bridge();
+    crate::openhuman::memory::sync::register_sync_stage_bridge(&config);
     crate::openhuman::composio::register_composio_trigger_subscriber();
+    crate::openhuman::agent_meetings::calendar::register_meet_calendar_subscriber();
+    crate::openhuman::agent_meetings::bus::register_meeting_event_subscriber();
     // Surface parked ApprovalGate requests as chat messages so the user can
     // answer yes/no in the thread (chat-native approval, issue #1339).
     crate::openhuman::channels::providers::web::register_approval_surface_subscriber();
@@ -253,47 +255,11 @@ pub async fn start_channels(mut config: Config) -> Result<()> {
 
     let runtime: Arc<dyn host_runtime::RuntimeAdapter> =
         Arc::from(host_runtime::create_runtime(&config.runtime)?);
-    // Ensure the agent's default projects home (~/OpenHuman/projects) exists and
-    // is a read-write trusted root, so the coding agent creates/edits projects
-    // there freely — distinct from the hidden internal workspace dir. A user who
-    // has already granted it (or any other root) is left untouched.
-    {
-        use crate::openhuman::security::{TrustedAccess, TrustedRoot};
-        let projects_dir = crate::openhuman::config::default_projects_dir();
-        if let Err(e) = tokio::fs::create_dir_all(&projects_dir).await {
-            tracing::warn!(
-                dir = %projects_dir.display(),
-                error = %e,
-                "[startup] could not create default projects dir"
-            );
-        }
-        let projects_path = projects_dir.to_string_lossy().to_string();
-        if !config
-            .autonomy
-            .trusted_roots
-            .iter()
-            .any(|r| r.path == projects_path)
-        {
-            config.autonomy.trusted_roots.push(TrustedRoot {
-                path: projects_path,
-                access: TrustedAccess::ReadWrite,
-            });
-        }
-    }
-    // Ensure the action sandbox directory exists (defaults to ~/OpenHuman/projects).
-    let action_dir = config.action_dir.clone();
-    if let Err(e) = tokio::fs::create_dir_all(&action_dir).await {
-        tracing::warn!(
-            dir = %action_dir.display(),
-            error = %e,
-            "[startup] could not create action sandbox dir"
-        );
-    }
-    tracing::info!(
-        workspace = %config.workspace_dir.display(),
-        action = %action_dir.display(),
-        "[startup] workspace (internal state) and action sandbox (tool cwd) directories configured"
-    );
+    // Create the agent's action sandbox + default projects home and register the
+    // projects dir as a ReadWrite trusted root. Shared with the always-run
+    // `bootstrap_core_runtime` boot so a fresh install gets these dirs even with
+    // no messaging integrations connected (#3353, RC-A).
+    crate::openhuman::config::ensure_agent_dirs(&mut config).await;
     // Install as the process-global live policy so runtime autonomy changes
     // (config.update_autonomy_settings) are reflected by `live_policy::current()`
     // and picked up by the next session.
@@ -349,25 +315,21 @@ pub async fn start_channels(mut config: Config) -> Result<()> {
         Arc::clone(&mem),
         &config.browser,
         &config.http_request,
-        &action_dir,
+        &config.action_dir,
         &config.agents,
         &config,
+        None,
+        None,
     ));
 
     let skills = crate::openhuman::workflows::load_workflow_metadata(&workspace);
 
     // Install the triggered-workflow subscriber now that workflows are
     // discovered — otherwise any workflow declaring `triggers:` is silently
-    // ignored in the channel runtime. The handle is parked in a process static
-    // so the RAII SubscriptionHandle isn't dropped (which would cancel it).
-    {
-        use crate::core::event_bus::SubscriptionHandle;
-        use std::sync::OnceLock;
-        static TRIGGERED_WORKFLOW_HANDLE: OnceLock<Option<SubscriptionHandle>> = OnceLock::new();
-        TRIGGERED_WORKFLOW_HANDLE.get_or_init(|| {
-            crate::openhuman::workflows::bus::register_triggered_workflow_subscriber(&skills)
-        });
-    }
+    // ignored. Idempotent + shares a process-global OnceLock with the
+    // `bootstrap_core_runtime` site, so it registers exactly once regardless of
+    // which startup path runs first (web-chat-only cores never reach here).
+    crate::openhuman::workflows::bus::ensure_triggered_workflow_subscriber(&workspace);
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![

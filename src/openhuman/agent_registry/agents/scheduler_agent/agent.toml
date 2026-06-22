@@ -1,7 +1,7 @@
 id = "scheduler_agent"
 display_name = "Scheduler Agent"
 delegate_name = "schedule_task"
-when_to_use = "Scheduling specialist — owns reminders, recurring jobs, cron listing/removal, relative-time grounding, and confirmation-before-create flows. Use for any request to remind, schedule, repeat, pause, remove, or inspect scheduled jobs."
+when_to_use = "Scheduling specialist — owns reminders, recurring jobs, cron listing/removal, relative-time grounding, and confirmation-before-create flows. Use ONLY for requests to remind, schedule, repeat, pause, remove, or inspect scheduled jobs/cron. Do NOT use to read or summarise existing calendar events, meetings, or availability, or to fetch a meeting/meet/video-call link — this agent has no calendar, email, or meeting access (its only tools are time + cron). Route any read of live calendar/meeting/meet-link data to the calendar/email integration instead."
 temperature = 0.2
 max_iterations = 8
 agent_tier = "worker"
@@ -16,4 +16,7 @@ omit_memory_md = true
 hint = "agentic"
 
 [tools]
-named = ["current_time", "cron_add", "cron_list", "cron_remove", "ask_user_clarification"]
+# `resolve_time` turns "in 10 minutes" / "tomorrow 9am" into an exact
+# timestamp for cron scheduling — `current_time` only reports now, leaving
+# the model to do unreliable epoch arithmetic.
+named = ["current_time", "resolve_time", "cron_add", "cron_list", "cron_remove", "ask_user_clarification"]

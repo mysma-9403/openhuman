@@ -10,6 +10,23 @@ use super::ops_types::{
     WORKFLOW_MD,
 };
 
+const EXCLUDED_SKILL_DIRS: &[&str] = &[
+    ".git",
+    ".github",
+    ".hub",
+    ".archive",
+    ".venv",
+    "venv",
+    "node_modules",
+    "site-packages",
+    "__pycache__",
+    ".tox",
+    ".nox",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+];
+
 /// Initialize the legacy skills directory in the specified workspace.
 ///
 /// Creates `<workspace>/skills/` and a placeholder `README.md` so the folder
@@ -78,58 +95,150 @@ pub fn is_workspace_trusted(workspace_dir: &Path) -> bool {
     workspace_dir.join(".openhuman").join(TRUST_MARKER).exists()
 }
 
+/// Which on-disk root category a bundle was discovered under.
+///
+/// `Workflow` roots (`.openhuman/workflows/`) hold task *automations* authored
+/// via "New workflow". `Skill` roots (`.openhuman/skills/`, `.agents/skills/`,
+/// and the legacy `<workspace>/skills/`) hold capability *skills*. Both are the
+/// same on-disk primitive (SKILL.md / WORKFLOW.md bundles) and the agent
+/// harness loads both — but the Automations UI lists only `Workflow`-root
+/// bundles (see [`discover_automations`]) so capability skills don't masquerade
+/// as task templates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RootKind {
+    Skill,
+    Workflow,
+}
+
+const ALL_ROOT_KINDS: &[RootKind] = &[RootKind::Skill, RootKind::Workflow];
+const WORKFLOW_ROOT_KINDS: &[RootKind] = &[RootKind::Workflow];
+
 pub(crate) fn discover_workflows_inner(
     home_dir: Option<&Path>,
     workspace_dir: Option<&Path>,
     trusted: bool,
 ) -> Vec<Workflow> {
+    discover_filtered(home_dir, workspace_dir, trusted, ALL_ROOT_KINDS)
+}
+
+/// Discover only *automation* bundles — those under the `workflows/` roots —
+/// for the Automations UI list (`openhuman.workflows_list`).
+///
+/// Capability skills (under the `skills/` / `.agents/skills/` / legacy
+/// `<workspace>/skills/` roots) are deliberately excluded so they don't show up
+/// as task templates. They remain fully available to the agent harness and the
+/// run/describe paths via [`discover_workflows`] / [`load_workflow_metadata`].
+///
+/// Note: bundles authored *before* the skills→workflows rename live under the
+/// `skills/` roots and will therefore not appear in this automations-only view;
+/// new automations created via "New workflow" land in `~/.openhuman/workflows/`.
+pub fn discover_automations(
+    home_dir: Option<&Path>,
+    workspace_dir: Option<&Path>,
+    trusted: bool,
+) -> Vec<Workflow> {
+    tracing::debug!(
+        trusted,
+        has_home = home_dir.is_some(),
+        has_workspace = workspace_dir.is_some(),
+        "[workflows] discover:automations:enter"
+    );
+    discover_filtered(home_dir, workspace_dir, trusted, WORKFLOW_ROOT_KINDS)
+}
+
+/// Shared discovery core. `kinds` selects which root categories to scan,
+/// letting the full surface ([`discover_workflows_inner`]) and the
+/// automations-only list ([`discover_automations`]) share collision handling.
+fn discover_filtered(
+    home_dir: Option<&Path>,
+    workspace_dir: Option<&Path>,
+    trusted: bool,
+    kinds: &[RootKind],
+) -> Vec<Workflow> {
+    tracing::debug!(
+        trusted,
+        has_home = home_dir.is_some(),
+        has_workspace = workspace_dir.is_some(),
+        include_skills = kinds.contains(&RootKind::Skill),
+        include_workflows = kinds.contains(&RootKind::Workflow),
+        "[workflows] discover:enter"
+    );
     // Scan order matters for collision resolution: the last scope to register
     // a name wins, so we scan user first, then project, then legacy.
     let mut by_name: HashMap<String, Workflow> = HashMap::new();
 
     if let Some(home) = home_dir {
-        for root in user_roots(home) {
-            absorb(&mut by_name, scan_root(&root, WorkflowScope::User));
+        for (root, kind) in user_roots(home) {
+            if kinds.contains(&kind) {
+                tracing::trace!(
+                    root = %root.display(),
+                    ?kind,
+                    scope = ?WorkflowScope::User,
+                    "[workflows] discover:branch:user"
+                );
+                absorb(&mut by_name, scan_root(&root, WorkflowScope::User));
+            }
         }
     }
 
     if let Some(ws) = workspace_dir {
         if trusted {
-            for root in project_roots(ws) {
-                absorb(&mut by_name, scan_root(&root, WorkflowScope::Project));
+            for (root, kind) in project_roots(ws) {
+                if kinds.contains(&kind) {
+                    tracing::trace!(
+                        root = %root.display(),
+                        ?kind,
+                        scope = ?WorkflowScope::Project,
+                        "[workflows] discover:branch:project"
+                    );
+                    absorb(&mut by_name, scan_root(&root, WorkflowScope::Project));
+                }
             }
         }
-        // Legacy `<workspace>/skills/` is always scanned so existing setups
-        // keep working without requiring users to move files or add the trust
-        // marker. Flagged with `legacy = true` so the UI can nudge migration.
-        absorb(
-            &mut by_name,
-            scan_root(&ws.join("skills"), WorkflowScope::Legacy),
-        );
+        // Legacy `<workspace>/skills/` is a skill root: scanned for the full
+        // surface (back-compat, no trust marker required) but excluded from the
+        // automations-only view. Flagged with `legacy = true` so the UI can
+        // nudge migration.
+        if kinds.contains(&RootKind::Skill) {
+            let legacy_root = ws.join("skills");
+            tracing::trace!(
+                root = %legacy_root.display(),
+                scope = ?WorkflowScope::Legacy,
+                "[workflows] discover:branch:legacy"
+            );
+            absorb(&mut by_name, scan_root(&legacy_root, WorkflowScope::Legacy));
+        }
     }
 
     let mut out: Vec<Workflow> = by_name.into_values().collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    tracing::debug!(discovered_count = out.len(), "[workflows] discover:exit");
     out
 }
 
-fn user_roots(home: &Path) -> Vec<PathBuf> {
+fn user_roots(home: &Path) -> Vec<(PathBuf, RootKind)> {
     // `workflows/` is the current layout (create writes here); the `skills/`
     // roots are still scanned for back-compat with installs created before the
     // skills→workflows rename. Order matters: `workflows/` is scanned last so a
     // same-named entry there wins over a legacy `skills/` one.
     vec![
-        home.join(".openhuman").join("skills"),
-        home.join(".agents").join("skills"),
-        home.join(".openhuman").join("workflows"),
+        (home.join(".openhuman").join("skills"), RootKind::Skill),
+        (home.join(".agents").join("skills"), RootKind::Skill),
+        (
+            home.join(".openhuman").join("workflows"),
+            RootKind::Workflow,
+        ),
     ]
 }
 
-fn project_roots(workspace: &Path) -> Vec<PathBuf> {
+fn project_roots(workspace: &Path) -> Vec<(PathBuf, RootKind)> {
     vec![
-        workspace.join(".openhuman").join("skills"),
-        workspace.join(".agents").join("skills"),
-        workspace.join(".openhuman").join("workflows"),
+        (workspace.join(".openhuman").join("skills"), RootKind::Skill),
+        (workspace.join(".agents").join("skills"), RootKind::Skill),
+        (
+            workspace.join(".openhuman").join("workflows"),
+            RootKind::Workflow,
+        ),
     ]
 }
 
@@ -179,9 +288,16 @@ fn precedence(scope: WorkflowScope) -> u8 {
 }
 
 fn scan_root(root: &Path, scope: WorkflowScope) -> Vec<Workflow> {
+    let mut out = Vec::new();
+    scan_root_inner(root, scope, &mut out);
+    out.sort_by(|a, b| a.dir_name.cmp(&b.dir_name));
+    out
+}
+
+fn scan_root_inner(root: &Path, scope: WorkflowScope, out: &mut Vec<Workflow>) {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+        Err(_) => return,
     };
 
     // `read_dir` order is unspecified. When two sibling directories declare
@@ -192,7 +308,6 @@ fn scan_root(root: &Path, scope: WorkflowScope) -> Vec<Workflow> {
     let mut entries: Vec<_> = entries.flatten().collect();
     entries.sort_by_key(|entry| entry.file_name());
 
-    let mut out = Vec::new();
     for entry in entries {
         // Use `file_type()` rather than `path.is_dir()` so a symlinked
         // child cannot be loaded as a skill. `is_dir()` dereferences
@@ -209,14 +324,15 @@ fn scan_root(root: &Path, scope: WorkflowScope) -> Vec<Workflow> {
         }
         let path = entry.path();
         let dir_name = entry.file_name().to_string_lossy().to_string();
-        if dir_name.starts_with('.') {
+        if dir_name.starts_with('.') || EXCLUDED_SKILL_DIRS.contains(&dir_name.as_str()) {
             continue;
         }
         if let Some(skill) = load_skill_dir(&path, &dir_name, scope) {
             out.push(skill);
+            continue;
         }
+        scan_root_inner(&path, scope, out);
     }
-    out
 }
 
 fn load_skill_dir(dir: &Path, dir_name: &str, scope: WorkflowScope) -> Option<Workflow> {
@@ -257,8 +373,9 @@ fn load_skill_dir(dir: &Path, dir_name: &str, scope: WorkflowScope) -> Option<Wo
 /// Read a bundled skill resource as UTF-8 text, hardened against directory
 /// traversal, symlink escape, and oversized payloads.
 ///
-/// `skill_id` identifies the skill by its discovered `name` — the same field
-/// surfaced on [`Workflow::name`]. The skill is resolved by running the standard
+/// `skill_id` identifies the skill by its discovered `name` or its on-disk
+/// `dir_name` slug — the same identifiers surfaced in the UI summary. The
+/// skill is resolved by running the standard
 /// discovery pipeline (`dirs::home_dir()` + `workspace_dir`, honoring the
 /// `.openhuman/trust` marker) and locating the matching entry; this keeps the
 /// read scoped to legitimately installed skills and reuses all the symlink /
@@ -320,11 +437,7 @@ pub fn read_workflow_resource(
     // `load_workflow_metadata` (which honors both user and workspace roots plus the
     // trust marker) so the resource read is scoped to the exact same set of
     // skills the UI would already have shown the user.
-    let skills = load_workflow_metadata(workspace_dir);
-    let skill = skills
-        .into_iter()
-        .find(|s| s.name == skill_id)
-        .ok_or_else(|| format!("skill '{skill_id}' not found"))?;
+    let skill = resolve_workflow_for_resource(load_workflow_metadata(workspace_dir), skill_id)?;
     let skill_root = skill
         .location
         .as_deref()
@@ -399,4 +512,47 @@ pub fn read_workflow_resource(
     );
 
     Ok(content)
+}
+
+fn resolve_workflow_for_resource(
+    workflows: Vec<Workflow>,
+    skill_id: &str,
+) -> Result<Workflow, String> {
+    let mut dir_match: Option<Workflow> = None;
+    let mut name_match: Option<Workflow> = None;
+
+    for workflow in workflows {
+        if workflow.dir_name == skill_id {
+            if dir_match.is_some() {
+                return Err(format!(
+                    "skill id '{skill_id}' is ambiguous across multiple skill directories"
+                ));
+            }
+            dir_match = Some(workflow);
+            continue;
+        }
+
+        if workflow.name == skill_id {
+            if name_match.is_some() {
+                return Err(format!(
+                    "skill name '{skill_id}' is ambiguous; use the directory id"
+                ));
+            }
+            name_match = Some(workflow);
+        }
+    }
+
+    match (dir_match, name_match) {
+        (Some(dir_skill), Some(name_skill)) => {
+            if dir_skill.location == name_skill.location {
+                Ok(dir_skill)
+            } else {
+                Err(format!(
+                    "skill id '{skill_id}' matches both a directory id and a different skill name"
+                ))
+            }
+        }
+        (Some(skill), None) | (None, Some(skill)) => Ok(skill),
+        (None, None) => Err(format!("skill '{skill_id}' not found")),
+    }
 }

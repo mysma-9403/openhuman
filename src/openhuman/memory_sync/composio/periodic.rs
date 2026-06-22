@@ -35,8 +35,10 @@
 //!     (bus subscribers, `on_connection_created`) via
 //!     [`record_sync_success`] so a recent non-periodic sync prevents
 //!     the scheduler from redundantly re-firing. The map is rebuilt on
-//!     restart, which is fine — a missed periodic sync is harmless
-//!     because the next tick after restart picks it back up immediately.
+//!     restart; to keep a user-configured cadence (e.g. "Sync every 24h",
+//!     #3302) from re-firing on every cold start, the due-check falls back
+//!     to the **persisted** sync-audit timestamp ([`read_audit_log`]) when
+//!     the in-memory record is absent — see [`persisted_since_last_sync`].
 //!   * Errors are logged and swallowed; the scheduler must never panic
 //!     out of its loop or periodic sync stops silently for the rest of
 //!     the process lifetime.
@@ -49,7 +51,11 @@ use std::time::{Duration, Instant};
 use tokio::time::interval;
 
 use crate::openhuman::config::rpc as config_rpc;
-use crate::openhuman::scheduler_gate::gate::current_policy;
+use crate::openhuman::config::DEFAULT_MEMORY_SYNC_INTERVAL_SECS;
+use crate::openhuman::memory_sources::{
+    memory_sync_defaults_for_toolkit, MemorySourceEntry, SourceKind,
+};
+use crate::openhuman::scheduler_gate::gate::{current_policy, resume_notify};
 use crate::openhuman::scheduler_gate::policy::PauseReason;
 
 use super::providers::{get_provider, ComposioUsage, ProviderContext, SyncReason};
@@ -57,7 +63,10 @@ use crate::openhuman::composio::client::{
     create_composio_client, direct_list_connections, ComposioClientKind,
 };
 use crate::openhuman::composio::ops;
-use crate::openhuman::memory_sync::sources::audit::{append_audit_entry, SyncAuditEntry};
+use crate::openhuman::memory_sync::sources::audit::{
+    append_audit_entry, read_audit_log, SyncAuditEntry,
+};
+use chrono::{DateTime, Utc};
 
 /// How often the scheduler wakes up to look for due syncs. Independent
 /// from per-provider `sync_interval_secs` — this just bounds how long
@@ -106,6 +115,137 @@ pub fn record_sync_success(toolkit: &str, connection_id: &str) {
     }
 }
 
+/// Resolve the effective periodic sync interval (seconds) for one connection,
+/// combining the provider's own default with the user's global
+/// memory-sync cadence ([`Config::memory_sync_interval_secs`], #3302).
+///
+/// - `global == Some(0)` → `None`: "Manual only" — the scheduler skips this
+///   source entirely (manual sync still works).
+/// - `global == Some(n)` → `Some(max(n, provider_default))`: the user's
+///   cadence overrides the provider default but is floored at it, so we never
+///   sync *more* often than the provider intended.
+/// - `global == None` → `Some(max(DEFAULT, provider_default))`: no explicit
+///   user choice, so fall back to the 24h default cadence (also floored at the
+///   provider default).
+pub(crate) fn effective_interval_secs(provider_default: u64, global: Option<u64>) -> Option<u64> {
+    match global {
+        Some(0) => None,
+        Some(n) => Some(n.max(provider_default)),
+        None => Some(DEFAULT_MEMORY_SYNC_INTERVAL_SECS.max(provider_default)),
+    }
+}
+
+/// Decide whether a connection is due for a periodic sync right now, given the
+/// effective interval and how long ago it last synced this run.
+///
+/// `since_last_sync == None` means we have no record of a sync this process
+/// lifetime, so we fire immediately (the restart-recovery path). Kept pure so
+/// the due-check can be simulated without driving the real `Instant` clock.
+pub(crate) fn connection_is_due(interval_secs: u64, since_last_sync: Option<Duration>) -> bool {
+    match since_last_sync {
+        Some(elapsed) => elapsed >= Duration::from_secs(interval_secs),
+        None => true,
+    }
+}
+
+/// Build an index of `connection_id → most recent successful Composio sync
+/// timestamp` from the persisted sync audit log (#3302).
+///
+/// The periodic loop writes audit entries with `source_id = connection_id` and
+/// `scope = "{toolkit}:{connection_id}"`; we accept either shape and key by the
+/// connection id. Only successful syncs count — matching the in-memory
+/// [`record_sync_success`] semantics, which never records a failed tick so the
+/// next tick retries. This is the wall-clock record that lets the cadence
+/// survive restarts (the in-memory monotonic map cannot).
+fn index_last_success_by_connection(entries: &[SyncAuditEntry]) -> HashMap<String, DateTime<Utc>> {
+    let mut idx: HashMap<String, DateTime<Utc>> = HashMap::new();
+    for e in entries {
+        if e.source_kind != "composio" || !e.success {
+            continue;
+        }
+        let connection_id = e
+            .scope
+            .rsplit_once(':')
+            .map(|(_, c)| c.to_string())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| e.source_id.clone());
+        idx.entry(connection_id)
+            .and_modify(|t| {
+                if e.timestamp > *t {
+                    *t = e.timestamp;
+                }
+            })
+            .or_insert(e.timestamp);
+    }
+    idx
+}
+
+/// Wall-clock elapsed since a connection's last persisted successful sync, if
+/// any. Saturates at zero for a future timestamp (clock skew), so a skewed
+/// record never reads as "wildly overdue". Returns `None` when the connection
+/// has no persisted sync — letting the caller treat it as never-synced.
+fn persisted_since_last_sync(
+    idx: &HashMap<String, DateTime<Utc>>,
+    connection_id: &str,
+    now: DateTime<Utc>,
+) -> Option<Duration> {
+    idx.get(connection_id).map(|ts| {
+        let secs = (now - *ts).num_seconds().max(0) as u64;
+        Duration::from_secs(secs)
+    })
+}
+
+/// Outcome of consulting the per-source registry for one Composio connection
+/// during a periodic tick (#2831).
+#[derive(Debug, PartialEq, Eq)]
+enum PeriodicSourceDecision {
+    /// The user toggled this source **off** — skip background sync entirely.
+    /// Manual `memory_sources_sync` still works (it has its own `enabled`
+    /// guard); only the automatic loop honours this here.
+    Skip,
+    /// Sync this connection with the given caps (`None` = uncapped for that
+    /// dimension).
+    Sync {
+        max_items: Option<u32>,
+        sync_depth_days: Option<u32>,
+    },
+}
+
+/// Decide whether — and with what caps — to periodically sync one connection,
+/// honouring the per-source `enabled` toggle (#2831). Pure so the three
+/// branches can be unit-tested without async/registry I/O.
+///
+/// - **disabled row** → [`PeriodicSourceDecision::Skip`]: the background loop
+///   must not sync a source the user switched off (this was the row-2 leak —
+///   previously the loop only read the registry for caps and synced disabled
+///   sources anyway, uncapped).
+/// - **enabled row** → `Sync` with the row's caps.
+/// - **no row yet** → `Sync` with conservative per-toolkit defaults
+///   ([`memory_sync_defaults_for_toolkit`]). `reconcile` normally backfills an
+///   enabled, capped row for every connection; this covers the brief
+///   pre-reconcile window. The no-match path defaults to *sync-bounded*, never
+///   *skip* and never *uncapped*, so a missing/mismatched row degrades safely
+///   (data keeps flowing, just capped) instead of silently going dark.
+fn decide_periodic_source(
+    source: Option<&MemorySourceEntry>,
+    toolkit: &str,
+) -> PeriodicSourceDecision {
+    match source {
+        Some(s) if !s.enabled => PeriodicSourceDecision::Skip,
+        Some(s) => PeriodicSourceDecision::Sync {
+            max_items: s.max_items,
+            sync_depth_days: s.sync_depth_days,
+        },
+        None => {
+            let (max_items, sync_depth_days) = memory_sync_defaults_for_toolkit(toolkit);
+            PeriodicSourceDecision::Sync {
+                max_items,
+                sync_depth_days,
+            }
+        }
+    }
+}
+
 /// Spawn the periodic sync background task. Idempotent: only the
 /// first call actually spawns the loop, every subsequent call is a
 /// cheap no-op (logged at `debug` so it's visible during startup
@@ -135,14 +275,35 @@ pub fn start_periodic_sync() {
 
 /// Inner loop, broken out so it's easy to mock-replace in tests if we
 /// ever want to drive ticks deterministically.
+///
+/// Each iteration waits on whichever comes first (#2831):
+///   * the 20-min `ticker` — the steady-state cadence, or
+///   * the scheduler-gate **resume** notify — fired when the user toggles
+///     Memory Tree back on or signs back in.
+///
+/// On a resume wake we run a tick **immediately** (so sync restarts within
+/// seconds, not at the next ≤20-min boundary) and `reset()` the ticker so the
+/// *next* scheduled tick is a full `TICK_SECONDS` out. The reset is what stops
+/// rapid off-on toggling from bunch-firing: many wakes collapse into at most
+/// one extra tick (the `Notify` stores a single permit), and the cadence
+/// re-bases from the last actual tick.
 async fn run_loop() {
     let mut ticker = interval(Duration::from_secs(TICK_SECONDS));
+    let resume = resume_notify();
     // Skip the immediate-fire tick so startup isn't slammed before the
     // user even has time to sign in.
     ticker.tick().await;
 
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = resume.notified() => {
+                // Woke early on a resume transition. Re-base the cadence so the
+                // next scheduled tick is TICK_SECONDS from now, then fall
+                // through and run the tick immediately.
+                ticker.reset();
+            }
+        }
         if let Err(e) = run_one_tick().await {
             tracing::warn!(
                 error = %e,
@@ -175,7 +336,7 @@ async fn run_loop() {
 ///   transitional / not-yet-resolved condition. Letting the tick proceed
 ///   here keeps periodic sync running through brief transitions instead of
 ///   pausing on stale unresolved state.
-fn periodic_pause_reason() -> Option<PauseReason> {
+pub(crate) fn periodic_pause_reason() -> Option<PauseReason> {
     // Delegate the `Policy::Paused { .. }` → `PauseReason` extraction to
     // the existing `Policy::pause_reason()` helper (avoids re-implementing
     // the same destructure twice). The allow-list below is the only thing
@@ -278,6 +439,42 @@ pub(crate) async fn run_one_tick() -> Result<(), String> {
 
     let sync_map = last_sync_map();
 
+    // Global, user-configurable memory-sync cadence (#3302). Applied to every
+    // opted-in source as a floor/override over the provider's own default; a
+    // value of `Some(0)` disables periodic auto-sync ("Manual only").
+    let global_interval = config.memory_sync_interval_secs;
+
+    // Persisted last-sync fallback (#3302). The in-memory `LAST_SYNC_AT` map is
+    // rebuilt empty on every launch, so without this a cold start would re-fire
+    // every connection on the first tick — silently breaking the configured
+    // "Sync every 24h" gap across app restarts. We index the persisted sync
+    // audit log (wall-clock timestamps that survive restarts) and use it as the
+    // due-check fallback whenever the in-memory monotonic record is absent.
+    let audit_index = index_last_success_by_connection(&read_audit_log(&config));
+    let now = Utc::now();
+
+    // Per-source registry snapshot (#2831). The periodic loop gates on the
+    // per-source `enabled` toggle so a source the user switched off stops
+    // syncing in the background — matching the manual paths
+    // (`memory_sources::sync_source`, `memory_sources_sync_all`), which already
+    // early-return on `!enabled`. Index every Composio source (enabled and
+    // disabled) by connection id; the per-connection branch below resolves
+    // skip/caps via `decide_periodic_source`.
+    //
+    // Built from the **already-loaded** `config` snapshot (Step 1), not a second
+    // `list_sources()` read. A separate read whose error we swallowed to an
+    // empty map would make every disabled source fall through to the
+    // `decide_periodic_source(None, ..)` default-caps path — silently
+    // re-enabling background sync for sources the user switched off on a
+    // transient config-read failure. Reusing the tick's snapshot is fail-closed
+    // (a disabled row stays disabled) and avoids the extra read entirely.
+    let composio_sources: HashMap<String, MemorySourceEntry> = config
+        .memory_sources
+        .iter()
+        .filter(|s| s.kind == SourceKind::Composio)
+        .filter_map(|s| s.connection_id.clone().map(|id| (id, s.clone())))
+        .collect();
+
     let mut considered = 0usize;
     let mut fired = 0usize;
     for conn in resp.connections {
@@ -296,37 +493,54 @@ pub(crate) async fn run_one_tick() -> Result<(), String> {
             continue;
         };
 
-        let Some(interval_secs) = provider.sync_interval_secs() else {
+        let Some(provider_default) = provider.sync_interval_secs() else {
             // Provider opted out of periodic sync entirely.
             continue;
         };
 
-        let key = (toolkit.clone(), conn.id.clone());
-        let due = {
-            let map = sync_map.lock().unwrap_or_else(|e| e.into_inner());
-            match map.get(&key) {
-                Some(when) => when.elapsed() >= Duration::from_secs(interval_secs),
-                None => true, // never synced this run — fire immediately
-            }
+        let Some(interval_secs) = effective_interval_secs(provider_default, global_interval) else {
+            // User selected "Manual only" — skip auto-sync for this source.
+            // Manual `memory_sources_sync` still works.
+            tracing::debug!(
+                toolkit = %toolkit,
+                connection_id = %conn.id,
+                "[composio:periodic] manual-only mode — skipping periodic sync"
+            );
+            continue;
         };
-        if !due {
+
+        let key = (toolkit.clone(), conn.id.clone());
+        // Prefer the in-memory monotonic record (most accurate within this run);
+        // fall back to the persisted audit timestamp so the configured cadence
+        // is honoured across restarts instead of re-firing on every cold start.
+        let since_last_sync = {
+            let map = sync_map.lock().unwrap_or_else(|e| e.into_inner());
+            map.get(&key).map(|when| when.elapsed())
+        }
+        .or_else(|| persisted_since_last_sync(&audit_index, &conn.id, now));
+        if !connection_is_due(interval_secs, since_last_sync) {
             continue;
         }
 
-        // Look up per-source caps from the memory_sources registry.
-        // Non-fatal: if the lookup fails we proceed without caps.
-        let (src_max_items, src_sync_depth_days) = {
-            let registry_sources = crate::openhuman::memory_sources::list_enabled_by_kind(
-                crate::openhuman::memory_sources::SourceKind::Composio,
-            )
-            .await
-            .unwrap_or_default();
-            registry_sources
-                .iter()
-                .find(|s| s.connection_id.as_deref() == Some(conn.id.as_str()))
-                .map(|s| (s.max_items, s.sync_depth_days))
-                .unwrap_or((None, None))
-        };
+        // Per-source gate + caps from the memory_sources registry (#2831).
+        // A disabled source is skipped here (the background-sync half of the
+        // toggle); enabled sources sync with their caps; a connection with no
+        // registry row yet syncs with conservative per-toolkit defaults.
+        let (src_max_items, src_sync_depth_days) =
+            match decide_periodic_source(composio_sources.get(&conn.id), &toolkit) {
+                PeriodicSourceDecision::Skip => {
+                    tracing::debug!(
+                        toolkit = %toolkit,
+                        connection_id = %conn.id,
+                        "[composio:periodic] source disabled — skipping periodic sync"
+                    );
+                    continue;
+                }
+                PeriodicSourceDecision::Sync {
+                    max_items,
+                    sync_depth_days,
+                } => (max_items, sync_depth_days),
+            };
 
         tracing::debug!(
             toolkit = %toolkit,
@@ -461,6 +675,339 @@ mod tests {
         // Sanity check: don't accidentally ship a 1-second tick.
         assert!(TICK_SECONDS >= 30);
         assert!(TICK_SECONDS <= 3600);
+    }
+
+    #[test]
+    fn effective_interval_none_falls_back_to_default() {
+        // No user choice → 24h default, floored at the provider default.
+        assert_eq!(
+            effective_interval_secs(15 * 60, None),
+            Some(DEFAULT_MEMORY_SYNC_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
+    fn effective_interval_manual_disables_sync() {
+        // Some(0) is the "Manual only" sentinel — periodic sync is skipped.
+        assert_eq!(effective_interval_secs(15 * 60, Some(0)), None);
+    }
+
+    #[test]
+    fn effective_interval_override_is_floored_at_provider_default() {
+        // A user cadence longer than the provider default is honoured as-is.
+        assert_eq!(
+            effective_interval_secs(15 * 60, Some(4 * 3600)),
+            Some(4 * 3600)
+        );
+        // A user cadence shorter than the provider default is clamped up to it
+        // so we never sync more often than the provider intends.
+        assert_eq!(effective_interval_secs(30 * 60, Some(60)), Some(30 * 60));
+        // Exactly equal stays equal.
+        assert_eq!(effective_interval_secs(1800, Some(1800)), Some(1800));
+    }
+
+    #[test]
+    fn effective_interval_default_is_floored_at_a_longer_provider_default() {
+        // If a provider ever defaults to longer than 24h, that wins under None.
+        let long = DEFAULT_MEMORY_SYNC_INTERVAL_SECS + 3600;
+        assert_eq!(effective_interval_secs(long, None), Some(long));
+    }
+
+    #[test]
+    fn connection_is_due_compares_elapsed_against_interval() {
+        let interval = 4 * 3600;
+        // Never synced this run → always due.
+        assert!(connection_is_due(interval, None));
+        // Synced more recently than the interval → not due.
+        assert!(!connection_is_due(
+            interval,
+            Some(Duration::from_secs(3600))
+        ));
+        // Synced exactly at the interval boundary → due.
+        assert!(connection_is_due(
+            interval,
+            Some(Duration::from_secs(interval))
+        ));
+        // Synced longer ago than the interval → due.
+        assert!(connection_is_due(
+            interval,
+            Some(Duration::from_secs(interval + 1))
+        ));
+    }
+
+    /// Build a minimal Composio `MemorySourceEntry` for the per-source gate
+    /// tests — only the fields `decide_periodic_source` reads are meaningful.
+    fn composio_source(
+        enabled: bool,
+        max_items: Option<u32>,
+        sync_depth_days: Option<u32>,
+    ) -> MemorySourceEntry {
+        MemorySourceEntry {
+            id: "src_test".to_string(),
+            kind: SourceKind::Composio,
+            label: "test".to_string(),
+            enabled,
+            toolkit: Some("gmail".to_string()),
+            connection_id: Some("cmp-1".to_string()),
+            path: None,
+            glob: None,
+            url: None,
+            branch: None,
+            paths: Vec::new(),
+            max_commits: None,
+            max_issues: None,
+            max_prs: None,
+            query: None,
+            since_days: None,
+            max_items,
+            selector: None,
+            max_tokens_per_sync: None,
+            max_cost_per_sync_usd: None,
+            sync_depth_days,
+        }
+    }
+
+    /// #2831 row 2: a source explicitly toggled **off** must be skipped by the
+    /// background loop — this is the leak the gate closes.
+    #[test]
+    fn decide_periodic_source_skips_disabled_source() {
+        let src = composio_source(false, Some(100), Some(30));
+        assert_eq!(
+            decide_periodic_source(Some(&src), "gmail"),
+            PeriodicSourceDecision::Skip
+        );
+    }
+
+    /// An enabled source syncs with exactly its configured caps (no defaulting).
+    #[test]
+    fn decide_periodic_source_uses_enabled_source_caps() {
+        let src = composio_source(true, Some(42), Some(7));
+        assert_eq!(
+            decide_periodic_source(Some(&src), "gmail"),
+            PeriodicSourceDecision::Sync {
+                max_items: Some(42),
+                sync_depth_days: Some(7),
+            }
+        );
+    }
+
+    /// A connection with no registry row yet (pre-reconcile window) syncs with
+    /// the conservative per-toolkit defaults — **bounded**, never uncapped, and
+    /// never skipped. This is the safe-direction fallback for a missing match.
+    #[test]
+    fn decide_periodic_source_defaults_caps_when_no_row() {
+        let (want_items, want_depth) = memory_sync_defaults_for_toolkit("gmail");
+        assert_eq!(
+            decide_periodic_source(None, "gmail"),
+            PeriodicSourceDecision::Sync {
+                max_items: want_items,
+                sync_depth_days: want_depth,
+            }
+        );
+        // The defaults are bounded for a known toolkit (regression guard against
+        // an accidental return to uncapped background fetches).
+        assert!(want_items.is_some());
+    }
+
+    /// Multi-account regression (#3443 added multiple account connections per
+    /// toolkit): two live connections of the *same* toolkit must be gated
+    /// **independently** by their own per-`connection_id` source rows. This
+    /// pins the loop's connection-id keying — re-keying the lookup by toolkit
+    /// would collapse the two accounts and is the regression this guards.
+    #[test]
+    fn per_connection_gate_is_independent_across_accounts_of_same_toolkit() {
+        // gmail account A: enabled with caps; gmail account B: disabled.
+        let mut a = composio_source(true, Some(10), Some(5));
+        a.connection_id = Some("conn-A".to_string());
+        a.toolkit = Some("gmail".to_string());
+        let mut b = composio_source(false, Some(99), Some(99));
+        b.connection_id = Some("conn-B".to_string());
+        b.toolkit = Some("gmail".to_string());
+
+        // Build the same connection_id → entry index the live tick builds.
+        let index: HashMap<String, MemorySourceEntry> = [a, b]
+            .into_iter()
+            .filter_map(|s| s.connection_id.clone().map(|id| (id, s)))
+            .collect();
+
+        // Account A (enabled) syncs with its own caps...
+        assert_eq!(
+            decide_periodic_source(index.get("conn-A"), "gmail"),
+            PeriodicSourceDecision::Sync {
+                max_items: Some(10),
+                sync_depth_days: Some(5),
+            }
+        );
+        // ...account B (disabled) is skipped, even though it shares the toolkit.
+        assert_eq!(
+            decide_periodic_source(index.get("conn-B"), "gmail"),
+            PeriodicSourceDecision::Skip
+        );
+        // A third, not-yet-registered account of the same toolkit falls back to
+        // bounded defaults (never skipped, never uncapped).
+        let (def_items, def_depth) = memory_sync_defaults_for_toolkit("gmail");
+        assert_eq!(
+            decide_periodic_source(index.get("conn-C"), "gmail"),
+            PeriodicSourceDecision::Sync {
+                max_items: def_items,
+                sync_depth_days: def_depth,
+            }
+        );
+    }
+
+    /// End-to-end simulation of the scheduler's per-connection decision: prove
+    /// that **changing the global setting changes when the next sync fires**
+    /// (issue #3302 acceptance criterion). We drive the same two pure helpers
+    /// the live tick uses (`effective_interval_secs` → `connection_is_due`)
+    /// across realistic last-sync ages, so no clock or network is needed.
+    #[test]
+    fn scheduler_decision_honors_the_global_setting() {
+        // A chatty provider that natively wants to sync every 15 minutes.
+        let provider_default = 15 * 60;
+
+        // Helper mirroring the live loop: returns whether the connection would
+        // fire right now, or `None` for "Manual only" (skipped entirely).
+        let decide = |global: Option<u64>, since: Option<Duration>| -> Option<bool> {
+            effective_interval_secs(provider_default, global)
+                .map(|interval| connection_is_due(interval, since))
+        };
+
+        let one_hour_ago = Some(Duration::from_secs(3600));
+        let five_hours_ago = Some(Duration::from_secs(5 * 3600));
+
+        // Baseline (no global override): with only the 15m provider default, a
+        // connection synced an hour ago is already overdue and WOULD fire.
+        // (This is the behavior the feature is reining in.)
+        assert!(connection_is_due(provider_default, one_hour_ago));
+
+        // User picks "every 4h": now that same hour-old connection must NOT
+        // fire — the global cadence (not the 15m default) governs the gap…
+        assert_eq!(decide(Some(4 * 3600), one_hour_ago), Some(false));
+        // …but once 5h have passed it fires again.
+        assert_eq!(decide(Some(4 * 3600), five_hours_ago), Some(true));
+
+        // User picks "Manual only" (0): never auto-fires, no matter how stale.
+        assert_eq!(decide(Some(0), five_hours_ago), None);
+        assert_eq!(decide(Some(0), None), None);
+
+        // Unset (None) → 24h default: the hour-old connection is not yet due,
+        // confirming the default is far more conservative than the 15m native
+        // cadence.
+        assert_eq!(decide(None, one_hour_ago), Some(false));
+        assert_eq!(
+            decide(None, Some(Duration::from_secs(25 * 3600))),
+            Some(true)
+        );
+
+        // A never-synced connection fires on any non-manual setting (the
+        // restart-recovery path).
+        assert_eq!(decide(Some(4 * 3600), None), Some(true));
+    }
+
+    fn audit_entry(
+        connection_id: &str,
+        scope: &str,
+        success: bool,
+        ts: DateTime<Utc>,
+    ) -> SyncAuditEntry {
+        SyncAuditEntry {
+            timestamp: ts,
+            source_id: connection_id.to_string(),
+            source_kind: "composio".to_string(),
+            scope: scope.to_string(),
+            items_fetched: 1,
+            batches: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_cost_usd: 0.0,
+            composio_actions_called: 1,
+            composio_cost_usd: 0.0,
+            actual_charged_usd: None,
+            duration_ms: 10,
+            success,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn index_last_success_keeps_latest_success_and_ignores_failures() {
+        let now = Utc::now();
+        let older = now - chrono::Duration::hours(6);
+        let newer = now - chrono::Duration::hours(1);
+        let entries = vec![
+            audit_entry("cmp-1", "gmail:cmp-1", true, older),
+            audit_entry("cmp-1", "gmail:cmp-1", true, newer), // newer success wins
+            audit_entry("cmp-1", "gmail:cmp-1", false, now),  // failure ignored
+            audit_entry("cmp-2", "slack:cmp-2", false, now),  // only-failure → absent
+        ];
+        let idx = index_last_success_by_connection(&entries);
+        assert_eq!(idx.get("cmp-1"), Some(&newer));
+        assert!(
+            !idx.contains_key("cmp-2"),
+            "a connection with only failed syncs is not indexed"
+        );
+    }
+
+    #[test]
+    fn index_last_success_falls_back_to_source_id_without_scope_suffix() {
+        let now = Utc::now();
+        // A non-composio kind is skipped entirely.
+        let entries = vec![
+            SyncAuditEntry {
+                source_kind: "github_repo".to_string(),
+                ..audit_entry("ignored", "github:org/repo", true, now)
+            },
+            // Composio entry whose scope has no ':' → key by source_id.
+            audit_entry("cmp-3", "noscope", true, now),
+        ];
+        let idx = index_last_success_by_connection(&entries);
+        assert!(idx.contains_key("cmp-3"));
+        assert!(!idx.contains_key("ignored"));
+    }
+
+    #[test]
+    fn persisted_since_last_sync_computes_and_saturates() {
+        let now = Utc::now();
+        let mut idx = HashMap::new();
+        idx.insert("cmp-1".to_string(), now - chrono::Duration::hours(3));
+        idx.insert("future".to_string(), now + chrono::Duration::hours(2));
+
+        let elapsed = persisted_since_last_sync(&idx, "cmp-1", now).unwrap();
+        // ~3h, allow a small window for test execution time.
+        assert!(elapsed >= Duration::from_secs(3 * 3600 - 5));
+        assert!(elapsed <= Duration::from_secs(3 * 3600 + 5));
+        // Clock skew (future timestamp) saturates to zero, not a huge value.
+        assert_eq!(
+            persisted_since_last_sync(&idx, "future", now),
+            Some(Duration::ZERO)
+        );
+        // Unknown connection → None (treated as never synced).
+        assert_eq!(persisted_since_last_sync(&idx, "unknown", now), None);
+    }
+
+    /// The cadence must survive a restart: with the in-memory map cold, the
+    /// persisted audit timestamp drives the due-check so a connection synced
+    /// 1h ago does NOT re-fire under a 4h setting, but one synced 5h ago does.
+    #[test]
+    fn cadence_survives_restart_via_persisted_audit() {
+        let now = Utc::now();
+        let mut idx = HashMap::new();
+        idx.insert("cmp-1".to_string(), now - chrono::Duration::hours(1));
+        idx.insert("cmp-2".to_string(), now - chrono::Duration::hours(5));
+
+        let interval = effective_interval_secs(15 * 60, Some(4 * 3600)).unwrap();
+
+        // cmp-1 (synced 1h ago) — in-memory cold, persisted fallback says NOT due.
+        let cmp1 = None.or_else(|| persisted_since_last_sync(&idx, "cmp-1", now));
+        assert!(!connection_is_due(interval, cmp1));
+
+        // cmp-2 (synced 5h ago) — persisted fallback says due.
+        let cmp2 = None.or_else(|| persisted_since_last_sync(&idx, "cmp-2", now));
+        assert!(connection_is_due(interval, cmp2));
+
+        // A connection with no persisted record still fires (truly fresh).
+        let fresh = None.or_else(|| persisted_since_last_sync(&idx, "cmp-new", now));
+        assert!(connection_is_due(interval, fresh));
     }
 
     /// A successful periodic tick produces a Composio-kind audit entry that

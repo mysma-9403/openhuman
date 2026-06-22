@@ -15,6 +15,9 @@ pub const MODEL_CHAT_V1: &str = "chat-v1";
 pub const MODEL_REASONING_QUICK_V1: &str = "reasoning-quick-v1";
 pub const MODEL_CODING_V1: &str = "coding-v1";
 pub const MODEL_SUMMARIZATION_V1: &str = "summarization-v1";
+/// Multimodal (image-input) tier. Managed backend serves this with the vision
+/// flag enabled; the vision sub-agent rides this tier via `hint:vision`.
+pub const MODEL_VISION_V1: &str = "vision-v1";
 /// Default model used when no explicit model is configured.
 ///
 /// Set to `chat-v1`, the backend's low-latency conversational tier. The
@@ -22,6 +25,16 @@ pub const MODEL_SUMMARIZATION_V1: &str = "summarization-v1";
 /// via `hint:chat`; reach for the slower `reasoning-v1` only when deep
 /// reasoning is needed.
 pub const DEFAULT_MODEL: &str = MODEL_CHAT_V1;
+
+/// Effective default global memory-sync cadence (seconds) used when
+/// [`Config::memory_sync_interval_secs`] is `None` — i.e. the user has not
+/// explicitly picked a schedule. 24h, matching the "Sync every 24h" preset
+/// surfaced in the Memory Sources UI. See issue #3302.
+pub const DEFAULT_MEMORY_SYNC_INTERVAL_SECS: u64 = 86_400;
+
+/// Preset memory-sync cadences (seconds) offered in the UI: 4h / 12h / 24h.
+/// "Manual only" is represented separately by `Some(0)`. See issue #3302.
+pub const MEMORY_SYNC_INTERVAL_PRESETS_SECS: [u64; 3] = [14_400, 43_200, 86_400];
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModelRegistryEntry {
@@ -131,6 +144,23 @@ pub struct Config {
     /// cadence, heartbeat/subconscious toggles. See issue #3117.
     #[serde(default)]
     pub agent_activity_level: AgentActivityLevel,
+
+    /// Global memory-sync cadence applied to **all** opted-in memory
+    /// sources, presented to the user like a backup schedule ("Sync
+    /// every 4h / 12h / 24h", plus "Manual only"). See issue #3302.
+    ///
+    /// Semantics consumed by `memory_sync::composio::periodic`:
+    /// - `None` — no explicit user choice; the effective cadence falls
+    ///   back to [`DEFAULT_MEMORY_SYNC_INTERVAL_SECS`] (24h).
+    /// - `Some(0)` — **Manual only**: the periodic scheduler skips
+    ///   auto-sync entirely; manual `memory_sources_sync` still works.
+    /// - `Some(n)` — sync every `n` seconds, applied per connection as
+    ///   `max(n, provider_default)` so it overrides the provider's own
+    ///   cadence while never syncing more often than the provider intends.
+    ///
+    /// Overridable via `OPENHUMAN_MEMORY_SYNC_INTERVAL_SECS` (`0` = manual).
+    #[serde(default)]
+    pub memory_sync_interval_secs: Option<u64>,
 
     #[serde(default)]
     pub agent: AgentConfig,
@@ -308,6 +338,11 @@ pub struct Config {
     /// Provider string for code generation and refactor workloads.
     #[serde(default)]
     pub coding_provider: Option<String>,
+
+    /// Provider string for the multimodal / image-understanding workload
+    /// (the vision sub-agent). Managed default resolves to `vision-v1`.
+    #[serde(default)]
+    pub vision_provider: Option<String>,
 
     /// Provider string for memory-tree extract + summarise workloads.
     #[serde(default)]
@@ -548,6 +583,7 @@ impl Config {
             "reasoning" => self.reasoning_provider.as_deref(),
             "agentic" => self.agentic_provider.as_deref(),
             "coding" => self.coding_provider.as_deref(),
+            "vision" => self.vision_provider.as_deref(),
             "memory" => self.memory_provider.as_deref(),
             "embeddings" => self.embeddings_provider.as_deref(),
             "heartbeat" => self.heartbeat_provider.as_deref(),
@@ -677,6 +713,7 @@ impl Default for Config {
             scheduler: SchedulerConfig::default(),
             scheduler_gate: SchedulerGateConfig::default(),
             agent_activity_level: AgentActivityLevel::default(),
+            memory_sync_interval_secs: None,
             agent: AgentConfig::default(),
             orchestrator: OrchestratorModelConfig::default(),
             teams: HashMap::new(),
@@ -718,6 +755,7 @@ impl Default for Config {
             reasoning_provider: None,
             agentic_provider: None,
             coding_provider: None,
+            vision_provider: None,
             memory_provider: None,
             embeddings_provider: None,
             heartbeat_provider: None,

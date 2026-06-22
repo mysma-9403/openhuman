@@ -26,6 +26,7 @@ import { isTauri } from '../../utils/tauriCommands/common';
 import {
   type ClientConfig,
   type CloudProviderCreds,
+  type ModelRegistryEntry,
   type ModelSettingsUpdate,
   openhumanGetClientConfig,
   openhumanUpdateLocalAiSettings,
@@ -50,6 +51,7 @@ export type WorkloadId =
   | 'reasoning'
   | 'agentic'
   | 'coding'
+  | 'vision'
   | 'memory'
   | 'heartbeat'
   | 'learning'
@@ -63,6 +65,14 @@ export const BACKGROUND_WORKLOADS: WorkloadId[] = [
   'subconscious',
 ];
 export const ALL_WORKLOADS: WorkloadId[] = [...CHAT_WORKLOADS, ...BACKGROUND_WORKLOADS];
+
+// Workloads that own a `<id>_provider` config field and must round-trip through
+// settings serialization. Includes the tier-specific `vision` workload, which
+// is deliberately NOT part of `CHAT_WORKLOADS`/`ALL_WORKLOADS`: it defaults to
+// the managed `vision-v1` tier and is a delegate (like agentic BYOK), so it does
+// not participate in the billing-suppression / "routed away from OpenHuman"
+// checks in `useUsageState`.
+export const ROUTABLE_WORKLOADS: WorkloadId[] = [...ALL_WORKLOADS, 'vision'];
 export const OPENAI_CODEX_OAUTH_MISSING_AUTH_URL = 'OPENAI_CODEX_OAUTH_MISSING_AUTH_URL';
 export const OPENAI_CODEX_OAUTH_MISSING_CALLBACK_URL = 'OPENAI_CODEX_OAUTH_MISSING_CALLBACK_URL';
 
@@ -132,6 +142,62 @@ const PROVIDER_MODEL_TEST_TIMEOUT_MS = 120_000;
 export interface AISettings {
   cloudProviders: CloudProviderView[];
   routing: Record<WorkloadId, ProviderRef>;
+  /**
+   * Per-model registry carrying each model's user-set `vision` flag, keyed by
+   * `(provider slug, model id)`. Surfaced in the custom-model dialog; gates chat
+   * image attachments for custom/BYOK models.
+   */
+  modelRegistry: ModelRegistryEntry[];
+  /**
+   * #3767: authoritative, core-side per-tier decision (mirrors the Rust factory's
+   * real routing resolution). For each chat-mode tier (`chat` = Quick mode,
+   * `reasoning` = Reasoning mode), true when that tier runs on a non-managed
+   * provider the user funds themselves (a usable BYO key, local runtime, or
+   * claude-code). `useUsageState` checks the tier matching the selected mode so
+   * the "buy credits" prompt is hidden exactly when the core says that mode does
+   * not bill managed credits. Each entry is `false` when the core snapshot
+   * predates this field (conservative — keep gating).
+   *
+   * Optional: `loadAISettings` always populates it, but AIPanel reconstructs a
+   * draft `AISettings` for `saveAISettings` (which ignores this read-only field)
+   * and test fixtures may omit it — consumers treat a missing entry as `false`.
+   */
+  creditsBypass?: { chat: boolean; reasoning: boolean };
+}
+
+/** Re-export so callers (e.g. the AI panel) can reference the entry type. */
+export type { ModelRegistryEntry };
+
+/** Find a model's vision flag in the registry, matching by (provider, id).
+ *  Tolerates an undefined registry (older snapshots / transient load state). */
+export function modelRegistryVision(
+  registry: ModelRegistryEntry[] | undefined,
+  provider: string,
+  id: string
+): boolean {
+  return (registry ?? []).some(e => e.provider === provider && e.id === id && e.vision);
+}
+
+/**
+ * Upsert a model's vision flag, returning a new array. Matches by
+ * `(provider, id)`; a `vision: false` entry is removed (absence ⇒ no vision).
+ */
+export function upsertModelRegistryVision(
+  registry: ModelRegistryEntry[] | undefined,
+  provider: string,
+  id: string,
+  vision: boolean
+): ModelRegistryEntry[] {
+  const base = registry ?? [];
+  const without = base.filter(e => !(e.provider === provider && e.id === id));
+  if (!vision) {
+    return without;
+  }
+  const existing = base.find(e => e.provider === provider && e.id === id);
+  return [
+    ...without,
+    { id, provider, cost_per_1m_output: existing?.cost_per_1m_output ?? 0, vision: true },
+  ];
 }
 
 // ─── Read path: load + parse ───────────────────────────────────────────────
@@ -238,6 +304,7 @@ export async function loadAISettings(): Promise<AISettings> {
     reasoning: parseProviderString(config.reasoning_provider),
     agentic: parseProviderString(config.agentic_provider),
     coding: parseProviderString(config.coding_provider),
+    vision: parseProviderString(config.vision_provider),
     memory: parseProviderString(config.memory_provider),
     heartbeat: parseProviderString(config.heartbeat_provider),
     learning: parseProviderString(config.learning_provider),
@@ -264,7 +331,18 @@ export async function loadAISettings(): Promise<AISettings> {
     );
   }
 
-  return { cloudProviders, routing };
+  // Per-model registry (vision flags). Defensive default for older snapshots.
+  const modelRegistry: ModelRegistryEntry[] = config.model_registry ?? [];
+
+  // #3767: authoritative per-tier bypass flags from the core. Each entry
+  // defaults to false for older snapshots that don't carry it (conservative —
+  // keep the credits gate on).
+  const creditsBypass = {
+    chat: config.credits_bypass?.chat === true,
+    reasoning: config.credits_bypass?.reasoning === true,
+  };
+
+  return { cloudProviders, routing, modelRegistry, creditsBypass };
 }
 // ─── Write path: diff + save ───────────────────────────────────────────────
 
@@ -302,7 +380,7 @@ export async function saveAISettings(prev: AISettings, next: AISettings): Promis
       }));
   }
 
-  for (const w of ALL_WORKLOADS) {
+  for (const w of ROUTABLE_WORKLOADS) {
     const a = serializeProviderRef(prev.routing[w]);
     const b = serializeProviderRef(next.routing[w]);
     if (a !== b) {
@@ -310,10 +388,35 @@ export async function saveAISettings(prev: AISettings, next: AISettings): Promis
     }
   }
 
+  // Per-model registry (vision flags): any change → send the full list.
+  if (!modelRegistriesEqual(prev.modelRegistry, next.modelRegistry)) {
+    patch.model_registry = next.modelRegistry.map(
+      ({ id, provider, cost_per_1m_output, vision }) => ({
+        id,
+        provider,
+        cost_per_1m_output,
+        vision,
+      })
+    );
+  }
+
   if (Object.keys(patch).length === 0) {
     return;
   }
   await openhumanUpdateModelSettings(patch);
+}
+
+/** Order-insensitive structural equality for two model registries. */
+function modelRegistriesEqual(a: ModelRegistryEntry[], b: ModelRegistryEntry[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  const key = (e: ModelRegistryEntry) => `${e.provider} ${e.id}`;
+  const bByKey = new Map(b.map(e => [key(e), e]));
+  return a.every(e => {
+    const m = bByKey.get(key(e));
+    return !!m && m.vision === e.vision && m.cost_per_1m_output === e.cost_per_1m_output;
+  });
 }
 
 // ─── API key management (per cloud provider slug) ──────────────────────────
