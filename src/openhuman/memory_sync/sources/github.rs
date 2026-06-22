@@ -177,7 +177,6 @@ pub async fn run_github_sync(
     // closure lifetime stays tied to this frame (avoids the "FnOnce is not
     // general enough" error). `buffered` preserves order so outputs[i] maps to
     // batches[i].
-    let batches: Vec<_> = batches.into_iter().collect();
     let concurrency = summarise_concurrency(config.workload_uses_local("memory"));
     tracing::debug!(
         source_id = %source_id,
