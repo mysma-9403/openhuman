@@ -932,12 +932,17 @@ mod tests {
         let end_window = now + Duration::minutes(120);
         let start = now + Duration::minutes(30);
 
-        let conns: Vec<ComposioConnection> = (1..=4)
+        // Drive *more* connections than the cap (N = CALENDAR_FANOUT_CONCURRENCY
+        // + 2) so this test fails if the implementation ever regresses to an
+        // unbounded fan-out: with exactly `CALENDAR_FANOUT_CONCURRENCY`
+        // connections the cap is indistinguishable from no cap at all.
+        let total = CALENDAR_FANOUT_CONCURRENCY + 2;
+        let conns: Vec<ComposioConnection> = (1..=total)
             .map(|n| conn(&format!("cal-{n}"), "googlecalendar", "ACTIVE"))
             .collect();
 
         let mut exec = FakeExecutor::new(30);
-        for n in 1..=4 {
+        for n in 1..=total {
             exec = exec.with(
                 &format!("cal-{n}"),
                 Ok(in_window_event(&format!("evt-{n}"), start)),
@@ -946,11 +951,16 @@ mod tests {
         let max_inflight = exec.max_inflight.clone();
 
         let events = collect_calendar_events_buffered(&exec, &conns, 120, now, end_window).await;
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), total);
+        let observed = max_inflight.load(Ordering::SeqCst);
         assert!(
-            max_inflight.load(Ordering::SeqCst) > 1,
-            "fan-out must overlap fetches (observed max in-flight = {})",
-            max_inflight.load(Ordering::SeqCst)
+            observed > 1,
+            "fan-out must overlap fetches (observed max in-flight = {observed})"
+        );
+        assert!(
+            observed <= CALENDAR_FANOUT_CONCURRENCY,
+            "fan-out must stay within the concurrency cap of {CALENDAR_FANOUT_CONCURRENCY} \
+             (observed max in-flight = {observed})"
         );
     }
 
