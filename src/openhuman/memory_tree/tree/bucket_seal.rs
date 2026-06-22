@@ -1100,6 +1100,16 @@ pub async fn seal_document_subtree(
         // the borrowed `batch` lifetime, which fails ("implementation of
         // `FnOnce` is not general enough") once this async fn is spawned. Eager
         // collection ties each future to this stack frame's concrete lifetime.
+        if batches.len() > 1 {
+            log::debug!(
+                "[tree::bucket_seal] doc-subtree concurrent seal tree_id={} doc_id_hash={} level={} batches={} concurrency={}",
+                tree.id,
+                redact(doc_id),
+                current_level,
+                batches.len(),
+                DOC_SUBTREE_SEAL_CONCURRENCY
+            );
+        }
         let batch_futures: Vec<_> = batches
             .iter()
             .map(|batch| {
