@@ -332,6 +332,41 @@ fn search_by_vector_returns_metadata_of_surviving_rows() {
     }
 }
 
+/// A row with corrupt metadata JSON (e.g. a hand-edited or partially written
+/// DB) must not break the search — the deferred parse falls back to `Null`
+/// rather than dropping the row or erroring. Inserted raw because
+/// `insert_with_vector` always serializes valid JSON.
+#[test]
+fn search_by_vector_falls_back_to_null_on_invalid_metadata() {
+    let store = fake_store(3);
+    {
+        let conn = store.conn.lock();
+        conn.execute(
+            "INSERT INTO vectors (id, namespace, text, embedding, metadata, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "bad",
+                "ns",
+                "t",
+                vec_to_bytes(&[1.0, 0.0, 0.0]),
+                "{not valid json",
+                0.0_f64,
+                0.0_f64
+            ],
+        )
+        .unwrap();
+    }
+
+    let results = store.search_by_vector("ns", &[1.0, 0.0, 0.0], 5).unwrap();
+
+    assert_eq!(results.len(), 1, "the row must still be returned");
+    assert_eq!(results[0].id, "bad");
+    assert!(
+        results[0].metadata.is_null(),
+        "invalid metadata json must fall back to Null"
+    );
+}
+
 #[test]
 fn search_by_vector_scores_correct() {
     let store = fake_store(3);

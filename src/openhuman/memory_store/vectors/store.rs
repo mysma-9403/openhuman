@@ -364,15 +364,27 @@ impl VectorStore {
         });
         scored.truncate(limit);
 
-        // Parse metadata only for the rows that survived truncation.
+        // Parse metadata only for the rows that survived truncation. Invalid
+        // JSON falls back to Null, but log it so data issues stay diagnosable.
         let results: Vec<SearchResult> = scored
             .into_iter()
-            .map(|row| SearchResult {
-                id: row.id,
-                namespace: row.namespace,
-                text: row.text,
-                score: row.score,
-                metadata: serde_json::from_str(&row.meta_str).unwrap_or(serde_json::Value::Null),
+            .map(|row| {
+                let metadata = serde_json::from_str(&row.meta_str).unwrap_or_else(|err| {
+                    tracing::debug!(
+                        target: "embeddings.store",
+                        "[vector-store] invalid metadata json: id={}, ns={}, err={err}",
+                        row.id,
+                        row.namespace,
+                    );
+                    serde_json::Value::Null
+                });
+                SearchResult {
+                    id: row.id,
+                    namespace: row.namespace,
+                    text: row.text,
+                    score: row.score,
+                    metadata,
+                }
             })
             .collect();
 
