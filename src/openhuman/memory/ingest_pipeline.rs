@@ -290,7 +290,7 @@ async fn persist(
     let source_id_for_store = source_id.to_string();
     let raw_refs_for_store = raw_refs_for_chunks.clone();
     let written = tokio::task::spawn_blocking(move || -> Result<Option<usize>> {
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashSet;
         chunk_store::with_connection(&config_owned, |conn| {
             // IMMEDIATE, not the default DEFERRED: this transaction reads
             // (get_chunk_lifecycle_status_tx) before it writes
@@ -362,11 +362,16 @@ async fn persist(
             // insert a new row that picks up the column DEFAULT — so reading
             // post-upsert can't distinguish "brand new" from
             // "already-admitted-from-prior-ingest".
-            let mut prior: HashMap<String, Option<String>> = HashMap::new();
-            for s in &staged_for_store {
-                let status = chunk_store::get_chunk_lifecycle_status_tx(&tx, &s.chunk.id)?;
-                prior.insert(s.chunk.id.clone(), status);
-            }
+            // Batch the prior-lifecycle read: one `SELECT … WHERE id IN (…)`
+            // instead of one round-trip per staged chunk. Keeping this short
+            // matters because it runs inside the write transaction, and SQLite
+            // serialises writers. `prior` maps a chunk id to its pre-upsert
+            // status; ids with no prior row are simply absent (a batch miss ==
+            // the old per-id `Ok(None)`), so the lookup below treats a miss as
+            // "genuinely new".
+            let staged_ids: Vec<String> =
+                staged_for_store.iter().map(|s| s.chunk.id.clone()).collect();
+            let prior = chunk_store::get_chunk_lifecycle_statuses_tx(&tx, &staged_ids)?;
 
             let n = chunk_store::upsert_staged_chunks_tx(&tx, &staged_for_store)?;
 
@@ -392,7 +397,7 @@ async fn persist(
             // leave the lifecycle alone and skip the extract enqueue.
             let mut to_schedule: HashSet<String> = HashSet::new();
             for s in &staged_for_store {
-                let pre = prior.get(&s.chunk.id).cloned().flatten();
+                let pre = prior.get(&s.chunk.id).cloned();
                 let needs_processing = matches!(
                     pre.as_deref(),
                     None | Some(chunk_store::CHUNK_STATUS_PENDING_EXTRACTION),

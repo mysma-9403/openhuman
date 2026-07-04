@@ -807,11 +807,64 @@ pub fn get_chunk_lifecycle_status(config: &Config, chunk_id: &str) -> Result<Opt
     })
 }
 
-pub(crate) fn get_chunk_lifecycle_status_tx(
+/// Batched form of the per-chunk lifecycle read, for use inside a write
+/// transaction.
+///
+/// Contract mirror of looping [`get_chunk_lifecycle_status`] over `chunk_ids`,
+/// but in `O(ceil(n / MAX_FETCH_BATCH))` SQLite round-trips instead of `O(n)`.
+/// The ingest pipeline reads every staged chunk's prior lifecycle *before* the
+/// upsert, inside its write transaction (issue #707) — doing that one
+/// `SELECT … WHERE id = ?` at a time is an N+1 that lengthens the write-lock
+/// critical section for multi-chunk documents. Batching keeps the transaction
+/// short, which matters because SQLite serialises writers.
+///
+/// The returned map contains only ids that exist in `mem_tree_chunks` with a
+/// non-null status; missing (or null-status) ids are silently absent, matching
+/// the single-id helper returning `Ok(None)`. Callers look each id up and treat
+/// a miss as "no prior row".
+pub(crate) fn get_chunk_lifecycle_statuses_tx(
     tx: &Transaction<'_>,
-    chunk_id: &str,
-) -> Result<Option<String>> {
-    get_chunk_lifecycle_status_conn(tx, chunk_id)
+    chunk_ids: &[String],
+) -> Result<HashMap<String, String>> {
+    get_chunk_lifecycle_statuses_conn(tx, chunk_ids)
+}
+
+fn get_chunk_lifecycle_statuses_conn(
+    conn: &Connection,
+    chunk_ids: &[String],
+) -> Result<HashMap<String, String>> {
+    let mut out: HashMap<String, String> = HashMap::with_capacity(chunk_ids.len());
+    if chunk_ids.is_empty() {
+        return Ok(out);
+    }
+    for window in chunk_ids.chunks(MAX_FETCH_BATCH) {
+        // Positional placeholders `?1, ?2, …, ?n` — rusqlite binds 1..n in the
+        // order values are passed. Same shape as `get_chunks_batch`.
+        let placeholders = (1..=window.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, lifecycle_status FROM mem_tree_chunks WHERE id IN ({placeholders})"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .context("prepare get_chunk_lifecycle_statuses")?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            window.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .context("query get_chunk_lifecycle_statuses")?;
+        for row in rows {
+            let (id, status) = row.context("decode get_chunk_lifecycle_statuses row")?;
+            if let Some(status) = status {
+                out.insert(id, status);
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn get_chunk_lifecycle_status_conn(conn: &Connection, chunk_id: &str) -> Result<Option<String>> {

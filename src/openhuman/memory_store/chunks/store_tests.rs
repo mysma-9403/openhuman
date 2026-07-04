@@ -1518,6 +1518,69 @@ fn get_chunks_batch_empty_input_and_missing_ids() {
     assert!(map.get("ghost:no-such-2").is_none());
 }
 
+// ---------- get_chunk_lifecycle_statuses_tx ----------
+//
+// Contract: batched, transaction-scoped form of the per-chunk lifecycle read.
+// Equivalent to looping the single-id `get_chunk_lifecycle_status` but in
+// `O(ceil(n / MAX_FETCH_BATCH))` round-trips. Only ids with a present,
+// non-null row appear in the map; misses are silently absent (same as the
+// single-id `Ok(None)`) — which is what the ingest pipeline relies on to
+// distinguish genuinely-new chunks from ones already past extraction.
+
+#[test]
+fn lifecycle_statuses_batch_matches_single_reads() {
+    let (_tmp, cfg) = test_config();
+    let c1 = sample_chunk("slack:#eng", 0, 1_700_000_000_000);
+    let c2 = sample_chunk("slack:#eng", 1, 1_700_000_000_000);
+    let c3 = sample_chunk("slack:#ops", 0, 1_700_000_000_000);
+    upsert_chunks(&cfg, &[c1.clone(), c2.clone(), c3.clone()]).unwrap();
+    set_chunk_lifecycle_status(&cfg, &c1.id, "admitted").unwrap();
+    set_chunk_lifecycle_status(&cfg, &c2.id, "sealed").unwrap();
+    // c3 keeps whatever the insert default is — the batch must still agree
+    // with the single-id read for it, without the test hardcoding that value.
+
+    let ids = vec![
+        c1.id.clone(),
+        c2.id.clone(),
+        c3.id.clone(),
+        "ghost:no-such".to_string(),
+    ];
+    let map = with_connection(&cfg, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        let m = get_chunk_lifecycle_statuses_tx(&tx, &ids)?;
+        tx.commit()?;
+        Ok(m)
+    })
+    .unwrap();
+
+    assert_eq!(map.get(&c1.id).map(String::as_str), Some("admitted"));
+    assert_eq!(map.get(&c2.id).map(String::as_str), Some("sealed"));
+    // Batch result must equal looping the single-id read, for every id.
+    for id in [&c1.id, &c2.id, &c3.id] {
+        let single = get_chunk_lifecycle_status(&cfg, id).unwrap();
+        assert_eq!(
+            map.get(id),
+            single.as_ref(),
+            "batch must match single-id read for {id}"
+        );
+    }
+    // Missing ids are silently absent (mirrors the single-id `Ok(None)`).
+    assert!(map.get("ghost:no-such").is_none());
+}
+
+#[test]
+fn lifecycle_statuses_batch_empty_input_issues_no_query() {
+    let (_tmp, cfg) = test_config();
+    let map = with_connection(&cfg, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        let m = get_chunk_lifecycle_statuses_tx(&tx, &[])?;
+        tx.commit()?;
+        Ok(m)
+    })
+    .unwrap();
+    assert!(map.is_empty());
+}
+
 // ---------- get_chunk_embeddings_for_signature_batch ----------
 //
 // Contract: equivalent to looping `get_chunk_embedding_for_signature`
