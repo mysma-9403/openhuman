@@ -94,6 +94,17 @@ fn parse_message_path(path: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// True when `path` addresses the announcements endpoint family
+/// (`/announcements/…`), tolerant of base-path prefixes such as
+/// `/api/v1/announcements/latest`. Segment-aware, so a substring like
+/// `/foo/announcementsxyz` does not match. Used to scope the best-effort 404
+/// suppression to this cosmetic endpoint (see `authed_json`).
+fn is_announcements_path(path: &str) -> bool {
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .any(|segment| segment == "announcements")
+}
+
 const CLIENT_VERSION_HEADER_MAX_LEN: usize = 64;
 
 /// Max bytes of the `body_shape` key-name list echoed into the `authed_json`
@@ -698,6 +709,35 @@ impl BackendOAuthClient {
                     );
                     anyhow::bail!(
                         "channel message not found (404) on {} {}",
+                        method.as_str(),
+                        url.path(),
+                    );
+                }
+
+                // 404 on the announcements endpoint is an expected state under
+                // staged backend deploys / rollback — the route
+                // (tinyhumansai/backend#1064) may not be shipped yet.
+                // Announcements-on-init (#4125) is a best-effort, fire-once,
+                // cosmetic feature, so a missing announcement is never worth a
+                // Sentry event. Suppress the report and bail with an
+                // announcements-scoped message; the caller degrades to "no
+                // announcement". Collapses the double-report at
+                // OPENHUMAN-TAURI-HW0 / KHX (~452 events). Non-404 errors on
+                // this path still report below, so this is not a blindfold.
+                if is_announcements_path(url.path()) {
+                    tracing::info!(
+                        domain = "backend_api",
+                        operation = "authed_json",
+                        method = method.as_str(),
+                        path = url.path(),
+                        status = status_code,
+                        failure = "non_2xx",
+                        "[backend_api] announcements 404 on {} {} — cosmetic best-effort endpoint, suppressing Sentry",
+                        method.as_str(),
+                        url.path(),
+                    );
+                    anyhow::bail!(
+                        "announcements not found (404) on {} {}",
                         method.as_str(),
                         url.path(),
                     );

@@ -1,6 +1,7 @@
 use super::{
-    backend_api_body_shape, flatten_authed_error, key_bytes_from_string, parse_message_path,
-    sanitize_client_version, BackendApiError, BackendOAuthClient, BACKEND_API_BODY_SHAPE_MAX_BYTES,
+    backend_api_body_shape, flatten_authed_error, is_announcements_path, key_bytes_from_string,
+    parse_message_path, sanitize_client_version, BackendApiError, BackendOAuthClient,
+    BACKEND_API_BODY_SHAPE_MAX_BYTES,
 };
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -356,6 +357,74 @@ async fn authed_json_surfaces_message_not_found_on_404() {
     };
     assert_eq!(provider, "discord");
     assert_eq!(message_id, "abc");
+}
+
+#[tokio::test]
+async fn authed_json_suppresses_announcements_404() {
+    // #4401 (OPENHUMAN-TAURI-HW0 / KHX): a 404 on the cosmetic announcements
+    // endpoint (route may not be shipped under a staged deploy / rollback) must
+    // be suppressed — no `report_error` — so the caller degrades to "no
+    // announcement". It takes the announcements-scoped bail branch (distinct
+    // message) rather than the generic report_error + bail path, and is NOT
+    // classified as the typed channel-message state.
+    let app = Router::new().route(
+        "/announcements/latest",
+        get(|| async { (axum::http::StatusCode::NOT_FOUND, "Not Found") }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let base_url = format!("http://{addr}");
+    let client = BackendOAuthClient::new(&base_url).unwrap();
+
+    let err = client
+        .authed_json("mock-jwt", Method::GET, "/announcements/latest", None)
+        .await
+        .unwrap_err();
+
+    // Not the typed channel-message state.
+    assert!(
+        err.downcast_ref::<BackendApiError>().is_none(),
+        "announcements 404 must not be classified as a typed channel error"
+    );
+    // Took the announcements suppression branch: its message is distinct from
+    // the generic report_error + bail path ("… failed (404): …").
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("announcements not found"),
+        "expected the announcements-scoped suppression message, got: {msg}"
+    );
+}
+
+// ── is_announcements_path unit tests (TAURI-HW0/KHX #4401 scoping guard) ──────
+
+#[test]
+fn announcements_path_canonical_form() {
+    assert!(is_announcements_path("/announcements/latest"));
+}
+
+#[test]
+fn announcements_path_tolerates_base_prefix() {
+    assert!(is_announcements_path("/api/v1/announcements/latest"));
+}
+
+#[test]
+fn announcements_path_tolerates_trailing_slash() {
+    assert!(is_announcements_path("/announcements/latest/"));
+}
+
+#[test]
+fn announcements_path_rejects_non_announcement_paths() {
+    // A substring that is not a whole path segment must not match — the
+    // suppression stays scoped to the real endpoint, never a code bug elsewhere.
+    assert!(!is_announcements_path("/foo/announcementsxyz"));
+    assert!(!is_announcements_path("/channels/telegram/messages/1"));
+    assert!(!is_announcements_path("/auth/profile"));
+    assert!(!is_announcements_path("/"));
+    assert!(!is_announcements_path(""));
 }
 
 #[tokio::test]

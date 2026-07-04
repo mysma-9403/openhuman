@@ -33,7 +33,30 @@ async fn get_authed_value(config: &Config, method: Method, path: &str) -> Result
 /// Fetch the latest active announcement for the signed-in user.
 /// Maps to `GET /announcements/latest`. The backend returns the announcement
 /// object or `null` when nothing qualifies; both pass through verbatim.
+///
+/// Announcements-on-init (#4125) is a best-effort, fire-once, cosmetic feature:
+/// a missing or unavailable announcement is never worth surfacing an error for.
+/// Any fetch failure — a 404 under a staged backend deploy / rollback
+/// (tinyhumansai/backend#1064), a lapsed session, transient infra — degrades to
+/// "no announcement" (`null`) instead of propagating an `Err` that the RPC layer
+/// would re-wrap into a second Sentry event (OPENHUMAN-TAURI-KHX). The frontend
+/// service documents the same intent. The REST layer still reports genuinely
+/// unexpected (non-404) errors to Sentry, so this is graceful degradation, not a
+/// blindfold. See #4401.
 pub async fn get_latest_announcement(config: &Config) -> Result<RpcOutcome<Value>, String> {
-    let data = get_authed_value(config, Method::GET, "/announcements/latest").await?;
-    Ok(RpcOutcome::single_log(data, "latest announcement fetched"))
+    match get_authed_value(config, Method::GET, "/announcements/latest").await {
+        Ok(data) => Ok(RpcOutcome::single_log(data, "latest announcement fetched")),
+        Err(e) => {
+            tracing::info!(
+                domain = "announcements",
+                operation = "get_latest_announcement",
+                error = %e,
+                "[announcements] latest fetch failed — degrading to no announcement (null)"
+            );
+            Ok(RpcOutcome::single_log(
+                Value::Null,
+                "no announcement (fetch failed, degraded to null)",
+            ))
+        }
+    }
 }
