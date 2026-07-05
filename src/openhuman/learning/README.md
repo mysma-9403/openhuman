@@ -53,7 +53,7 @@ Not re-exported but public within the module: `candidate::global()`, the `linked
 
 ## RPC / controllers
 
-Namespace `learning` (wired into `src/core/all.rs`; 11 controllers). Methods:
+Namespace `learning` (wired into `src/core/all.rs`; 12 controllers). Methods:
 
 | Method | Purpose |
 | --- | --- |
@@ -63,6 +63,7 @@ Namespace `learning` (wired into `src/core/all.rs`; 11 controllers). Methods:
 | `learning.cache_stats` | Cache totals + per-state and per-class breakdown. |
 | `learning.list_facets` | List Active + Provisional facets, optional `class` filter. |
 | `learning.get_facet` | Fetch one facet by `class` + `key` suffix. |
+| `learning.facet_provenance` | Evidence behind one facet — its stored `evidence_refs` rendered as `{ type, label, ids }` entries for a "what I know about you" surface. |
 | `learning.update_facet` | Set a facet value and pin it (`user_state = Pinned`). |
 | `learning.pin_facet` / `learning.unpin_facet` | Toggle `user_state` Pinned ↔ Auto. |
 | `learning.forget_facet` | Mark `Dropped` + `user_state = Forgotten` (blocks re-promotion). |

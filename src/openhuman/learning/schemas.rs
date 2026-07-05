@@ -15,6 +15,7 @@ pub fn all_learning_controller_schemas() -> Vec<ControllerSchema> {
         learning_schemas("learning_cache_stats"),
         learning_schemas("learning_list_facets"),
         learning_schemas("learning_get_facet"),
+        learning_schemas("learning_facet_provenance"),
         learning_schemas("learning_update_facet"),
         learning_schemas("learning_pin_facet"),
         learning_schemas("learning_unpin_facet"),
@@ -48,6 +49,10 @@ pub fn all_learning_registered_controllers() -> Vec<RegisteredController> {
         RegisteredController {
             schema: learning_schemas("learning_get_facet"),
             handler: handle_get_facet,
+        },
+        RegisteredController {
+            schema: learning_schemas("learning_facet_provenance"),
+            handler: handle_facet_provenance,
         },
         RegisteredController {
             schema: learning_schemas("learning_update_facet"),
@@ -287,6 +292,56 @@ pub fn learning_schemas(function: &str) -> ControllerSchema {
                 },
             ],
         },
+        "learning_facet_provenance" => ControllerSchema {
+            namespace: "learning",
+            function: "facet_provenance",
+            description: "The provenance behind one facet — the evidence the assistant learned it \
+                 from, rendered for a \"what I know about you\" surface. Each entry carries a \
+                 `type`, a human-readable `label`, and the source's own identifiers.",
+            inputs: vec![
+                FieldSchema {
+                    name: "class",
+                    ty: TypeSchema::String,
+                    comment: "Facet class: style | identity | tooling | veto | goal | channel.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "key",
+                    ty: TypeSchema::String,
+                    comment:
+                        "Key suffix within the class (e.g. \"verbosity\" for style/verbosity).",
+                    required: true,
+                },
+            ],
+            outputs: vec![
+                FieldSchema {
+                    name: "found",
+                    ty: TypeSchema::Bool,
+                    comment: "Whether the facet exists.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "key",
+                    ty: TypeSchema::String,
+                    comment: "The resolved full facet key (class/suffix).",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "evidence_count",
+                    ty: TypeSchema::U64,
+                    comment: "Total observations that reinforced the facet (may exceed the \
+                        number of traceable sources below).",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "evidence",
+                    ty: TypeSchema::Array(Box::new(TypeSchema::Json)),
+                    comment: "Traceable sources, each `{ type, label, …ref-specific ids }` — \
+                        e.g. episodic / tree_topic / document_chunk / email_message / provider.",
+                    required: true,
+                },
+            ],
+        },
         "learning_update_facet" => ControllerSchema {
             namespace: "learning",
             function: "update_facet",
@@ -438,13 +493,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_schemas_returns_eleven() {
-        assert_eq!(all_learning_controller_schemas().len(), 11);
+    fn all_schemas_returns_twelve() {
+        assert_eq!(all_learning_controller_schemas().len(), 12);
     }
 
     #[test]
-    fn all_controllers_returns_eleven() {
-        assert_eq!(all_learning_registered_controllers().len(), 11);
+    fn all_controllers_returns_twelve() {
+        assert_eq!(all_learning_registered_controllers().len(), 12);
+    }
+
+    #[test]
+    fn facet_provenance_schema_shape() {
+        let s = learning_schemas("learning_facet_provenance");
+        assert_eq!(s.namespace, "learning");
+        assert_eq!(s.function, "facet_provenance");
+        let required_inputs: Vec<_> = s
+            .inputs
+            .iter()
+            .filter(|f| f.required)
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(required_inputs, vec!["class", "key"]);
+        let out_names: Vec<_> = s.outputs.iter().map(|f| f.name).collect();
+        assert_eq!(
+            out_names,
+            vec!["found", "key", "evidence_count", "evidence"]
+        );
+    }
+
+    #[test]
+    fn provenance_entry_renders_type_label_and_ids() {
+        use crate::openhuman::learning::candidate::EvidenceRef;
+
+        let episodic = provenance_entry(&EvidenceRef::Episodic { episodic_id: 42 });
+        assert_eq!(episodic["type"], "episodic");
+        assert_eq!(episodic["label"], "Episodic memory #42");
+        assert_eq!(episodic["episodic_id"], 42);
+
+        let topic = provenance_entry(&EvidenceRef::TreeTopic {
+            topic_id: "roadmap".into(),
+        });
+        assert_eq!(topic["type"], "tree_topic");
+        assert_eq!(topic["label"], "Topic \"roadmap\"");
+        assert_eq!(topic["topic_id"], "roadmap");
+
+        let email = provenance_entry(&EvidenceRef::EmailMessage {
+            source_id: "gmail:abc".into(),
+            message_id: "m1".into(),
+        });
+        assert_eq!(email["type"], "email_message");
+        assert_eq!(email["message_id"], "m1");
+
+        // The batch wrapper preserves order and length.
+        let entries = provenance_entries(&[
+            EvidenceRef::Episodic { episodic_id: 1 },
+            EvidenceRef::Episodic { episodic_id: 2 },
+        ]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["episodic_id"], 1);
+        assert_eq!(entries[1]["episodic_id"], 2);
     }
 
     #[test]
@@ -738,6 +845,86 @@ fn facet_to_json(f: &crate::openhuman::memory_store::profile::ProfileFacet) -> s
     })
 }
 
+/// Render one [`EvidenceRef`] as a UI-friendly provenance entry: a stable
+/// `type` discriminator, a short human-readable `label`, and the ref's own
+/// identifier fields so a caller can deep-link into the source later. Pure —
+/// no cross-store lookups — so it is cheap and deterministic.
+fn provenance_entry(r: &crate::openhuman::learning::candidate::EvidenceRef) -> serde_json::Value {
+    use crate::openhuman::learning::candidate::EvidenceRef as E;
+    match r {
+        E::Episodic { episodic_id } => serde_json::json!({
+            "type": "episodic",
+            "label": format!("Episodic memory #{episodic_id}"),
+            "episodic_id": episodic_id,
+        }),
+        E::EpisodicWindow { from_id, to_id } => serde_json::json!({
+            "type": "episodic_window",
+            "label": format!("Episodic memories #{from_id}–#{to_id}"),
+            "from_id": from_id,
+            "to_id": to_id,
+        }),
+        E::SourceSummary { summary_id } => serde_json::json!({
+            "type": "source_summary",
+            "label": format!("Source summary {summary_id}"),
+            "summary_id": summary_id,
+        }),
+        E::TreeTopic { topic_id } => serde_json::json!({
+            "type": "tree_topic",
+            "label": format!("Topic \"{topic_id}\""),
+            "topic_id": topic_id,
+        }),
+        E::DocumentChunk {
+            source_id,
+            chunk_id,
+        } => serde_json::json!({
+            "type": "document_chunk",
+            "label": format!("Document {source_id}"),
+            "source_id": source_id,
+            "chunk_id": chunk_id,
+        }),
+        E::EmailMessage {
+            source_id,
+            message_id,
+        } => serde_json::json!({
+            "type": "email_message",
+            "label": format!("Email in {source_id}"),
+            "source_id": source_id,
+            "message_id": message_id,
+        }),
+        E::Provider {
+            toolkit,
+            connection_id,
+            field,
+        } => serde_json::json!({
+            "type": "provider",
+            "label": format!("{toolkit} · {field}"),
+            "toolkit": toolkit,
+            "connection_id": connection_id,
+            "field": field,
+        }),
+        E::ToolCall {
+            tool_name,
+            episodic_id,
+        } => serde_json::json!({
+            "type": "tool_call",
+            "label": format!("Tool call {tool_name}"),
+            "tool_name": tool_name,
+            "episodic_id": episodic_id,
+        }),
+        E::TreeSourceWeight { window_label } => serde_json::json!({
+            "type": "tree_source_weight",
+            "label": format!("Source weight {window_label}"),
+            "window_label": window_label,
+        }),
+    }
+}
+
+/// Render a facet's stored evidence refs as an ordered list of provenance
+/// entries for the "what the assistant learned about you" surface.
+fn provenance_entries(refs: &[crate::openhuman::learning::candidate::EvidenceRef]) -> Vec<Value> {
+    refs.iter().map(provenance_entry).collect()
+}
+
 // ── list_facets ───────────────────────────────────────────────────────────────
 
 fn handle_list_facets(params: Map<String, Value>) -> ControllerFuture {
@@ -814,6 +1001,46 @@ fn handle_get_facet(params: Map<String, Value>) -> ControllerFuture {
 
         let log = vec![format!("learning.get_facet: key={fk} found={found}")];
         let payload = serde_json::json!({ "facet": facet_val, "found": found });
+        RpcOutcome::new(payload, log).into_cli_compatible_json()
+    })
+}
+
+// ── facet_provenance ──────────────────────────────────────────────────────────
+
+fn handle_facet_provenance(params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let class_str = params
+            .get("class")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "missing required `class`".to_string())?
+            .to_string();
+        let key_suffix = params
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "missing required `key`".to_string())?
+            .to_string();
+
+        let fk = full_key(&class_str, &key_suffix);
+        tracing::debug!("[learning.facet_provenance] key={fk}");
+
+        let cache = get_cache()?;
+        let facet = cache.get(&fk).map_err(|e| format!("get failed: {e:#}"))?;
+
+        let (found, evidence, evidence_count) = match &facet {
+            Some(f) => (true, provenance_entries(&f.evidence_refs), f.evidence_count),
+            None => (false, Vec::new(), 0),
+        };
+
+        let log = vec![format!(
+            "learning.facet_provenance: key={fk} found={found} sources={}",
+            evidence.len()
+        )];
+        let payload = serde_json::json!({
+            "found": found,
+            "key": fk,
+            "evidence_count": evidence_count,
+            "evidence": evidence,
+        });
         RpcOutcome::new(payload, log).into_cli_compatible_json()
     })
 }
