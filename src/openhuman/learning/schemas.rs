@@ -295,9 +295,13 @@ pub fn learning_schemas(function: &str) -> ControllerSchema {
         "learning_facet_provenance" => ControllerSchema {
             namespace: "learning",
             function: "facet_provenance",
-            description: "The provenance behind one facet — the evidence the assistant learned it \
-                 from, rendered for a \"what I know about you\" surface. Each entry carries a \
-                 `type`, a human-readable `label`, and the source's own identifiers.",
+            description: "Provenance for one facet: the observations recorded for its \
+                 (class, key) that the assistant learned from, rendered for a \"what I know \
+                 about you\" surface. Refs are facet-KEY-scoped — the stability detector \
+                 merges every candidate's evidence for the key before persisting the single \
+                 winning value, so this may include observations that reinforced a prior or \
+                 competing value, not only the current one. Each entry carries a `type`, a \
+                 human-readable `label`, and the source's own identifiers.",
             inputs: vec![
                 FieldSchema {
                     name: "class",
@@ -336,8 +340,10 @@ pub fn learning_schemas(function: &str) -> ControllerSchema {
                 FieldSchema {
                     name: "evidence",
                     ty: TypeSchema::Array(Box::new(TypeSchema::Json)),
-                    comment: "Traceable sources, each `{ type, label, …ref-specific ids }` — \
-                        e.g. episodic / tree_topic / document_chunk / email_message / provider.",
+                    comment: "Key-scoped observations for this facet, each `{ type, label, \
+                        …ref-specific ids }` — e.g. episodic / tree_topic / document_chunk / \
+                        email_message / provider. Not filtered to the winning value (see \
+                        description).",
                     required: true,
                 },
             ],
@@ -920,7 +926,11 @@ fn provenance_entry(r: &crate::openhuman::learning::candidate::EvidenceRef) -> s
 }
 
 /// Render a facet's stored evidence refs as an ordered list of provenance
-/// entries for the "what the assistant learned about you" surface.
+/// entries for the "what the assistant learned about you" surface. The refs are
+/// key-scoped (the detector merges all candidate evidence for a `(class, key)`
+/// before persisting the winning value), so this reflects observations for the
+/// facet key, not proof of the current value specifically — callers should frame
+/// it that way.
 fn provenance_entries(refs: &[crate::openhuman::learning::candidate::EvidenceRef]) -> Vec<Value> {
     refs.iter().map(provenance_entry).collect()
 }
