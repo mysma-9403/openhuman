@@ -46,11 +46,16 @@ async fn get_authed_value(config: &Config, method: Method, path: &str) -> Result
 pub async fn get_latest_announcement(config: &Config) -> Result<RpcOutcome<Value>, String> {
     match get_authed_value(config, Method::GET, "/announcements/latest").await {
         Ok(data) => Ok(RpcOutcome::single_log(data, "latest announcement fetched")),
-        Err(e) => {
+        Err(_e) => {
+            // Deliberately do NOT log the raw error: for a non-404 failure
+            // `authed_json` formats it as "GET /announcements/latest failed
+            // (…): {body}", so `%e` could write a raw upstream response body
+            // (potential PII) to the logs. The REST layer already reports the
+            // real error with a PII-safe `body_shape`; here we only note that
+            // the cosmetic fetch degraded.
             tracing::info!(
                 domain = "announcements",
                 operation = "get_latest_announcement",
-                error = %e,
                 "[announcements] latest fetch failed — degrading to no announcement (null)"
             );
             Ok(RpcOutcome::single_log(
