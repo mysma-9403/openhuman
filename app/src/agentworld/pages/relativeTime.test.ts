@@ -47,4 +47,10 @@ describe('relativeTime', () => {
     // Timestamp 5s in the future (server clock ahead of client).
     expect(relativeTime(new Date(NOW + 5_000).toISOString())).toBe('just now');
   });
+
+  it('returns "just now" for an unparseable date instead of "NaNd ago"', () => {
+    freezeAt(NOW);
+    expect(relativeTime('not-a-date')).toBe('just now');
+    expect(relativeTime('')).toBe('just now');
+  });
 });

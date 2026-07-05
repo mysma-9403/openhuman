@@ -10,10 +10,15 @@
  * sections.
  *
  * Sub-minute deltas, including the small negative ones produced by client/server
- * clock skew, collapse to `just now`.
+ * clock skew, collapse to `just now`. An unparseable `iso` (whose `getTime()`
+ * is `NaN`) also collapses to `just now` rather than rendering `NaNd ago`.
  */
 export function relativeTime(iso: string): string {
   const ms = Date.now() - new Date(iso).getTime();
+  // `new Date('garbage').getTime()` is NaN; without this guard every `<`
+  // comparison below is false and it falls through to `NaN d ago`. Treat an
+  // unparseable timestamp as the safe default.
+  if (!Number.isFinite(ms)) return 'just now';
   const mins = Math.floor(ms / 60000);
   if (mins < 1) return 'just now';
   if (mins < 60) return `${mins}m ago`;
