@@ -331,8 +331,10 @@ pub fn learning_schemas(function: &str) -> ControllerSchema {
                     required: true,
                 },
                 FieldSchema {
+                    // `I64`, not `U64`: the wire value is `ProfileFacet::evidence_count`
+                    // (an `i32`, emitted raw), so the signed type matches the source.
                     name: "evidence_count",
-                    ty: TypeSchema::U64,
+                    ty: TypeSchema::I64,
                     comment: "Total observations that reinforced the facet (may exceed the \
                         number of traceable sources below).",
                     required: true,
@@ -528,36 +530,142 @@ mod tests {
     }
 
     #[test]
-    fn provenance_entry_renders_type_label_and_ids() {
-        use crate::openhuman::learning::candidate::EvidenceRef;
+    fn provenance_entry_renders_every_variant() {
+        use crate::openhuman::learning::candidate::EvidenceRef as E;
 
-        let episodic = provenance_entry(&EvidenceRef::Episodic { episodic_id: 42 });
+        // One assertion row per `EvidenceRef` arm so the exhaustive `match` in
+        // `provenance_entry` is not just compiled but verified to emit the
+        // intended `type` / `label` / id fields. Ordered to mirror the enum.
+        let episodic = provenance_entry(&E::Episodic { episodic_id: 42 });
         assert_eq!(episodic["type"], "episodic");
         assert_eq!(episodic["label"], "Episodic memory #42");
         assert_eq!(episodic["episodic_id"], 42);
 
-        let topic = provenance_entry(&EvidenceRef::TreeTopic {
+        let window = provenance_entry(&E::EpisodicWindow {
+            from_id: 3,
+            to_id: 7,
+        });
+        assert_eq!(window["type"], "episodic_window");
+        assert_eq!(window["label"], "Episodic memories #3–#7");
+        assert_eq!(window["from_id"], 3);
+        assert_eq!(window["to_id"], 7);
+
+        let summary = provenance_entry(&E::SourceSummary {
+            summary_id: "sum-9".into(),
+        });
+        assert_eq!(summary["type"], "source_summary");
+        assert_eq!(summary["label"], "Source summary sum-9");
+        assert_eq!(summary["summary_id"], "sum-9");
+
+        let topic = provenance_entry(&E::TreeTopic {
             topic_id: "roadmap".into(),
         });
         assert_eq!(topic["type"], "tree_topic");
         assert_eq!(topic["label"], "Topic \"roadmap\"");
         assert_eq!(topic["topic_id"], "roadmap");
 
-        let email = provenance_entry(&EvidenceRef::EmailMessage {
+        let chunk = provenance_entry(&E::DocumentChunk {
+            source_id: "doc:5".into(),
+            chunk_id: "c2".into(),
+        });
+        assert_eq!(chunk["type"], "document_chunk");
+        assert_eq!(chunk["label"], "Document doc:5");
+        assert_eq!(chunk["source_id"], "doc:5");
+        assert_eq!(chunk["chunk_id"], "c2");
+
+        let email = provenance_entry(&E::EmailMessage {
             source_id: "gmail:abc".into(),
             message_id: "m1".into(),
         });
         assert_eq!(email["type"], "email_message");
+        assert_eq!(email["label"], "Email in gmail:abc");
+        assert_eq!(email["source_id"], "gmail:abc");
         assert_eq!(email["message_id"], "m1");
+
+        let provider = provenance_entry(&E::Provider {
+            toolkit: "gmail".into(),
+            connection_id: "conn1".into(),
+            field: "timezone".into(),
+        });
+        assert_eq!(provider["type"], "provider");
+        assert_eq!(provider["label"], "gmail · timezone");
+        assert_eq!(provider["toolkit"], "gmail");
+        assert_eq!(provider["connection_id"], "conn1");
+        assert_eq!(provider["field"], "timezone");
+
+        let tool_call = provenance_entry(&E::ToolCall {
+            tool_name: "web_search".into(),
+            episodic_id: 11,
+        });
+        assert_eq!(tool_call["type"], "tool_call");
+        assert_eq!(tool_call["label"], "Tool call web_search");
+        assert_eq!(tool_call["tool_name"], "web_search");
+        assert_eq!(tool_call["episodic_id"], 11);
+
+        let weight = provenance_entry(&E::TreeSourceWeight {
+            window_label: "w-2024".into(),
+        });
+        assert_eq!(weight["type"], "tree_source_weight");
+        assert_eq!(weight["label"], "Source weight w-2024");
+        assert_eq!(weight["window_label"], "w-2024");
 
         // The batch wrapper preserves order and length.
         let entries = provenance_entries(&[
-            EvidenceRef::Episodic { episodic_id: 1 },
-            EvidenceRef::Episodic { episodic_id: 2 },
+            E::Episodic { episodic_id: 1 },
+            E::Episodic { episodic_id: 2 },
         ]);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["episodic_id"], 1);
         assert_eq!(entries[1]["episodic_id"], 2);
+    }
+
+    #[test]
+    fn build_provenance_payload_found_and_not_found() {
+        use crate::openhuman::learning::candidate::EvidenceRef;
+        use crate::openhuman::memory_store::profile::{
+            FacetState, FacetType, ProfileFacet, UserState,
+        };
+
+        // Not-found: the None branch reports an honest empty result.
+        let missing = build_provenance_payload("style/verbosity", None);
+        assert_eq!(missing["found"], false);
+        assert_eq!(missing["key"], "style/verbosity");
+        assert_eq!(missing["evidence_count"], 0);
+        assert_eq!(missing["evidence"].as_array().unwrap().len(), 0);
+
+        // Found: `evidence_count` passes through raw and each stored ref is
+        // rendered into the `evidence` array in order.
+        let facet = ProfileFacet {
+            facet_id: "f1".into(),
+            facet_type: FacetType::Preference,
+            key: "style/verbosity".into(),
+            value: "terse".into(),
+            confidence: 0.9,
+            evidence_count: 5,
+            source_segment_ids: None,
+            first_seen_at: 1000.0,
+            last_seen_at: 1200.0,
+            state: FacetState::Active,
+            stability: 0.8,
+            user_state: UserState::Auto,
+            evidence_refs: vec![
+                EvidenceRef::Episodic { episodic_id: 1 },
+                EvidenceRef::TreeTopic {
+                    topic_id: "roadmap".into(),
+                },
+            ],
+            class: Some("style".into()),
+            cue_families: None,
+        };
+        let found = build_provenance_payload("style/verbosity", Some(&facet));
+        assert_eq!(found["found"], true);
+        assert_eq!(found["key"], "style/verbosity");
+        // Passthrough of the raw i32 count (may exceed traceable sources).
+        assert_eq!(found["evidence_count"], 5);
+        let evidence = found["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0]["type"], "episodic");
+        assert_eq!(evidence[1]["type"], "tree_topic");
     }
 
     #[test]
@@ -1036,22 +1144,35 @@ fn handle_facet_provenance(params: Map<String, Value>) -> ControllerFuture {
         let cache = get_cache()?;
         let facet = cache.get(&fk).map_err(|e| format!("get failed: {e:#}"))?;
 
-        let (found, evidence, evidence_count) = match &facet {
-            Some(f) => (true, provenance_entries(&f.evidence_refs), f.evidence_count),
-            None => (false, Vec::new(), 0),
-        };
-
+        let payload = build_provenance_payload(&fk, facet.as_ref());
+        let found = payload["found"].as_bool().unwrap_or(false);
+        let sources = payload["evidence"].as_array().map_or(0, Vec::len);
         let log = vec![format!(
-            "learning.facet_provenance: key={fk} found={found} sources={}",
-            evidence.len()
+            "learning.facet_provenance: key={fk} found={found} sources={sources}"
         )];
-        let payload = serde_json::json!({
-            "found": found,
-            "key": fk,
-            "evidence_count": evidence_count,
-            "evidence": evidence,
-        });
         RpcOutcome::new(payload, log).into_cli_compatible_json()
+    })
+}
+
+/// Assemble the `learning.facet_provenance` JSON payload from a resolved facet.
+///
+/// Pure — split out of [`handle_facet_provenance`] (which owns the async
+/// param-parse + cache plumbing) so the found / not-found shape can be
+/// unit-tested without a live [`FacetCache`]. A missing facet renders as
+/// `found=false` with an empty evidence list and a zero count.
+fn build_provenance_payload(
+    fk: &str,
+    facet: Option<&crate::openhuman::memory_store::profile::ProfileFacet>,
+) -> Value {
+    let (found, evidence, evidence_count) = match facet {
+        Some(f) => (true, provenance_entries(&f.evidence_refs), f.evidence_count),
+        None => (false, Vec::new(), 0),
+    };
+    serde_json::json!({
+        "found": found,
+        "key": fk,
+        "evidence_count": evidence_count,
+        "evidence": evidence,
     })
 }
 
