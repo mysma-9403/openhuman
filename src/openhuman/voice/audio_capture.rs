@@ -530,7 +530,6 @@ pub fn list_input_devices() -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// Convert interleaved multi-channel samples to mono by averaging channels.
 /// Convert interleaved signed `i16` PCM samples to normalised `f32` in
 /// `[-1.0, 1.0)` (`s / 32768`). Extracted so the preferred and fallback stream
 /// paths share one conversion instead of duplicating it inline.
@@ -547,6 +546,7 @@ pub(crate) fn u16_to_f32(data: &[u16]) -> Vec<f32> {
         .collect()
 }
 
+/// Convert interleaved multi-channel samples to mono by averaging channels.
 pub(crate) fn to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return samples.to_vec();
