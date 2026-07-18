@@ -130,9 +130,13 @@ fn scrub_paths(input: &str) -> String {
     // via `eq_ignore_ascii_case`. A case-sensitive check let non-canonical
     // casings like `c:\users\alice` or `/HOME/alice` short-circuit here and get
     // returned verbatim, leaking the OS username into the durable approval audit
-    // row instead of redacting it to `<HOME>`.
-    let lower = input.to_ascii_lowercase();
-    if !lower.contains("users") && !lower.contains("home") {
+    // row instead of redacting it to `<HOME>`. Scan the bytes in place with a
+    // sliding window rather than allocating a full lowercase copy — tool args can
+    // be large (source/file contents), and the common case bails without a match.
+    let bytes = input.as_bytes();
+    let has_users = bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"users"));
+    let has_home = bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"home"));
+    if !has_users && !has_home {
         return input.to_string();
     }
     let mut out = String::with_capacity(input.len());
