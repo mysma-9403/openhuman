@@ -90,6 +90,9 @@ fn http_adapter(allowed_domains: Vec<String>) -> OpenHumanHttp {
             allowed_domains,
             ..Default::default()
         },
+        http_creds: Arc::new(
+            crate::openhuman::credentials::HttpCredentialsStore::from_config(&config),
+        ),
     }
 }
 
@@ -203,7 +206,12 @@ async fn engine_run_drives_trigger_to_http_request_through_the_real_seam() {
 async fn code_adapter_javascript_passthrough_round_trips_json() {
     let tmp = TempDir::new().unwrap();
     let config = test_config(&tmp);
-    let runner = OpenHumanCode { config };
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+        &config.action_dir,
+    ));
+    let runner = OpenHumanCode { config, security };
 
     let input = json!([{ "json": { "n": 7 } }]);
     let result = runner
@@ -222,7 +230,12 @@ async fn code_adapter_javascript_passthrough_round_trips_json() {
 // without any global state.
 
 fn tools_adapter(config: Arc<Config>) -> OpenHumanTools {
-    OpenHumanTools { config }
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+        &config.action_dir,
+    ));
+    OpenHumanTools { config, security }
 }
 
 #[tokio::test]
@@ -345,4 +358,395 @@ fn http_cred_name_parses_and_trims() {
 fn http_cred_name_returns_none_for_non_http_cred_ref_or_empty_name() {
     assert_eq!(super::caps::http_cred_name("composio:slack:acct_1"), None);
     assert_eq!(super::caps::http_cred_name("http_cred:"), None);
+}
+
+// ── structured agent output (parse_llm_json) ────────────────────────────
+
+#[test]
+fn parse_llm_json_accepts_bare_and_fenced_objects() {
+    let obj = super::caps::parse_llm_json(r#"{ "to": "a@b.com", "subject": "hi" }"#)
+        .expect("bare object parses");
+    assert_eq!(obj["to"], "a@b.com");
+
+    let fenced = "```json\n{ \"to\": \"a@b.com\" }\n```";
+    let obj = super::caps::parse_llm_json(fenced).expect("fenced object parses");
+    assert_eq!(obj["to"], "a@b.com");
+
+    let fenced_plain = "```\n[1, 2]\n```";
+    assert_eq!(
+        super::caps::parse_llm_json(fenced_plain),
+        Some(serde_json::json!([1, 2]))
+    );
+}
+
+#[test]
+fn parse_llm_json_rejects_prose_and_scalars() {
+    // Prose is not JSON.
+    assert_eq!(super::caps::parse_llm_json("Sure! Here's the email."), None);
+    // Scalars parse as JSON but are not addressable — legacy shape instead.
+    assert_eq!(super::caps::parse_llm_json("42"), None);
+    assert_eq!(super::caps::parse_llm_json("\"just a string\""), None);
+}
+
+// ── tool_call required-arg preflight ─────────────────────────────────────
+
+#[test]
+fn missing_required_args_flags_absent_and_null() {
+    let required = vec!["to".to_string(), "subject".to_string(), "body".to_string()];
+    let args = json!({ "to": null, "subject": "hi" });
+    assert_eq!(
+        super::caps::missing_required_args(&required, &args),
+        vec!["to".to_string(), "body".to_string()]
+    );
+    let full = json!({ "to": "a@b.com", "subject": "hi", "body": "text" });
+    assert!(super::caps::missing_required_args(&required, &full).is_empty());
+}
+
+/// Minimal seeded [`ToolContract`](super::caps::ToolContract) for the tests
+/// below — only `required_args` matters for the preflight, so every other
+/// field is left at its "unknown" default.
+fn seeded_required_args_contract(
+    slug: &str,
+    toolkit: &str,
+    required: &[&str],
+) -> super::caps::ToolContract {
+    super::caps::ToolContract {
+        slug: slug.to_string(),
+        toolkit: toolkit.to_string(),
+        description: None,
+        required_args: required.iter().map(|s| s.to_string()).collect(),
+        input_schema: None,
+        output_fields: Vec::new(),
+        output_schema: None,
+        primary_array_path: None,
+        is_curated: false,
+    }
+}
+
+#[tokio::test]
+async fn preflight_fails_before_dispatch_naming_the_missing_field() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+    // Seed the schema cache so no live Composio backend is needed. Uses its
+    // own toolkit/slug (never `"gmail"`) — the process-global
+    // `LIVE_CATALOG_CACHE` is shared with every `#[tokio::test]` in this
+    // file, and `preflight_invoker_gates_the_mock_tool_path` below seeds a
+    // DIFFERENT required-args list under the same slug; under parallel
+    // execution one test could overwrite the other's cache entry between
+    // seed and assert, making both flaky.
+    super::caps::seed_live_catalog_cache(
+        "preflightfailtest",
+        vec![seeded_required_args_contract(
+            "PREFLIGHTFAILTEST_SEND_EMAIL",
+            "preflightfailtest",
+            &["to", "subject", "body"],
+        )],
+    );
+
+    // `to` resolved to null (the classic mis-wired agent → tool_call case).
+    let err = super::caps::preflight_composio_args(
+        &config,
+        "PREFLIGHTFAILTEST_SEND_EMAIL",
+        &json!({ "to": null, "subject": "hi", "body": "text" }),
+    )
+    .await
+    .expect_err("null required arg must fail preflight");
+    let msg = err.to_string();
+    assert!(msg.contains("`to`"), "error must name the field: {msg}");
+    assert!(
+        msg.contains("=nodes.<node_id>.item.json.<field>"),
+        "error must suggest the wiring fix: {msg}"
+    );
+    assert!(
+        msg.contains("output schema"),
+        "error must mention the agent output schema rule: {msg}"
+    );
+
+    // Fully-wired args pass.
+    super::caps::preflight_composio_args(
+        &config,
+        "PREFLIGHTFAILTEST_SEND_EMAIL",
+        &json!({ "to": "a@b.com", "subject": "hi", "body": "text" }),
+    )
+    .await
+    .expect("wired args must pass preflight");
+}
+
+#[tokio::test]
+async fn preflight_skips_when_no_schema_is_available() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+    // A slug whose toolkit is unknown to the curation catalog has no schema
+    // source at all — the preflight must skip, never block.
+    super::caps::preflight_composio_args(&config, "NOT_A_REAL_TOOLKIT_ACTION", &json!({}))
+        .await
+        .expect("preflight must be best-effort when no schema is available");
+}
+
+#[tokio::test]
+async fn preflight_invoker_gates_the_mock_tool_path() {
+    use tinyflows::caps::ToolInvoker as _;
+
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+    // Own toolkit/slug (never `"gmail"`) — see the comment in
+    // `preflight_fails_before_dispatch_naming_the_missing_field` above for
+    // why sharing the `"gmail"` cache key across parallel tests is flaky.
+    super::caps::seed_live_catalog_cache(
+        "preflightgatetest",
+        vec![seeded_required_args_contract(
+            "PREFLIGHTGATETEST_SEND_EMAIL",
+            "preflightgatetest",
+            &["to"],
+        )],
+    );
+
+    let mock = tinyflows::caps::mock::mock_capabilities();
+    let invoker = super::caps::PreflightToolInvoker {
+        config,
+        inner: mock.tools.clone(),
+    };
+
+    // Unwired required arg: fails with the named field even though the inner
+    // mock would echo anything.
+    let err = invoker
+        .invoke("PREFLIGHTGATETEST_SEND_EMAIL", json!({ "to": null }), None)
+        .await
+        .expect_err("dry-run preflight must catch the unwired arg");
+    assert!(err.to_string().contains("`to`"));
+
+    // Wired arg: delegates to the mock echo.
+    let ok = invoker
+        .invoke(
+            "PREFLIGHTGATETEST_SEND_EMAIL",
+            json!({ "to": "a@b.com" }),
+            None,
+        )
+        .await
+        .expect("wired arg passes through to the mock");
+    assert_eq!(ok["tool"], "PREFLIGHTGATETEST_SEND_EMAIL");
+
+    // Native `oh:` slugs bypass the Composio preflight (no Composio schema).
+    // The mock echoes them unchecked.
+    let ok = invoker
+        .invoke("oh:web_search", json!({}), None)
+        .await
+        .expect("native slug bypasses composio preflight");
+    assert_eq!(ok["tool"], "oh:web_search");
+}
+
+// ── OpenHumanAgentRunner: routing + request/model mapping (Phase A) ───────────
+
+use super::caps::{
+    build_agent_result, clamp_run_timeout_secs, harness_model_default_override,
+    node_request_to_prompt, resolve_node_model, route_custom_entry_lookup, route_for_agent_ref,
+    structured_output_instruction, AgentRoute,
+};
+
+#[test]
+fn node_request_to_prompt_prefers_prompt_string() {
+    let req = json!({ "prompt": "  summarize this  " });
+    assert_eq!(node_request_to_prompt(&req), "summarize this");
+}
+
+#[test]
+fn node_request_to_prompt_flattens_messages_when_no_prompt() {
+    let req = json!({
+        "messages": [
+            { "role": "system", "content": "be terse" },
+            { "role": "user", "content": "hello" },
+            { "role": "assistant", "content": "" }
+        ]
+    });
+    // Blank content is skipped; each surviving entry is `role: content`.
+    assert_eq!(
+        node_request_to_prompt(&req),
+        "system: be terse\n\nuser: hello"
+    );
+}
+
+#[test]
+fn node_request_to_prompt_empty_when_nothing_usable() {
+    assert_eq!(node_request_to_prompt(&json!({})), "");
+    assert_eq!(node_request_to_prompt(&json!({ "prompt": "   " })), "");
+    assert_eq!(node_request_to_prompt(&json!({ "messages": [] })), "");
+}
+
+#[test]
+fn resolve_node_model_precedence() {
+    // 1. Node config.model wins over the registry entry model (raw passthrough).
+    let req = json!({ "model": "reasoning-v1" });
+    assert_eq!(
+        resolve_node_model(&req, Some("chat-v1")).as_deref(),
+        Some("reasoning-v1")
+    );
+
+    // 2. No node model → the registry entry model is used.
+    let req = json!({ "prompt": "hi" });
+    assert_eq!(
+        resolve_node_model(&req, Some("custom-model")).as_deref(),
+        Some("custom-model")
+    );
+
+    // 3. Neither → None (the definition/role default stands).
+    assert_eq!(resolve_node_model(&req, None), None);
+    // Blank/whitespace strings are treated as absent.
+    let req = json!({ "model": "   " });
+    assert_eq!(resolve_node_model(&req, Some("  ")), None);
+}
+
+#[test]
+fn harness_model_default_override_normalises_tiers_to_hint_roles() {
+    // Bare managed tiers → the `hint:<role>` form the session builder routes on
+    // (a bare tier would otherwise fall through to the chat workload).
+    assert_eq!(
+        harness_model_default_override("reasoning-v1"),
+        "hint:reasoning"
+    );
+    assert_eq!(harness_model_default_override("chat-v1"), "hint:chat");
+    // `hint:*` aliases pass through their role.
+    assert_eq!(
+        harness_model_default_override("hint:reasoning"),
+        "hint:reasoning"
+    );
+}
+
+#[test]
+fn harness_model_default_override_forwards_raw_byok_models_verbatim() {
+    // Raw/BYOK ids a user pins on an agent node are forwarded verbatim (issue
+    // #4598) — normalising them to `hint:chat` would collapse the explicit
+    // per-node model onto the managed chat tier. They reach the harness `chat`
+    // role, which inherits `config.default_model`, and `make_openhuman_backend`
+    // forwards the non-tier id to the backend unchanged.
+    assert_eq!(
+        harness_model_default_override("claude-opus-4"),
+        "claude-opus-4"
+    );
+    assert_eq!(
+        harness_model_default_override("openai:gpt-4o"),
+        "openai:gpt-4o"
+    );
+    // Empty / whitespace is not a raw id — falls back to the chat workload.
+    assert_eq!(harness_model_default_override("   "), "hint:chat");
+}
+
+#[test]
+fn clamp_run_timeout_secs_bounds_and_default() {
+    assert_eq!(clamp_run_timeout_secs(None), 240);
+    assert_eq!(clamp_run_timeout_secs(Some(0)), 10); // below floor
+    assert_eq!(clamp_run_timeout_secs(Some(5)), 10);
+    assert_eq!(clamp_run_timeout_secs(Some(120)), 120);
+    assert_eq!(clamp_run_timeout_secs(Some(600)), 600);
+    assert_eq!(clamp_run_timeout_secs(Some(10_000)), 600); // above ceiling
+}
+
+#[test]
+fn structured_output_instruction_only_when_requested() {
+    // Plain prose node — no steering.
+    assert!(structured_output_instruction(&json!({ "prompt": "hi" })).is_none());
+
+    // response_format: "json" triggers steering.
+    let inst = structured_output_instruction(&json!({ "response_format": "json" }))
+        .expect("json response_format requests structured output");
+    assert!(inst.contains("single JSON object"));
+
+    // An output_parser.schema is echoed into the instruction.
+    let inst = structured_output_instruction(&json!({
+        "output_parser": { "schema": { "type": "object", "required": ["plan"] } }
+    }))
+    .expect("output_parser.schema requests structured output");
+    assert!(inst.contains("JSON Schema"));
+    assert!(inst.contains("\"plan\""));
+}
+
+#[test]
+fn build_agent_result_shapes_structured_vs_prose() {
+    // Prose node: `{ text, agent_ref }`.
+    let out = build_agent_result("researcher", "just prose", &json!({ "prompt": "x" }));
+    assert_eq!(out["text"], "just prose");
+    assert_eq!(out["agent_ref"], "researcher");
+
+    // Structured node whose text is JSON: the parsed object is returned (no
+    // agent_ref wrapper) so `=item.<field>` bindings work downstream.
+    let req = json!({ "response_format": "json" });
+    let out = build_agent_result("planner", "{\"plan\": \"do it\"}", &req);
+    assert_eq!(out["plan"], "do it");
+    assert!(out.get("agent_ref").is_none());
+
+    // Structured requested but unparseable text → `{text}` fallback shape.
+    let out = build_agent_result("planner", "not json", &req);
+    assert_eq!(out["text"], "not json");
+    assert_eq!(out["agent_ref"], "planner");
+}
+
+#[test]
+fn route_for_agent_ref_selects_harness_for_definitions_else_fallback() {
+    // Ensure the global registry is populated (idempotent no-op if another test
+    // already initialised it; builtins are always present either way).
+    let _ =
+        crate::openhuman::agent::harness::definition::AgentDefinitionRegistry::init_global_builtins(
+        );
+
+    // A shipped harness definition → full-loop harness path.
+    assert_eq!(route_for_agent_ref("workflow_builder"), AgentRoute::Harness);
+    assert_eq!(route_for_agent_ref("researcher"), AgentRoute::Harness);
+
+    // An id with no harness definition → the custom-registry completion fallback.
+    assert_eq!(
+        route_for_agent_ref("totally_unknown_custom_agent_xyz"),
+        AgentRoute::RegistryFallback
+    );
+}
+
+// ── B38 (Gap 2): a custom agent_ref must route to the harness (real tools),
+// not the persona-only completion fallback ─────────────────────────────────
+
+fn custom_registry_entry(enabled: bool) -> crate::openhuman::agent_registry::AgentRegistryEntry {
+    use crate::openhuman::agent_registry::types::{AgentRegistrySource, AgentSubagentPolicy};
+    crate::openhuman::agent_registry::AgentRegistryEntry {
+        id: "finance_analyst".to_string(),
+        name: "Finance Analyst".to_string(),
+        description: "Reviews spend and drafts finance summaries.".to_string(),
+        source: AgentRegistrySource::Custom,
+        enabled,
+        model: Some("hint:reasoning".to_string()),
+        system_prompt: Some("You are a meticulous finance analyst.".to_string()),
+        tool_allowlist: vec!["memory_search".to_string()],
+        tool_denylist: Vec::new(),
+        subagents: AgentSubagentPolicy::default(),
+        tags: Vec::new(),
+        metadata: json!(null),
+    }
+}
+
+#[test]
+fn route_custom_entry_lookup_routes_enabled_custom_entry_to_harness() {
+    let entry = custom_registry_entry(true);
+    assert_eq!(
+        route_custom_entry_lookup(Some(&entry)),
+        AgentRoute::Harness,
+        "a known, enabled custom-registry agent must run through the harness (real tools), \
+         not the persona-only completion fallback"
+    );
+}
+
+#[test]
+fn route_custom_entry_lookup_falls_back_for_disabled_custom_entry() {
+    let entry = custom_registry_entry(false);
+    assert_eq!(
+        route_custom_entry_lookup(Some(&entry)),
+        AgentRoute::RegistryFallback,
+        "a disabled custom entry must still go through run_via_registry_fallback, which \
+         rejects it with a clear \"is disabled\" error"
+    );
+}
+
+#[test]
+fn route_custom_entry_lookup_falls_back_when_no_entry_exists() {
+    assert_eq!(
+        route_custom_entry_lookup(None),
+        AgentRoute::RegistryFallback,
+        "an agent_ref unknown to both the harness registry and the custom config registry \
+         must still resolve through the fallback (which reports \"unknown agent_ref\")"
+    );
 }

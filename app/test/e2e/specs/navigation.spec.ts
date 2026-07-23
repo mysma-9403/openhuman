@@ -32,19 +32,24 @@ interface Route {
 //   /home        → /chat        (Phase 6 — /home is now the merged chat surface)
 //   /human       → /chat        (Phase 6 — back-compat redirect)
 //   /skills      → /connections (Phase 2 — back-compat redirect)
-//   /intelligence → /activity   (Phase 3 — back-compat redirect)
-// Note: /home is intentionally omitted here because AppRoutes.tsx redirects it
-// to /chat — navigateViaHash('/home') settles on #/chat, which is covered by
-// the /chat row. Keeping /home in ROUTES would cause the hash assertion to
-// fail since the actual hash is #/chat, not #/home.
+//   /intelligence → /settings/notifications (Phase 3 — back-compat redirect)
+//   /activity     → /settings/notifications (back-compat redirect)
+// Note: /home and /activity are intentionally omitted here because AppRoutes.tsx
+// now redirects them (/home → /chat, /activity → /settings/notifications).
+// navigateViaHash settles on the redirect target, so keeping them in ROUTES
+// would fail the `^#<hash>` assertion (actual hash is the redirect destination).
 const ROUTES: Route[] = [
   { hash: '/chat' },
   { hash: '/connections' },
-  { hash: '/activity' },
   { hash: '/rewards' },
   { hash: '/settings' },
   { hash: '/agent-world' },
   { hash: '/flows' },
+  // Orchestration folded under Brain; `/orchestration` now redirects to
+  // `/brain?tab=orchestration`, so we assert the Brain destination instead
+  // (the bare `/orchestration` hash would settle on the redirect target and
+  // fail the `^#/orchestration` match, same reasoning as /home above).
+  { hash: '/brain' },
 ];
 
 async function rootTextLength(): Promise<number> {

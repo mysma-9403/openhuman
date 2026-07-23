@@ -22,8 +22,8 @@
 //! run: definition lookup/allowlists, archetype prompt assembly, toolkit
 //! filtering, sandbox/action-root narrowing, checkpoint/handback, and
 //! worker-thread transcript mirroring. Mapping it onto TinyAgents
-//! `SubAgent`/`SubAgentSession`/subgraph primitives is tracked in
-//! `docs/tinyagents-full-migration-plan/07-subagents/`.
+//! `SubAgent`/`SubAgentSession`/subgraph primitives is tracked in WP-5 of
+//! `docs/tinyagents-migration-plan-2026-07-22.md`.
 //!
 //! ## Layout
 //!
@@ -46,7 +46,9 @@ mod tool_prep;
 mod types;
 
 // Public API — the entry point and the shapes it returns.
-pub use autonomous::{autonomous_iter_cap, with_autonomous_iter_cap};
+pub use autonomous::{
+    autonomous_iter_cap, subagent_iter_cap_with_autonomous_lift, with_autonomous_iter_cap,
+};
 pub use ops::run_subagent;
 pub use types::{
     SubagentCheckpointData, SubagentMode, SubagentRunError, SubagentRunOptions, SubagentRunOutcome,
@@ -62,7 +64,7 @@ pub(crate) use tool_prep::build_text_mode_tool_instructions;
 // `ResultHandoffCache` with the `extract_from_result` tool.
 pub(crate) use handoff::{apply_handoff, ResultHandoffCache};
 pub(crate) use ops::run_agent_turn_request_via_default_graph;
-pub(crate) use ops::{append_subagent_role_contract, resolve_subagent_provider};
+pub(crate) use ops::{append_subagent_role_contract, resolve_subagent_source};
 
 // `user_is_signed_in_to_composio` is the mode-aware "can the user call
 // composio at all?" probe added in Wave 2 (#1710). Re-exported here so

@@ -464,7 +464,7 @@ async fn try_arm(
     ];
 
     let request = AgentTurnRequest {
-        provider: Arc::clone(&resolved.provider),
+        turn_model_source: resolved.turn_model_source.clone(),
         history,
         tools_registry: Arc::new(Vec::new()),
         provider_name: resolved.provider_name.clone(),
@@ -647,7 +647,7 @@ fn is_prompt_guard_rejection(message: &str) -> bool {
 ///
 /// The vocabulary matches the OpenHuman backend's error copy and common
 /// third-party provider phrasing. It does **not** mirror the
-/// *semantics* of `channels/providers/web.rs` (a different code path);
+/// *semantics* of `web_chat/` (a different code path);
 /// it is an independent, conservative allowlist evaluated inline so the
 /// triage evaluator carries no cross-domain import.
 ///
@@ -749,6 +749,8 @@ fn extract_inline_prompt(def: &AgentDefinition) -> Option<String> {
                 personality_soul_md: None,
                 personality_memory_md: None,
                 personality_roster: vec![],
+                agents_md_global: None,
+                agents_md_local: None,
             };
             match build(&ctx) {
                 Ok(body) if !body.is_empty() => Some(body),

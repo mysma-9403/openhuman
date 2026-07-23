@@ -33,8 +33,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::store::ToolMemoryStore;
-use super::types::{ToolMemoryPriority, ToolMemorySource};
+use super::{tool_memory_store, ToolMemoryPriority, ToolMemorySource, ToolMemoryStore};
 use crate::openhuman::agent::hooks::{PostTurnHook, ToolCallRecord, TurnContext};
 use crate::openhuman::memory::Memory;
 
@@ -52,7 +51,7 @@ impl ToolMemoryCaptureHook {
     /// Build a new capture hook backed by the given memory.
     pub fn new(memory: Arc<dyn Memory>, enabled: bool) -> Self {
         Self {
-            store: ToolMemoryStore::new(memory),
+            store: tool_memory_store(memory),
             enabled,
         }
     }
@@ -82,8 +81,10 @@ impl ToolMemoryCaptureHook {
         // phrases like "I want to stop working" don't trigger false captures.
         let stop_imperative =
             lower.starts_with("stop ") || lower.contains(". stop ") || lower.contains("\nstop ");
-        if !(lower.contains("never ") || lower.contains("don't ") || lower.contains("do not "))
-            && !stop_imperative
+        if !(lower.contains("never ")
+            || lower.contains("don't ")
+            || lower.contains("do not ")
+            || stop_imperative)
         {
             return Vec::new();
         }
@@ -98,7 +99,7 @@ impl ToolMemoryCaptureHook {
             .unwrap_or_else(|| "__unscoped__".to_string());
 
         let mut out = Vec::new();
-        for raw_line in trimmed.split(|c: char| matches!(c, '.' | '\n' | ';')) {
+        for raw_line in trimmed.split(['.', '\n', ';']) {
             let line = raw_line.trim();
             if line.is_empty() {
                 continue;
@@ -289,8 +290,8 @@ fn tool_aliases(tool_name: &str) -> Vec<&'static str> {
 mod tests {
     use super::*;
     use crate::openhuman::agent::hooks::ToolCallRecord;
-    use crate::openhuman::memory_tools::store::ToolMemoryStore;
     use crate::openhuman::memory_tools::test_helpers::MockMemory;
+    use crate::openhuman::memory_tools::tool_memory_store;
 
     fn ctx_with(message: &str, tool_calls: Vec<ToolCallRecord>) -> TurnContext {
         TurnContext {
@@ -391,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn on_turn_complete_persists_critical_rule_for_user_edict() {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory::default());
-        let store = ToolMemoryStore::new(memory.clone());
+        let store = tool_memory_store(memory.clone());
         let hook = ToolMemoryCaptureHook::from_store(store.clone(), true);
 
         hook.on_turn_complete(&ctx_with(
@@ -411,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn on_turn_complete_no_op_when_disabled() {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory::default());
-        let store = ToolMemoryStore::new(memory.clone());
+        let store = tool_memory_store(memory.clone());
         let hook = ToolMemoryCaptureHook::from_store(store.clone(), false);
         hook.on_turn_complete(&ctx_with(
             "Never email Sarah.",
@@ -428,7 +429,7 @@ mod tests {
     #[tokio::test]
     async fn safety_case_never_email_sarah_pins_into_prompt_block() {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory::default());
-        let store = ToolMemoryStore::new(memory.clone());
+        let store = tool_memory_store(memory.clone());
         let hook = ToolMemoryCaptureHook::from_store(store.clone(), true);
 
         // 1. Capture the edict from a normal user turn.
@@ -466,7 +467,7 @@ mod tests {
     #[tokio::test]
     async fn on_turn_complete_records_repeated_failure_observation() {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory::default());
-        let store = ToolMemoryStore::new(memory.clone());
+        let store = tool_memory_store(memory.clone());
         let hook = ToolMemoryCaptureHook::from_store(store.clone(), true);
         hook.on_turn_complete(&ctx_with(
             "Try again",

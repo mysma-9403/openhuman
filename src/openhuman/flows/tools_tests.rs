@@ -58,6 +58,9 @@ async fn valid_graph_returns_workflow_proposal_success() {
     assert_eq!(parsed["type"], "workflow_proposal");
     assert_eq!(parsed["name"], "Daily standup summary");
     assert_eq!(parsed["graph"]["nodes"].as_array().unwrap().len(), 3);
+    // A proposal is never a persisted flow — the payload must say so (WS2) so
+    // an agent can't misread it as a save confirmation.
+    assert_eq!(parsed["persisted"], false);
 }
 
 #[tokio::test]
@@ -137,6 +140,20 @@ async fn explicit_require_approval_false_is_respected() {
 
     let parsed: Value = serde_json::from_str(&result.output()).unwrap();
     assert_eq!(parsed["require_approval"], false);
+}
+
+#[tokio::test]
+async fn explicit_require_approval_true_is_respected() {
+    let tmp = TempDir::new().unwrap();
+    let tool = ProposeWorkflowTool::new(test_config(&tmp));
+
+    let result = tool
+        .execute(json!({ "name": "demo", "graph": valid_graph(), "require_approval": true }))
+        .await
+        .unwrap();
+
+    let parsed: Value = serde_json::from_str(&result.output()).unwrap();
+    assert_eq!(parsed["require_approval"], true);
 }
 
 #[tokio::test]
@@ -261,4 +278,148 @@ fn display_label_humanizes_the_tool_name() {
         tool.display_label(&Value::Null).as_deref(),
         Some("Propose Workflow")
     );
+}
+
+// ── enforcing binding-resolvability gate ────────────────────────────────────
+
+#[tokio::test]
+async fn propose_workflow_rejects_unschemad_agent_binding() {
+    // The proven live-failure graph: `summarize` has no `output_parser.schema`,
+    // so `post`'s `args.channel` binding is guaranteed to resolve null at
+    // runtime. Unlike the advisory dry-run check, propose_workflow must
+    // REJECT this outright rather than warn (warning_count would have been 0
+    // here — nothing stopped this from reaching save_workflow before).
+    let tmp = TempDir::new().unwrap();
+    let tool = ProposeWorkflowTool::new(test_config(&tmp));
+
+    let graph = json!({
+        "nodes": [
+            { "id": "t", "kind": "trigger", "name": "Manual" },
+            { "id": "summarize", "kind": "agent", "name": "Summarize",
+              "config": { "agent_ref": "researcher", "prompt": "summarize" } },
+            { "id": "notify", "kind": "tool_call", "name": "Notify",
+              "config": { "slug": "SLACK_SEND_MESSAGE",
+                "args": { "channel": "=nodes.summarize.item.json.channel" } } }
+        ],
+        "edges": [
+            { "from_node": "t", "to_node": "summarize" },
+            { "from_node": "summarize", "to_node": "notify" }
+        ]
+    });
+
+    let result = tool
+        .execute(json!({ "name": "Summarize and notify", "graph": graph }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error, "must be rejected: {}", result.output());
+    let output = result.output();
+    assert!(output.contains("notify"), "{output}");
+    assert!(output.contains("channel"), "{output}");
+    assert!(output.contains("summarize"), "{output}");
+    assert!(
+        output.contains("output_parser.schema"),
+        "must name the missing schema as the fix: {output}"
+    );
+}
+
+#[tokio::test]
+async fn propose_workflow_rejects_an_incompatible_saved_child_reference() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+    let tool = ProposeWorkflowTool::new(Arc::clone(&config));
+
+    // Simulate a legacy child saved before the current TinyFlows engine
+    // rejected nested conditional fan-in. The parent itself is structurally
+    // valid, so only the config-aware shared builder gate can catch this.
+    let legacy_child = json!({
+        "nodes": [
+            { "id": "start", "kind": "trigger", "name": "Trigger" },
+            { "id": "outer", "kind": "condition", "name": "Outer", "config": { "field": "outer" } },
+            { "id": "inner", "kind": "condition", "name": "Inner", "config": { "field": "inner" } },
+            { "id": "outer_else", "kind": "output_parser", "name": "Outer else" },
+            { "id": "inner_else", "kind": "output_parser", "name": "Inner else" },
+            { "id": "a", "kind": "output_parser", "name": "A" },
+            { "id": "c", "kind": "output_parser", "name": "C" },
+            { "id": "m", "kind": "merge", "name": "Merge" }
+        ],
+        "edges": [
+            { "from_node": "start", "to_node": "outer" },
+            { "from_node": "start", "to_node": "c" },
+            { "from_node": "outer", "from_port": "true", "to_node": "inner" },
+            { "from_node": "outer", "from_port": "false", "to_node": "outer_else" },
+            { "from_node": "inner", "from_port": "true", "to_node": "a" },
+            { "from_node": "inner", "from_port": "false", "to_node": "inner_else" },
+            { "from_node": "a", "to_node": "m" },
+            { "from_node": "c", "to_node": "m" }
+        ]
+    });
+    let child_graph = crate::openhuman::flows::ops::migrate_and_deserialize_graph(legacy_child)
+        .expect("legacy child should deserialize");
+    tinyflows::validate::validate(&child_graph)
+        .expect("legacy child should remain structurally valid");
+    let child = crate::openhuman::flows::store::create_flow(
+        &config,
+        "Legacy unsafe child".to_string(),
+        child_graph,
+        false,
+        false,
+    )
+    .unwrap();
+    let parent = json!({
+        "nodes": [
+            { "id": "start", "kind": "trigger", "name": "Trigger" },
+            {
+                "id": "saved-child",
+                "kind": "sub_workflow",
+                "name": "Saved child",
+                "config": { "workflow_id": child.id }
+            }
+        ],
+        "edges": [{ "from_node": "start", "to_node": "saved-child" }]
+    });
+
+    let result = tool
+        .execute(json!({ "name": "Parent", "graph": parent }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error, "must reject unsafe saved child");
+    let output = result.output();
+    assert!(
+        output.contains("unsupported_nested_conditional_fan_in"),
+        "{output}"
+    );
+    assert!(output.contains(&child.id), "{output}");
+    assert!(output.contains("saved-child"), "{output}");
+    assert!(output.contains("call propose_workflow again"), "{output}");
+}
+
+/// Docs-drift guard (F2): `propose_workflow`'s hand-written description and the
+/// typed node-kind contracts are two views of the SAME DSL, and they must not
+/// diverge. If a node kind is added/renamed or a required config field changes
+/// in `node_contracts.rs`, this fails until the tool description is updated to
+/// match — the "prose can never diverge from code" check the plan calls for.
+#[test]
+fn propose_workflow_description_matches_typed_node_contracts() {
+    let tmp = TempDir::new().unwrap();
+    let tool = ProposeWorkflowTool::new(test_config(&tmp));
+    let desc = tool.description();
+    for contract in crate::openhuman::flows::all_node_kind_contracts() {
+        assert!(
+            desc.contains(&contract.kind),
+            "propose_workflow description is missing node kind `{}` — update it to match \
+             node_contracts.rs",
+            contract.kind
+        );
+        for field in contract.config_fields.iter().filter(|f| f.required) {
+            assert!(
+                desc.contains(&field.name),
+                "propose_workflow description is missing required field `config.{}` of node kind \
+                 `{}` — update it to match node_contracts.rs",
+                field.name,
+                contract.kind
+            );
+        }
+    }
 }

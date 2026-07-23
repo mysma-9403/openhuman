@@ -16,10 +16,13 @@ const ALL_FUNCTIONS: &[&str] = &[
     "purge",
     "turn_state_get",
     "turn_state_list",
+    "turn_state_history",
+    "turn_state_get_turn",
     "turn_state_clear",
     "task_board_get",
     "task_board_put",
     "token_usage",
+    "transcript_get",
 ];
 
 #[test]

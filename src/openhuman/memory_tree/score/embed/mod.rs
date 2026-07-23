@@ -29,16 +29,12 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
-pub mod cloud;
 pub mod factory;
 pub mod inert;
-pub mod ollama;
 pub mod openai_compat;
 
-pub use cloud::CloudEmbedder;
 pub use factory::{build_embedder_from_config, build_write_embedder};
 pub use inert::InertEmbedder;
-pub use ollama::OllamaEmbedder;
 pub use openai_compat::OpenAiCompatEmbedder;
 
 /// Embedding dimensionality used across the memory tree.
@@ -89,6 +85,43 @@ pub trait Embedder: Send + Sync {
     }
 }
 
+/// Adapts the canonical host embedding-provider contract to the legacy
+/// memory-tree embedder shape. Concrete network implementations live in
+/// `tinyagents::harness::embeddings`; this bridge owns only dimension checks
+/// and the memory tree's per-position batch fallback contract.
+pub struct ProviderEmbedder {
+    inner: Box<dyn crate::openhuman::embeddings::EmbeddingProvider>,
+    label: &'static str,
+}
+
+impl ProviderEmbedder {
+    pub fn new(
+        inner: Box<dyn crate::openhuman::embeddings::EmbeddingProvider>,
+        label: &'static str,
+    ) -> Self {
+        Self { inner, label }
+    }
+}
+
+#[async_trait]
+impl Embedder for ProviderEmbedder {
+    fn name(&self) -> &'static str {
+        self.label
+    }
+
+    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        self.inner
+            .embed_one(text)
+            .await
+            .with_context(|| format!("{} embeddings failed", self.label))
+            .and_then(|vector| check_embed_dim(vector, self.label))
+    }
+
+    async fn embed_batch(&self, texts: &[&str]) -> Vec<Result<Vec<f32>>> {
+        embed_batch_via_provider(self.inner.as_ref(), self.label, texts).await
+    }
+}
+
 /// Validate that a freshly-produced embedding has exactly [`EMBEDDING_DIM`]
 /// floats, returning a labelled error otherwise. Shared by the per-text and
 /// batched provider adapters so the "wrong dims" diagnostic is identical
@@ -110,7 +143,7 @@ const MAX_BATCH_TOKENS: usize = 1_000_000;
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
 fn estimate_tokens(text: &str) -> usize {
-    (text.len() + CHARS_PER_TOKEN_ESTIMATE - 1) / CHARS_PER_TOKEN_ESTIMATE
+    text.len().div_ceil(CHARS_PER_TOKEN_ESTIMATE)
 }
 
 /// Split `texts` into sub-batches that respect the batch API limits:

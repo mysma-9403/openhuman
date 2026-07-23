@@ -1,0 +1,170 @@
+/**
+ * WorkflowRunsPage — the aggregate "All runs" view: every workflow's runs across
+ * the whole `flows` domain, newest first, backed by the `flows_list_all_runs`
+ * core RPC. Each row links back to its workflow's canvas. Stays live via
+ * {@link useFlowRunsLiveRefresh} while any listed run is still active, via a
+ * lightweight `refetchRuns` (re-fetches just the runs, not `listFlows()` too)
+ * so a run doesn't sit on "Running" until the user reloads the page.
+ */
+import debug from 'debug';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+
+import PanelPage from '../components/layout/PanelPage';
+import { CenteredLoadingState, ErrorBanner } from '../components/ui/LoadingState';
+import { useFlowRunFinished } from '../hooks/useFlowRunFinished';
+import { useFlowRunsLiveRefresh } from '../hooks/useFlowRunsLiveRefresh';
+import { useFlowRunStarted } from '../hooks/useFlowRunStarted';
+import {
+  resolveDisplayStatus,
+  useRunsPendingApprovalSet,
+} from '../hooks/useRunsPendingApprovalSet';
+import { useT } from '../lib/i18n/I18nContext';
+import {
+  type Flow,
+  type FlowRun,
+  type FlowRunStatus,
+  listAllFlowRuns,
+  listFlows,
+} from '../services/api/flowsApi';
+
+const log = debug('app:flows:runs-page');
+
+const STATUS_CLASS: Record<FlowRunStatus, string> = {
+  running: 'bg-primary-500/15 text-primary-600 dark:text-primary-300',
+  completed: 'bg-sage-500/15 text-sage-700 dark:text-sage-300',
+  completed_with_warnings: 'bg-amber-500/15 text-amber-700 dark:text-amber-300',
+  pending_approval: 'bg-amber-500/15 text-amber-700 dark:text-amber-300',
+  failed: 'bg-coral-500/15 text-coral-700 dark:text-coral-300',
+  cancelled: 'bg-content-faint/15 text-content-secondary',
+  interrupted: 'bg-amber-500/15 text-amber-700 dark:text-amber-300',
+};
+
+export default function WorkflowRunsPage() {
+  const { t } = useT();
+  const navigate = useNavigate();
+  const [runs, setRuns] = useState<FlowRun[]>([]);
+  const [flowNames, setFlowNames] = useState<Record<string, string>>({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Per-request generation counter: a `load()` started before a run-started
+  // event (see `useFlowRunStarted` below) can resolve AFTER the event-driven
+  // `refetchRuns` and, without this guard, clobber the fresh "Running" row
+  // with stale data. Only the most-recently-issued request may apply its
+  // result — shared between `load` and `refetchRuns` below.
+  const requestGenRef = useRef(0);
+
+  const load = useCallback(async () => {
+    const requestGen = ++requestGenRef.current;
+    setLoading(true);
+    setError(null);
+    try {
+      const [allRuns, flows] = await Promise.all([listAllFlowRuns(), listFlows()]);
+      if (requestGen !== requestGenRef.current) return;
+      const names: Record<string, string> = {};
+      flows.forEach((f: Flow) => {
+        names[f.id] = f.name;
+      });
+      setRuns(allRuns);
+      setFlowNames(names);
+    } catch (err) {
+      if (requestGen !== requestGenRef.current) return;
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // Lighter-weight than `load` — only re-fetches the runs (not `listFlows()`
+  // too), since flow names rarely change mid-run and re-fetching them on
+  // every live-refresh tick would be wasted work.
+  const refetchRuns = useCallback(() => {
+    const requestGen = ++requestGenRef.current;
+    listAllFlowRuns()
+      .then(result => {
+        if (requestGen !== requestGenRef.current) return;
+        setRuns(result);
+      })
+      .catch(err => {
+        // Best-effort background refresh — a transient failure here shouldn't
+        // clobber the page's existing error/loading state from `load`.
+        log('refetchRuns failed: %o', err);
+      });
+  }, []);
+
+  useFlowRunsLiveRefresh(runs, refetchRuns);
+  // Unconditional (unlike useFlowRunsLiveRefresh, which is gated on an
+  // already-active run) — fills the empty-list gap ("No runs yet") that hook
+  // can't reach, so the very first run across any flow shows up as "Running"
+  // instantly instead of waiting for a manual refresh (issue B35). No
+  // `flowId` filter — this is the flow-agnostic "all runs" page.
+  useFlowRunStarted(() => void refetchRuns());
+  // Terminal companion to the above (issue B35 follow-up) — flips a run to
+  // Completed/Failed the instant it settles instead of waiting on
+  // `useFlowRunsLiveRefresh`'s debounced/backstop refetch to notice. No
+  // `flowId` filter, same rationale as `useFlowRunStarted` above.
+  useFlowRunFinished(() => void refetchRuns());
+  const pendingRunIds = useRunsPendingApprovalSet(runs);
+
+  const statusLabel = (status: FlowRunStatus) =>
+    t(`flows.allRuns.status.${status}`, status.replace(/_/g, ' '));
+
+  return (
+    <PanelPage
+      testId="workflow-runs-page"
+      title={t('flows.allRuns.title')}
+      description={t('flows.allRuns.description')}>
+      <div className="p-4">
+        {loading ? (
+          <CenteredLoadingState label={t('flows.allRuns.loading')} />
+        ) : error ? (
+          <ErrorBanner message={error} />
+        ) : runs.length === 0 ? (
+          <p
+            className="py-8 text-center text-sm text-content-muted"
+            data-testid="workflow-runs-empty">
+            {t('flows.allRuns.empty')}
+          </p>
+        ) : (
+          <ul
+            className="divide-y divide-line rounded-xl border border-line"
+            data-testid="workflow-runs-list">
+            {runs.map(run => {
+              const displayStatus = resolveDisplayStatus(run, pendingRunIds);
+              return (
+                <li key={run.id}>
+                  <button
+                    type="button"
+                    data-testid={`workflow-run-${run.id}`}
+                    onClick={() => navigate(`/flows/${run.flow_id}`)}
+                    className="flex w-full items-center gap-3 p-3 text-left hover:bg-surface-hover">
+                    <span
+                      className={`flex-shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${STATUS_CLASS[displayStatus]}`}>
+                      {statusLabel(displayStatus)}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-sm font-medium text-content">
+                      {flowNames[run.flow_id] ?? t('flows.allRuns.unknownWorkflow')}
+                    </span>
+                    <span className="flex-shrink-0 text-[11px] text-content-faint">
+                      {new Date(run.started_at).toLocaleString()}
+                    </span>
+                  </button>
+                  {run.error && (
+                    <p className="px-3 pb-2 text-[11px] text-coral-600 dark:text-coral-300">
+                      {run.error}
+                    </p>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+    </PanelPage>
+  );
+}

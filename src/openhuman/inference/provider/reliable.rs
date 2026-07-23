@@ -21,7 +21,7 @@
 //! wrapper stays authoritative for single-attempt retry on the live path.
 
 use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamError, StreamOptions, StreamResult,
+    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
 };
 use super::Provider;
 use crate::openhuman::inference::provider::record_resolved_provider_route;
@@ -38,6 +38,14 @@ use std::time::Duration;
 // `reliable::{is_rate_limited, is_upstream_unhealthy, parse_retry_after_ms}` /
 // `reliable::format_failure_aggregate` import paths continue to resolve.
 pub(crate) use super::error_classify::*;
+
+/// Minimum retry budget for a **transient** streaming `429`, so a multi-second
+/// server `Retry-After` window can actually be waited out. The configured
+/// `provider_retries` (default 2, ~1.5 s of fixed backoff) is too small to ride
+/// out a rate-limit window; rate-limited streams get at least this many retries
+/// while every other failure keeps the configured budget (#4895). Bounded, and
+/// only applies to retryable (non-plan/quota) `429`s.
+const STREAM_RATE_LIMIT_MIN_RETRIES: u32 = 3;
 
 fn push_failure(
     failures: &mut Vec<String>,
@@ -133,6 +141,15 @@ impl ReliableProvider {
 
 #[async_trait]
 impl Provider for ReliableProvider {
+    fn telemetry_provider_id(&self) -> String {
+        // Delegate to the primary (first) upstream - the one that serves the
+        // call unless a failover kicks in.
+        self.providers
+            .first()
+            .map(|(_, p)| p.telemetry_provider_id())
+            .unwrap_or_else(|| "custom".to_string())
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
             tracing::info!(provider = name, "Warming up provider connection pool");
@@ -234,18 +251,19 @@ impl Provider for ReliableProvider {
                             );
 
                             // On rate-limit, try rotating API key
-                            if rate_limited && !non_retryable_rate_limit {
-                                if self.rotate_key().is_some() {
-                                    tracing::info!(
-                                        provider = provider_name,
-                                        error = %error_detail,
-                                        key_slot = %rotated_key_log_detail(
-                                            self.key_index.load(Ordering::Relaxed),
-                                            self.api_keys.len()
-                                        ),
-                                        "Rate limited, rotated API key"
-                                    );
-                                }
+                            if rate_limited
+                                && !non_retryable_rate_limit
+                                && self.rotate_key().is_some()
+                            {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    error = %error_detail,
+                                    key_slot = %rotated_key_log_detail(
+                                        self.key_index.load(Ordering::Relaxed),
+                                        self.api_keys.len()
+                                    ),
+                                    "Rate limited, rotated API key"
+                                );
                             }
 
                             if non_retryable {
@@ -370,18 +388,19 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            if rate_limited && !non_retryable_rate_limit {
-                                if self.rotate_key().is_some() {
-                                    tracing::info!(
-                                        provider = provider_name,
-                                        error = %error_detail,
-                                        key_slot = %rotated_key_log_detail(
-                                            self.key_index.load(Ordering::Relaxed),
-                                            self.api_keys.len()
-                                        ),
-                                        "Rate limited, rotated API key"
-                                    );
-                                }
+                            if rate_limited
+                                && !non_retryable_rate_limit
+                                && self.rotate_key().is_some()
+                            {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    error = %error_detail,
+                                    key_slot = %rotated_key_log_detail(
+                                        self.key_index.load(Ordering::Relaxed),
+                                        self.api_keys.len()
+                                    ),
+                                    "Rate limited, rotated API key"
+                                );
                             }
 
                             if non_retryable {
@@ -535,18 +554,19 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            if rate_limited && !non_retryable_rate_limit {
-                                if self.rotate_key().is_some() {
-                                    tracing::info!(
-                                        provider = provider_name,
-                                        error = %error_detail,
-                                        key_slot = %rotated_key_log_detail(
-                                            self.key_index.load(Ordering::Relaxed),
-                                            self.api_keys.len()
-                                        ),
-                                        "Rate limited, rotated API key"
-                                    );
-                                }
+                            if rate_limited
+                                && !non_retryable_rate_limit
+                                && self.rotate_key().is_some()
+                            {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    error = %error_detail,
+                                    key_slot = %rotated_key_log_detail(
+                                        self.key_index.load(Ordering::Relaxed),
+                                        self.api_keys.len()
+                                    ),
+                                    "Rate limited, rotated API key"
+                                );
                             }
 
                             if non_retryable {
@@ -664,18 +684,19 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            if rate_limited && !non_retryable_rate_limit {
-                                if self.rotate_key().is_some() {
-                                    tracing::info!(
-                                        provider = provider_name,
-                                        error = %error_detail,
-                                        key_slot = %rotated_key_log_detail(
-                                            self.key_index.load(Ordering::Relaxed),
-                                            self.api_keys.len()
-                                        ),
-                                        "Rate limited, rotated API key"
-                                    );
-                                }
+                            if rate_limited
+                                && !non_retryable_rate_limit
+                                && self.rotate_key().is_some()
+                            {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    error = %error_detail,
+                                    key_slot = %rotated_key_log_detail(
+                                        self.key_index.load(Ordering::Relaxed),
+                                        self.api_keys.len()
+                                    ),
+                                    "Rate limited, rotated API key"
+                                );
                             }
 
                             if non_retryable {
@@ -812,6 +833,10 @@ impl Provider for ReliableProvider {
         let max_retries = self.max_retries;
 
         tokio::spawn(async move {
+            // Tracks whether the *last* candidate error was a rate-limit (429),
+            // so the terminal message surfaced on exhaustion is a clear
+            // rate-limit notice rather than a generic failure (#4895).
+            let mut last_error_rate_limited = false;
             for (provider_name, provider, current_model) in candidates {
                 let mut backoff_ms = base_backoff_ms;
                 let mut attempts = 0u32;
@@ -846,6 +871,19 @@ impl Provider for ReliableProvider {
                         }
                         Some(Err(ref e)) => {
                             let non_retryable = is_stream_error_non_retryable(e);
+                            // A retryable (transient) 429 — as opposed to a
+                            // plan/quota 429, which `is_stream_error_non_retryable`
+                            // already flags — gets a larger, bounded retry budget
+                            // so a multi-second Retry-After window can be waited
+                            // out (#4895).
+                            let retryable_rate_limited =
+                                !non_retryable && is_stream_rate_limited(e);
+                            last_error_rate_limited = is_stream_rate_limited(e);
+                            let effective_max = if retryable_rate_limited {
+                                max_retries.max(STREAM_RATE_LIMIT_MIN_RETRIES)
+                            } else {
+                                max_retries
+                            };
 
                             tracing::warn!(
                                 provider = provider_name,
@@ -855,12 +893,17 @@ impl Provider for ReliableProvider {
                                 "Streaming failed{}", if non_retryable { " (non-retryable)" } else { "" }
                             );
 
-                            if non_retryable || attempts >= max_retries {
+                            if non_retryable || attempts >= effective_max {
                                 break; // Move to next candidate
                             }
 
                             attempts += 1;
-                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            // Honor the server's Retry-After (capped) on
+                            // rate-limits instead of the raw exponential doubling,
+                            // which previously fired all attempts within ~1.5 s and
+                            // ignored the backend's requested wait entirely (#4895).
+                            let wait = compute_stream_backoff_ms(backoff_ms, e);
+                            tokio::time::sleep(Duration::from_millis(wait)).await;
                             backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             // Re-create the candidate stream on the next iteration.
                             continue;
@@ -880,11 +923,20 @@ impl Provider for ReliableProvider {
                 }
             }
 
-            // All providers/models exhausted
+            // All providers/models exhausted. When the terminal failure was a
+            // rate-limit, surface a clear, user-actionable message instead of a
+            // generic one so the turn no longer dies silently (#4895) — this
+            // string propagates to the chat error surface via
+            // `crate_provider`'s `ProviderFailed` → `bail!` mapping.
+            let terminal = if last_error_rate_limited {
+                "You're being rate-limited (sending requests faster than your current plan allows). \
+                 Please wait a few seconds and try again."
+                    .to_string()
+            } else {
+                "All streaming providers/models failed".to_string()
+            };
             let _ = tx
-                .send(Err(super::traits::StreamError::Provider(
-                    "All streaming providers/models failed".to_string(),
-                )))
+                .send(Err(super::traits::StreamError::Provider(terminal)))
                 .await;
         });
 

@@ -244,6 +244,7 @@ impl Agent {
         let limits = self.config.resolved_memory_limits();
         let tree_root_summaries = collect_tree_root_summaries(
             &self.workspace_dir,
+            &self.memory_subdir,
             limits.per_namespace_max_chars,
             limits.total_tree_max_chars,
         );
@@ -288,6 +289,22 @@ impl Agent {
         // prompt build.
         let prompt_tools = PromptTool::from_tools(tools_slice);
         let prompt_visible_tool_names = self.tool_policy_session.visible_tool_names_for_prompt();
+        // Load AGENTS.md instruction layers once per system-prompt build (never
+        // re-read per turn — the caller builds the prompt once at session start
+        // and reuses the bytes, preserving the frozen-prefix / KV-cache
+        // contract). Global layer from the workspace dir; project layer from the
+        // effective action dir. Gated by `agents_md_enabled`.
+        let agents_md = if self.config.agents_md_enabled {
+            crate::openhuman::agent::prompts::load_agents_md_layers(
+                &self.workspace_dir,
+                &self.action_dir,
+            )
+        } else {
+            tracing::debug!(
+                "[agents_md] disabled by config; skipping AGENTS.md injection for main agent"
+            );
+            crate::openhuman::agent::prompts::AgentsMdContent::default()
+        };
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             model_name: &self.model_name,
@@ -305,13 +322,14 @@ impl Agent {
             include_memory_md: !self.omit_memory_md,
             curated_snapshot: None,
             user_identity: crate::openhuman::app_state::peek_cached_current_user_identity(),
-            // TODO(phase-2): Wire personality context into the live agent turn.
-            // Currently personalities only take effect during delegate_to_personality sub-agent runs.
-            // To activate: load the active profile via AgentProfileStore::resolve(), build
-            // PersonalityContext::from_profile(), and populate these fields.
-            personality_soul_md: None, // TODO: personality_ctx.soul_md_override
-            personality_memory_md: None, // TODO: personality_ctx.memory_md_override
+            // Profile SOUL.md and curated MEMORY.md are bound at session
+            // construction so the normal identity/user-files sections use
+            // them instead of their workspace-root fallbacks.
+            personality_soul_md: self.personality_soul_md.clone(),
+            personality_memory_md: self.personality_memory_md.clone(),
             personality_roster: vec![], // TODO: build_personality_roster(&workspace_dir)
+            agents_md_global: agents_md.global,
+            agents_md_local: agents_md.local,
         };
         // Route through the global context manager so every
         // prompt-building call-site — main agent, sub-agent runner,

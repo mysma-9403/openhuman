@@ -6,10 +6,135 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    build_http_schema_dump, default_state, escape_html, invoke_method, is_param_validation_error,
-    is_session_expired_error, is_unconfirmed_unauthorized_error, is_wallet_not_configured_error,
-    params_to_object, parse_json_params, rpc_handler, type_name,
+    default_state, invoke_method, is_session_expired_error, is_unconfirmed_unauthorized_error,
+    params_to_object, parse_json_params, type_name, DomainSubscriberPlan,
 };
+// These are the `http-server`-gated RPC-surface symbols (#5048); the tests that
+// name them below carry the same `#[cfg]` so the disabled-build test compile
+// (`cargo test --no-default-features`) stays green.
+#[cfg(feature = "http-server")]
+use super::{
+    build_http_schema_dump, escape_html, is_param_validation_error, is_wallet_not_configured_error,
+    rpc_handler,
+};
+
+// ---- domain-subscriber gating (#4796 DoD item 3) ----------------------------
+// `register_domain_subscribers` registers on the process-global event bus behind
+// a `Once`, so its gating is proven via the pure `DomainSubscriberPlan` the
+// registrar consumes — no real subscribers, no bus mutation.
+
+#[test]
+fn domain_subscriber_plan_full_registers_every_gated_subscriber() {
+    let plan = DomainSubscriberPlan::for_domains(crate::core::runtime::DomainSet::full());
+    assert_eq!(
+        plan,
+        DomainSubscriberPlan {
+            platform: true,
+            channels: true,
+            flows: true,
+            memory: true,
+            meet: true,
+            agent: true,
+            mcp: true,
+        },
+        "full() must register every gated domain subscriber"
+    );
+}
+
+#[test]
+fn domain_subscriber_plan_none_registers_no_gated_subscriber() {
+    let plan = DomainSubscriberPlan::for_domains(crate::core::runtime::DomainSet::none());
+    assert_eq!(
+        plan,
+        DomainSubscriberPlan {
+            platform: false,
+            channels: false,
+            flows: false,
+            memory: false,
+            meet: false,
+            agent: false,
+            mcp: false,
+        },
+        "none() must register no gated domain subscriber (core infra still runs, ungated)"
+    );
+}
+
+#[test]
+fn domain_subscriber_plan_harness_gates_by_owning_group() {
+    let plan = DomainSubscriberPlan::for_domains(crate::core::runtime::DomainSet::harness());
+    // harness() = agent + memory + threads + config + security.
+    assert!(
+        plan.agent,
+        "harness keeps agent + orchestration subscribers"
+    );
+    assert!(
+        plan.memory,
+        "harness keeps memory conversation-persistence + sync bridge"
+    );
+    // Platform / Channels / Flows / Meet / Mcp are NOT in harness.
+    assert!(
+        !plan.platform,
+        "harness must skip webhook/notification/composio/task-sources/device-tunnel"
+    );
+    assert!(
+        !plan.channels,
+        "harness must skip channel-inbound + web-only proactive"
+    );
+    assert!(!plan.flows, "harness must skip flows trigger dispatch");
+    assert!(!plan.meet, "harness must skip agent_meetings subscribers");
+    assert!(!plan.mcp, "harness must skip mcp_registry bus init");
+}
+
+/// #5027 — the tool-execution timeout must be seeded on the always-on core boot
+/// path (`register_domain_subscribers`), NOT inside
+/// `channels::runtime::startup::start_channels`, which is skipped for
+/// channel-less / web-chat-only cores (and when `OPENHUMAN_DISABLE_CHANNEL_LISTENERS`
+/// is set). A minimal `DomainSet::none()` must still seed, because the seed is
+/// DomainSet-independent.
+///
+/// The seed sits just *before* the ungated `INFRA: Once` block, so it re-runs on
+/// every `register_domain_subscribers` call (each `bootstrap_core_runtime`),
+/// re-applying the freshly reloaded config on an in-process restart — a seed gated
+/// by the process-global `Once` would only fire on the first boot. `TEST_ENV_LOCK`
+/// (via `EnvVarGuard`) serializes with `OPENHUMAN_TOOL_TIMEOUT_SECS` cleared so the
+/// operator env override cannot mask the config-derived value. Runs under a tokio
+/// runtime like the real boot paths — the INFRA block calls `subscribe_global`,
+/// which `tokio::spawn`s when the global bus is already initialized by another test
+/// in the binary.
+#[tokio::test]
+async fn tool_timeout_seeds_on_channelless_core_boot() {
+    // Clear the operator override behind a panic-safe RAII guard: if any assertion
+    // below panics, `Drop` still restores the previous value, so sibling tests that
+    // share `TEST_ENV_LOCK` never inherit the cleared var.
+    let _env = EnvVarGuard::remove_many(vec!["OPENHUMAN_TOOL_TIMEOUT_SECS"]);
+
+    // Distinctive, in-range (1..=3600) value so the assertion can only pass on a
+    // real seed, never on the default. Channel-less: `channels_config` stays empty,
+    // which is exactly the config for which `start_channels` is skipped.
+    let mut config = crate::openhuman::config::Config::default();
+    config.agent.agent_timeout_secs = 1234;
+    assert!(
+        config.channels_config.active_channel.is_none(),
+        "test premise: channel-less config, so start_channels would be skipped"
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Minimal DomainSet — INFRA (and thus the timeout seed) is DomainSet-independent,
+    // so even `none()` must seed. `embedded_core = true` skips the standalone
+    // process-exit shutdown subscriber.
+    super::register_domain_subscribers(
+        tmp.path().to_path_buf(),
+        config,
+        true,
+        crate::core::runtime::DomainSet::none(),
+    );
+
+    assert_eq!(
+        crate::openhuman::tool_timeout::tool_execution_timeout_secs(),
+        1234,
+        "channel-less core boot must seed the tool-execution timeout from [agent].agent_timeout_secs"
+    );
+}
 
 struct EnvVarGuard {
     old_values: Vec<(&'static str, Option<OsString>)>,
@@ -25,6 +150,25 @@ impl EnvVarGuard {
         for (key, value) in vars {
             let old = std::env::var_os(key);
             std::env::set_var(key, value);
+            old_values.push((key, old));
+        }
+        Self {
+            old_values,
+            _lock: lock,
+        }
+    }
+
+    /// Remove the named vars (capturing their prior values) for the guard's
+    /// lifetime, restoring each on `Drop`. Mirrors [`set_many`] for tests that
+    /// need an env var *absent* rather than set to a fixed value.
+    fn remove_many(keys: Vec<&'static str>) -> Self {
+        let lock = crate::openhuman::config::TEST_ENV_LOCK
+            .lock()
+            .expect("test env lock poisoned");
+        let mut old_values = Vec::with_capacity(keys.len());
+        for key in keys {
+            let old = std::env::var_os(key);
+            std::env::remove_var(key);
             old_values.push((key, old));
         }
         Self {
@@ -176,6 +320,46 @@ async fn invoke_doctor_models_rejects_unknown_param() {
     assert!(err.contains("unknown param 'invalid'"));
 }
 
+// Uses a `flows.*` method as its gated-family vehicle: without the `flows`
+// feature there is no flows controller in the registry and the `.expect()`
+// below would panic. The transport-layer gating it proves is orthogonal to the
+// compile-time gate (#4797).
+#[cfg(feature = "flows")]
+#[tokio::test]
+async fn gated_method_is_unknown_at_transport_even_with_malformed_params() {
+    // #4808 review (CodeRabbit): prove the schema-gate fix at the JSON-RPC
+    // TRANSPORT layer (`invoke_method`), not only via direct dispatch. Under a
+    // harness() ambient context a gated method must return an unknown-method
+    // error for BOTH well-formed and malformed params — never the controller's
+    // param-validation error, which would leak that the hidden method exists.
+    use crate::core::runtime::context::CoreContext;
+    use crate::core::runtime::DomainSet;
+
+    let gated_method = crate::core::all::all_registered_controllers()
+        .into_iter()
+        .find(|c| c.schema.namespace == "flows")
+        .map(|c| c.rpc_method_name())
+        .expect("a flows.* method exists in the full registry");
+
+    for params in [json!({}), json!({ "obviously_not_a_real_param_xyz": true })] {
+        let ctx = CoreContext::for_test(DomainSet::harness(), None);
+        let err = CoreContext::scope(
+            ctx,
+            invoke_method(default_state(), &gated_method, params.clone()),
+        )
+        .await
+        .expect_err("gated flows method must error under harness()");
+        assert!(
+            err.contains("unknown method"),
+            "gated `{gated_method}` with params {params} must be unknown-method at transport, got: {err}"
+        );
+        assert!(
+            !err.contains("param"),
+            "gated `{gated_method}` must NOT leak a param-validation error (surface leak), got: {err}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn invoke_config_get_runtime_flags_via_registry() {
     let result = invoke_method(
@@ -188,6 +372,10 @@ async fn invoke_config_get_runtime_flags_via_registry() {
     assert!(result.get("result").is_some());
 }
 
+// `autocomplete_*` is gated behind `desktop-automation` (#5049); with the gate
+// off the controller is unregistered, so this param-validation test only applies
+// when the feature is enabled (it is in the default/shipped build).
+#[cfg(feature = "desktop-automation")]
 #[tokio::test]
 async fn invoke_autocomplete_status_rejects_unknown_param() {
     let err = invoke_method(
@@ -295,6 +483,7 @@ async fn invoke_migrate_hermes_rejects_unknown_param() {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn http_schema_dump_includes_openhuman_and_core_methods() {
     let dump = build_http_schema_dump();
     let methods = dump.methods;
@@ -500,6 +689,7 @@ async fn team_revoke_invite_missing_invite_id_fails_validation() {
 }
 
 #[tokio::test]
+#[cfg(feature = "http-server")]
 async fn schema_dump_includes_new_billing_and_team_methods() {
     let dump = build_http_schema_dump();
     let methods: Vec<&str> = dump.methods.iter().map(|m| m.method.as_str()).collect();
@@ -755,7 +945,7 @@ fn is_session_expired_error_skips_discord_rewrap_for_2285() {
     // to avoid, plus the canonical post-rewrap message body, so
     // either-side drift fails loudly.
     let canonical_rewrap = "Discord API error: Discord list_guilds: bot token was rejected \
-         (upstream HTTP four-oh-one). Open Settings → Channels → Discord \
+         (upstream HTTP four-oh-one). Open Connections → Channels → Discord \
          and rotate / reconnect the bot token.";
     assert!(
         !is_session_expired_error(canonical_rewrap),
@@ -767,12 +957,13 @@ fn is_session_expired_error_skips_discord_rewrap_for_2285() {
     // future regression visible.
     let canonical_rewrap_403 =
         "Discord API error: Discord list_channels: bot token lacks required Discord permissions \
-         (upstream HTTP four-oh-three). Open Settings → Channels → Discord \
+         (upstream HTTP four-oh-three). Open Connections → Channels → Discord \
          and rotate / reconnect the bot token.";
     assert!(!is_session_expired_error(canonical_rewrap_403));
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn is_param_validation_error_matches_the_three_validator_shapes() {
     // Regression guard for OPENHUMAN-TAURI-20: pre-#1467 cores rejected
     // `api_key` because it wasn't in the schema yet. The error string
@@ -792,6 +983,7 @@ fn is_param_validation_error_matches_the_three_validator_shapes() {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn is_param_validation_error_does_not_match_unrelated_errors() {
     // Handler-side / network / auth failures must still be reported.
     assert!(!is_param_validation_error(
@@ -828,6 +1020,7 @@ fn is_session_expired_error_matches_missing_backend_session_token() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "http-server")]
 async fn structured_rpc_error_envelope_passes_through_generic_dispatch() {
     // The transport layer must surface any controller-emitted
     // `StructuredRpcError` payload without inspecting the method name —
@@ -867,7 +1060,9 @@ async fn structured_rpc_error_envelope_passes_through_generic_dispatch() {
     assert!(message.contains("thread-ghost"));
 }
 
+#[cfg(feature = "crash-reporting")]
 #[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "http-server")]
 async fn thread_not_found_rpc_error_does_not_report_to_sentry() {
     use axum::body::to_bytes;
     use axum::extract::State;
@@ -980,7 +1175,9 @@ async fn thread_not_found_rpc_error_does_not_report_to_sentry() {
     );
 }
 
+#[cfg(feature = "crash-reporting")]
 #[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "http-server")]
 async fn unknown_method_severity_split_by_probe_allow_list() {
     // #3567: prove the full severity split at the transport boundary —
     // (1) an allow-listed probe name is NOT captured to Sentry (debug-only),
@@ -1108,6 +1305,7 @@ fn is_session_expired_error_matches_session_jwt_required() {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn escape_html_escapes_all_special_chars() {
     let raw = r#"<script>alert("x&y'z")</script>"#;
     let escaped = escape_html(raw);
@@ -1124,6 +1322,7 @@ fn escape_html_escapes_all_special_chars() {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn escape_html_is_noop_for_safe_text() {
     assert_eq!(escape_html("safe text 123"), "safe text 123");
     assert_eq!(escape_html(""), "");
@@ -1131,6 +1330,7 @@ fn escape_html_is_noop_for_safe_text() {
 
 // --- telegram callback fetch-metadata gate --------------------------------
 
+#[cfg(feature = "http-server")]
 fn hdr_map(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
     let mut m = axum::http::HeaderMap::new();
     for (k, v) in pairs {
@@ -1143,6 +1343,7 @@ fn hdr_map(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn telegram_callback_origin_ok_accepts_no_metadata_headers() {
     // Older browsers and CLI clients (curl) send neither Sec-Fetch-* nor
     // Origin/Referer. The legacy flow has to keep working — reject only
@@ -1152,6 +1353,7 @@ fn telegram_callback_origin_ok_accepts_no_metadata_headers() {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn telegram_callback_origin_ok_accepts_legit_top_nav_from_telegram() {
     let headers = hdr_map(&[
         ("sec-fetch-mode", "navigate"),
@@ -1163,6 +1365,7 @@ fn telegram_callback_origin_ok_accepts_legit_top_nav_from_telegram() {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn telegram_callback_origin_ok_accepts_same_origin_local_nav() {
     let headers = hdr_map(&[
         ("sec-fetch-mode", "navigate"),
@@ -1173,6 +1376,7 @@ fn telegram_callback_origin_ok_accepts_same_origin_local_nav() {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn telegram_callback_origin_ok_rejects_image_embed() {
     let headers = hdr_map(&[
         ("sec-fetch-mode", "no-cors"),
@@ -1183,6 +1387,7 @@ fn telegram_callback_origin_ok_rejects_image_embed() {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn telegram_callback_origin_ok_rejects_iframe_embed() {
     let headers = hdr_map(&[
         ("sec-fetch-mode", "navigate"),
@@ -1193,6 +1398,7 @@ fn telegram_callback_origin_ok_rejects_iframe_embed() {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn telegram_callback_origin_ok_rejects_cross_site_from_non_telegram() {
     let headers = hdr_map(&[
         ("sec-fetch-mode", "navigate"),
@@ -1204,12 +1410,14 @@ fn telegram_callback_origin_ok_rejects_cross_site_from_non_telegram() {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn telegram_callback_origin_ok_rejects_non_telegram_referer_without_fetch_metadata() {
     let headers = hdr_map(&[("referer", "https://attacker.example/post")]);
     assert!(super::telegram_callback_origin_ok(&headers).is_err());
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn telegram_callback_origin_ok_rejects_localhost_host_prefix_decoy() {
     // Regression: prefix-matching the referer accepted hostnames like
     // `http://localhost.attacker.example/...`. With exact-host parsing
@@ -1291,6 +1499,7 @@ async fn invoke_method_core_version_via_tier1_reflects_state() {
 }
 
 #[tokio::test]
+#[cfg(feature = "http-server")]
 async fn test_http_health_handler_returns_correct_status() {
     use axum::body::to_bytes;
     use axum::http::StatusCode;
@@ -1352,6 +1561,7 @@ async fn test_http_health_handler_returns_correct_status() {
 }
 
 #[tokio::test]
+#[cfg(feature = "http-server")]
 async fn desktop_auth_rejects_deprecated_direct_session_token_marker() {
     use axum::body::to_bytes;
     use axum::extract::Query;
@@ -1379,6 +1589,7 @@ async fn desktop_auth_rejects_deprecated_direct_session_token_marker() {
 }
 
 #[tokio::test]
+#[cfg(feature = "http-server")]
 async fn desktop_auth_rejects_embedded_fetch_metadata() {
     use axum::body::to_bytes;
     use axum::extract::Query;
@@ -1409,6 +1620,7 @@ async fn desktop_auth_rejects_embedded_fetch_metadata() {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn is_wallet_not_configured_error_matches_wallet_constant() {
     // The classifier keys off the wallet layer's exact "not configured"
     // message so a wallet-less user's tinyplace RPC stays out of Sentry.
@@ -1418,6 +1630,7 @@ fn is_wallet_not_configured_error_matches_wallet_constant() {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn is_wallet_not_configured_error_is_coupled_to_the_wallet_constant() {
     // Drift guard: if the wallet wording changes without updating the shared
     // constant the classifier matches, this fails — preventing the noise from
@@ -1429,6 +1642,7 @@ fn is_wallet_not_configured_error_is_coupled_to_the_wallet_constant() {
 }
 
 #[test]
+#[cfg(feature = "http-server")]
 fn is_wallet_not_configured_error_does_not_match_other_errors() {
     // Other wallet/seed-derivation failures (decrypt, key derivation, locked
     // keychain) are real defects and must keep reaching Sentry.

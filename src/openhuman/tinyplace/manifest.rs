@@ -174,7 +174,7 @@ pub(crate) fn handle_tinyplace_directory_resolve(params: Map<String, Value>) -> 
         }
 
         // Directory-card fallback: query by username.
-        match directory_card_fallback(&client, &name).await {
+        match directory_card_fallback(client, &name).await {
             Some(card) => {
                 log::debug!(
                     "{LOG_PREFIX} directory_resolve: found '{name}' via directory card \
@@ -586,7 +586,7 @@ pub(crate) fn handle_tinyplace_registry_register(params: Map<String, Value>) -> 
             Ok(identity) => {
                 log::debug!("{LOG_PREFIX} registry_register free-tier ok username={username}");
                 let _ =
-                    publish_directory_card_for_identity(&client, signer.as_ref(), &identity).await;
+                    publish_directory_card_for_identity(client, signer.as_ref(), &identity).await;
                 return to_value(serde_json::json!({ "identity": identity }));
             }
             Err(e) => match e.payment_required() {
@@ -615,7 +615,7 @@ pub(crate) fn handle_tinyplace_registry_register(params: Map<String, Value>) -> 
         if let Some(network) = challenge.network.as_deref() {
             ensure_cluster_matches(network)?;
         }
-        ensure_backend_mint_matches(&client).await?;
+        ensure_backend_mint_matches(client).await?;
 
         let mut extra_metadata = HashMap::new();
         extra_metadata.insert("identity".to_string(), format!("@{username}"));
@@ -642,9 +642,8 @@ pub(crate) fn handle_tinyplace_registry_register(params: Map<String, Value>) -> 
                     log::debug!(
                         "{LOG_PREFIX} registry_register settled username={username} attempt={attempt}"
                     );
-                    let _ =
-                        publish_directory_card_for_identity(&client, signer.as_ref(), &identity)
-                            .await;
+                    let _ = publish_directory_card_for_identity(client, signer.as_ref(), &identity)
+                        .await;
                     return to_value(serde_json::json!({
                         "identity": identity,
                         "payment": { "onChainTx": on_chain_tx },
@@ -680,9 +679,8 @@ pub(crate) fn handle_tinyplace_registry_register(params: Map<String, Value>) -> 
                     log::debug!(
                         "{LOG_PREFIX} registry_register recovered owned identity username={username}"
                     );
-                    let _ =
-                        publish_directory_card_for_identity(&client, signer.as_ref(), &identity)
-                            .await;
+                    let _ = publish_directory_card_for_identity(client, signer.as_ref(), &identity)
+                        .await;
                     return to_value(serde_json::json!({
                         "identity": identity,
                         "payment": { "onChainTx": on_chain_tx },
@@ -916,7 +914,7 @@ pub(crate) fn handle_tinyplace_marketplace_buy_product(
         if let Some(network) = challenge.network.as_deref() {
             ensure_cluster_matches(network)?;
         }
-        ensure_backend_mint_matches(&client).await?;
+        ensure_backend_mint_matches(client).await?;
         let mut extra_metadata = HashMap::new();
         extra_metadata.insert("productId".to_string(), product_id.clone());
         let fulfilled = fulfill_payment(
@@ -1011,7 +1009,7 @@ pub(crate) fn handle_tinyplace_marketplace_buy_identity(
         if let Some(network) = challenge.network.as_deref() {
             ensure_cluster_matches(network)?;
         }
-        ensure_backend_mint_matches(&client).await?;
+        ensure_backend_mint_matches(client).await?;
         let mut extra_metadata = HashMap::new();
         extra_metadata.insert("listingId".to_string(), listing_id.clone());
         let fulfilled = fulfill_payment(
@@ -1118,7 +1116,7 @@ pub(crate) fn handle_tinyplace_marketplace_bid(params: Map<String, Value>) -> Co
             .place_bid_with_payment(
                 &listing_id,
                 bid,
-                tinyplace::api::marketplace::IdentityBidPaymentOptions::default(),
+                tinyplace::api::marketplace::IdentityBidPaymentOptions,
             )
             .await
             .map_err(map_err)?;
@@ -1168,7 +1166,7 @@ pub(crate) fn handle_tinyplace_marketplace_offer(params: Map<String, Value>) -> 
             .marketplace
             .create_offer_with_payment(
                 offer,
-                tinyplace::api::marketplace::IdentityOfferPaymentOptions::default(),
+                tinyplace::api::marketplace::IdentityOfferPaymentOptions,
             )
             .await
             .map_err(map_err)?;
@@ -2498,6 +2496,249 @@ pub(crate) fn handle_tinyplace_registry_assign_primary(
     })
 }
 
+fn transfer_allowed_by_primary_state(primary: Option<bool>) -> bool {
+    primary == Some(false)
+}
+
+/// Transfer one of the wallet's handles to another tiny.place identity
+/// (gift / account move, #4929). DESTRUCTIVE and irreversible for the sender:
+/// on success the recipient becomes the sole owner of `name`.
+///
+/// The recipient is given as a `recipient` handle (with or without a leading
+/// @) — we resolve it to the recipient's `cryptoId` + `publicKey` via
+/// `registry.get`, so the caller never has to know raw key material and an
+/// unresolvable recipient fails **closed** before anything is signed. The
+/// SDK attaches the owning wallet's signature over the transfer payload, so
+/// the backend only lets a caller transfer a handle their *own* wallet owns.
+///
+/// Ordering (read-only preflight → sign+POST → real read-back):
+/// 1. Resolve the recipient and validate it is a live registration whose
+///    `available`/`status` don't flag a stale/expired record (M2, #4998).
+/// 2. Read the sender's *own* current ownership. If it already reads back as
+///    the recipient — a retry after a lost-but-applied POST — return the
+///    existing state without re-signing (idempotency, M1, #4998), and reject a
+///    self-transfer / unregistered / primary handle before signing.
+/// 3. Sign + POST the transfer.
+/// 4. **Read-back via `registry.get`**, NOT the POST response body. The POST has
+///    already returned 2xx by this point, so a mismatch means "submitted but
+///    unconfirmed", never "did not happen" — we never claim the handle wasn't
+///    reassigned, because the handler cannot know that (B1, #4998).
+pub(crate) fn handle_tinyplace_registry_transfer(params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let name = req_str(&params, "name")?
+            .trim()
+            .trim_start_matches('@')
+            .to_string();
+        if name.is_empty() {
+            return Err("missing required param 'name'".to_string());
+        }
+        let recipient = req_str(&params, "recipient")?
+            .trim()
+            .trim_start_matches('@')
+            .to_string();
+        if recipient.is_empty() {
+            return Err("missing required param 'recipient'".to_string());
+        }
+        // Cheap reject before any network/signing: a self-transfer burns a
+        // signature as a no-op and would read back as trivially "confirmed".
+        if name.eq_ignore_ascii_case(&recipient) {
+            return Err("cannot transfer a handle to itself".to_string());
+        }
+        // Never log the handle or recipient — both are user-identifying.
+        log::debug!("{LOG_PREFIX} registry_transfer requested");
+
+        let client = global_state().client().await?;
+
+        // (1) Resolve the recipient handle to a verified cryptoId + publicKey.
+        // An unknown/expired/available recipient fails closed here, before we
+        // sign. We query with the `@`-prefixed form, matching the proven
+        // availability path (`useHandleAvailability` → registry.get(`@handle`)).
+        let availability = client
+            .registry
+            .get(&format!("@{recipient}"))
+            .await
+            .map_err(map_err)?;
+        let (recipient_crypto_id, recipient_public_key) =
+            validate_recipient_availability(&availability)?;
+        log::debug!("{LOG_PREFIX} registry_transfer recipient resolved");
+
+        // (2) Read the sender's own current ownership BEFORE signing. This
+        // hoisted, side-effect-free read lets us (a) short-circuit a retry whose
+        // transfer already landed, and (b) reject a not-registered / primary
+        // handle with the right diagnosis — separately from the nonexistent case.
+        let own = client
+            .registry
+            .get(&format!("@{name}"))
+            .await
+            .map_err(map_err)?;
+        match preflight_own_handle(&own, &recipient_crypto_id) {
+            OwnHandlePreflight::AlreadyTransferred => {
+                // Idempotency (M1): the handle already reads back as the
+                // recipient — a prior POST landed but its response was lost. Do
+                // NOT re-sign; report the existing state.
+                log::debug!("{LOG_PREFIX} registry_transfer already applied; idempotent no-op");
+                return to_value(serde_json::json!({
+                    "identity": own.identity,
+                    "alreadyTransferred": true,
+                }));
+            }
+            OwnHandlePreflight::Reject(message) => {
+                log::warn!("{LOG_PREFIX} registry_transfer rejected in preflight");
+                return Err(message);
+            }
+            OwnHandlePreflight::Proceed => {}
+        }
+
+        // (3) Sign + POST the transfer.
+        let request = tinyplace::types::IdentityTransferRequest {
+            crypto_id: recipient_crypto_id.clone(),
+            public_key: recipient_public_key,
+            ..Default::default()
+        };
+        client
+            .registry
+            .transfer(&name, request)
+            .await
+            .map_err(map_err)?;
+
+        // (4) Real read-back: re-query the registry rather than trusting the POST
+        // response body (`Identity::crypto_id` is `#[serde(default)]`, so an
+        // enveloped/renamed/partial body deserializes to "" and would falsely
+        // fail a transfer that DID land — B1). The transfer is already submitted,
+        // so an unconfirmed read-back is "submitted but unconfirmed", NOT "did
+        // not happen": we must never tell the user they still own it.
+        let readback_identity = client
+            .registry
+            .get(&format!("@{name}"))
+            .await
+            .ok()
+            .and_then(|r| r.identity);
+        let confirmed_owner = readback_identity
+            .as_ref()
+            .map(|i| i.crypto_id.trim().to_string())
+            .unwrap_or_default();
+        match classify_transfer_readback(&confirmed_owner, &recipient_crypto_id) {
+            TransferReadback::Confirmed => {
+                log::debug!("{LOG_PREFIX} registry_transfer confirmed by read-back");
+                // Return the identity from the SAME read-back we confirmed against
+                // (no redundant second GET — the confirmed owner is already here).
+                to_value(serde_json::json!({ "identity": readback_identity, "confirmed": true }))
+            }
+            TransferReadback::Unconfirmed => {
+                log::warn!("{LOG_PREFIX} registry_transfer submitted but unconfirmed by read-back");
+                Err(
+                    "handle transfer was submitted but could not be confirmed. Do not retry \
+                     until you have checked the handle's current owner."
+                        .to_string(),
+                )
+            }
+        }
+    })
+}
+
+/// Validate a recipient's availability lookup before a transfer (#4998, M2).
+///
+/// Returns the recipient's `(cryptoId, publicKey)` when it is a live
+/// registration, or an error when the record is stale/expired/incomplete — so
+/// an irreversible transfer never targets a wallet the recipient may no longer
+/// control at that `@handle`. Pure, so the policy is unit-testable without a
+/// live registry.
+fn validate_recipient_availability(
+    availability: &tinyplace::types::AvailabilityResponse,
+) -> Result<(String, String), String> {
+    // A registered handle reads back as NOT available. `available == true` means
+    // the name is currently free (never registered, or expired-and-released),
+    // so any attached `identity` is stale — refuse rather than transfer to it.
+    if availability.available {
+        return Err(
+            "recipient handle is not currently registered; refusing to transfer".to_string(),
+        );
+    }
+    let identity = availability
+        .identity
+        .as_ref()
+        .ok_or("recipient handle is not registered on tiny.place")?;
+    // An expired identity carries a stale owner record even before the name is
+    // released back to `available` — never send an irreversible transfer to it.
+    if identity.status.trim().eq_ignore_ascii_case("expired") {
+        return Err("recipient handle has expired; refusing to transfer".to_string());
+    }
+    let crypto_id = identity.crypto_id.trim().to_string();
+    let public_key = identity.public_key.trim().to_string();
+    if crypto_id.is_empty() || public_key.is_empty() {
+        return Err(
+            "recipient identity is missing key material; cannot transfer safely".to_string(),
+        );
+    }
+    Ok((crypto_id, public_key))
+}
+
+/// Outcome of the pre-sign check on the sender's own handle (#4998, M1/M2).
+#[derive(Debug, PartialEq, Eq)]
+enum OwnHandlePreflight {
+    /// The handle already reads back as owned by the recipient — a retry after a
+    /// lost-but-applied POST. Return the existing state; do NOT re-sign.
+    AlreadyTransferred,
+    /// Safe to proceed to signing + POST.
+    Proceed,
+    /// Reject before signing with this message.
+    Reject(String),
+}
+
+/// Decide whether to proceed with, short-circuit, or reject a transfer based on
+/// the sender's own current ownership. Pure, so unit-testable without a client.
+fn preflight_own_handle(
+    own: &tinyplace::types::AvailabilityResponse,
+    recipient_crypto_id: &str,
+) -> OwnHandlePreflight {
+    let Some(identity) = own.identity.as_ref() else {
+        // Not registered at all — a distinct diagnosis from the primary case, so
+        // a nonexistent handle doesn't get "mark it non-primary" (M2 tail).
+        return OwnHandlePreflight::Reject(
+            "this handle is not registered on tiny.place".to_string(),
+        );
+    };
+    // Idempotency (M1): already owned by the recipient — a prior transfer landed.
+    if identity.crypto_id.trim() == recipient_crypto_id {
+        return OwnHandlePreflight::AlreadyTransferred;
+    }
+    // A primary (active) handle is locked from transfer server-side; mirror that
+    // client-side so a direct JSON-RPC caller can't bypass the UI gate.
+    if !transfer_allowed_by_primary_state(identity.primary) {
+        return OwnHandlePreflight::Reject(
+            "cannot transfer this handle while it is your active (primary) handle; make \
+             another handle active first"
+                .to_string(),
+        );
+    }
+    OwnHandlePreflight::Proceed
+}
+
+/// Outcome of the post-transfer read-back confirmation (#4998, B1).
+#[derive(Debug, PartialEq, Eq)]
+enum TransferReadback {
+    /// The registry reads back the recipient as the current owner.
+    Confirmed,
+    /// The read-back neither confirms nor refutes reassignment — the POST is
+    /// already submitted, so this is "submitted but unconfirmed", never a claim
+    /// that the transfer did not happen.
+    Unconfirmed,
+}
+
+/// Classify the post-transfer read-back. Only a non-empty owner that equals the
+/// recipient confirms; anything else (empty/enveloped body, mismatch, failed
+/// read) is treated as unconfirmed. Pure, so unit-testable without a client.
+fn classify_transfer_readback(
+    confirmed_owner: &str,
+    recipient_crypto_id: &str,
+) -> TransferReadback {
+    if !confirmed_owner.is_empty() && confirmed_owner == recipient_crypto_id {
+        TransferReadback::Confirmed
+    } else {
+        TransferReadback::Unconfirmed
+    }
+}
+
 // ── Users email verification ────────────────────────────────────────────────
 
 pub(crate) fn handle_tinyplace_users_start_email_verification(
@@ -2606,10 +2847,12 @@ pub(crate) fn handle_tinyplace_streams_start(params: Map<String, Value>) -> Cont
         let kind = match kind_str_trimmed {
             "inbox" => super::streams::StreamKind::Inbox,
             "conversation" => super::streams::StreamKind::Conversation,
+            "feed" => super::streams::StreamKind::Feed,
             _ => return Err(format!("unsupported streamType: {kind_str_trimmed}")),
         };
 
-        // conversation streams require a target id.
+        // conversation and feed streams require a target id (conversation_id /
+        // feed handle respectively); inbox is a singleton with no target.
         let target_id = params
             .get("streamId")
             .and_then(|v| v.as_str())
@@ -2618,6 +2861,9 @@ pub(crate) fn handle_tinyplace_streams_start(params: Map<String, Value>) -> Cont
 
         if kind == super::streams::StreamKind::Conversation && target_id.is_none() {
             return Err("streamId is required for conversation streams".to_string());
+        }
+        if kind == super::streams::StreamKind::Feed && target_id.is_none() {
+            return Err("streamId is required for feed streams".to_string());
         }
 
         log::debug!(
@@ -2670,7 +2916,6 @@ use std::sync::Arc;
 
 use tinyplace::signal::session::SignalSession;
 use tinyplace::signal::store::SessionStore;
-use tinyplace::signal::store::SessionStore as _;
 
 /// Get the `Arc<dyn Signer>` from the client or fail with a clear message.
 ///
@@ -2927,7 +3172,7 @@ pub(crate) fn handle_tinyplace_signal_get_bundle(params: Map<String, Value>) -> 
         let client = global_state().client().await?;
 
         // Resolve the identifier (handle or crypto_id) before the bundle lookup.
-        let agent_id = resolve_recipient_to_agent_id(&client, &raw_agent_id).await?;
+        let agent_id = resolve_recipient_to_agent_id(client, &raw_agent_id).await?;
         log::debug!("{LOG_PREFIX} signal_get_bundle resolved agent_id={agent_id}");
 
         let result = match client.keys.get_bundle(&agent_id).await {
@@ -2985,19 +3230,25 @@ pub(crate) fn handle_tinyplace_signal_key_status(_params: Map<String, Value>) ->
         // AND does it match the current identity key? A stale key (from a
         // previous wallet) should show as NOT published so the user
         // re-registers.
-        let encryption_key_published = match client.directory.get_agent(&agent_id).await {
-            Ok(card) => {
+        // Bounded: once a card exists, fetching it hits the relay; a degraded
+        // relay must degrade this to "not published" (like the Err arm), never
+        // hang the caller (self_identity → the orchestration identity card).
+        let card_fetch = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.directory.get_agent(&agent_id),
+        )
+        .await;
+        let encryption_key_published = match card_fetch {
+            Ok(Ok(card)) => {
                 let published_key = card
                     .metadata
                     .as_ref()
                     .and_then(|m| m.get("encryptionPublicKey"));
-                let current_key_b64 = base64::engine::general_purpose::STANDARD.encode(
-                    store
-                        .identity_x25519_key_pair()
-                        .await
-                        .map(|kp| kp.public_key)
-                        .unwrap_or([0u8; 32]),
-                );
+                // The card advertises the Ed25519 identity key (the addressable
+                // messaging key where the bundle + mailbox live), not the X25519
+                // DH key — see `signal_register_encryption_key`. Compare against
+                // that so readiness reflects what peers actually resolve.
+                let current_key_b64 = signer.public_key_base64();
                 let matches = published_key
                     .map(|pk| pk == &current_key_b64)
                     .unwrap_or(false);
@@ -3010,8 +3261,14 @@ pub(crate) fn handle_tinyplace_signal_key_status(_params: Map<String, Value>) ->
                 log::debug!("{LOG_PREFIX} signal_key_status encryption_key_published={matches}");
                 matches
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 log::warn!("{LOG_PREFIX} signal_key_status directory card fetch failed: {e}");
+                false
+            }
+            Err(_) => {
+                log::warn!(
+                    "{LOG_PREFIX} signal_key_status directory card fetch timed out (relay slow)"
+                );
                 false
             }
         };
@@ -3024,6 +3281,67 @@ pub(crate) fn handle_tinyplace_signal_key_status(_params: Map<String, Value>) ->
             "encryptionKeyPublished": encryption_key_published,
         }))
     })
+}
+
+/// Idempotently make this agent **discoverable** so peers can encrypt replies to
+/// it — the precondition for the orchestration receive loop. Mirrors the two
+/// manual UI actions (Messaging → "Set up encryption keys" + "Make
+/// discoverable") but runs automatically: provision pre-keys if missing, then
+/// publish the encryption (identity) key to the directory card if not already
+/// advertised.
+///
+/// Returns `Ok(true)` once the agent is confirmed discoverable
+/// (`encryptionKeyPublished`), `Ok(false)` if a publish step was attempted but
+/// the status could not yet be confirmed, and `Err` when prerequisites are
+/// missing (e.g. wallet locked → no signer). Callers retry on `Ok(false)`/`Err`.
+///
+/// Cheap on the steady state: when keys are already provisioned and published it
+/// performs only the status probe and returns without mutating anything.
+pub async fn ensure_signal_keys_published() -> Result<bool, String> {
+    // 1. Probe current readiness. This requires a signer (unlocked wallet); it
+    //    surfaces as an Err the caller retries on.
+    let status = handle_tinyplace_signal_key_status(Map::new()).await?;
+    let keys_ready = status
+        .get("hasActiveSignedPreKey")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && status
+            .get("localPreKeyCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0;
+    let published = status
+        .get("encryptionKeyPublished")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if keys_ready && published {
+        log::debug!("{LOG_PREFIX} ensure_signal_keys_published: already discoverable");
+        return Ok(true);
+    }
+
+    // 2. Provision pre-keys if missing (signed pre-key + one-time pre-keys).
+    if !keys_ready {
+        log::info!("{LOG_PREFIX} ensure_signal_keys_published: provisioning pre-keys");
+        handle_tinyplace_signal_provision(Map::new()).await?;
+    }
+
+    // 3. Advertise the encryption (identity) key on the directory card so peers
+    //    can resolve the prekey bundle and encrypt to this agent.
+    if !published {
+        log::info!("{LOG_PREFIX} ensure_signal_keys_published: publishing encryption key");
+        handle_tinyplace_signal_register_encryption_key(Map::new()).await?;
+    }
+
+    // 4. Re-probe so the caller can confirm the agent is now discoverable and
+    //    stop retrying.
+    let after = handle_tinyplace_signal_key_status(Map::new()).await?;
+    let now_published = after
+        .get("encryptionKeyPublished")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    log::info!("{LOG_PREFIX} ensure_signal_keys_published: done published={now_published}");
+    Ok(now_published)
 }
 
 // ── Signal messaging helpers ──────────────────────────────────────────────────
@@ -3246,7 +3564,7 @@ pub(crate) fn handle_tinyplace_signal_send_message(params: Map<String, Value>) -
 
         // Resolve the recipient identifier (@handle, bare handle, or crypto_id) to
         // the canonical crypto_id before any key-bundle or directory lookup.
-        let agent_id = resolve_recipient_to_agent_id(&client, &recipient).await?;
+        let agent_id = resolve_recipient_to_agent_id(client, &recipient).await?;
         log::debug!("{LOG_PREFIX} signal_send_message resolved to agent_id={agent_id}");
 
         // Fetch recipient's published key bundle (always needed for the X25519
@@ -3611,32 +3929,35 @@ pub(crate) fn handle_tinyplace_contacts_stats(_params: Map<String, Value>) -> Co
 
 // ── Signal: encryption key registration (0D) ────────────────────────────────
 
-/// Publish the user's X25519 identity public key on their directory card as
+/// Publish the user's Ed25519 identity key (the addressable cryptoId, where the
+/// Signal prekey bundle + mailbox live) on their directory card as
 /// `metadata.encryptionPublicKey`. This makes the user discoverable for
-/// encrypted DMs via `find_agent_by_encryption_key`.
+/// encrypted DMs via `find_agent_by_encryption_key`; peers derive the X25519 DH
+/// key from the fetched bundle themselves.
 ///
-/// SECURITY: only the PUBLIC key is published. The private key never leaves
-/// the `FileSessionStore`.
+/// SECURITY: only the PUBLIC key is published.
 pub(crate) fn handle_tinyplace_signal_register_encryption_key(
     _params: Map<String, Value>,
 ) -> ControllerFuture {
     Box::pin(async move {
         log::debug!("{LOG_PREFIX} signal_register_encryption_key");
 
-        // 1. Read identity public key from the signal store.
-        let store = crate::openhuman::tinyplace::signal_store::global_signal_store().await?;
-        let identity_kp = store
-            .identity_x25519_key_pair()
-            .await
-            .map_err(|e| format!("identity key: {e}"))?;
-        let encryption_key_b64 =
-            base64::engine::general_purpose::STANDARD.encode(identity_kp.public_key);
-        log::debug!("{LOG_PREFIX} signal_register_encryption_key derived key (not logging value)");
-
-        // 2. Acquire client and signer.
+        // 1. Acquire client and signer.
         let client = global_state().client().await?;
         let signer = require_signer(client)?;
         let agent_id = signer.agent_id();
+
+        // 2. The messaging key peers resolve from this directory card must be the
+        //    wallet's **Ed25519 identity key** — that is the addressable identity
+        //    where the Signal prekey bundle is published (`/keys/<cryptoId>/bundle`)
+        //    and where the mailbox is keyed. Peers derive the X25519 DH key from
+        //    the bundle's identity key themselves (see `decode_identity_key`), so
+        //    they never need a separate X25519 key advertised here. Publishing the
+        //    X25519 key instead made every peer resolve to a *bundle-less* key and
+        //    404 on the bundle fetch — the exact reason inbound DMs never reached
+        //    this agent. Advertise the identity key so resolution + delivery align.
+        let encryption_key_b64 = signer.public_key_base64();
+        log::debug!("{LOG_PREFIX} signal_register_encryption_key advertising identity key (value not logged)");
 
         // 3. Fetch current AgentCard to preserve existing fields. A wallet that
         //    has Signal keys but no directory presence yet (e.g. it registered a
@@ -4953,7 +5274,7 @@ pub(crate) fn handle_tinyplace_bounties_create(params: Map<String, Value>) -> Co
         if let Some(network) = challenge.network.as_deref() {
             ensure_cluster_matches(network)?;
         }
-        ensure_backend_mint_matches(&client).await?;
+        ensure_backend_mint_matches(client).await?;
 
         let mut extra_metadata = HashMap::new();
         extra_metadata.insert("title".to_string(), request.title.clone());
@@ -5203,6 +5524,240 @@ mod tests {
         params.insert("username".to_string(), Value::String("   ".to_string()));
         let err = block_on(handle_tinyplace_registry_register(params)).unwrap_err();
         assert!(err.contains("username"), "got: {err}");
+    }
+
+    /// #4929: transfer rejects a missing/blank `name` or `recipient` before any
+    /// client/network work — the destructive path never runs on bad input.
+    #[test]
+    fn transfer_requires_name_and_recipient() {
+        // Missing name.
+        let err = block_on(handle_tinyplace_registry_transfer(Map::new())).unwrap_err();
+        assert!(err.contains("name"), "got: {err}");
+
+        // A bare "@" normalizes to an empty name and is rejected before any
+        // client/network work (the destructive path never runs).
+        let mut params = Map::new();
+        params.insert("name".to_string(), Value::String("@".to_string()));
+        params.insert("recipient".to_string(), Value::String("bravo".to_string()));
+        let err = block_on(handle_tinyplace_registry_transfer(params)).unwrap_err();
+        assert!(err.contains("name"), "got: {err}");
+
+        // Name present, recipient missing.
+        let mut params = Map::new();
+        params.insert("name".to_string(), Value::String("alpha".to_string()));
+        let err = block_on(handle_tinyplace_registry_transfer(params)).unwrap_err();
+        assert!(err.contains("recipient"), "got: {err}");
+
+        // Name present, recipient blank → still rejected.
+        let mut params = Map::new();
+        params.insert("name".to_string(), Value::String("alpha".to_string()));
+        params.insert("recipient".to_string(), Value::String("   ".to_string()));
+        let err = block_on(handle_tinyplace_registry_transfer(params)).unwrap_err();
+        assert!(err.contains("recipient"), "got: {err}");
+    }
+
+    /// #4929: transfer eligibility fails closed when the registry omits the
+    /// primary flag; only an explicit `false` may reach the destructive path.
+    #[test]
+    fn transfer_requires_explicit_non_primary_state() {
+        assert!(!transfer_allowed_by_primary_state(None));
+        assert!(!transfer_allowed_by_primary_state(Some(true)));
+        assert!(transfer_allowed_by_primary_state(Some(false)));
+    }
+
+    // ── #4998 destructive-path coverage (B1 read-back, M1 idempotency, M2
+    //    recipient validation) — the pure policy helpers the async handler
+    //    delegates to, so the irreversible-transfer decisions are unit-tested. ──
+
+    fn test_identity(
+        crypto_id: &str,
+        status: &str,
+        primary: Option<bool>,
+    ) -> tinyplace::types::Identity {
+        tinyplace::types::Identity {
+            username: "handle".to_string(),
+            crypto_id: crypto_id.to_string(),
+            public_key: if crypto_id.is_empty() {
+                String::new()
+            } else {
+                "pubkey".to_string()
+            },
+            registered_at: String::new(),
+            expires_at: String::new(),
+            status: status.to_string(),
+            registration_tx: None,
+            payment_methods: None,
+            primary,
+            subnames: None,
+            signature: None,
+            payment: None,
+            last_renewal_tx: None,
+            updated_at: String::new(),
+        }
+    }
+
+    fn availability(
+        available: bool,
+        identity: Option<tinyplace::types::Identity>,
+    ) -> tinyplace::types::AvailabilityResponse {
+        tinyplace::types::AvailabilityResponse {
+            available,
+            name: "@handle".to_string(),
+            identity,
+            lifecycle: None,
+        }
+    }
+
+    /// M2: a recipient whose name is currently `available` (free / released) is
+    /// refused even if a stale `identity` record is attached — never transfer to
+    /// a wallet the recipient may no longer control at that @handle.
+    #[test]
+    fn recipient_available_is_refused() {
+        let avail = availability(
+            true,
+            Some(test_identity("recipientCid", "active", Some(false))),
+        );
+        let err = validate_recipient_availability(&avail).unwrap_err();
+        assert!(err.contains("not currently registered"), "got: {err}");
+    }
+
+    /// M2: a recipient with no identity record at all fails closed.
+    #[test]
+    fn recipient_missing_identity_is_refused() {
+        let err = validate_recipient_availability(&availability(false, None)).unwrap_err();
+        assert!(err.contains("not registered on tiny.place"), "got: {err}");
+    }
+
+    /// M2: an EXPIRED recipient identity (stale owner record before release) is
+    /// refused — case-insensitively.
+    #[test]
+    fn recipient_expired_status_is_refused() {
+        for status in ["expired", "EXPIRED", "Expired"] {
+            let avail = availability(
+                false,
+                Some(test_identity("recipientCid", status, Some(false))),
+            );
+            let err = validate_recipient_availability(&avail).unwrap_err();
+            assert!(err.contains("expired"), "status {status} → {err}");
+        }
+    }
+
+    /// M2: a recipient missing key material can't be transferred to safely.
+    #[test]
+    fn recipient_missing_key_material_is_refused() {
+        let avail = availability(false, Some(test_identity("", "active", Some(false))));
+        let err = validate_recipient_availability(&avail).unwrap_err();
+        assert!(err.contains("missing key material"), "got: {err}");
+    }
+
+    /// A live, registered recipient resolves to its (cryptoId, publicKey).
+    #[test]
+    fn recipient_live_resolves_key_material() {
+        let avail = availability(
+            false,
+            Some(test_identity("recipientCid", "active", Some(false))),
+        );
+        let (cid, pk) = validate_recipient_availability(&avail).unwrap();
+        assert_eq!(cid, "recipientCid");
+        assert_eq!(pk, "pubkey");
+    }
+
+    /// M1 idempotency: when the sender's own handle ALREADY reads back as the
+    /// recipient (a retry after a lost-but-applied POST), the preflight
+    /// short-circuits and must NOT re-sign.
+    #[test]
+    fn preflight_already_transferred_short_circuits() {
+        let own = availability(
+            false,
+            Some(test_identity("recipientCid", "active", Some(false))),
+        );
+        assert_eq!(
+            preflight_own_handle(&own, "recipientCid"),
+            OwnHandlePreflight::AlreadyTransferred
+        );
+    }
+
+    /// M2 tail: a nonexistent own-handle gets the right diagnosis, NOT the
+    /// "mark it non-primary" message.
+    #[test]
+    fn preflight_unregistered_own_handle_is_distinct() {
+        match preflight_own_handle(&availability(true, None), "recipientCid") {
+            OwnHandlePreflight::Reject(msg) => {
+                assert!(msg.contains("not registered"), "got: {msg}");
+                assert!(
+                    !msg.contains("primary"),
+                    "must not misdiagnose as primary: {msg}"
+                );
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// A primary (active) own-handle is rejected before signing.
+    #[test]
+    fn preflight_primary_handle_is_rejected() {
+        let own = availability(false, Some(test_identity("ownerCid", "active", Some(true))));
+        match preflight_own_handle(&own, "recipientCid") {
+            OwnHandlePreflight::Reject(msg) => assert!(msg.contains("active"), "got: {msg}"),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+        // Missing primary flag also fails closed.
+        let own_none = availability(false, Some(test_identity("ownerCid", "active", None)));
+        assert!(matches!(
+            preflight_own_handle(&own_none, "recipientCid"),
+            OwnHandlePreflight::Reject(_)
+        ));
+    }
+
+    /// A non-primary own-handle owned by someone other than the recipient
+    /// proceeds to signing.
+    #[test]
+    fn preflight_non_primary_proceeds() {
+        let own = availability(
+            false,
+            Some(test_identity("ownerCid", "active", Some(false))),
+        );
+        assert_eq!(
+            preflight_own_handle(&own, "recipientCid"),
+            OwnHandlePreflight::Proceed
+        );
+    }
+
+    /// B1: the read-back confirms ONLY when the registry returns a non-empty
+    /// owner equal to the recipient. An empty owner (enveloped/renamed/partial
+    /// body, or a failed read) is "unconfirmed" — never a claim the transfer
+    /// didn't happen.
+    #[test]
+    fn readback_confirms_only_on_matching_nonempty_owner() {
+        assert_eq!(
+            classify_transfer_readback("recipientCid", "recipientCid"),
+            TransferReadback::Confirmed
+        );
+        // Empty owner (default-deserialized crypto_id "" from an enveloped body).
+        assert_eq!(
+            classify_transfer_readback("", "recipientCid"),
+            TransferReadback::Unconfirmed
+        );
+        // Owner reads back as someone else.
+        assert_eq!(
+            classify_transfer_readback("otherCid", "recipientCid"),
+            TransferReadback::Unconfirmed
+        );
+        // Defensive: an empty recipient never vacuously confirms on an empty read.
+        assert_eq!(
+            classify_transfer_readback("", ""),
+            TransferReadback::Unconfirmed
+        );
+    }
+
+    /// A self-transfer is rejected before any network/signing work.
+    #[test]
+    fn transfer_rejects_self_transfer() {
+        let mut params = Map::new();
+        params.insert("name".to_string(), Value::String("@alpha".to_string()));
+        params.insert("recipient".to_string(), Value::String("alpha".to_string()));
+        let err = block_on(handle_tinyplace_registry_transfer(params)).unwrap_err();
+        assert!(err.contains("itself"), "got: {err}");
     }
 
     /// Buy handlers reject a missing/blank `id` before any client/network work.
@@ -5742,6 +6297,19 @@ mod tests {
         );
         let err = block_on(handle_tinyplace_streams_start(params)).unwrap_err();
         assert!(err.contains("streamId"), "got: {err}");
+    }
+
+    /// streams_start rejects a feed stream without a streamId (the feed handle).
+    /// Regression for #4926: "feed" is a valid streamType but, like
+    /// "conversation", it is target-scoped and must carry a streamId.
+    #[test]
+    fn streams_start_feed_requires_stream_id() {
+        let mut params = Map::new();
+        params.insert("streamType".to_string(), Value::String("feed".to_string()));
+        let err = block_on(handle_tinyplace_streams_start(params)).unwrap_err();
+        assert!(err.contains("streamId"), "got: {err}");
+        // And it must NOT be rejected as an unsupported streamType.
+        assert!(!err.contains("unsupported"), "got: {err}");
     }
 
     /// streams_stop rejects a missing/blank streamId.

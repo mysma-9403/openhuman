@@ -27,6 +27,7 @@ import chatRuntimeReducer from './chatRuntimeSlice';
 import companionReducer from './companionSlice';
 import connectivityReducer from './connectivitySlice';
 import coreModeReducer from './coreModeSlice';
+import githubStarReducer from './githubStarSlice';
 import layoutReducer from './layoutSlice';
 import localeReducer from './localeSlice';
 import mascotReducer from './mascotSlice';
@@ -102,6 +103,7 @@ const themePersistConfig = {
     'mode',
     'tabBarLabels',
     'fontSize',
+    'customFontSizePx',
     'agentMessageViewMode',
     'developerMode',
     'hideAgentInsights',
@@ -218,6 +220,11 @@ const persistedChatRuntimeReducer = persistReducer(chatRuntimePersistConfig, cha
 const announcementPersistConfig = { key: 'announcement', storage, whitelist: ['shownIds'] };
 const persistedAnnouncementReducer = persistReducer(announcementPersistConfig, announcementReducer);
 
+// Persist whether this user dismissed/acted on the "Star us on GitHub" CTA
+// (#5005) so the nudge never reappears once handled (user-scoped, durable).
+const githubStarPersistConfig = { key: 'githubStar', storage, whitelist: ['dismissed'] };
+const persistedGithubStarReducer = persistReducer(githubStarPersistConfig, githubStarReducer);
+
 export const store = configureStore({
   reducer: {
     backendMeet: backendMeetReducer,
@@ -239,6 +246,7 @@ export const store = configureStore({
     theme: persistedThemeReducer,
     ptt: persistedPttReducer,
     announcement: persistedAnnouncementReducer,
+    githubStar: persistedGithubStarReducer,
     // In-memory only (not persisted): survives route changes / background-job
     // completion, resets on restart + user switch. Durable storage is a #3931
     // follow-up.

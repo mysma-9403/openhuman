@@ -116,7 +116,7 @@ impl Tool for CallMemoryAgentTool {
         let max_turns = args
             .get("max_turns")
             .and_then(|v| v.as_u64())
-            .map(|v| v.max(1).min(20) as usize);
+            .map(|v| v.clamp(1, 20) as usize);
 
         let is_async = args.get("async").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -226,7 +226,7 @@ impl Tool for CallMemoryAgentTool {
 
         // Synchronous path — block until the memory agent finishes.
         let started = std::time::Instant::now();
-        match run_subagent(&definition, &prompt, options).await {
+        match run_subagent(definition, &prompt, options).await {
             Ok(outcome) => {
                 let elapsed = started.elapsed();
                 log::info!(

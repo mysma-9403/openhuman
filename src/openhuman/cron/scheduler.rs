@@ -25,9 +25,9 @@ const AGENT_JOB_USER_FAILURE_MESSAGE: &str = "Something went wrong. Please try a
 // instead of "Something went wrong". Static `&'static str` only — they carry no
 // `err` fields, honouring the no-leak contract on `agent_error_to_user_message`.
 const CRON_HALT_API_KEY_UNSET_MESSAGE: &str =
-    "No API key is set for your AI provider. Add one in Settings \u{2192} AI \u{2192} LLM, then re-run.";
+    "No API key is set for your AI provider. Add it in Connections \u{2192} API keys \u{2192} LLM, then re-run.";
 const CRON_HALT_INSUFFICIENT_CREDITS_MESSAGE: &str =
-    "Your AI provider is out of credits. Top it up or update its key in Settings \u{2192} AI \u{2192} LLM.";
+    "Your AI provider is out of credits. Top it up or update its key in Connections \u{2192} API keys \u{2192} LLM.";
 const CRON_HALT_BUDGET_EXHAUSTED_MESSAGE: &str =
     "You've reached your managed AI budget. Raise it in Settings \u{2192} Billing.";
 const MORNING_BRIEFING_AGENT_ID: &str = "morning_briefing";
@@ -57,7 +57,7 @@ fn agent_error_to_user_message(err: &AgentError) -> &'static str {
             "The model provider is temporarily unavailable. The next run will retry automatically."
         }
         AgentError::ProviderError { retryable: false, .. } => {
-            "The model provider rejected the request. Check your provider credentials in Settings \u{2192} AI \u{2192} LLM."
+            "The model provider rejected the request. Check provider credentials in Connections \u{2192} API keys \u{2192} LLM."
         }
         AgentError::ContextLimitExceeded { .. } => {
             "The conversation grew too long for the model. Start a new session or pick a model with a larger context window."
@@ -66,7 +66,7 @@ fn agent_error_to_user_message(err: &AgentError) -> &'static str {
             "You've reached the daily cost budget for this agent. Raise it in Settings \u{2192} Billing or wait for the next budget window."
         }
         AgentError::MaxIterationsExceeded { .. } => {
-            "The agent stopped after too many tool iterations. Raise the iteration cap in Settings \u{2192} AI \u{2192} LLM or simplify the task."
+            "Too many tool iterations. Raise the iteration cap in Connections \u{2192} API keys \u{2192} LLM or simplify the task."
         }
         AgentError::EmptyProviderResponse { .. } => {
             // Issue #3335: the prior copy named a "local provider"
@@ -76,9 +76,9 @@ fn agent_error_to_user_message(err: &AgentError) -> &'static str {
             // contract, for clean notification-drawer rendering) names
             // the two highest-signal remedies — credits and model
             // configuration. The richer three-remedy copy lives on the
-            // chat-surface side (`channels/providers/web_errors.rs`'s
+            // chat-surface side (`web_chat/web_errors.rs`'s
             // empty_response arm) where there's no drawer-width limit.
-            "Empty model response. Out of credits (Settings \u{2192} Billing) or try a different model in Settings \u{2192} AI \u{2192} LLM."
+            "Empty model response. Out of credits (Settings \u{2192} Billing) or try another model in Connections \u{2192} API keys \u{2192} LLM."
         }
         AgentError::CompactionFailed { .. } => {
             "Automatic history compaction failed. The next run will start with a fresh context."
@@ -433,11 +433,11 @@ fn is_api_key_unset_failure(
 }
 
 /// TAURI-RUST-12K — a cron **agent** job pinned to a **local** LLM provider
-/// (LM Studio / Ollama / llama.cpp on `localhost:<port>`) fails at the TCP
-/// layer with "connection refused" because the user's local server isn't
-/// running. This is a genuinely unpreventable user-environment state: the app
-/// has no lever to start a user's local model server, and retrying across the
-/// backoff loop cannot bring the port up within one cron cycle.
+/// (LM Studio / Ollama / llama.cpp on `localhost:<port>`) fails because the
+/// user's local runtime is unavailable or reachable-but-idle with no model
+/// loaded. This is a genuinely unpreventable user-environment state: the app
+/// has no lever to start a user's local model server or load a model there, and
+/// retrying across the backoff loop cannot fix it within one cron cycle.
 ///
 /// The provider / agent emit sites already demote this via
 /// `report_error_or_expected` (the `expected_error_kind` classifier routes it
@@ -448,13 +448,15 @@ fn is_api_key_unset_failure(
 /// the source demotion and the sibling billing / api-key guards
 /// (TAURI-RUST-514 / -BMW / -HCK).
 ///
-/// Delegates to the single-source matcher
+/// Delegates loopback-unreachable detection to the single-source matcher
 /// [`crate::core::observability::is_local_provider_unreachable_message`] so
-/// the wording cannot drift from the classifier emit site. Narrow by design:
-/// only **loopback** connection-refused matches, so a transient *remote*
-/// provider / backend network error still retries and still reports. Routes on
-/// `last_agent_error` first (the raw anyhow chain carrying the wire message),
-/// falling back to `last_output`. Restricted to `JobType::Agent`.
+/// the wording cannot drift from the classifier emit site. Also recognizes the
+/// inference provider's stable local-runtime "no model loaded" user message.
+/// Narrow by design: a transient *remote* provider / backend network error
+/// still retries and still reports. Checks both `last_agent_error` (the raw
+/// anyhow chain carrying the wire message) and `last_output` (the surfaced user
+/// message), because some provider paths preserve only one of those shapes.
+/// Restricted to `JobType::Agent`.
 fn is_local_provider_unreachable_failure(
     job_type: &JobType,
     last_agent_error: Option<&str>,
@@ -463,8 +465,17 @@ fn is_local_provider_unreachable_failure(
     if !matches!(job_type, JobType::Agent) {
         return false;
     }
-    let signal = last_agent_error.unwrap_or(last_output);
-    crate::core::observability::is_local_provider_unreachable_message(signal)
+    let raw_signal = last_agent_error.unwrap_or("");
+    crate::core::observability::is_local_provider_unreachable_message(raw_signal)
+        || crate::core::observability::is_local_provider_unreachable_message(last_output)
+        || is_local_provider_no_model_loaded_message(raw_signal)
+        || is_local_provider_no_model_loaded_message(last_output)
+}
+
+fn is_local_provider_no_model_loaded_message(signal: &str) -> bool {
+    let lower = signal.to_ascii_lowercase();
+    (lower.contains("local inference server") && lower.contains("no model loaded"))
+        || lower.contains("no models loaded")
 }
 
 async fn execute_job_with_retry(
@@ -636,9 +647,7 @@ async fn execute_job_with_retry(
         && !local_unreachable
         && !permanent_config_halt
     {
-        let report_message = last_agent_error
-            .as_deref()
-            .unwrap_or_else(|| last_output.as_str());
+        let report_message = last_agent_error.as_deref().unwrap_or(last_output.as_str());
         crate::core::observability::report_error(
             report_message,
             "cron",
@@ -717,15 +726,13 @@ fn permanent_halt_message(credits_exhausted: bool, budget_exhausted: bool) -> &'
 /// deep-link action even though no chat thread is active.
 fn publish_cron_user_error(kind: &str) {
     log::debug!("[cron] action=surface_user_error kind={kind}");
-    crate::openhuman::channels::providers::web::publish_web_channel_event(
-        crate::core::socketio::WebChannelEvent {
-            event: "user_error".to_string(),
-            client_id: "system".to_string(),
-            error_type: Some(kind.to_string()),
-            error_source: Some("cron".to_string()),
-            ..Default::default()
-        },
-    );
+    crate::openhuman::web_chat::publish_web_channel_event(crate::core::socketio::WebChannelEvent {
+        event: "user_error".to_string(),
+        client_id: "system".to_string(),
+        error_type: Some(kind.to_string()),
+        error_source: Some("cron".to_string()),
+        ..Default::default()
+    });
 }
 
 async fn process_due_jobs(config: &Config, security: &Arc<SecurityPolicy>, jobs: Vec<CronJob>) {
@@ -837,8 +844,16 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String, Option<
                     .unwrap_or_else(|| crate::openhuman::config::DEFAULT_MODEL.to_string());
                 let resolved_model = match &def.model {
                     ModelSpec::Hint(workload) => {
-                        match crate::openhuman::inference::provider::create_chat_provider(
-                            workload, &effective,
+                        // Resolve the workload's configured model id via the crate
+                        // `ChatModel` factory (#4249 Phase 1). We only need the
+                        // resolved model string here, so the built model is
+                        // discarded — `create_chat_model_with_model_id` wraps the
+                        // same `create_chat_provider` resolution, so the model id is
+                        // identical; temperature is irrelevant to id resolution.
+                        match crate::openhuman::inference::provider::create_chat_model_with_model_id(
+                            workload,
+                            &effective,
+                            effective.default_temperature,
                         ) {
                             Ok((_, m)) => {
                                 tracing::debug!(
@@ -867,7 +882,12 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String, Option<
                     ModelSpec::Exact(name) => name.clone(),
                 };
                 effective.default_model = Some(resolved_model);
-                effective.agent.max_tool_iterations = def.max_iterations;
+                // Issue #4868 — the iteration cap is no longer set here. The
+                // session builder (`build_session_agent_inner`) resolves it
+                // from `def.effective_max_iterations()` directly, which (unlike
+                // this cron path previously) correctly honors
+                // `iteration_policy = "extended"` agents (e.g. `tools_agent`
+                // getting 50, not the raw `max_iterations = 10`).
             } else {
                 tracing::warn!(
                     job_id = %job.id,
@@ -891,7 +911,7 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String, Option<
                 "[cron] building isolated agent for scheduled job"
             );
             match build_agent_for_cron_job(&effective, job) {
-                Ok(mut agent) => {
+                Ok(BuiltCronAgent { mut agent, profile }) => {
                     // Tag events so downstream subscribers can correlate
                     // cron-triggered turns. `cron` is the channel so the
                     // event bus can filter from other flows (`cli`, `web`…).
@@ -907,9 +927,12 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String, Option<
                             source:
                                 crate::openhuman::agent::turn_origin::TrustedAutomationSource::Cron,
                         };
-                    let turn = crate::openhuman::agent::turn_origin::with_origin(
-                        origin,
-                        agent.run_single(&prefixed_prompt),
+                    let turn = crate::openhuman::memory::source_scope::with_source_scope(
+                        profile.and_then(|profile| profile.memory_sources),
+                        crate::openhuman::agent::turn_origin::with_origin(
+                            origin,
+                            agent.run_single(&prefixed_prompt),
+                        ),
                     );
                     // Morning briefing only: install a 24h task-recency window
                     // so Composio task-fetch tools (Linear/ClickUp/Notion/Asana)
@@ -958,7 +981,11 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String, Option<
             // and provider URLs are appropriate; it must NOT reach the
             // user-visible notification body.
             let user_message = classify_agent_anyhow_for_user(&e);
-            (false, user_message.to_string(), Some(e.to_string()))
+            // Preserve the FULL anyhow chain (`{:#}`), not just the top-level
+            // message: the loopback-unreachable classifier and the observability
+            // pipeline key on the transport cause (`… tcp connect error: Connection
+            // refused (os error N)`), which a bare `to_string()` drops.
+            (false, user_message.to_string(), Some(format!("{e:#}")))
         }
     }
 }
@@ -990,7 +1017,112 @@ fn run_flow_schedule_job(job: &CronJob) -> (bool, String) {
 /// no text. Never delivered to chat — used only for the run-history record.
 const EMPTY_AGENT_OUTPUT: &str = "agent job executed";
 
-fn build_agent_for_cron_job(config: &Config, job: &CronJob) -> anyhow::Result<Agent> {
+/// Resolve the agent profile a cron job is attributed to, if any.
+///
+/// Returns `Some(profile)` only when `job.profile_id` is set AND that profile
+/// still exists in the store. A deleted profile yields `Ok(None)` so the caller
+/// runs the job without a profile rather than failing it (2b). Profile-store
+/// failures are returned: attribution must not fail open when the scheduler
+/// cannot determine whether the referenced profile still exists.
+fn resolve_cron_profile(
+    config: &Config,
+    job: &CronJob,
+) -> anyhow::Result<Option<crate::openhuman::profiles::AgentProfile>> {
+    let Some(profile_id) = job.profile_id.as_deref() else {
+        return Ok(None);
+    };
+    match crate::openhuman::profiles::load_profiles(&config.workspace_dir) {
+        Ok(state) => {
+            let found = state.profiles.into_iter().find(|p| p.id == profile_id);
+            if found.is_none() {
+                tracing::warn!(
+                    job_id = %job.id,
+                    profile_id = %profile_id,
+                    "[cron] attributed profile no longer exists — running job without a profile"
+                );
+            }
+            Ok(found)
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "failed to load attributed profile {profile_id:?} for cron job {}: {e}",
+            job.id
+        )),
+    }
+}
+
+struct BuiltCronAgent {
+    agent: Agent,
+    profile: Option<crate::openhuman::profiles::AgentProfile>,
+}
+
+fn apply_cron_profile_runtime_defaults(
+    config: &Config,
+    job: &CronJob,
+    profile: &crate::openhuman::profiles::AgentProfile,
+) -> Config {
+    let mut effective = config.clone();
+    if let Some(model) = profile.model_override.clone() {
+        effective.default_model = Some(model);
+    }
+    if let Some(temperature) = profile.temperature {
+        effective.default_temperature = temperature;
+    }
+    // A job-level pin is the most specific model choice.
+    if let Some(model) = job.model.clone() {
+        effective.default_model = Some(model);
+    }
+    effective
+}
+
+fn build_agent_for_cron_job(config: &Config, job: &CronJob) -> anyhow::Result<BuiltCronAgent> {
+    // 2b — profile attribution. When the job names a profile that still exists,
+    // build the run under it via the SAME profile-aware session path the task
+    // dispatcher uses (`from_config_for_agent_with_profile`), so the run inherits
+    // the profile's SOUL, memory scope, dedicated-workspace descriptor, and
+    // tool/skill/MCP allowlists. A deleted profile falls through (warned in
+    // `resolve_cron_profile`) to the profile-less path below.
+    if let Some(profile) = resolve_cron_profile(config, job)? {
+        // Apply the same profile runtime defaults as interactive chat. A
+        // per-job model pin remains the most specific choice and therefore
+        // wins over the profile model. The profile-aware builder consumes the
+        // prompt suffix directly and gives profile temperature precedence over
+        // the selected agent definition.
+        let effective = apply_cron_profile_runtime_defaults(config, job, &profile);
+        // A job may pin a built-in `agent_id`; otherwise the profile picks its
+        // own agent definition.
+        let agent_id = job
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| profile.agent_id.clone());
+        let agent = Agent::from_config_for_agent_with_profile(
+            &effective,
+            &agent_id,
+            None,
+            profile.system_prompt_suffix.clone(),
+            Some(&profile),
+        )
+        .inspect(|_| {
+            tracing::debug!(
+                job_id = %job.id,
+                profile_id = %profile.id,
+                agent_id = %agent_id,
+                "[cron] built scheduled job agent under attributed profile"
+            );
+        })
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to build cron job {} under attributed profile {:?} with agent {:?}: {e:#}",
+                job.id,
+                profile.id,
+                agent_id
+            )
+        })?;
+        return Ok(BuiltCronAgent {
+            agent,
+            profile: Some(profile),
+        });
+    }
+
     if let Some(agent_id) = job.agent_id.as_deref() {
         match Agent::from_config_for_agent(config, agent_id) {
             Ok(agent) => {
@@ -999,7 +1131,10 @@ fn build_agent_for_cron_job(config: &Config, job: &CronJob) -> anyhow::Result<Ag
                     agent_id = %agent_id,
                     "[cron] built scheduled job agent from definition"
                 );
-                Ok(agent)
+                Ok(BuiltCronAgent {
+                    agent,
+                    profile: None,
+                })
             }
             Err(e) => {
                 tracing::warn!(
@@ -1008,11 +1143,17 @@ fn build_agent_for_cron_job(config: &Config, job: &CronJob) -> anyhow::Result<Ag
                     error = %e,
                     "[cron] failed to build agent from definition; falling back to generic agent"
                 );
-                Agent::from_config(config)
+                Agent::from_config(config).map(|agent| BuiltCronAgent {
+                    agent,
+                    profile: None,
+                })
             }
         }
     } else {
-        Agent::from_config(config)
+        Agent::from_config(config).map(|agent| BuiltCronAgent {
+            agent,
+            profile: None,
+        })
     }
 }
 
@@ -1045,13 +1186,21 @@ async fn persist_job_result(
         duration_ms,
     );
 
-    if is_one_shot_auto_delete(job) {
-        if success {
+    // A fixed-instant (`Schedule::At`) job is inherently one-shot: its `at` is in
+    // the past the moment it runs, so `reschedule_after_run` (which writes
+    // next_run = at for an `At` schedule) leaves next_run <= now and the job is
+    // re-selected by `due_jobs` on every poll, re-executing forever. Terminate
+    // every `At` job after a single run, regardless of `delete_after_run`. Only an
+    // auto-delete job that succeeded is removed; everything else is kept disabled
+    // so its run history stays inspectable. (Inside this `At` branch
+    // `is_one_shot_auto_delete` reduces to `job.delete_after_run`.)
+    if matches!(job.schedule, Schedule::At { .. }) {
+        if is_one_shot_auto_delete(job) && success {
             if let Err(e) = remove_job(config, &job.id) {
                 tracing::warn!("Failed to remove one-shot cron job after success: {e}");
             }
         } else {
-            let _ = record_last_run(config, &job.id, finished_at, false, output);
+            let _ = record_last_run(config, &job.id, finished_at, success, output);
             if let Err(e) = update_job(
                 config,
                 &job.id,
@@ -1060,7 +1209,7 @@ async fn persist_job_result(
                     ..CronJobPatch::default()
                 },
             ) {
-                tracing::warn!("Failed to disable failed one-shot cron job: {e}");
+                tracing::warn!("Failed to disable one-shot cron job: {e}");
             }
         }
         return success;
@@ -1188,29 +1337,28 @@ async fn deliver_if_configured(
 
         // Announce delivery — the cron job specifies the exact channel
         // and target. Used for explicit channel-targeted output.
-        "announce" => {
-            if deliver_to_chat {
-                let channel = delivery.channel.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("delivery.channel is required for announce mode")
-                })?;
-                let target = delivery
-                    .to
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+        "announce" if deliver_to_chat => {
+            let channel = delivery
+                .channel
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("delivery.channel is required for announce mode"))?;
+            let target = delivery
+                .to
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
 
-                tracing::debug!(
-                    job_id = %job.id,
-                    channel = %channel,
-                    target = %target,
-                    "[cron] publishing CronDeliveryRequested event"
-                );
-                publish_global(DomainEvent::CronDeliveryRequested {
-                    job_id: job.id.clone(),
-                    channel: channel.to_string(),
-                    target: target.to_string(),
-                    output: output.to_string(),
-                });
-            }
+            tracing::debug!(
+                job_id = %job.id,
+                channel = %channel,
+                target = %target,
+                "[cron] publishing CronDeliveryRequested event"
+            );
+            publish_global(DomainEvent::CronDeliveryRequested {
+                job_id: job.id.clone(),
+                channel: channel.to_string(),
+                target: target.to_string(),
+                output: output.to_string(),
+            });
         }
 
         // No delivery configured — output is stored in last_output only.

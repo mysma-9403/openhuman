@@ -17,10 +17,10 @@ use crate::openhuman::memory::ingestion::{
     IngestionJob, IngestionQueue, IngestionState, MemoryIngestionConfig, MemoryIngestionRequest,
     MemoryIngestionResult,
 };
+use crate::openhuman::memory_store::namespace_store::UnifiedMemory;
 use crate::openhuman::memory_store::types::{
     NamespaceDocumentInput, NamespaceMemoryHit, NamespaceRetrievalContext,
 };
-use crate::openhuman::memory_store::unified::UnifiedMemory;
 
 /// Reference-counted handle to a `MemoryClient`.
 pub type MemoryClientRef = Arc<MemoryClient>;
@@ -56,7 +56,7 @@ pub struct MemoryClient {
 impl MemoryClient {
     /// Returns a handle to the underlying SQLite connection for direct
     /// profile-facet writes via
-    /// [`crate::openhuman::memory_store::unified::profile::profile_upsert`].
+    /// [`crate::openhuman::memory_store::namespace_store::profile::profile_upsert`].
     ///
     /// Intentionally `pub(crate)` — external consumers should use the
     /// higher-level `MemoryClient` API; this escape hatch exists so
@@ -254,9 +254,33 @@ impl MemoryClient {
         document_id: Option<String>,
     ) -> Result<(), String> {
         let namespace = format!("skill-{}", skill_id.trim());
+        // The upsert dedup key must be a stable, opaque identifier — never
+        // free-form human text. Sync providers pass a `{toolkit}:{id}`
+        // `document_id` (e.g. `gmail:<message_id>`); use it as the key so the
+        // provider's human-readable title (an email subject can legitimately
+        // contain verification codes, token-rotation notices, or other
+        // secret-/PII-looking strings) is never run through the
+        // `upsert_document` secret/PII namespace/key guard. A single such
+        // subject would otherwise abort the whole non-tolerant provider sync
+        // with `document namespace/key cannot contain secrets` (see #4947).
+        // Callers without a stable id (e.g. LinkedIn enrichment) keep the
+        // title as the key, unchanged.
+        let stable_id = document_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let key = match stable_id {
+            Some(id) => id.to_string(),
+            None => title.to_string(),
+        };
+        tracing::debug!(
+            namespace = %namespace,
+            key_from_document_id = stable_id.is_some(),
+            "[memory_store] store_skill_sync: upserting synchronized document"
+        );
         let input = NamespaceDocumentInput {
             namespace,
-            key: title.to_string(),
+            key,
             title: title.to_string(),
             content: content.to_string(),
             source_type: source_type.unwrap_or_else(|| "doc".to_string()),

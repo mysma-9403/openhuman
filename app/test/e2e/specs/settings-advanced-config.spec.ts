@@ -23,7 +23,9 @@ async function readLocalStorageJson<T = unknown>(key: string): Promise<T | null>
   }, key);
 }
 
-describe('Settings - Advanced Config', () => {
+describe('Settings - Advanced Config', function () {
+  this.timeout(90_000);
+
   before(async function beforeSuite() {
     this.timeout(90_000);
     await startMockServer();
@@ -87,8 +89,36 @@ describe('Settings - Advanced Config', () => {
 
     const disabledToolkitsInput = await browser.$('#disabled-toolkits');
     await disabledToolkitsInput.waitForExist({ timeout: 10_000 });
-    await disabledToolkitsInput.setValue('gmail, slack');
-    await clickText('Save', 10_000);
+    const clickedTriageSave = await browser.execute(() => {
+      const input = document.querySelector<HTMLInputElement>('#disabled-toolkits');
+      if (!input) return false;
+
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        'value'
+      )?.set;
+      if (setter) setter.call(input, 'gmail, slack');
+      else input.value = 'gmail, slack';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+
+      // The merged Composio page has its own Save button above this embedded
+      // triage panel. Walk upward to the nearest container with a Save button
+      // so this test clicks the button that owns disabled-toolkits.
+      let container: HTMLElement | null = input.parentElement;
+      while (container) {
+        const save = Array.from(container.querySelectorAll('button')).find(
+          button => button.textContent?.trim() === 'Save'
+        );
+        if (save) {
+          save.click();
+          return true;
+        }
+        container = container.parentElement;
+      }
+      return false;
+    });
+    expect(clickedTriageSave).toBe(true);
     await waitForText('Settings saved', 10_000);
 
     await browser.waitUntil(
@@ -121,7 +151,23 @@ describe('Settings - Advanced Config', () => {
 
     const input = await browser.$('#autonomy-max-actions');
     await input.waitForExist({ timeout: 10_000 });
-    await input.setValue(String(target));
+    // Drive the controlled number input via the native value setter + React
+    // change event. WebDriver's setValue clears the field but doesn't reliably
+    // fire React's synthetic onChange, so `draft`/`isChanged` wouldn't update
+    // and the Save button (canSave = isValid && isChanged) would stay a
+    // disabled no-op — "Saved." would never appear.
+    await browser.execute((val: string) => {
+      const el = document.querySelector<HTMLInputElement>('#autonomy-max-actions');
+      if (!el) return;
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        'value'
+      )?.set;
+      if (setter) setter.call(el, val);
+      else el.value = val;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }, String(target));
     await clickText('Save', 10_000);
     await waitForText('Saved.', 10_000);
 

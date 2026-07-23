@@ -1,3 +1,6 @@
+worktrees/*
+!worktrees/.gitkeep
+
 # Workflow docs (local only)
 workflow
 create_issue
@@ -71,7 +74,10 @@ app/src-tauri/runtime-skill-*
 .mypy_cache
 .ruff_cache
 .kotlin
-.cargo
+# Keep .cargo/ untracked (local per-machine config + credentials) EXCEPT the
+# shared, opt-in repo config that documents faster-linker setup.
+.cargo/*
+!.cargo/config.toml
 
 CLAUDE.local.md
 
@@ -127,3 +133,5 @@ distribution.cer
 CHANGELOG.preview.md
 *.profraw
 *.diff
+
+.claude/worktrees/

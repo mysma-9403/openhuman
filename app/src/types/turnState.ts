@@ -63,6 +63,13 @@ export interface PersistedSubagentToolCall {
   displayName?: string;
   /** Server-computed contextual detail (path / recipient / query). */
   detail?: string;
+  /** Plain-language failure explanation for a FAILED child call (#4459).
+   *  Mirrors the parent {@link PersistedToolTimelineEntry.failure}; absent on
+   *  successful rows and on snapshots written before this field. */
+  failure?: PersistedToolFailure;
+  /** Size-capped child tool result text. Absent while running and on
+   *  snapshots written before this field. */
+  output?: string;
 }
 
 /**
@@ -96,6 +103,9 @@ export type PersistedSubagentTranscriptItem =
       outputChars?: number;
       displayName?: string;
       detail?: string;
+      /** Plain-language failure explanation for a FAILED child tool call
+       *  (#4459); mirrors {@link PersistedSubagentToolCall.failure}. */
+      failure?: PersistedToolFailure;
     };
 
 export interface PersistedSubagentActivity {
@@ -143,6 +153,14 @@ export interface PersistedToolTimelineEntry {
   sourceToolName?: string;
   subagent?: PersistedSubagentActivity;
   failure?: PersistedToolFailure;
+  /** Size-capped tool result text. Absent while running and on snapshots
+   *  written before this field. */
+  output?: string;
+  /** Per-turn monotonic ordering key stamped when the row is first created, so
+   *  a rehydrated timeline orders rows identically to the live stream (shares
+   *  the per-turn ordering space with {@link PersistedTranscriptItem.seq}).
+   *  Absent on snapshots written before this field. */
+  seq?: number;
 }
 
 export interface PersistedTurnState {

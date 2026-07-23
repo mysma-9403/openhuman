@@ -32,8 +32,9 @@ use tokio::sync::mpsc::Sender;
 
 use crate::openhuman::agent::progress::AgentProgress;
 use crate::openhuman::config::{MultimodalConfig, MultimodalFileConfig};
-use crate::openhuman::inference::provider::{ChatMessage, Provider};
+use crate::openhuman::inference::provider::ChatMessage;
 use crate::openhuman::tinyagents::run_turn_via_tinyagents_shared;
+use crate::openhuman::tinyagents::TurnModelSource;
 use crate::openhuman::tools::Tool;
 
 /// Drive a channel/CLI turn on the graph engine. Returns the final assistant
@@ -41,7 +42,7 @@ use crate::openhuman::tools::Tool;
 /// onto `AgentProgress`; pass `None` for a fire-and-forget final-text turn.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_channel_turn_via_graph(
-    provider: Arc<dyn Provider>,
+    source: TurnModelSource,
     history: &mut Vec<ChatMessage>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
     extra_tools: Vec<Box<dyn Tool>>,
@@ -55,24 +56,43 @@ pub(crate) async fn run_channel_turn_via_graph(
 ) -> Result<String> {
     let extra_arc = Arc::new(extra_tools);
 
-    // The callable set is the visibility whitelist (empty = every tool visible
-    // across the registry + per-turn extras). The runner advertises each via its
-    // own `spec()`, deduped by name (extras shadow the registry).
-    let allowed = visible_tool_names.cloned().unwrap_or_default();
+    // The callable set is the visibility whitelist. The runner advertises each via
+    // its own `spec()`, deduped by name (extras shadow the registry).
+    // Fail-closed allowlist plumbing (issue #4452): the shared seam takes an
+    // `Option<HashSet<String>>` where `None` = no filter (all visible tools) and
+    // `Some(set)` = exactly those tools. The channel/CLI path's historical
+    // convention is "no filter / empty set = every visible tool", so map both a
+    // missing filter and an empty set to `None`; only a populated set is treated
+    // as an explicit whitelist.
+    let allowed: Option<HashSet<String>> = match visible_tool_names {
+        Some(set) if !set.is_empty() => Some(set.clone()),
+        _ => None,
+    };
 
-    // Capture native-tool support before `provider` is moved into the runner: the
-    // durable history append below serializes this turn's typed suffix with the
-    // matching dispatcher (native envelope vs prompt-guided text).
-    let native_tools = provider.supports_native_tools();
+    // Resolve the model's effective context window (async provider probe) so the
+    // harness can run the context-window summarization step (issue #4249) on
+    // channel/CLI turns too — long-running channel threads otherwise grew
+    // unbounded until the cap error — then build the turn's crate `ChatModel` set.
+    // The `Provider` is confined to the seam `TurnModelSource` (issue #4249,
+    // Phase 3 / Motion A): the harness graph names crate model types only, and
+    // reads native-tool / vision capability + telemetry id off the built bundle.
+    let context_window = source.effective_context_window(model).await;
+    let turn_models = source.build(model, temperature, context_window)?;
+
+    // Native-tool support drives the durable history-suffix dispatcher (native
+    // envelope vs prompt-guided text) at the end of this turn; capture it before
+    // `turn_models` is moved into the runner.
+    let native_tools = turn_models.native_tools();
+    let provider_id = turn_models.provider_id().to_string();
 
     // Multimodal prep (parity with the chat route's
     // `run_turn_via_tinyagents_session`, issue #4249): rehydrate image
-    // placeholders for vision-capable providers, then expand `[IMAGE:…]` /
+    // placeholders for vision-capable models, then expand `[IMAGE:…]` /
     // `[FILE:…]` markers into provider-ready content before dispatch. The
     // expanded copy is provider-only — it is sent to the model but never
     // persisted back into the channel `history` (see the reconstruction below).
     let mut prepared = history.clone();
-    if provider.supports_vision()
+    if turn_models.supports_vision()
         && crate::openhuman::agent::multimodal::has_image_placeholders(&prepared)
     {
         prepared = crate::openhuman::agent::multimodal::rehydrate_image_placeholders(&prepared);
@@ -86,11 +106,6 @@ pub(crate) async fn run_channel_turn_via_graph(
     .map(|prepared| prepared.messages)
     .unwrap_or(prepared);
 
-    // Resolve the provider's effective context window so the harness can run the
-    // context-window summarization step (issue #4249) on channel/CLI turns too —
-    // long-running channel threads otherwise grew unbounded until the cap error.
-    let context_window = provider.effective_context_window(model).await;
-
     tracing::info!(
         model,
         max_iterations,
@@ -99,9 +114,9 @@ pub(crate) async fn run_channel_turn_via_graph(
         "[channel:graph] routing channel turn through tinyagents harness"
     );
     let outcome = run_turn_via_tinyagents_shared(
-        provider,
+        turn_models,
+        provider_id,
         model,
-        temperature,
         prepared,
         vec![extra_arc, tools_registry],
         allowed,
@@ -132,6 +147,10 @@ pub(crate) async fn run_channel_turn_via_graph(
         None,
         // Interactive channel/CLI turn — never serve a cached model response.
         false,
+        // #4457 (defect C): the channel/CLI path has no post-run wrap-up and does
+        // NOT emit `TurnCompleted` itself, so let the seam emit the single
+        // terminal event (legacy-engine parity).
+        false,
     )
     .await?;
     // Append only this turn's typed suffix (assistant tool-calls + tool results +
@@ -160,7 +179,7 @@ pub(crate) async fn run_channel_turn_via_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openhuman::inference::provider::{ChatResponse, ToolCall};
+    use crate::openhuman::inference::provider::{ChatResponse, Provider, ToolCall};
     use crate::openhuman::tools::ToolResult;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -230,9 +249,9 @@ mod tests {
         let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(PingTool)]);
         let mut history = vec![ChatMessage::user("ping please")];
         let text = run_channel_turn_via_graph(
-            Arc::new(PingThenDone {
+            TurnModelSource::new(Arc::new(PingThenDone {
                 calls: AtomicUsize::new(0),
-            }),
+            })),
             &mut history,
             registry,
             vec![],

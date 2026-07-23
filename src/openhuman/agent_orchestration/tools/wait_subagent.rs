@@ -161,6 +161,16 @@ impl Tool for WaitSubagentTool {
                     resolved_task_id,
                     iterations
                 );
+                // The parent is collecting this result inline and will present
+                // it in this turn, so suppress the detached completion's separate
+                // background-delivery turn — otherwise the same result is
+                // re-answered as a duplicate. Only the Completed arm marks:
+                // AwaitingUser/Failed never record a completion, and a
+                // still-Running/TimedOut sub-agent has no terminal result yet, so
+                // a genuinely-later completion must still surface.
+                crate::openhuman::agent_orchestration::background_completions::mark_collected(
+                    &resolved_task_id,
+                );
                 let status = wait_status_payload(
                     resume_ref.as_ref(),
                     &resolved_task_id,
@@ -265,19 +275,17 @@ impl Tool for WaitSubagentTool {
                     "[wait_subagent] outcome=unknown task_id={}",
                     resolved_task_id
                 );
-                Ok(ToolResult::error(format!(
-                    "wait_subagent: no sub-agent was found for that reference. It may have already finished and \
-                     been collected, or the task_id is wrong."
-                )))
+                Ok(ToolResult::error("wait_subagent: no sub-agent was found for that reference. It may have already finished and \
+                     been collected, or the task_id is wrong.".to_string()))
             }
             Err(WaitError::NotOwned) => {
                 log::debug!(
                     "[wait_subagent] outcome=not_owned task_id={}",
                     resolved_task_id
                 );
-                Ok(ToolResult::error(format!(
-                    "wait_subagent: that sub-agent was not started by this agent."
-                )))
+                Ok(ToolResult::error(
+                    "wait_subagent: that sub-agent was not started by this agent.".to_string(),
+                ))
             }
         }
     }

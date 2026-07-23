@@ -18,11 +18,85 @@ use crate::openhuman::agent::progress::AgentProgress;
 
 use super::store::TurnStateStore;
 use super::types::{
-    SubagentActivity, SubagentToolCall, SubagentTranscriptItem, ToolTimelineEntry,
-    ToolTimelineStatus, TranscriptItem, TurnLifecycle, TurnPhase, TurnState,
+    PersistedToolFailure, SubagentActivity, SubagentToolCall, SubagentTranscriptItem,
+    ToolTimelineEntry, ToolTimelineStatus, TranscriptItem, TurnLifecycle, TurnPhase, TurnState,
 };
 
 const MIRROR_LOG_PREFIX: &str = "[threads:turn_state:mirror]";
+
+/// Upper bound on the tool result text persisted per timeline row. The
+/// snapshot file is rewritten in full at every tool boundary, so this is
+/// deliberately tighter than the 256 KiB live-socket cap — it bounds the
+/// per-flush rewrite while still giving the rehydrated "View processing"
+/// panel a meaningful result preview.
+const MAX_PERSISTED_TOOL_OUTPUT: usize = 64 * 1024;
+
+/// Bytes reserved within the cap for the truncation marker so the final
+/// persisted payload (content + marker) never exceeds
+/// [`MAX_PERSISTED_TOOL_OUTPUT`].
+const TRUNCATION_MARKER_BUDGET: usize = 80;
+
+/// Upper bound on a single persisted transcript prose item (one coalesced
+/// narration or reasoning block, parent or sub-agent). A runaway reasoning
+/// stream would otherwise grow one item without bound and bloat every
+/// full-file snapshot rewrite. Tighter than [`MAX_PERSISTED_TOOL_OUTPUT`]
+/// because a turn can accumulate many prose items.
+const MAX_PERSISTED_TRANSCRIPT_ITEM: usize = 16 * 1024;
+
+/// Marker appended once when a transcript prose item is truncated at its cap.
+const TRANSCRIPT_TRUNCATION_MARKER: &str = "\n…[truncated]";
+
+/// Append `delta` to a coalescing transcript prose buffer, enforcing
+/// [`MAX_PERSISTED_TRANSCRIPT_ITEM`] on a char boundary and stamping a one-time
+/// truncation marker the first time the cap is hit. Once at the cap, further
+/// deltas are dropped (the marker is already present). Used by both the parent
+/// and sub-agent transcript coalescers so a single streamed block stays bounded.
+fn append_capped_transcript_text(text: &mut String, delta: &str) {
+    if delta.is_empty() {
+        return;
+    }
+    if text.len() >= MAX_PERSISTED_TRANSCRIPT_ITEM {
+        // Already at the cap but more content is arriving — ensure the marker is
+        // present exactly once so the truncation is visible even when deltas
+        // land exactly on the boundary (never straddling it).
+        if !text.ends_with(TRANSCRIPT_TRUNCATION_MARKER) {
+            text.push_str(TRANSCRIPT_TRUNCATION_MARKER);
+        }
+        return;
+    }
+    let remaining = MAX_PERSISTED_TRANSCRIPT_ITEM - text.len();
+    if delta.len() <= remaining {
+        text.push_str(delta);
+        return;
+    }
+    let mut end = remaining;
+    while end > 0 && !delta.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.push_str(&delta[..end]);
+    text.push_str(TRANSCRIPT_TRUNCATION_MARKER);
+}
+
+/// Cap `output` for snapshot persistence, slicing on a char boundary and
+/// appending a truncation marker when content was dropped. Returns `None`
+/// for empty output (payload capture off) so the field serializes away.
+fn cap_persisted_output(output: &str) -> Option<String> {
+    if output.is_empty() {
+        return None;
+    }
+    if output.len() <= MAX_PERSISTED_TOOL_OUTPUT {
+        return Some(output.to_string());
+    }
+    let mut end = MAX_PERSISTED_TOOL_OUTPUT.saturating_sub(TRUNCATION_MARKER_BUDGET);
+    while end > 0 && !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    let omitted = output.len() - end;
+    Some(format!(
+        "{}\n…[truncated {omitted} bytes of tool output]",
+        &output[..end]
+    ))
+}
 
 /// In-process cursor that keeps the authoritative [`TurnState`] in sync
 /// with the agent loop and writes it through to a [`TurnStateStore`].
@@ -36,6 +110,11 @@ pub struct TurnStateMirror {
     /// order narration vs thinking vs tool calls *within* one iteration, so
     /// every transcript push stamps and increments this.
     next_seq: u32,
+    /// Separate monotonic ordering key for [`ToolTimelineEntry::seq`] — the flat
+    /// timeline is an independent projection from the interleaved transcript, so
+    /// it gets its own space (sharing `next_seq` would leave gaps in the
+    /// transcript's contiguous ordering).
+    next_tool_seq: u64,
 }
 
 impl TurnStateMirror {
@@ -54,6 +133,7 @@ impl TurnStateMirror {
             state,
             turn_completed: false,
             next_seq: 0,
+            next_tool_seq: 0,
         };
         mirror.flush();
         mirror
@@ -120,6 +200,7 @@ impl TurnStateMirror {
                         existing.detail = display_detail.clone();
                     }
                 } else {
+                    let seq = self.next_tool_seq();
                     self.state.tool_timeline.push(ToolTimelineEntry {
                         id: call_id.clone(),
                         name: tool_name.clone(),
@@ -130,13 +211,20 @@ impl TurnStateMirror {
                         detail: display_detail.clone(),
                         source_tool_name: None,
                         subagent: None,
+                        failure: None,
+                        output: None,
+                        seq: Some(seq),
                     });
                 }
                 self.flush();
                 true
             }
             AgentProgress::ToolCallCompleted {
-                call_id, success, ..
+                call_id,
+                success,
+                failure,
+                output,
+                ..
             } => {
                 if let Some(entry) = self
                     .state
@@ -150,6 +238,14 @@ impl TurnStateMirror {
                     } else {
                         ToolTimelineStatus::Error
                     };
+                    // Persist the plain-language failure so the explanation
+                    // survives a thread switch / cold boot (#4459). Clear it on
+                    // a (re-)success so a retried row doesn't keep stale copy.
+                    entry.failure = failure.as_ref().map(PersistedToolFailure::from);
+                    // Persist the (capped) result text so the rehydrated
+                    // timeline can show what the tool returned, matching the
+                    // live `tool_result` socket payload.
+                    entry.output = cap_persisted_output(output);
                 }
                 if self.state.active_tool.is_some() {
                     self.state.active_tool = None;
@@ -169,6 +265,7 @@ impl TurnStateMirror {
             } => {
                 self.state.phase = Some(TurnPhase::Subagent);
                 self.state.active_subagent = Some(agent_id.clone());
+                let seq = self.next_tool_seq();
                 self.state.tool_timeline.push(ToolTimelineEntry {
                     id: format!("subagent:{task_id}"),
                     name: format!("subagent:{agent_id}"),
@@ -193,6 +290,9 @@ impl TurnStateMirror {
                         tool_calls: Vec::new(),
                         transcript: Vec::new(),
                     }),
+                    failure: None,
+                    output: None,
+                    seq: Some(seq),
                 });
                 self.flush();
                 true
@@ -269,6 +369,8 @@ impl TurnStateMirror {
                             output_chars: None,
                             display_name: display_label.clone(),
                             detail: display_detail.clone(),
+                            failure: None,
+                            output: None,
                         });
                         // Mirror the call into the ordered transcript so the
                         // rehydrated thoughts interleave it at the right spot.
@@ -294,8 +396,10 @@ impl TurnStateMirror {
                 task_id,
                 call_id,
                 success,
+                output,
                 output_chars,
                 elapsed_ms,
+                failure,
                 ..
             } => {
                 if let Some(entry) = self.find_subagent_entry_mut(task_id) {
@@ -305,6 +409,7 @@ impl TurnStateMirror {
                         } else {
                             ToolTimelineStatus::Error
                         };
+                        let persisted_failure = failure.as_ref().map(PersistedToolFailure::from);
                         if let Some(call) = activity
                             .tool_calls
                             .iter_mut()
@@ -314,6 +419,10 @@ impl TurnStateMirror {
                             call.status = status;
                             call.elapsed_ms = Some(*elapsed_ms);
                             call.output_chars = Some(*output_chars);
+                            // Carry the child failure so a failed sub-agent row
+                            // keeps its explanation across a round-trip (#4459).
+                            call.failure = persisted_failure;
+                            call.output = cap_persisted_output(output);
                         }
                         // Keep the transcript's Tool item in lockstep so the
                         // rehydrated row shows the terminal status + timing.
@@ -389,6 +498,7 @@ impl TurnStateMirror {
                     // No matching entry yet — `ToolCallArgsDelta` may
                     // arrive before `ToolCallStarted` so synthesise a
                     // placeholder we can update once the start event lands.
+                    let seq = self.next_tool_seq();
                     self.state.tool_timeline.push(ToolTimelineEntry {
                         id: call_id.clone(),
                         name: tool_name.clone(),
@@ -399,6 +509,9 @@ impl TurnStateMirror {
                         detail: None,
                         source_tool_name: None,
                         subagent: None,
+                        failure: None,
+                        output: None,
+                        seq: Some(seq),
                     });
                 }
                 false
@@ -417,8 +530,8 @@ impl TurnStateMirror {
                 self.flush();
                 true
             }
-            AgentProgress::TurnCostUpdated { .. } => {
-                // Cost updates don't change the turn-state snapshot
+            AgentProgress::TurnCostUpdated { .. } | AgentProgress::ModelCallCompleted { .. } => {
+                // Cost/usage updates don't change the turn-state snapshot
                 // shape (lifecycle / phase / active tool / etc.), so
                 // we just acknowledge them without flushing. Surfacing
                 // cost in the persisted snapshot would force a disk
@@ -445,6 +558,69 @@ impl TurnStateMirror {
         self.state.active_subagent = None;
         self.state.updated_at = chrono::Utc::now().to_rfc3339();
         self.flush();
+        self.persist_interrupted_partial();
+    }
+
+    /// Append the partial streamed answer of an interrupted turn to the session
+    /// transcript so the derived display view (Phase B) can surface it even
+    /// after the live turn_state snapshot is gone. Display-only: the
+    /// model-context reader skips `interrupted:true` lines.
+    ///
+    /// Guard: the root transcript file must already exist. An interrupted
+    /// **first** turn has no session file yet (the harness has not persisted a
+    /// turn), so there is nothing to append to — that case stays recoverable
+    /// from the turn_state snapshot alone, as today. We log and skip it.
+    fn persist_interrupted_partial(&self) {
+        let partial = self.state.streaming_text.trim();
+        if partial.is_empty() {
+            return;
+        }
+        let thread_id = self.state.thread_id.trim();
+        if thread_id.is_empty() {
+            return;
+        }
+        let workspace_dir = self.store.workspace_dir();
+        let Some(path) =
+            crate::openhuman::agent::harness::session::transcript::find_root_transcript_for_thread(
+                workspace_dir,
+                thread_id,
+            )
+        else {
+            log::debug!(
+                "{MIRROR_LOG_PREFIX} no root transcript for thread={thread_id} yet — leaving interrupted partial ({} chars) in turn_state snapshot only",
+                partial.len()
+            );
+            return;
+        };
+        let request_id = if self.state.request_id.is_empty() {
+            None
+        } else {
+            Some(self.state.request_id.as_str())
+        };
+        let thinking = self.state.thinking.trim();
+        let reasoning = if thinking.is_empty() {
+            None
+        } else {
+            Some(thinking)
+        };
+        match crate::openhuman::agent::harness::session::transcript::append_interrupted_partial(
+            &path,
+            partial,
+            request_id,
+            Some(self.state.iteration),
+            reasoning,
+        ) {
+            Ok(()) => log::debug!(
+                "{MIRROR_LOG_PREFIX} appended interrupted partial ({} chars, thinking={} chars) for thread={thread_id} request_id={} to {}",
+                partial.len(),
+                thinking.len(),
+                self.state.request_id,
+                path.display()
+            ),
+            Err(err) => log::warn!(
+                "{MIRROR_LOG_PREFIX} failed to append interrupted partial for thread={thread_id}: {err}"
+            ),
+        }
     }
 
     fn flush(&mut self) {
@@ -466,16 +642,16 @@ impl TurnStateMirror {
             self.state.transcript.last_mut()
         {
             if *r == round {
-                text.push_str(delta);
+                append_capped_transcript_text(text, delta);
                 return;
             }
         }
         let seq = self.next_seq();
-        self.state.transcript.push(TranscriptItem::Narration {
-            round,
-            seq,
-            text: delta.to_string(),
-        });
+        let mut text = String::new();
+        append_capped_transcript_text(&mut text, delta);
+        self.state
+            .transcript
+            .push(TranscriptItem::Narration { round, seq, text });
     }
 
     /// Append a hidden-reasoning delta to the transcript, with the same
@@ -485,16 +661,16 @@ impl TurnStateMirror {
             self.state.transcript.last_mut()
         {
             if *r == round {
-                text.push_str(delta);
+                append_capped_transcript_text(text, delta);
                 return;
             }
         }
         let seq = self.next_seq();
-        self.state.transcript.push(TranscriptItem::Thinking {
-            round,
-            seq,
-            text: delta.to_string(),
-        });
+        let mut text = String::new();
+        append_capped_transcript_text(&mut text, delta);
+        self.state
+            .transcript
+            .push(TranscriptItem::Thinking { round, seq, text });
     }
 
     /// Record a tool call in the transcript at the point it occurred, as a
@@ -520,6 +696,13 @@ impl TurnStateMirror {
     fn next_seq(&mut self) -> u32 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
+        seq
+    }
+
+    /// Return the next monotonic tool-timeline ordering key and advance it.
+    fn next_tool_seq(&mut self) -> u64 {
+        let seq = self.next_tool_seq;
+        self.next_tool_seq = self.next_tool_seq.saturating_add(1);
         seq
     }
 
@@ -556,27 +739,29 @@ impl TurnStateMirror {
                 iteration: it,
                 text,
             }) if is_thinking && *it == Some(iteration) => {
-                text.push_str(delta);
+                append_capped_transcript_text(text, delta);
                 return;
             }
             Some(SubagentTranscriptItem::Text {
                 iteration: it,
                 text,
             }) if !is_thinking && *it == Some(iteration) => {
-                text.push_str(delta);
+                append_capped_transcript_text(text, delta);
                 return;
             }
             _ => {}
         }
+        let mut text = String::new();
+        append_capped_transcript_text(&mut text, delta);
         activity.transcript.push(if is_thinking {
             SubagentTranscriptItem::Thinking {
                 iteration: Some(iteration),
-                text: delta.to_string(),
+                text,
             }
         } else {
             SubagentTranscriptItem::Text {
                 iteration: Some(iteration),
-                text: delta.to_string(),
+                text,
             }
         });
     }

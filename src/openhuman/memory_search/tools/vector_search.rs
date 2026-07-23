@@ -11,13 +11,13 @@ use std::fmt::Write;
 
 use crate::openhuman::config::rpc as config_rpc;
 use crate::openhuman::embeddings::provider_from_config;
-use crate::openhuman::memory_search::vector::mmr::{mmr_select, MmrCandidate};
 use crate::openhuman::memory_store::chunks::store::{
     get_chunk_embeddings_for_signature_batch, list_chunks, ListChunksQuery,
 };
 use crate::openhuman::memory_store::chunks::types::SourceKind;
 use crate::openhuman::memory_store::vectors::cosine_similarity;
 use crate::openhuman::tools::traits::{Tool, ToolResult};
+use tinycortex::memory::retrieval::mmr::{mmr_select, MmrCandidate};
 
 pub struct MemoryVectorSearchTool;
 
@@ -152,6 +152,7 @@ impl Tool for MemoryVectorSearchTool {
             since_ms,
             until_ms: None,
             limit: Some(1000),
+            offset: None,
             source_scope: crate::openhuman::memory::source_scope::current_source_scope(),
             exclude_dropped: false,
         };
@@ -196,7 +197,7 @@ impl Tool for MemoryVectorSearchTool {
                 .iter()
                 .map(|(idx, score, emb)| MmrCandidate {
                     index: *idx,
-                    embedding: *emb,
+                    embedding: emb,
                     relevance: *score,
                 })
                 .collect();

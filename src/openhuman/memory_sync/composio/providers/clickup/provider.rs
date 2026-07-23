@@ -27,12 +27,10 @@
 use async_trait::async_trait;
 use serde_json::json;
 
-use super::source::run_clickup_sync;
-use super::sync;
+use super::normalization;
 use crate::openhuman::memory_sync::composio::providers::{
     first_array_str, merge_extra, pick_str, resolve_sync_interval_secs, ComposioProvider,
-    CuratedTool, NormalizedTask, ProviderContext, ProviderUserProfile, SyncOutcome, SyncReason,
-    TaskFetchFilter, TaskKind,
+    CuratedTool, NormalizedTask, ProviderContext, ProviderUserProfile, TaskFetchFilter, TaskKind,
 };
 
 pub(crate) const ACTION_GET_AUTHORIZED_USER: &str = "CLICKUP_GET_AUTHORIZED_USER";
@@ -107,7 +105,7 @@ impl ComposioProvider for ClickUpProvider {
         let data = &resp.data;
         let display_name = pick_str(data, &["user.username", "data.user.username", "username"]);
         let email = pick_str(data, &["user.email", "data.user.email", "email"]);
-        let username = sync::extract_user_id(data);
+        let username = normalization::extract_user_id(data);
         let avatar_url = pick_str(
             data,
             &[
@@ -136,10 +134,6 @@ impl ComposioProvider for ClickUpProvider {
     /// `max_items` cap, the epoch-ms `sync_depth_days` window, and cursor
     /// handling live in `run_sync`; the ClickUp-specific primitives live in
     /// [`super::source`].
-    async fn sync(&self, ctx: &ProviderContext, reason: SyncReason) -> Result<SyncOutcome, String> {
-        run_clickup_sync(ctx, reason).await
-    }
-
     async fn fetch_tasks(
         &self,
         ctx: &ProviderContext,
@@ -174,7 +168,7 @@ impl ComposioProvider for ClickUpProvider {
                         resp.error.unwrap_or_else(|| "provider failure".into())
                     ));
                 }
-                sync::extract_workspace_ids(&resp.data)
+                normalization::extract_workspace_ids(&resp.data)
             }
         };
 
@@ -194,7 +188,7 @@ impl ComposioProvider for ClickUpProvider {
                     resp.error.unwrap_or_else(|| "provider failure".into())
                 ));
             }
-            let id = sync::extract_user_id(&resp.data).ok_or_else(|| {
+            let id = normalization::extract_user_id(&resp.data).ok_or_else(|| {
                 "[composio:clickup] CLICKUP_GET_AUTHORIZED_USER returned no user.id".to_string()
             })?;
             vec![id]
@@ -233,7 +227,7 @@ impl ComposioProvider for ClickUpProvider {
                 ));
             }
 
-            for task in sync::extract_tasks(&resp.data) {
+            for task in normalization::extract_tasks(&resp.data) {
                 if out.len() >= max {
                     break 'workspaces;
                 }
@@ -251,13 +245,9 @@ impl ComposioProvider for ClickUpProvider {
 /// Map a raw ClickUp task payload into a [`NormalizedTask`]. Returns
 /// `None` only when the task has no extractable id (unroutable).
 fn normalize_clickup_task(task: &serde_json::Value) -> Option<NormalizedTask> {
-    let external_id =
-        crate::openhuman::memory_sync::composio::providers::sync_state::extract_item_id(
-            task,
-            TASK_ID_PATHS,
-        )?;
-    let title =
-        sync::extract_task_name(task).unwrap_or_else(|| format!("ClickUp task {external_id}"));
+    let external_id = pick_str(task, TASK_ID_PATHS)?;
+    let title = normalization::extract_task_name(task)
+        .unwrap_or_else(|| format!("ClickUp task {external_id}"));
     Some(NormalizedTask {
         external_id,
         source_id: String::new(),
@@ -275,7 +265,7 @@ fn normalize_clickup_task(task: &serde_json::Value) -> Option<NormalizedTask> {
         due: pick_str(task, &["due_date", "data.due_date"]),
         labels: Vec::new(),
         priority: pick_str(task, &["priority.priority", "data.priority.priority"]),
-        updated_at: sync::extract_task_updated(task),
+        updated_at: normalization::extract_task_updated(task),
         raw: task.clone(),
     })
 }

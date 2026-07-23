@@ -49,12 +49,30 @@ pub fn create_backend_inference_provider(
             url,
             key.len()
         );
+        let model = crate::openhuman::inference::provider::crate_openai::build_crate_openai_model(
+            crate::openhuman::inference::provider::crate_openai::CrateOpenAiConfig {
+                provider_name: "custom_openai",
+                endpoint: url,
+                api_key: key,
+                auth_style: crate::openhuman::inference::provider::auth::AuthStyle::Bearer,
+                model: "",
+                temperature_unsupported_models: &[],
+                temperature_override: None,
+                merge_system_into_user: false,
+                extra_headers: &[],
+                native_tool_calling: None,
+                vision: None,
+                default_provider_options: None,
+                responses_api_primary: false,
+                responses_omit_max_output_tokens: false,
+                extra_query_params: &[],
+                user_agent: None,
+            },
+        );
         Ok(Box::new(
-            crate::openhuman::inference::provider::compatible::OpenAiCompatibleProvider::new_no_responses_fallback(
+            crate::openhuman::inference::provider::crate_provider::CrateBackedProvider::new(
+                model,
                 "custom_openai",
-                url,
-                Some(key),
-                crate::openhuman::inference::provider::compatible::AuthStyle::Bearer,
             ),
         ))
     } else {
@@ -154,8 +172,8 @@ pub fn create_routed_provider_with_options(
 ) -> anyhow::Result<Box<dyn Provider>> {
     // Test-only: a mock provider injected by an e2e test wins over any
     // config-derived routing (covers the triage remote arm). Gated on
-    // cfg(test) / the off-by-default `e2e-test-support` feature.
-    #[cfg(any(test, feature = "e2e-test-support"))]
+    // cfg(test) / the off-by-default test and profiling features.
+    #[cfg(any(test, feature = "e2e-test-support", feature = "rss-bench"))]
     if let Some(p) = super::super::factory::test_provider_override::current() {
         return Ok(Box::new(
             super::super::factory::test_provider_override::ProviderHandle(p),

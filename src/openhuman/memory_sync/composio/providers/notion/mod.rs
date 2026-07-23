@@ -1,7 +1,5 @@
-mod ingest;
+mod normalization;
 mod provider;
-mod source;
-mod sync;
 #[cfg(test)]
 mod tests;
 pub mod tools;

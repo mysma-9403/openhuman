@@ -250,10 +250,7 @@ fn ownership_file_paths(ownership: Option<&str>) -> Result<Vec<PathBuf>, String>
     };
     let mut paths = Vec::new();
     for raw in rest.split([',', '\n']) {
-        let trimmed = raw
-            .trim()
-            .trim_start_matches(|c: char| c == '-' || c == '*')
-            .trim();
+        let trimmed = raw.trim().trim_start_matches(['-', '*']).trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -412,7 +409,7 @@ fn snapshot_agent_definitions(
         .collect()
 }
 
-pub(crate) fn prepare_spawn_parallel_tasks_from_defs(
+pub(super) fn prepare_spawn_parallel_tasks_from_defs(
     tasks: Vec<ParallelAgentTask>,
     definitions: &HashMap<String, AgentDefinition>,
     parent: &ParentExecutionContext,
@@ -701,7 +698,7 @@ async fn stage_spawn_parallel_workers_from_defs(
             progress_sink,
             &definition,
             &task_id,
-            prompt.chars().count(),
+            &prompt,
             task.ownership
                 .as_deref()
                 .map(str::trim)
@@ -968,9 +965,10 @@ async fn project_spawn_parallel_spawned(
     progress_sink: Option<&Sender<AgentProgress>>,
     definition: &AgentDefinition,
     task_id: &str,
-    prompt_chars: usize,
+    prompt: &str,
     has_ownership: bool,
 ) {
+    let prompt_chars = prompt.chars().count();
     tracing::debug!(
         parent_session = %parent_session,
         task_id = %task_id,
@@ -994,6 +992,7 @@ async fn project_spawn_parallel_spawned(
                 mode: "typed".to_string(),
                 dedicated_thread: false,
                 prompt_chars,
+                prompt: prompt.to_string(),
                 worker_thread_id: None,
                 display_name: Some(definition.display_name().to_string()),
             })
@@ -1052,6 +1051,7 @@ async fn project_spawn_parallel_result(
                         elapsed_ms: *elapsed_ms,
                         iterations: *iterations,
                         output_chars: output.as_ref().map(|s| s.chars().count()).unwrap_or(0),
+                        output: output.clone().unwrap_or_default(),
                         worktree_path: worktree_path.clone(),
                         changed_files: changed_files.clone(),
                         dirty_status: *dirty_status,

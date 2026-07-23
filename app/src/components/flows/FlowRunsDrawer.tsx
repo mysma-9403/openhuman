@@ -8,10 +8,11 @@
  * to-close + Escape-to-close via `useEscapeKey`) so it renders as a fixed
  * overlay regardless of where the parent mounts it.
  *
- * Data is a one-shot fetch via `listFlowRuns` — no polling here. The run
- * inspector already polls a single run's live status via `useFlowRunPoller`;
- * polling the whole list here would duplicate that logic for no benefit
- * (the list only needs to be fresh when the drawer opens).
+ * Data loads via `listFlowRuns` on open, then stays live via
+ * {@link useFlowRunsLiveRefresh} while any run in the list is still active —
+ * so a run stuck on "Running" here updates without the user having to close
+ * and reopen the drawer. The run inspector separately polls a single run's
+ * live status via `useFlowRunPoller`; that's unrelated to this list refresh.
  *
  * Clicking a run sets `selectedRunId` and renders the existing
  * `FlowRunInspectorDrawer` stacked on top: both are `fixed inset-0 z-50`
@@ -24,15 +25,23 @@
  * single Escape press closes only the topmost overlay (the inspector) first.
  */
 import debug from 'debug';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { useEscapeKey } from '../../hooks/useEscapeKey';
+import { useFlowRunFinished } from '../../hooks/useFlowRunFinished';
+import { useFlowRunsLiveRefresh } from '../../hooks/useFlowRunsLiveRefresh';
+import { useFlowRunStarted } from '../../hooks/useFlowRunStarted';
+import {
+  resolveDisplayStatus,
+  useRunsPendingApprovalSet,
+} from '../../hooks/useRunsPendingApprovalSet';
 import { useT } from '../../lib/i18n/I18nContext';
 import { type FlowRun, listFlowRuns } from '../../services/api/flowsApi';
 import {
   FLOW_RUN_STATUS_ACCENT,
   FLOW_RUN_STATUS_DOT,
   FLOW_RUN_STATUS_KEY,
+  type FlowRepairRequest,
   FlowRunInspectorDrawer,
 } from './FlowRunInspectorDrawer';
 
@@ -56,6 +65,8 @@ interface Props {
   /** Flow name for the drawer title, when known. */
   flowName?: string;
   onClose: () => void;
+  /** "Fix with agent" (Phase 5c) — forwarded to the inspector for failed runs. */
+  onFixWithAgent?: (request: FlowRepairRequest) => void;
 }
 
 /**
@@ -63,14 +74,28 @@ interface Props {
  * unconditionally and just flip `flowId` (same convention as
  * `FlowRunInspectorDrawer`/`SubagentDrawer`).
  */
-export function FlowRunsDrawer({ flowId, flowName, onClose }: Props) {
+export function FlowRunsDrawer({ flowId, flowName, onClose, onFixWithAgent }: Props) {
   const { t } = useT();
   const [runs, setRuns] = useState<FlowRun[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  // Tracks the flowId this drawer instance is *currently* showing, so an
+  // in-flight `refetch()` started for a previous flow (see below) can detect
+  // it's stale once the drawer flips to a new flowId and bail instead of
+  // clobbering the new flow's already-loaded runs.
+  const currentFlowIdRef = useRef(flowId);
+  // Per-request generation counter, shared by the initial load effect and
+  // `refetch` below: a request started before a run-started event (or before
+  // a newer refetch) can resolve AFTER it and, without this guard, clobber a
+  // fresh "Running" row with stale data — even for the SAME flowId, where the
+  // `currentFlowIdRef` check alone can't tell requests apart. Only the
+  // most-recently-issued request for the current flow may apply its result.
+  const requestGenRef = useRef(0);
 
   useEffect(() => {
+    currentFlowIdRef.current = flowId;
+
     // Reset for the new target so a previous flow's runs/error can't linger
     // under a different flowId while the new fetch is in flight.
     setSelectedRunId(null);
@@ -83,16 +108,17 @@ export function FlowRunsDrawer({ flowId, flowName, onClose }: Props) {
     }
 
     let cancelled = false;
+    const requestGen = ++requestGenRef.current;
     setLoading(true);
     log('loading runs: flowId=%s', flowId);
     listFlowRuns(flowId)
       .then(result => {
-        if (cancelled) return;
+        if (cancelled || requestGen !== requestGenRef.current) return;
         setRuns(result);
         log('loaded runs: flowId=%s count=%d', flowId, result.length);
       })
       .catch(err => {
-        if (cancelled) return;
+        if (cancelled || requestGen !== requestGenRef.current) return;
         const msg = err instanceof Error ? err.message : String(err);
         log('load failed: flowId=%s err=%s', flowId, msg);
         setError(msg);
@@ -105,6 +131,48 @@ export function FlowRunsDrawer({ flowId, flowName, onClose }: Props) {
       cancelled = true;
     };
   }, [flowId]);
+
+  // Background refresh for the live-update hook below — deliberately doesn't
+  // touch `loading`/`error` so a poll tick or progress event never flashes
+  // the loading state or clobbers a real load error with a transient one.
+  // Guards against a stale response two ways: if the drawer flips from flow A
+  // to flow B while an A refetch is still in flight, the late A response must
+  // not overwrite B's already-loaded runs (`currentFlowIdRef`); and if two
+  // requests for the SAME flow race (e.g. the initial load and an
+  // event-driven refetch, or two refetches back to back), only the response
+  // to the most-recently-issued one may apply (`requestGenRef`).
+  const refetch = useCallback(() => {
+    if (!flowId) return;
+    const requestFlowId = flowId;
+    const requestGen = ++requestGenRef.current;
+    listFlowRuns(requestFlowId)
+      .then(result => {
+        if (currentFlowIdRef.current !== requestFlowId || requestGen !== requestGenRef.current) {
+          return;
+        }
+        setRuns(result);
+        log('refetched runs: flowId=%s count=%d', requestFlowId, result.length);
+      })
+      .catch(err => {
+        if (currentFlowIdRef.current !== requestFlowId || requestGen !== requestGenRef.current) {
+          return;
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        log('refetch failed: flowId=%s err=%s', requestFlowId, msg);
+      });
+  }, [flowId]);
+
+  useFlowRunsLiveRefresh(runs, refetch);
+  // Unconditional (unlike useFlowRunsLiveRefresh, which is gated on an
+  // already-active run) — fills the empty-list gap ("No runs yet") that hook
+  // can't reach, so the very first run shows up as "Running" instantly
+  // instead of waiting for a manual refresh (issue B35).
+  useFlowRunStarted(() => void refetch(), flowId);
+  // Terminal companion to the above (issue B35 follow-up) — flips a run to
+  // Completed/Failed the instant it settles instead of waiting on
+  // `useFlowRunsLiveRefresh`'s debounced/backstop refetch to notice.
+  useFlowRunFinished(() => void refetch(), flowId);
+  const pendingRunIds = useRunsPendingApprovalSet(runs);
 
   useEscapeKey(
     () => {
@@ -176,6 +244,7 @@ export function FlowRunsDrawer({ flowId, flowName, onClose }: Props) {
               <ul className="space-y-2" data-testid="flow-runs-list">
                 {runs.map(run => {
                   const startedAt = formatTimestamp(run.started_at);
+                  const displayStatus = resolveDisplayStatus(run, pendingRunIds);
                   return (
                     <li key={run.id}>
                       <button
@@ -185,12 +254,12 @@ export function FlowRunsDrawer({ flowId, flowName, onClose }: Props) {
                         className="flex w-full items-center gap-2 rounded-lg border border-line bg-surface-muted px-3 py-2 text-left text-xs hover:bg-surface-hover">
                         <span
                           data-testid={`flow-run-row-dot-${run.id}`}
-                          className={`h-2 w-2 shrink-0 rounded-full ${FLOW_RUN_STATUS_DOT[run.status]}`}
+                          className={`h-2 w-2 shrink-0 rounded-full ${FLOW_RUN_STATUS_DOT[displayStatus]}`}
                           aria-hidden
                         />
                         <span
-                          className={`inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 font-medium ${FLOW_RUN_STATUS_ACCENT[run.status]}`}>
-                          {t(FLOW_RUN_STATUS_KEY[run.status])}
+                          className={`inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 font-medium ${FLOW_RUN_STATUS_ACCENT[displayStatus]}`}>
+                          {t(FLOW_RUN_STATUS_KEY[displayStatus])}
                         </span>
                         {startedAt && (
                           <span className="truncate text-content-muted">{startedAt}</span>
@@ -209,7 +278,11 @@ export function FlowRunsDrawer({ flowId, flowName, onClose }: Props) {
       </div>
 
       {selectedRunId && (
-        <FlowRunInspectorDrawer runId={selectedRunId} onClose={() => setSelectedRunId(null)} />
+        <FlowRunInspectorDrawer
+          runId={selectedRunId}
+          onClose={() => setSelectedRunId(null)}
+          onFixWithAgent={onFixWithAgent}
+        />
       )}
     </>
   );

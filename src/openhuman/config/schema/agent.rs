@@ -159,6 +159,71 @@ fn default_max_depth() -> u32 {
     3
 }
 
+/// A per-agent contract requiring a structured JSON block in every turn's final
+/// reply (issue #4117).
+///
+/// Some agents are consumed by downstream parsing/routing that expects a
+/// mandated JSON block — e.g. a `thoughts` block like
+/// `{"thoughts": "…", "next_action": "…"}` — on **every** turn. Models
+/// frequently omit it, leaving those consumers with nothing. When this contract
+/// is set on [`AgentConfig::required_output`], the turn engine validates the
+/// reply and repairs an omitted block before the turn is accepted (see
+/// `crate::openhuman::agent::harness::required_output`), so consumers always get
+/// a well-formed block.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct RequiredOutputContract {
+    /// The JSON key that identifies the required block (e.g. `"thoughts"`). The
+    /// contract is satisfied when the reply contains a JSON object carrying this
+    /// key — plus every key in [`required_keys`](Self::required_keys) — with a
+    /// non-null value. A blank `block_key` makes the contract inert (enforcement
+    /// is skipped), so it is a safe no-op default.
+    pub block_key: String,
+    /// Additional sibling keys that must also be present and non-null in the
+    /// same block (e.g. `["next_action"]`). The `block_key` is always required
+    /// and need not be repeated here.
+    pub required_keys: Vec<String>,
+}
+
+impl RequiredOutputContract {
+    /// Construct a contract from a block key with no extra required siblings.
+    pub fn new(block_key: impl Into<String>) -> Self {
+        Self {
+            block_key: block_key.into(),
+            required_keys: Vec::new(),
+        }
+    }
+
+    /// Every key that must be present — the block key followed by any declared
+    /// siblings — order-preserving, trimmed, and de-duplicated. Empty when the
+    /// contract carries no non-blank keys, in which case it is inert and the
+    /// turn engine skips enforcement.
+    pub fn all_keys(&self) -> Vec<String> {
+        // The block key is the contract's defining key — a blank one makes the
+        // whole contract inert, even if `required_keys` lists siblings, so the
+        // feature never accepts or synthesizes a block missing that key.
+        let block_key = self.block_key.trim();
+        if block_key.is_empty() {
+            return Vec::new();
+        }
+
+        let mut keys: Vec<String> = vec![block_key.to_string()];
+        for key in &self.required_keys {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() && !keys.iter().any(|k| k == trimmed) {
+                keys.push(trimmed.to_string());
+            }
+        }
+        keys
+    }
+
+    /// Whether this contract actually constrains output. A contract with no
+    /// non-blank keys is inert and enforcement is skipped.
+    pub fn is_active(&self) -> bool {
+        !self.all_keys().is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct AgentConfig {
@@ -174,6 +239,13 @@ pub struct AgentConfig {
     /// Maximum number of tool calls to execute concurrently when `parallel_tools` is true.
     #[serde(default = "default_max_parallel_tools")]
     pub max_parallel_tools: usize,
+    /// How the agent formats tool calls to text-only providers.
+    /// - `"auto"` (default): native structured tool-calling when the provider
+    ///   supports it, otherwise JSON-in-tag (`<tool_call>{…}</tool_call>`).
+    /// - `"native"`: force provider-native structured tool calls.
+    /// - `"xml"`: force JSON-in-tag.
+    /// - `"pformat"`: force compact positional P-Format (`tool[a|b]`) — most
+    ///   token-efficient, but mis-parses on some models, so it is opt-in only.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
     /// **Legacy** — maximum characters of memory context to inject per
@@ -259,10 +331,58 @@ pub struct AgentConfig {
     /// [`crate::openhuman::session_import::live::dual_write_enabled`].
     #[serde(default = "default_session_dual_write")]
     pub session_dual_write: bool,
+
+    /// Store-backed **shadow read** of a resumed session's messages: on the
+    /// legacy transcript read path (`session/turn/session_io.rs` →
+    /// `try_load_session_transcript`), also read the same session back from the
+    /// TinyAgents journal (`{workspace}/tinyagents_store/journal`), normalize
+    /// both sides through the importer's `session_import::convert` machinery,
+    /// compare, and log any divergence (`[session_shadow_read]`, issue #4249,
+    /// sessions 04.2 phase 2).
+    ///
+    /// Defaults **OFF** (unlike `session_dual_write`, which defaults ON): this
+    /// is an observation-only parity probe with no product effect. The legacy
+    /// JSONL read stays authoritative — the shadow read only observes and logs
+    /// on a background task; a store-read failure is treated as "no shadow
+    /// available" and never breaks or slows the authoritative read. The
+    /// `OPENHUMAN_SESSION_SHADOW_READS` env var is a pure **kill switch**: a
+    /// falsy value (`0`/`false`/`no`/`off`/`disable`) forces the shadow read
+    /// OFF regardless of config; it can never force it ON. See
+    /// [`crate::openhuman::session_import::live::shadow_reads_enabled`].
+    #[serde(default = "default_session_shadow_reads")]
+    pub session_shadow_reads: bool,
+
+    /// Optional required structured-output contract. When set to an active
+    /// contract, every turn's final reply must contain the mandated JSON block;
+    /// the turn engine validates and repairs an omitted block before the turn is
+    /// accepted (issue #4117). `None` (the default) disables enforcement so
+    /// existing agents are unaffected.
+    #[serde(default)]
+    pub required_output: Option<RequiredOutputContract>,
+
+    /// Whether to load `AGENTS.md` instruction files into the agent's system
+    /// prompt — OpenHuman's analog of Claude Code's `CLAUDE.md` / Codex's
+    /// `AGENTS.md`. When `true` (the default), the harness reads
+    /// `<workspace_dir>/AGENTS.md` (global) and `<action_dir>/AGENTS.md`
+    /// (project) once at system-prompt build time and injects them as
+    /// `## Project instructions (AGENTS.md)`. When `false`, no AGENTS.md content
+    /// is loaded or injected. Missing/empty files are always a silent no-op, so
+    /// leaving this on has zero effect until the user actually creates an
+    /// `AGENTS.md`.
+    #[serde(default = "default_agents_md_enabled")]
+    pub agents_md_enabled: bool,
+}
+
+fn default_agents_md_enabled() -> bool {
+    true
 }
 
 fn default_session_dual_write() -> bool {
     true
+}
+
+fn default_session_shadow_reads() -> bool {
+    false
 }
 
 fn default_tool_result_budget_bytes() -> usize {
@@ -395,6 +515,9 @@ impl Default for AgentConfig {
             tool_result_budget_bytes: default_tool_result_budget_bytes(),
             agent_timeout_secs: default_agent_timeout_secs(),
             session_dual_write: default_session_dual_write(),
+            session_shadow_reads: default_session_shadow_reads(),
+            required_output: None,
+            agents_md_enabled: default_agents_md_enabled(),
         }
     }
 }
@@ -593,5 +716,27 @@ mod memory_window_tests {
         let migrated = cfg.migrate_channel_permissions_if_legacy(Vec::<String>::new());
         assert!(!migrated);
         assert!(cfg.channel_permissions.is_empty());
+    }
+
+    #[test]
+    fn agents_md_enabled_defaults_to_true() {
+        assert!(
+            AgentConfig::default().agents_md_enabled,
+            "AGENTS.md loading must be on by default"
+        );
+    }
+
+    #[test]
+    fn agents_md_enabled_defaults_true_when_field_omitted() {
+        // A config that predates the field must deserialize with the feature on
+        // (matches the `#[serde(default = ...)]` contract).
+        let cfg: AgentConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.agents_md_enabled);
+    }
+
+    #[test]
+    fn agents_md_enabled_roundtrips_when_disabled() {
+        let cfg: AgentConfig = serde_json::from_str(r#"{"agents_md_enabled": false}"#).unwrap();
+        assert!(!cfg.agents_md_enabled);
     }
 }

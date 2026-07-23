@@ -168,6 +168,11 @@ pub struct AppStateSnapshot {
     pub local_state: StoredAppState,
     pub keyring_status: crate::openhuman::keyring_consent::KeyringStatus,
     pub runtime: RuntimeSnapshot,
+    /// Process + component health, folded into this snapshot so the frontend
+    /// hydrates the daemon-health store from the same poll instead of running a
+    /// second `health_snapshot` poller. Fields stay snake_case (the type has no
+    /// camelCase rename) to match the frontend's existing health parser.
+    pub health: crate::openhuman::health::HealthSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,6 +521,11 @@ async fn finish_revalidated_user_activation(
             "{LOG_PREFIX} failed to bind memory client after pending session revalidation: {error}"
         );
     }
+    if let Err(error) = crate::core::runtime::context::CoreContext::rebind_default_workspace_dir(
+        &target_config.workspace_dir,
+    ) {
+        warn!("{LOG_PREFIX} failed to rebind core context after pending session revalidation: {error}");
+    }
     // Rebind the people store to the activated user's workspace, mirroring the
     // memory-client rebind so people controllers/tools follow the active user
     // instead of the pre-switch workspace (#4378).
@@ -529,7 +539,7 @@ async fn finish_revalidated_user_activation(
     crate::openhuman::memory_conversations::register_conversation_persistence_subscriber(
         target_config.workspace_dir.clone(),
     );
-    if let Err(error) = crate::openhuman::subconscious::global::bootstrap_after_login().await {
+    if let Err(error) = crate::openhuman::subconscious::registry::bootstrap_after_login().await {
         warn!("{LOG_PREFIX} subconscious bootstrap failed after pending session revalidation: {error}");
     }
     if let Some(source_config) = service_rebind_source {
@@ -672,7 +682,7 @@ async fn clear_deferred_session_after_backend_rejection(
         Err(_) => {}
     }
     crate::openhuman::credentials::stop_login_gated_services(config).await;
-    crate::openhuman::subconscious::global::reset_engine_for_user_switch().await;
+    crate::openhuman::subconscious::registry::reset_engine_for_user_switch().await;
     crate::openhuman::credentials::sentry_scope::clear();
 
     clear_result
@@ -1215,6 +1225,7 @@ pub async fn snapshot() -> Result<RpcOutcome<AppStateSnapshot>, String> {
     );
 
     let keyring_status = crate::openhuman::keyring_consent::policy::current_status();
+    let health = crate::openhuman::health::snapshot();
 
     Ok(RpcOutcome::new(
         AppStateSnapshot {
@@ -1228,6 +1239,7 @@ pub async fn snapshot() -> Result<RpcOutcome<AppStateSnapshot>, String> {
             local_state,
             keyring_status,
             runtime,
+            health,
         },
         vec!["core app state snapshot fetched".to_string()],
     ))

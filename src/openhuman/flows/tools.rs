@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use tinyflows::model::{Node, NodeKind, WorkflowGraph};
 
 use crate::openhuman::config::Config;
-use crate::openhuman::flows::ops::validate_and_migrate_graph;
+use crate::openhuman::flows::ops::{build_builder_proposal, validate_and_migrate_graph};
 use crate::openhuman::tools::traits::{PermissionLevel, Tool, ToolResult};
 
 /// Max characters kept for a `config_hint` before truncation, so a long
@@ -52,7 +52,11 @@ impl Tool for ProposeWorkflowTool {
          ONLY VALIDATES the graph and returns a summary — it NEVER creates or enables the flow; \
          the user must click \"Save & enable\" in the UI before anything is persisted or can \
          run. Build a tinyflows WorkflowGraph: nodes[] ({id, kind, name, config}) + edges[] \
-         ({from_node, to_node, from_port?, to_port?}; ports default \"main\"). Exactly ONE \
+         ({from_node, to_node, from_port?, to_port?}; ports default \"main\"). For a branching \
+         node (condition/switch), the branch label goes on from_port — NEVER on to_port \
+         (to_port just stays \"main\"); routing is keyed exclusively on from_port, so a label \
+         on to_port instead silently turns the branch into an unconditional fan-out and is a \
+         hard reject. Exactly ONE \
          trigger node is required. The 12 node kinds: trigger (config.trigger_kind: manual | \
          schedule | webhook | app_event | form | chat_message | evaluation | system | \
          execute_by_workflow; schedule needs config.schedule = {kind:\"cron\",expr,tz?} | \
@@ -60,7 +64,8 @@ impl Tool for ProposeWorkflowTool {
          config.trigger_slug), agent (config.prompt), tool_call (config.slug REQUIRED + \
          config.args), http_request (config.method/url, optional headers/body), code \
          (config.language: \"javascript\"|\"python\" + config.source), condition (config.field; \
-         routes ports \"true\"/\"false\"), switch (config.expression or config.field; routes to \
+         routes on from_port \"true\"/\"false\", e.g. {from_node:\"gate\",from_port:\"true\",\
+         to_node:\"x\",to_port:\"main\"}), switch (config.expression or config.field; routes to \
          the matching case port, or \"default\"), transform (config.set: {key: \"=expr\"} \
          merged onto each item), split_out (config.path to an array field; fans out one item per \
          element), merge (fan-in passthrough, no config), output_parser (passthrough today; no \
@@ -107,8 +112,8 @@ impl Tool for ProposeWorkflowTool {
                                 "properties": {
                                     "from_node": { "type": "string" },
                                     "to_node": { "type": "string" },
-                                    "from_port": { "type": "string", "description": "Defaults to \"main\"." },
-                                    "to_port": { "type": "string", "description": "Defaults to \"main\"." }
+                                    "from_port": { "type": "string", "description": "Defaults to \"main\". For a condition/switch branch, this is where the branch label (e.g. \"true\"/\"false\") goes." },
+                                    "to_port": { "type": "string", "description": "Defaults to \"main\". Almost always stays \"main\" — branch labels go on from_port, not here." }
                                 },
                                 "required": ["from_node", "to_node"]
                             }
@@ -176,30 +181,175 @@ impl Tool for ProposeWorkflowTool {
             }
         };
 
-        let summary = build_summary(&graph);
-        let graph_value = serde_json::to_value(&graph)?;
+        // Route every first proposal through the same canonical hard-gate and
+        // payload builder as revise/edit/save. In particular, this includes
+        // compatibility checks for literal workflow_id children, which cannot
+        // be detected by graph-only validation because they require the store.
+        match build_builder_proposal(
+            &self.config,
+            "propose_workflow",
+            &name,
+            &graph,
+            require_approval,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(payload) => Ok(ToolResult::success(serde_json::to_string_pretty(&payload)?)),
+            Err(error) => {
+                tracing::debug!(
+                    target: "flows",
+                    %name,
+                    %error,
+                    "[flows] propose_workflow: builder gate rejected the graph"
+                );
+                Ok(ToolResult::error(error))
+            }
+        }
+    }
+}
+
+/// Runs a **saved** workflow by id so the `workflow-builder` agent can *test*
+/// it end-to-end. Unlike [`crate::openhuman::flows::builder_tools::DryRunWorkflowTool`]
+/// (a MOCK sandbox), this is a **real** run — so it is `PermissionLevel::Write`
+/// with `external_effect() == true`. Two safety layers remain: the flow's own
+/// `require_approval` gate still pauses outbound-action nodes mid-run, and the
+/// agent prompt requires it to ASK THE USER for confirmation before ever
+/// calling this. It only runs an already-persisted flow (no `flow_id`, no run).
+pub struct RunFlowTool {
+    config: Arc<Config>,
+}
+
+impl RunFlowTool {
+    pub fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+#[async_trait]
+impl Tool for RunFlowTool {
+    fn name(&self) -> &str {
+        // NOTE: deliberately `run_flow`, not `run_workflow` — the latter
+        // name is already taken by the unrelated legacy skills-workflow
+        // runner (`crate::openhuman::agent::tools::run_workflow`,
+        // `RUN_WORKFLOW_TOOL_NAME`), which is registered in the same
+        // default tool registry (`tools::ops::all_tools_with_runtime`).
+        // Both tools were previously named identically, which
+        // `all_tools_default_registry_has_no_duplicate_tool_names` caught
+        // as a duplicate-tool-name registry bug.
+        "run_flow"
+    }
+
+    fn description(&self) -> &str {
+        "Run a SAVED workflow by id to TEST it end-to-end. This is a REAL run, not a \
+         simulation — real effects can fire (use dry_run_workflow for a safe MOCK run \
+         instead). It only works on a flow the user has already saved; pass its `flow_id`. \
+         You MUST ask the user to confirm and wait for an explicit 'yes' before calling this \
+         — never run a workflow unprompted. The flow's own approval gate still pauses \
+         outbound-action nodes. Params: { flow_id (required), input? }. Returns the run's \
+         status + any nodes paused for approval."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "flow_id": {
+                    "type": "string",
+                    "description": "Id of the SAVED flow to run (the user must have saved it first)."
+                },
+                "input": {
+                    "description": "Optional trigger input passed to the run (defaults to {})."
+                }
+            },
+            "required": ["flow_id"]
+        })
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        // A real run with real effects — gated like a Write-class action.
+        PermissionLevel::Write
+    }
+
+    fn external_effect(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let flow_id = match args.get("flow_id").and_then(Value::as_str).map(str::trim) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                return Ok(ToolResult::error(
+                    "Missing 'flow_id' — run_flow only works on a SAVED flow. Ask the user \
+                     to Save the workflow first, then run it by id."
+                        .to_string(),
+                ))
+            }
+        };
+        let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
 
         tracing::info!(
             target: "flows",
-            %name,
-            node_count = graph.nodes.len(),
-            require_approval,
-            "[flows] propose_workflow: proposal ready for user review"
+            %flow_id,
+            "[flows] run_flow: agent-initiated test run starting (detached)"
         );
 
-        Ok(ToolResult::success(serde_json::to_string_pretty(&json!({
-            "type": "workflow_proposal",
-            "name": name,
-            "graph": graph_value,
-            "require_approval": require_approval,
-            "summary": summary,
-        }))?))
+        // Detach (bug B41): a flow whose first real node is a live-research
+        // agent node inherently runs longer than the tinyagents harness's 120s
+        // per-tool-call cap, so a blocking `run_flow` could never succeed —
+        // it died at 120s, orphaning the run row (bug B42). `flows_run_detached`
+        // validates + compile-checks synchronously (so a broken flow still
+        // returns an immediate, actionable error), fires the run on a background
+        // task, and returns `{ run_id, status: "running" }` in well under 120s.
+        // The copilot then polls `get_flow_run(run_id)` to observe completion.
+        match crate::openhuman::flows::ops::flows_run_detached(
+            &self.config,
+            &flow_id,
+            input,
+            crate::openhuman::flows::types::FlowRunTrigger::Rpc,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                let run_id = outcome
+                    .value
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(ToolResult::success(serde_json::to_string_pretty(&json!({
+                    "type": "workflow_run_started",
+                    "flow_id": flow_id,
+                    "run_id": run_id,
+                    "status": "running",
+                    "detached": true,
+                    "note": "The run started in the background and is now 'running'. Poll \
+                             get_flow_run with this run_id to see it settle to a terminal \
+                             status (completed / failed / interrupted / pending_approval); \
+                             do not assume success from this response alone.",
+                    "result": outcome.value,
+                }))?))
+            }
+            Err(e) => {
+                tracing::debug!(target: "flows", %flow_id, error = %e, "[flows] run_flow: failed to start");
+                Ok(ToolResult::error(format!(
+                    "Could not start flow '{flow_id}': {e}"
+                )))
+            }
+        }
     }
 }
 
 /// Builds the `{ trigger, steps }` summary surfaced to both the LLM (in the
 /// tool result) and the chat UI's `WorkflowProposalCard`.
-fn build_summary(graph: &WorkflowGraph) -> Value {
+///
+/// `pub(crate)` so the `workflow-builder` tool belt's
+/// [`crate::openhuman::flows::builder_tools::ReviseWorkflowTool`] reuses the
+/// identical summary shape rather than duplicating it.
+pub(crate) fn build_summary(graph: &WorkflowGraph) -> Value {
     let trigger = graph
         .trigger()
         .map(describe_trigger)
@@ -237,7 +387,11 @@ fn node_kind_str(kind: &NodeKind) -> String {
 /// One-line human description of a trigger node, for the summary's
 /// `"trigger"` field — e.g. `"schedule: 0 9 * * *"`, `"app event:
 /// gmail/GMAIL_NEW_GMAIL_MESSAGE"`, `"manual"`.
-fn describe_trigger(node: &Node) -> String {
+///
+/// `pub(crate)` so [`crate::openhuman::flows::builder_tools::SaveWorkflowTool`]
+/// reuses it verbatim for its enabled+auto-trigger arming warning (issue
+/// B29) instead of re-deriving the same human string.
+pub(crate) fn describe_trigger(node: &Node) -> String {
     let trigger_kind = node
         .config
         .get("trigger_kind")

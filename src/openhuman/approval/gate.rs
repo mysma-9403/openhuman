@@ -43,7 +43,9 @@ use crate::openhuman::config::Config;
 use crate::openhuman::security::POLICY_DENIED_MARKER;
 
 use super::store;
-use super::types::{ApprovalDecision, ExecutionOutcome, GateOutcome, PendingApproval};
+use super::types::{
+    ApprovalDecision, ApprovalSourceContext, ExecutionOutcome, GateOutcome, PendingApproval,
+};
 
 /// Disambiguates why [`ApprovalGate::decide`] returned `Ok(None)`. See
 /// [`ApprovalGate::classify_decide_miss`] for the lookup that produces this.
@@ -67,9 +69,22 @@ const DEFAULT_APPROVAL_TTL: Duration = Duration::from_secs(60 * 10);
 /// minutes — if nobody approves within two, deny and move on.
 const IN_CALL_APPROVAL_TTL: Duration = Duration::from_secs(120);
 
+/// Shorter park window for approvals raised by the Flow Canvas copilot's
+/// live-run path — `flows_build` streaming into the copilot pane calling
+/// `run_flow` / `resume_flow_run` (PR #5090). A stale ten-minute park on a
+/// copilot pane the user may have already navigated away from is a long time
+/// to leave a live Slack/Gmail/HTTP node waiting; if nobody approves within
+/// three minutes, deny and let the authoring turn continue (the user can
+/// still re-trigger the run from the Runs rail). Mirrors
+/// [`IN_CALL_APPROVAL_TTL`]'s clamp, scoped by [`APPROVAL_COPILOT_STREAM_CONTEXT`]
+/// instead of [`APPROVAL_IN_CALL_CONTEXT`]. Deliberately NOT applied to
+/// main-chat `WebChat` parks — only `flows::ops::flows_build`'s streaming
+/// branch scopes the task-local below.
+const COPILOT_APPROVAL_TTL: Duration = Duration::from_secs(180);
+
 /// Per-turn chat context for routing a parked approval's yes/no reply back to
 /// the originating thread. The web channel scopes this task-local around the
-/// agent run (`channels::providers::web`); because the `run_turn` handler, the
+/// agent run (`web_chat`); because the `run_turn` handler, the
 /// tool loop, and `intercept` all run inline (`.await`) within that spawned
 /// task, it propagates down to `intercept` with no signature plumbing. Absent
 /// for non-chat callers (CLI, sub-agents) — their approvals are simply not
@@ -102,6 +117,38 @@ pub struct InCallApprovalContext {
 
 tokio::task_local! {
     pub static APPROVAL_IN_CALL_CONTEXT: InCallApprovalContext;
+}
+
+tokio::task_local! {
+    /// Marks a park as originating from the Flow Canvas copilot's streaming
+    /// `flows_build` path — scoped by `flows::ops::flows_build` around the
+    /// streaming `agent.run_single(&prompt)` call, alongside the existing
+    /// `AgentTurnOrigin::WebChat` + [`APPROVAL_CHAT_CONTEXT`] double-scope that
+    /// path already uses. Presence alone is the signal (no fields needed): when
+    /// set, the park window is clamped to [`COPILOT_APPROVAL_TTL`] instead of
+    /// the gate's own (possibly env-overridden) TTL. Absent for every other
+    /// caller — in particular, plain main-chat `WebChat` turns do not scope
+    /// this, so they keep the full [`DEFAULT_APPROVAL_TTL`].
+    pub static APPROVAL_COPILOT_STREAM_CONTEXT: ();
+}
+
+/// Per-run flow context (flow-approval-surface, PR2 of the tinyflows
+/// approval-surfacing design). `flows::ops::flows_run` / `flows_resume`
+/// scope this around the engine invocation, alongside the existing
+/// `Workflow` [`AgentTurnOrigin`](crate::openhuman::agent::turn_origin::AgentTurnOrigin),
+/// so a tool call parked from that run can correlate
+/// [`PendingApproval::source_context`](super::types::PendingApproval) back to
+/// the exact flow + run (the origin alone only carries `flow_id`, not
+/// `run_id`). Absent for every non-flow caller — chat, cron, subconscious,
+/// CLI never scope this.
+#[derive(Clone, Debug)]
+pub struct FlowRunContext {
+    pub flow_id: String,
+    pub run_id: String,
+}
+
+tokio::task_local! {
+    pub static APPROVAL_FLOW_RUN_CONTEXT: FlowRunContext;
 }
 
 /// Parse a chat reply to a parked approval into a binary decision (v1). Only an
@@ -182,6 +229,72 @@ pub struct ApprovalGate {
     meeting_to_request: Mutex<HashMap<String, String>>,
 }
 
+/// RAII guard that tears the parked waiter down even when the surrounding turn
+/// future is dropped mid-park.
+///
+/// `intercept_audited_inner` only runs its cleanup (`evict_waiter` /
+/// `store::decide(Deny)` / routing-map removal) inside the
+/// `tokio::time::timeout(...).await` match arms — i.e. only when the park
+/// resolves *normally*. Once a turn future can be torn down *externally* — the
+/// harness `max_wall_clock_ms` backstop (#4746) or the outer web backstop
+/// (#4751) firing while a tool call is parked — dropping the future skips those
+/// arms entirely, leaving the in-memory waiter, the thread/meeting routing
+/// mappings, and the `pending_approvals` row dangling until the store TTL
+/// sweeps them. A later yes/no arriving before that expiry would then route to a
+/// dead request and return without starting a fresh turn (#4774).
+///
+/// The guard is created just before the park await and [`disarm`](Self::disarm)ed
+/// on every normal exit (the match arm already ran the exact teardown for its
+/// outcome), so its `Drop` fires *only* on external cancellation.
+struct WaiterGuard<'a> {
+    gate: &'a ApprovalGate,
+    request_id: String,
+    thread_id: Option<String>,
+    meeting_key: Option<String>,
+    armed: bool,
+}
+
+impl WaiterGuard<'_> {
+    /// Mark the park as resolved normally so `Drop` becomes a no-op.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // External teardown: the normal cleanup was skipped. Evict the waiter,
+        // drop the routing mappings so a later chat/voice reply is not
+        // mis-routed to this now-dead request, and deny the still-open pending
+        // row. `store::decide` is `WHERE decided_at IS NULL`, so a decision that
+        // committed in the same instant is honored rather than overwritten.
+        self.gate.evict_waiter(&self.request_id);
+        // Only clear the routing entry when it still points at *this* request.
+        // On external teardown a replacement turn can park a new approval on the
+        // same thread/meeting and overwrite the mapping before this guard drops;
+        // an unconditional `remove` would delete the *new* request's routing, so
+        // the next typed yes/no would fall through as a fresh chat turn instead
+        // of resolving the live gate (#4774).
+        if let Some(thread_id) = &self.thread_id {
+            self.gate
+                .clear_thread_route_if_owned(thread_id, &self.request_id);
+        }
+        if let Some(meeting_key) = &self.meeting_key {
+            self.gate
+                .clear_meeting_route_if_owned(meeting_key, &self.request_id);
+        }
+        let _ = store::decide(&self.gate.config, &self.request_id, ApprovalDecision::Deny);
+        tracing::warn!(
+            request_id = %self.request_id,
+            "[approval::gate] parked approval future dropped mid-park (external turn teardown) — \
+             evicted waiter, cleared routing, denied pending row (#4774)"
+        );
+    }
+}
+
 impl ApprovalGate {
     /// Install the process-global gate. Returns the existing gate if
     /// one was already installed (re-install is a no-op so repeated
@@ -257,6 +370,28 @@ impl ApprovalGate {
         self.ttl
     }
 
+    /// Resolve the actual park duration from the gate's own `effective_ttl`
+    /// plus whichever origin-specific clamp is active for this call
+    /// (`in_call` → [`IN_CALL_APPROVAL_TTL`], `copilot_stream` →
+    /// [`COPILOT_APPROVAL_TTL`]). A clamp only ever *shortens* the park — it
+    /// can never extend `effective_ttl` past what the gate itself allows
+    /// (e.g. a debug env override). Both flags are expected to be mutually
+    /// exclusive in production (a live-meeting turn and a `flows_build`
+    /// copilot stream are different call sites), but if both were ever true
+    /// the tighter of the two clamps wins, since each `min` only narrows.
+    /// Split out (rather than inlined at the call site) so it is unit
+    /// testable without needing to actually park a future.
+    fn resolve_park_ttl(effective_ttl: Duration, in_call: bool, copilot_stream: bool) -> Duration {
+        let mut ttl = effective_ttl;
+        if in_call {
+            ttl = ttl.min(IN_CALL_APPROVAL_TTL);
+        }
+        if copilot_stream {
+            ttl = ttl.min(COPILOT_APPROVAL_TTL);
+        }
+        ttl
+    }
+
     /// Whether `tool_name` is on the user's "Always allow" list. Prefers the
     /// process-global live policy (so a grant made this session is seen
     /// immediately) and falls back to the gate's boot-time config snapshot.
@@ -269,6 +404,23 @@ impl ApprovalGate {
             .auto_approve
             .iter()
             .any(|t| t == tool_name)
+    }
+
+    /// Whether the user has opted into "auto-approve everything" — a
+    /// blanket bypass of the human approval prompt. Mirrors
+    /// [`Self::tool_is_auto_approved`]'s live-policy-first, boot-config-
+    /// fallback pattern so a toggle made this session (config save + live
+    /// policy reload) takes effect on the very next tool call.
+    ///
+    /// Callers MUST still exclude `TrustedAutomationSource::SubconsciousTainted`
+    /// and `AgentTurnOrigin::Unknown` before trusting this flag — see the
+    /// `matches!` guard at the call site below. This method only reports the
+    /// user's setting; it does not know about origin.
+    fn is_auto_approve_all_enabled(&self) -> bool {
+        if let Some(policy) = crate::openhuman::security::live_policy::current() {
+            return policy.auto_approve_all;
+        }
+        self.config.autonomy.auto_approve_all
     }
 
     /// Intercept a tool call. Blocks until the user decides or the
@@ -310,12 +462,120 @@ impl ApprovalGate {
         action_summary: &str,
         args_redacted: serde_json::Value,
     ) -> (GateOutcome, Option<String>) {
+        // No caller-supplied park bound: identical behavior to before. With
+        // `park_bound = None` the inner never takes the caller-bound abandon
+        // path, so the out-flag stays `false` and is discarded here.
+        let mut _park_bound_elapsed = false;
+        self.intercept_audited_inner(
+            tool_name,
+            action_summary,
+            args_redacted,
+            None,
+            &mut _park_bound_elapsed,
+        )
+        .await
+    }
+
+    /// Like [`Self::intercept_audited`] but the caller may cap how long the
+    /// gate parks (issue #4756).
+    ///
+    /// When `park_bound` is `Some` and shorter than the gate's own effective
+    /// TTL and it elapses before a decision arrives, the gate abandons the park
+    /// in a **cancellation-safe** way — it evicts the in-memory waiter and
+    /// clears the thread/meeting routing mappings (so a later chat/voice reply
+    /// is not mis-routed to this now-abandoned request) but deliberately LEAVES
+    /// the `pending_approvals` row open, so a later human card-click can still
+    /// resolve it in the DB — and returns `None`. This is why callers must bound
+    /// the park through the gate rather than racing an outer
+    /// `tokio::time::timeout` against [`Self::intercept_audited`]: dropping the
+    /// parked future would skip that cleanup and orphan the waiter + routing
+    /// mappings (chatgpt-codex review on #4756).
+    ///
+    /// A `None` bound (or one `>=` the effective TTL) behaves exactly like
+    /// [`Self::intercept_audited`] and always returns `Some`.
+    pub async fn intercept_audited_bounded(
+        &self,
+        tool_name: &str,
+        action_summary: &str,
+        args_redacted: serde_json::Value,
+        park_bound: Option<Duration>,
+    ) -> Option<(GateOutcome, Option<String>)> {
+        let mut park_bound_elapsed = false;
+        let resolved = self
+            .intercept_audited_inner(
+                tool_name,
+                action_summary,
+                args_redacted,
+                park_bound,
+                &mut park_bound_elapsed,
+            )
+            .await;
+        if park_bound_elapsed {
+            None
+        } else {
+            Some(resolved)
+        }
+    }
+
+    /// Shared core of [`Self::intercept_audited`] and
+    /// [`Self::intercept_audited_bounded`]. When `park_bound` is `Some` and
+    /// shorter than the effective TTL, the park is capped at it; on that bound
+    /// elapsing the park is abandoned cancellation-safely (waiter evicted,
+    /// thread/meeting routing cleared, `pending_approvals` row left open) and
+    /// `*park_bound_elapsed` is set so the bounded caller can render its own
+    /// fast-path result instead of a `Deny`.
+    async fn intercept_audited_inner(
+        &self,
+        tool_name: &str,
+        action_summary: &str,
+        args_redacted: serde_json::Value,
+        park_bound: Option<Duration>,
+        park_bound_elapsed: &mut bool,
+    ) -> (GateOutcome, Option<String>) {
         // Origin tells us who scheduled this turn. Entry points (web channel,
         // channel runtime, subconscious, cron, CLI) scope a typed
         // `AgentTurnOrigin` around `run_turn`. Unlabelled callers map to
         // `Unknown`, which is denied — the gate refuses to execute an
         // external_effect tool from an unlabelled call site.
         let origin = turn_origin::current().unwrap_or(AgentTurnOrigin::Unknown);
+
+        // Per-flow tool trust shortcut (flow-approval-surface, PR2): a prior
+        // `ApproveAlwaysForFlow` decision on this exact `(flow_id, tool_name)`
+        // pair short-circuits to `Allow` for every future Workflow-origin call
+        // of that tool from that flow — including a `require_approval: true`
+        // flow and a Supervised-tier `caps.rs::gate_call_for_tier` escalation,
+        // both of which otherwise force the park below. The trust is scoped to
+        // the *flow*, never the tool alone, so it cannot leak into a different
+        // workflow that happens to call the same tool (that stays gated, or
+        // uses the separate global `autonomy.auto_approve` allowlist). Checked
+        // before any other origin branching so it wins regardless of which
+        // arm of the match below would otherwise fire.
+        if let AgentTurnOrigin::TrustedAutomation {
+            source: TrustedAutomationSource::Workflow { .. },
+            job_id: flow_id,
+        } = &origin
+        {
+            match store::is_flow_tool_trusted(&self.config, flow_id, tool_name) {
+                Ok(true) => {
+                    tracing::debug!(
+                        tool = tool_name,
+                        flow_id = %flow_id,
+                        "[approval::gate] flow_tool_trust hit — auto-allowing without prompt"
+                    );
+                    return (GateOutcome::Allow, None);
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        tool = tool_name,
+                        flow_id = %flow_id,
+                        error = %err,
+                        "[approval::gate] flow_tool_trust lookup failed — falling through to \
+                         normal gating (fail-safe: still gated, not silently allowed)"
+                    );
+                }
+            }
+        }
 
         // An autonomous goal continuation runs with no user present, so an
         // irreversible external action must never be auto-allowed — not even via
@@ -337,6 +597,45 @@ impl ApprovalGate {
                 ..
             }
         );
+
+        // Blanket "auto-approve everything" bypass (opt-in, off by default).
+        // Sits ABOVE the origin match below so it prevents parking entirely
+        // for every origin except the two that must never be silently
+        // allowed: a subconscious tick whose memory context is tainted by
+        // external-sync content (indirect prompt injection defense) and an
+        // unlabelled call site (fail-closed default). Both are excluded here
+        // so they still fall through to the origin match and hit their Deny
+        // arms unchanged. This check is independent of — and does not
+        // weaken — `is_always_forbidden`, `is_workspace_internal_path`, or
+        // `ToolPolicyMiddleware`, which all run inside the tool
+        // implementation itself, not the approval gate.
+        let auto_all = self.is_auto_approve_all_enabled()
+            && !matches!(
+                &origin,
+                AgentTurnOrigin::TrustedAutomation {
+                    source: TrustedAutomationSource::SubconsciousTainted,
+                    ..
+                } | AgentTurnOrigin::Unknown
+            );
+
+        if auto_all {
+            // `origin_class` is the sanitized variant label (no thread/client
+            // ids, channel sender, reply target, or message id) — safe at
+            // `info`. The full `?origin` (with those identifiers) is still
+            // available at `debug` for local troubleshooting.
+            tracing::info!(
+                tool = tool_name,
+                origin_class = %origin.class(),
+                auto_approved = true,
+                "[approval::gate] auto_approve_all enabled — auto-approving without prompt"
+            );
+            tracing::debug!(
+                tool = tool_name,
+                origin = ?origin,
+                "[approval::gate] auto_approve_all full origin (debug-only)"
+            );
+            return (GateOutcome::Allow, None);
+        }
 
         // "Always allow" allowlist shortcut — the user's persisted
         // `autonomy.auto_approve` set. Read from the live policy first so a
@@ -362,6 +661,11 @@ impl ApprovalGate {
         // live-meeting orchestrator turn. Enables the spoken approval
         // channel alongside the thread card (issue #3513).
         let in_call_ctx = APPROVAL_IN_CALL_CONTEXT.try_with(|c| c.clone()).ok();
+
+        // Copilot-streaming context — set by `flows::ops::flows_build` around
+        // the streaming `run_single` call. Presence alone clamps the park
+        // window to `COPILOT_APPROVAL_TTL`; see that task-local's doc.
+        let copilot_stream = APPROVAL_COPILOT_STREAM_CONTEXT.try_with(|_| ()).is_ok();
 
         // Branch by origin. Web chat parks for an in-app approval; external
         // channel persists an audit row and TTL-denies (no routable approval
@@ -521,8 +825,42 @@ impl ApprovalGate {
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
-        let expires_at =
-            Some(now + chrono::Duration::from_std(self.effective_ttl()).unwrap_or_default());
+        // Resolve the clamped park TTL up front so the persisted `expires_at`
+        // and the actual wait below (see `resolve_park_ttl` further down)
+        // use the same value — see `Self::resolve_park_ttl` and the
+        // COPILOT_APPROVAL_TTL / IN_CALL_APPROVAL_TTL clamps. Computing this
+        // only after persisting the pending row let a copilot-streaming park
+        // advertise the old 10-minute `expires_at` while only actually
+        // waiting 180s, so a core restart or an `expire_stale` sweep mid-park
+        // could leave the row "actionable" for the wrong window (CodeRabbit
+        // + Codex review on PR #5112).
+        let effective_ttl =
+            Self::resolve_park_ttl(self.effective_ttl(), in_call_ctx.is_some(), copilot_stream);
+        let expires_at = Some(now + chrono::Duration::from_std(effective_ttl).unwrap_or_default());
+
+        // Correlation context (flow-approval-surface, PR2): a Workflow-origin
+        // park carries the flow id on the origin itself, but not the run id —
+        // that comes from the `APPROVAL_FLOW_RUN_CONTEXT` task-local
+        // `flows::ops::flows_run`/`flows_resume` scope alongside `with_origin`.
+        // `try_with` returns `Err` for every non-flow caller (chat, cron,
+        // subconscious, CLI, and even a Workflow origin reached without the
+        // flows module's scope, which "should never happen" but must not
+        // panic), so `source_context` stays `None` there — unchanged chat
+        // behavior.
+        let source_context = match &origin {
+            AgentTurnOrigin::TrustedAutomation {
+                source: TrustedAutomationSource::Workflow { .. },
+                job_id: flow_id,
+            } => APPROVAL_FLOW_RUN_CONTEXT
+                .try_with(|ctx| ApprovalSourceContext::Flow {
+                    flow_id: flow_id.clone(),
+                    run_id: ctx.run_id.clone(),
+                    node_id: None,
+                })
+                .ok(),
+            _ => None,
+        };
+
         let pending = PendingApproval {
             request_id: request_id.clone(),
             tool_name: tool_name.to_string(),
@@ -530,6 +868,7 @@ impl ApprovalGate {
             args_redacted: args_redacted.clone(),
             created_at: now,
             expires_at,
+            source_context: source_context.clone(),
         };
 
         // Register the waiter BEFORE persisting the row so a fast
@@ -559,7 +898,8 @@ impl ApprovalGate {
 
         if let Err(err) = store::insert_pending(&self.config, &pending, &self.session_id) {
             self.evict_waiter(&request_id);
-            self.clear_thread(&chat_thread_id);
+            self.clear_thread(&chat_thread_id, &request_id);
+            self.clear_meeting(&in_call_ctx, &request_id);
             tracing::error!(
                 error = %err,
                 tool = tool_name,
@@ -592,6 +932,37 @@ impl ApprovalGate {
             client_id: chat_client_id.clone(),
         });
 
+        // Flow-origin surface bridge (flow-approval-surface, PR3): a flow run
+        // has no chat thread/client to route the generic `ApprovalRequested`
+        // through (both are `None` above, so the web-channel bridge silently
+        // drops it — see `web_chat::event_bus`'s
+        // `ApprovalSurfaceSubscriber`), which is exactly the silent-deadlock
+        // bug this correlation fixes. Broadcast a dedicated
+        // `flow_approval_request` socket event (no thread/client required,
+        // unlike the chat path) plus a `CoreNotification` with the three
+        // flow-scoped decision actions, so the Workflows UI can surface and
+        // resolve the park without polling.
+        if let Some(ApprovalSourceContext::Flow {
+            flow_id, run_id, ..
+        }) = &source_context
+        {
+            tracing::info!(
+                request_id = %request_id,
+                flow_id = %flow_id,
+                run_id = %run_id,
+                tool = tool_name,
+                "[approval::gate] flow-origin park — surfacing flow_approval_request + notification"
+            );
+            publish_global(DomainEvent::FlowApprovalRequested {
+                request_id: request_id.clone(),
+                flow_id: flow_id.clone(),
+                run_id: run_id.clone(),
+                tool_name: tool_name.to_string(),
+                summary: action_summary.to_string(),
+            });
+            publish_flow_gate_notification(&request_id, flow_id, run_id, tool_name, action_summary);
+        }
+
         // Voice channel (issue #3513): tell the meeting bus to speak the
         // approval prompt into the call.
         if let Some(ic) = in_call_ctx.as_ref() {
@@ -609,17 +980,48 @@ impl ApprovalGate {
             "[approval::gate] tool call parked, waiting for decision"
         );
 
-        // Live meetings get a clamped park window — see IN_CALL_APPROVAL_TTL.
-        // `effective_ttl()` applies the debug-only env override; the in-call
-        // clamp is applied on top so a longer override can't extend a live
-        // meeting's park window past IN_CALL_APPROVAL_TTL.
-        let effective_ttl = if in_call_ctx.is_some() {
-            IN_CALL_APPROVAL_TTL.min(self.effective_ttl())
-        } else {
-            self.effective_ttl()
+        // Live meetings and copilot-streaming flows_build runs each get a
+        // clamped park window — see IN_CALL_APPROVAL_TTL / COPILOT_APPROVAL_TTL
+        // and `Self::resolve_park_ttl`. `effective_ttl` was resolved above
+        // (before `expires_at` was built) so the persisted expiry and this
+        // wait use the identical clamped duration; `effective_ttl()` applies
+        // the debug-only env override, and the clamp is applied on top so a
+        // longer override can't extend either park past its clamp.
+        if copilot_stream {
+            tracing::debug!(
+                tool = tool_name,
+                ttl_secs = COPILOT_APPROVAL_TTL.as_secs(),
+                "[approval::gate] flows_build copilot-streaming park — clamping park window to \
+                 COPILOT_APPROVAL_TTL"
+            );
+        }
+
+        // Optional caller-supplied park bound (issue #4756). A caller
+        // (`composio_connect`) can cap how long the gate parks so a turn
+        // degrades to a fast prompt instead of blocking to the full TTL.
+        // Bounding must never *extend* the park, so we wait `min(bound, ttl)`;
+        // the caller-bound abandon path fires only when the bound is what
+        // elapses (`park_bound_active`).
+        let park_bound_active = matches!(park_bound, Some(b) if b < effective_ttl);
+        let wait = match park_bound {
+            Some(b) => b.min(effective_ttl),
+            None => effective_ttl,
         };
 
-        let outcome = match tokio::time::timeout(effective_ttl, rx).await {
+        // RAII cleanup for external teardown (#4774): if the turn future is
+        // dropped while parked on the await below (the #4746/#4751 wall-clock
+        // backstop firing), the match arms never run, so this guard evicts the
+        // waiter, clears routing, and denies the pending row on drop. Disarmed
+        // right after the match on every normal exit.
+        let mut waiter_guard = WaiterGuard {
+            gate: self,
+            request_id: request_id.clone(),
+            thread_id: chat_thread_id.clone(),
+            meeting_key: in_call_ctx.as_ref().map(|ic| ic.meeting_key.clone()),
+            armed: true,
+        };
+
+        let outcome = match tokio::time::timeout(wait, rx).await {
             Ok(Ok(decision)) => {
                 tracing::info!(
                     request_id = %request_id,
@@ -628,7 +1030,7 @@ impl ApprovalGate {
                     "[approval::gate] decision received"
                 );
                 if decision.is_approve() {
-                    (GateOutcome::Allow, Some(request_id))
+                    (GateOutcome::Allow, Some(request_id.clone()))
                 } else {
                     (
                         GateOutcome::Deny {
@@ -656,6 +1058,39 @@ impl ApprovalGate {
                         reason: format!(
                             "{POLICY_DENIED_MARKER} Approval channel for '{tool_name}' closed \
                              before a decision was made."
+                        ),
+                    },
+                    None,
+                )
+            }
+            Err(_elapsed) if park_bound_active => {
+                // Caller park bound elapsed (#4756) — NOT the gate's own TTL.
+                // Abandon the park cancellation-safely: evict the in-memory
+                // waiter and (via `clear_thread`/`clear_meeting` below, on every
+                // exit) drop the routing mappings so a later chat/voice reply is
+                // not mis-routed to this now-abandoned request. Deliberately do
+                // NOT `store::decide(Deny)` — the `pending_approvals` row stays
+                // open so a later human card-click still resolves it in the DB
+                // and a re-ask sees it already-connected. Signal the elapse so
+                // the bounded caller renders its own fast-path result rather than
+                // a `Deny`.
+                self.evict_waiter(&request_id);
+                *park_bound_elapsed = true;
+                tracing::info!(
+                    request_id = %request_id,
+                    tool = tool_name,
+                    bound_secs = wait.as_secs(),
+                    "[approval::gate] caller park bound elapsed — abandoning park (row left \
+                     pending for a later card-click; waiter + routing cleared) (#4756)"
+                );
+                // Placeholder outcome; the bounded caller discards it once
+                // `*park_bound_elapsed` is set (returns `None`).
+                (
+                    GateOutcome::Deny {
+                        reason: format!(
+                            "{POLICY_DENIED_MARKER} Approval for '{tool_name}' exceeded the caller \
+                             park bound ({}s).",
+                            wait.as_secs()
                         ),
                     },
                     None,
@@ -689,7 +1124,7 @@ impl ApprovalGate {
                     // on this path too — otherwise the stale thread→request
                     // mapping survives and the next yes/no on the thread could be
                     // routed to this already-finished request.
-                    (GateOutcome::Allow, Some(request_id))
+                    (GateOutcome::Allow, Some(request_id.clone()))
                 } else {
                     tracing::warn!(
                         request_id = %request_id,
@@ -711,10 +1146,14 @@ impl ApprovalGate {
                 }
             }
         };
+        // Reached only on a normal park resolution: the match arm above already
+        // ran the exact teardown for its outcome, so disarm the RAII guard (its
+        // Drop is reserved for external cancellation — see `WaiterGuard`).
+        waiter_guard.disarm();
         // The routing mappings are only needed while parked; clear them on
         // every exit (decision, channel drop, or timeout).
-        self.clear_thread(&chat_thread_id);
-        self.clear_meeting(&in_call_ctx);
+        self.clear_thread(&chat_thread_id, &request_id);
+        self.clear_meeting(&in_call_ctx, &request_id);
         outcome
     }
 
@@ -826,6 +1265,34 @@ impl ApprovalGate {
         store::list_recent_decisions(&self.config, limit)
     }
 
+    /// List undecided rows correlated with a specific flow run (issue
+    /// flow-approval-surface, PR2) — lets a dedicated Workflows review
+    /// surface fetch just the gates blocking one run instead of filtering
+    /// [`Self::list_pending`] client-side.
+    pub fn list_pending_for_flow_run(
+        &self,
+        flow_id: &str,
+        run_id: &str,
+    ) -> anyhow::Result<Vec<PendingApproval>> {
+        store::list_pending_for_flow_run(&self.config, flow_id, run_id)
+    }
+
+    /// Grant "approve always for this flow" trust to `(flow_id, tool_name)`.
+    /// Called by the `approval_decide` RPC handler after an
+    /// [`ApprovalDecision::ApproveAlwaysForFlow`] decides a flow-origin row —
+    /// mirrors the RPC-owns-persistence split documented on
+    /// [`Self::decide`] for `ApproveAlwaysForTool`.
+    pub fn insert_flow_trust(&self, flow_id: &str, tool_name: &str) -> anyhow::Result<()> {
+        store::insert_flow_trust(&self.config, flow_id, tool_name)
+    }
+
+    /// Whether `(flow_id, tool_name)` currently holds "approve always for
+    /// this flow" trust. Exposed for tests and diagnostics; `intercept_audited`
+    /// consults [`store::is_flow_tool_trusted`] directly.
+    pub fn is_flow_tool_trusted(&self, flow_id: &str, tool_name: &str) -> anyhow::Result<bool> {
+        store::is_flow_tool_trusted(&self.config, flow_id, tool_name)
+    }
+
     /// Return the session id this gate was installed with (used by
     /// RPC handlers for diagnostics).
     pub fn session_id(&self) -> &str {
@@ -855,19 +1322,111 @@ impl ApprovalGate {
         self.meeting_to_request.lock().get(meeting_key).cloned()
     }
 
-    /// Drop the thread → request mapping (best-effort; no-op when absent).
-    fn clear_thread(&self, thread_id: &Option<String>) {
+    /// Drop the thread → request mapping when it still belongs to this request.
+    fn clear_thread(&self, thread_id: &Option<String>, request_id: &str) {
         if let Some(t) = thread_id {
-            self.thread_to_request.lock().remove(t);
+            self.clear_thread_route_if_owned(t, request_id);
         }
     }
 
-    /// Drop the meeting → request mapping (best-effort; no-op when absent).
-    fn clear_meeting(&self, ctx: &Option<InCallApprovalContext>) {
+    /// Drop the meeting → request mapping when it still belongs to this request.
+    fn clear_meeting(&self, ctx: &Option<InCallApprovalContext>, request_id: &str) {
         if let Some(ic) = ctx {
-            self.meeting_to_request.lock().remove(&ic.meeting_key);
+            self.clear_meeting_route_if_owned(&ic.meeting_key, request_id);
         }
     }
+
+    /// Drop the thread → request mapping **only if** it still points at
+    /// `request_id`. Used by [`WaiterGuard::drop`] on external teardown, where a
+    /// replacement turn may have already parked a new approval on the same
+    /// thread and overwritten the entry; clearing unconditionally would delete
+    /// the *new* request's routing (#4774).
+    fn clear_thread_route_if_owned(&self, thread_id: &str, request_id: &str) {
+        let mut map = self.thread_to_request.lock();
+        if map.get(thread_id).is_some_and(|rid| rid == request_id) {
+            map.remove(thread_id);
+        }
+    }
+
+    /// Meeting-map analogue of [`Self::clear_thread_route_if_owned`].
+    fn clear_meeting_route_if_owned(&self, meeting_key: &str, request_id: &str) {
+        let mut map = self.meeting_to_request.lock();
+        if map.get(meeting_key).is_some_and(|rid| rid == request_id) {
+            map.remove(meeting_key);
+        }
+    }
+}
+
+/// Wall-clock milliseconds since the Unix epoch, for `CoreNotificationEvent::timestamp_ms`.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Surfaces a flow-origin park as a `CoreNotification` (category `Agents`,
+/// `kind: "flow-gate-approval"`) with three action buttons matching the
+/// [`ApprovalDecision`] variants a flow-scoped approval accepts:
+/// `approve_once` / `approve_always_for_flow` / `deny`. Each action's payload
+/// carries the same `{kind, request_id, flow_id, tool_name, summary}` shape
+/// (plus `run_id`, additive) so the frontend can dispatch straight to
+/// `approval_decide` without a second round-trip to fetch the pending row.
+///
+/// Mirrors `flows::ops::notify_pending_approval` (the tinyflows-native
+/// per-node HITL gate's notification) but is a distinct surface: this one
+/// fires from the *tool-call* `ApprovalGate`, not the graph's own
+/// `require_approval` gate node.
+fn publish_flow_gate_notification(
+    request_id: &str,
+    flow_id: &str,
+    run_id: &str,
+    tool_name: &str,
+    summary: &str,
+) {
+    use crate::openhuman::notifications::bus::publish_core_notification;
+    use crate::openhuman::notifications::types::{
+        CoreNotificationAction, CoreNotificationCategory, CoreNotificationEvent,
+    };
+
+    const KIND: &str = "flow-gate-approval";
+    let base_payload = |action: ApprovalDecision| {
+        serde_json::json!({
+            "kind": KIND,
+            "request_id": request_id,
+            "flow_id": flow_id,
+            "run_id": run_id,
+            "tool_name": tool_name,
+            "summary": summary,
+            "decision": action.as_str(),
+        })
+    };
+
+    publish_core_notification(CoreNotificationEvent {
+        id: format!("{KIND}:{request_id}"),
+        category: CoreNotificationCategory::Agents,
+        title: "Workflow needs approval".to_string(),
+        body: format!("\"{tool_name}\" — {summary}"),
+        deep_link: None,
+        timestamp_ms: now_ms(),
+        actions: Some(vec![
+            CoreNotificationAction {
+                action_id: "approve_once".to_string(),
+                label: "Approve once".to_string(),
+                payload: Some(base_payload(ApprovalDecision::ApproveOnce)),
+            },
+            CoreNotificationAction {
+                action_id: "approve_always_for_flow".to_string(),
+                label: "Always allow for this workflow".to_string(),
+                payload: Some(base_payload(ApprovalDecision::ApproveAlwaysForFlow)),
+            },
+            CoreNotificationAction {
+                action_id: "deny".to_string(),
+                label: "Deny".to_string(),
+                payload: Some(base_payload(ApprovalDecision::Deny)),
+            },
+        ]),
+    });
 }
 
 #[cfg(test)]
@@ -907,11 +1466,12 @@ mod tests {
 
     /// A matching web-chat origin for the chat context fixture. Tests
     /// exercising the parking flow scope BOTH task-locals — production
-    /// callers in `channels/providers/web` do the same.
+    /// callers in `web_chat` do the same.
     fn web_origin() -> AgentTurnOrigin {
         AgentTurnOrigin::WebChat {
             thread_id: "t-test".into(),
             client_id: "c-test".into(),
+            request_id: Some("req-test".into()),
         }
     }
 
@@ -969,6 +1529,40 @@ mod tests {
             gate.pending_for_meeting("meet-1").is_none(),
             "meeting mapping must be cleared once the park resolves"
         );
+    }
+
+    #[test]
+    fn guard_cleanup_only_clears_routing_it_still_owns() {
+        // Regression for #4774: on external turn teardown a replacement turn may
+        // have already parked a new approval on the same thread/meeting and
+        // overwritten the routing entry. The dropped guard for the *old* request
+        // must not clobber the *new* request's mapping.
+        let (gate, _dir) = test_gate();
+
+        gate.thread_to_request
+            .lock()
+            .insert("thread-1".into(), "req-new".into());
+        gate.meeting_to_request
+            .lock()
+            .insert("meet-1".into(), "req-new".into());
+
+        // Stale guard for the superseded request is a no-op.
+        gate.clear_thread_route_if_owned("thread-1", "req-old");
+        gate.clear_meeting_route_if_owned("meet-1", "req-old");
+        assert_eq!(
+            gate.pending_for_thread("thread-1").as_deref(),
+            Some("req-new")
+        );
+        assert_eq!(
+            gate.pending_for_meeting("meet-1").as_deref(),
+            Some("req-new")
+        );
+
+        // The owning request's guard clears its own routing.
+        gate.clear_thread_route_if_owned("thread-1", "req-new");
+        gate.clear_meeting_route_if_owned("meet-1", "req-new");
+        assert!(gate.pending_for_thread("thread-1").is_none());
+        assert!(gate.pending_for_meeting("meet-1").is_none());
     }
 
     #[tokio::test]
@@ -1107,6 +1701,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aborting_older_chat_waiter_preserves_newer_thread_route() {
+        let (gate, _dir) = test_gate();
+        let gate = Arc::new(gate);
+
+        let old_gate = gate.clone();
+        let old_handle = tokio::spawn(async move {
+            turn_origin::with_origin(
+                web_origin(),
+                APPROVAL_CHAT_CONTEXT.scope(
+                    chat_ctx(),
+                    old_gate.intercept("composio", "old action", serde_json::json!({})),
+                ),
+            )
+            .await
+        });
+
+        let mut tries = 0;
+        let old_request_id = loop {
+            if let Some(request_id) = gate.pending_for_thread("t-test") {
+                break request_id;
+            }
+            tries += 1;
+            assert!(tries < 1_000, "old chat approval route never appeared");
+            tokio::task::yield_now().await;
+        };
+
+        let new_gate = gate.clone();
+        let new_handle = tokio::spawn(async move {
+            turn_origin::with_origin(
+                web_origin(),
+                APPROVAL_CHAT_CONTEXT.scope(
+                    chat_ctx(),
+                    new_gate.intercept("composio", "new action", serde_json::json!({})),
+                ),
+            )
+            .await
+        });
+
+        let mut tries = 0;
+        let new_request_id = loop {
+            if let Some(request_id) = gate.pending_for_thread("t-test") {
+                if request_id != old_request_id {
+                    break request_id;
+                }
+            }
+            tries += 1;
+            assert!(tries < 1_000, "new chat approval route never appeared");
+            tokio::task::yield_now().await;
+        };
+
+        old_handle.abort();
+        assert!(old_handle.await.unwrap_err().is_cancelled());
+
+        assert_eq!(
+            gate.pending_for_thread("t-test").as_deref(),
+            Some(new_request_id.as_str())
+        );
+        assert!(!gate.waiters.lock().contains_key(&old_request_id));
+        assert!(gate.waiters.lock().contains_key(&new_request_id));
+        assert_eq!(
+            store::get_decision(&gate.config, &old_request_id).unwrap(),
+            Some(ApprovalDecision::Deny)
+        );
+
+        gate.decide(&new_request_id, ApprovalDecision::ApproveOnce)
+            .unwrap();
+        assert!(matches!(new_handle.await.unwrap(), GateOutcome::Allow));
+        assert!(gate.pending_for_thread("t-test").is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_store_failure_clears_in_call_meeting_route() {
+        let dir = TempDir::new().unwrap();
+        let blocked_workspace = dir.path().join("workspace-file");
+        std::fs::write(&blocked_workspace, b"not a directory").unwrap();
+        let config = Config {
+            workspace_dir: blocked_workspace,
+            ..Config::default()
+        };
+        let gate = ApprovalGate::new(
+            config,
+            format!("session-{}", uuid::Uuid::new_v4()),
+            Duration::from_secs(2),
+        );
+
+        let outcome = turn_origin::with_origin(
+            meet_origin(),
+            APPROVAL_IN_CALL_CONTEXT.scope(
+                in_call_ctx(),
+                gate.intercept("composio", "send email", serde_json::json!({})),
+            ),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            GateOutcome::Deny { reason } if reason.contains("could not persist")
+        ));
+        assert!(gate.waiters.lock().is_empty());
+        assert!(gate.pending_for_meeting("meet-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn externally_aborted_in_call_waiter_cleans_meeting_route() {
+        let (gate, _dir) = test_gate();
+        let gate = Arc::new(gate);
+
+        let g = gate.clone();
+        let handle = tokio::spawn(async move {
+            turn_origin::with_origin(
+                meet_origin(),
+                APPROVAL_IN_CALL_CONTEXT.scope(
+                    in_call_ctx(),
+                    g.intercept("composio", "send email", serde_json::json!({})),
+                ),
+            )
+            .await
+        });
+
+        let mut tries = 0;
+        let request_id = loop {
+            if let Some(request_id) = gate.pending_for_meeting("meet-1") {
+                break request_id;
+            }
+            tries += 1;
+            assert!(tries < 1_000, "meeting approval route never appeared");
+            tokio::task::yield_now().await;
+        };
+        assert!(gate.waiters.lock().contains_key(&request_id));
+
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+
+        assert!(gate.pending_for_meeting("meet-1").is_none());
+        assert!(!gate.waiters.lock().contains_key(&request_id));
+        assert!(gate.list_pending().unwrap().is_empty());
+        assert_eq!(
+            store::get_decision(&gate.config, &request_id).unwrap(),
+            Some(ApprovalDecision::Deny)
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_older_in_call_waiter_preserves_newer_meeting_route() {
+        let (gate, _dir) = test_gate();
+        let gate = Arc::new(gate);
+
+        let old_gate = gate.clone();
+        let old_handle = tokio::spawn(async move {
+            turn_origin::with_origin(
+                meet_origin(),
+                APPROVAL_IN_CALL_CONTEXT.scope(
+                    in_call_ctx(),
+                    old_gate.intercept("composio", "old action", serde_json::json!({})),
+                ),
+            )
+            .await
+        });
+
+        let mut tries = 0;
+        let old_request_id = loop {
+            if let Some(request_id) = gate.pending_for_meeting("meet-1") {
+                break request_id;
+            }
+            tries += 1;
+            assert!(tries < 1_000, "old meeting approval route never appeared");
+            tokio::task::yield_now().await;
+        };
+
+        let new_gate = gate.clone();
+        let new_handle = tokio::spawn(async move {
+            turn_origin::with_origin(
+                meet_origin(),
+                APPROVAL_IN_CALL_CONTEXT.scope(
+                    in_call_ctx(),
+                    new_gate.intercept("composio", "new action", serde_json::json!({})),
+                ),
+            )
+            .await
+        });
+
+        let mut tries = 0;
+        let new_request_id = loop {
+            if let Some(request_id) = gate.pending_for_meeting("meet-1") {
+                if request_id != old_request_id {
+                    break request_id;
+                }
+            }
+            tries += 1;
+            assert!(tries < 1_000, "new meeting approval route never appeared");
+            tokio::task::yield_now().await;
+        };
+
+        old_handle.abort();
+        assert!(old_handle.await.unwrap_err().is_cancelled());
+
+        assert_eq!(
+            gate.pending_for_meeting("meet-1").as_deref(),
+            Some(new_request_id.as_str())
+        );
+        assert!(!gate.waiters.lock().contains_key(&old_request_id));
+        assert!(gate.waiters.lock().contains_key(&new_request_id));
+        assert_eq!(
+            store::get_decision(&gate.config, &old_request_id).unwrap(),
+            Some(ApprovalDecision::Deny)
+        );
+
+        gate.decide(&new_request_id, ApprovalDecision::ApproveOnce)
+            .unwrap();
+        assert!(matches!(new_handle.await.unwrap(), GateOutcome::Allow));
+        assert!(gate.pending_for_meeting("meet-1").is_none());
+    }
+
+    #[tokio::test]
     async fn auto_approve_tool_skips_prompt() {
         // The gate reads the "Always allow" allowlist from the process-global
         // live policy. Serialize with the other tests that install/reload it
@@ -1146,6 +1954,234 @@ mod tests {
         assert!(
             gate.list_pending().unwrap().is_empty(),
             "an auto-approved call must not create a pending approval row"
+        );
+    }
+
+    /// With `auto_approve_all: true`, a WebChat-origin call resolves to
+    /// `Allow` immediately — no pending row is created and the chat context
+    /// is never consulted, proving the short-circuit fires above the park.
+    #[tokio::test]
+    async fn auto_approve_all_resolves_allow() {
+        let _env = crate::openhuman::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (gate, dir) = test_gate();
+        let policy = crate::openhuman::security::SecurityPolicy {
+            auto_approve_all: true,
+            ..crate::openhuman::security::SecurityPolicy::default()
+        };
+        // Scoped: restores whatever live_policy held before this test on drop
+        // (including on panic), so a leaked `auto_approve_all: true` can never
+        // reach a sibling gate test that doesn't hold `TEST_ENV_LOCK`.
+        let _policy_guard = crate::openhuman::security::live_policy::install_scoped(
+            Arc::new(policy),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+
+        let outcome = turn_origin::with_origin(
+            web_origin(),
+            gate.intercept("openhuman_test_aaa_webchat", "noop", serde_json::json!({})),
+        )
+        .await;
+
+        assert!(matches!(outcome, GateOutcome::Allow));
+        assert!(
+            gate.list_pending().unwrap().is_empty(),
+            "auto_approve_all must short-circuit before any pending row is persisted"
+        );
+    }
+
+    /// Control test: with `auto_approve_all: false` (the default), a
+    /// WebChat-origin call parks normally — it does NOT resolve to `Allow`
+    /// until a decision is sent on the oneshot.
+    #[tokio::test]
+    async fn auto_approve_all_off_still_parks() {
+        let _env = crate::openhuman::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (gate, dir) = test_gate();
+        let policy = crate::openhuman::security::SecurityPolicy {
+            auto_approve_all: false,
+            ..crate::openhuman::security::SecurityPolicy::default()
+        };
+        let _policy_guard = crate::openhuman::security::live_policy::install_scoped(
+            Arc::new(policy),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+        let gate = Arc::new(gate);
+
+        let g = gate.clone();
+        let handle = tokio::spawn(async move {
+            turn_origin::with_origin(
+                web_origin(),
+                APPROVAL_CHAT_CONTEXT.scope(
+                    chat_ctx(),
+                    g.intercept("openhuman_test_aaa_off", "noop", serde_json::json!({})),
+                ),
+            )
+            .await
+        });
+
+        // The call must actually park: poll for the pending row instead of
+        // racing an immediate result.
+        let mut tries = 0;
+        let pending = loop {
+            let rows = gate.list_pending().unwrap();
+            if let Some(p) = rows.into_iter().next() {
+                break p;
+            }
+            tries += 1;
+            assert!(
+                tries < 50,
+                "pending row never appeared — call resolved without parking"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        gate.decide(&pending.request_id, ApprovalDecision::ApproveOnce)
+            .unwrap();
+        let outcome = handle.await.unwrap();
+        assert!(matches!(outcome, GateOutcome::Allow));
+    }
+
+    /// `auto_approve_all: true` must NOT override a `SubconsciousTainted`
+    /// origin — the gate still hard-denies it (indirect prompt injection
+    /// defense).
+    #[tokio::test]
+    async fn auto_approve_all_does_not_override_subconscioustainted() {
+        let _env = crate::openhuman::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (gate, dir) = test_gate();
+        let policy = crate::openhuman::security::SecurityPolicy {
+            auto_approve_all: true,
+            ..crate::openhuman::security::SecurityPolicy::default()
+        };
+        let _policy_guard = crate::openhuman::security::live_policy::install_scoped(
+            Arc::new(policy),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+
+        let origin = AgentTurnOrigin::TrustedAutomation {
+            job_id: "job-tainted".into(),
+            source: TrustedAutomationSource::SubconsciousTainted,
+        };
+        let outcome = turn_origin::with_origin(
+            origin,
+            gate.intercept("openhuman_test_aaa_tainted", "noop", serde_json::json!({})),
+        )
+        .await;
+
+        match outcome {
+            GateOutcome::Deny { reason } => assert!(reason.contains("external-sync")),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    /// `auto_approve_all: true` must NOT override an `Unknown` origin — the
+    /// gate still fails closed for unlabelled call sites.
+    #[tokio::test]
+    async fn auto_approve_all_does_not_override_unknown() {
+        let _env = crate::openhuman::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (gate, dir) = test_gate();
+        let policy = crate::openhuman::security::SecurityPolicy {
+            auto_approve_all: true,
+            ..crate::openhuman::security::SecurityPolicy::default()
+        };
+        let _policy_guard = crate::openhuman::security::live_policy::install_scoped(
+            Arc::new(policy),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+
+        // No `with_origin` scope at all — mirrors an unlabelled call site,
+        // which `turn_origin::current()` maps to `AgentTurnOrigin::Unknown`.
+        let outcome = gate
+            .intercept("openhuman_test_aaa_unknown", "noop", serde_json::json!({}))
+            .await;
+
+        match outcome {
+            GateOutcome::Deny { reason } => assert!(reason.contains("no origin label")),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    /// `auto_approve_all: true` overrides the `GoalContinuation` bypass —
+    /// normally that origin skips the per-tool allowlist and always parks,
+    /// but the blanket bypass sits above that check and allows immediately.
+    #[tokio::test]
+    async fn auto_approve_all_overrides_bypass_shortcut() {
+        let _env = crate::openhuman::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (gate, dir) = test_gate();
+        let policy = crate::openhuman::security::SecurityPolicy {
+            auto_approve_all: true,
+            ..crate::openhuman::security::SecurityPolicy::default()
+        };
+        let _policy_guard = crate::openhuman::security::live_policy::install_scoped(
+            Arc::new(policy),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+
+        let origin = AgentTurnOrigin::TrustedAutomation {
+            job_id: "goal-1".into(),
+            source: TrustedAutomationSource::GoalContinuation,
+        };
+        let outcome = turn_origin::with_origin(
+            origin,
+            gate.intercept("openhuman_test_aaa_goal", "noop", serde_json::json!({})),
+        )
+        .await;
+
+        assert!(matches!(outcome, GateOutcome::Allow));
+        assert!(
+            gate.list_pending().unwrap().is_empty(),
+            "auto_approve_all must short-circuit before any pending row is persisted"
+        );
+    }
+
+    /// `auto_approve_all: true` overrides a `Workflow { require_approval: true }`
+    /// origin — normally the user's per-flow "gate every action" choice forces
+    /// a park, but the blanket bypass sits above that check too.
+    #[tokio::test]
+    async fn auto_approve_all_overrides_require_approval_workflow() {
+        let _env = crate::openhuman::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (gate, dir) = test_gate();
+        let policy = crate::openhuman::security::SecurityPolicy {
+            auto_approve_all: true,
+            ..crate::openhuman::security::SecurityPolicy::default()
+        };
+        let _policy_guard = crate::openhuman::security::live_policy::install_scoped(
+            Arc::new(policy),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+
+        let origin = AgentTurnOrigin::TrustedAutomation {
+            job_id: "flow-1".into(),
+            source: TrustedAutomationSource::Workflow {
+                require_approval: true,
+            },
+        };
+        let outcome = turn_origin::with_origin(
+            origin,
+            gate.intercept("openhuman_test_aaa_workflow", "noop", serde_json::json!({})),
+        )
+        .await;
+
+        assert!(matches!(outcome, GateOutcome::Allow));
+        assert!(
+            gate.list_pending().unwrap().is_empty(),
+            "auto_approve_all must short-circuit before any pending row is persisted"
         );
     }
 
@@ -1248,6 +2284,7 @@ mod tests {
         let origin = AgentTurnOrigin::WebChat {
             thread_id: "thread-42".into(),
             client_id: "client-1".into(),
+            request_id: Some("req-42".into()),
         };
         let handle = tokio::spawn(async move {
             turn_origin::with_origin(
@@ -1276,6 +2313,154 @@ mod tests {
 
         // Mapping is cleared once intercept returns.
         assert!(gate.pending_for_thread("thread-42").is_none());
+    }
+
+    #[tokio::test]
+    async fn waiter_future_dropped_mid_park_evicts_waiter_clears_routing_and_denies_row() {
+        // #4774: once a turn future can be torn down *externally* (the #4746
+        // harness wall-clock backstop / #4751 outer web backstop firing while a
+        // tool call is parked), dropping the intercept future must not leak the
+        // waiter, the thread→request routing mapping, or the still-open pending
+        // row. The `WaiterGuard` Drop impl runs the cleanup the timeout match
+        // arms would otherwise own.
+        let (gate, _dir) = test_gate();
+        let gate = Arc::new(gate);
+
+        // Build the parked future with the WebChat origin + chat context scoped,
+        // exactly like the production web channel caller — but drive it locally
+        // so we can drop it mid-park instead of resolving it.
+        let g = gate.clone();
+        // `Box::pin` (not `tokio::pin!`) so `drop(fut)` below drops the *future
+        // itself* — and thus the `WaiterGuard` saved in its async state — rather
+        // than just a `Pin<&mut _>` reference.
+        let mut fut = Box::pin(turn_origin::with_origin(
+            web_origin(),
+            APPROVAL_CHAT_CONTEXT.scope(
+                chat_ctx(),
+                g.intercept("shell", "run rm", serde_json::json!({})),
+            ),
+        ));
+
+        // Poll it just long enough to register the waiter, persist the pending
+        // row, and park on the TTL timeout. Nothing resolves it, so the outer
+        // timeout must elapse with the future still pending.
+        let parked = tokio::time::timeout(Duration::from_millis(200), &mut fut).await;
+        assert!(
+            parked.is_err(),
+            "future should still be parked, not resolved"
+        );
+
+        // Capture the request_id from the routing mapping while parked, and
+        // confirm the waiter + pending row exist before teardown.
+        let request_id = gate
+            .pending_for_thread("t-test")
+            .expect("thread→request mapping must exist while parked");
+        assert!(
+            gate.waiters.lock().contains_key(&request_id),
+            "waiter must be registered while parked"
+        );
+        assert!(
+            matches!(store::get_decision(&gate.config, &request_id), Ok(None)),
+            "pending row must be open (undecided) while parked"
+        );
+
+        // External teardown: the wall-clock backstop tears the turn future down
+        // mid-park. This skips the timeout match arms entirely.
+        drop(fut);
+
+        // The RAII guard must have run the cleanup on drop.
+        assert!(
+            !gate.waiters.lock().contains_key(&request_id),
+            "waiter must be evicted when the parked future is dropped"
+        );
+        assert!(
+            gate.pending_for_thread("t-test").is_none(),
+            "thread→request routing must be cleared on external teardown"
+        );
+        assert!(
+            matches!(
+                store::get_decision(&gate.config, &request_id),
+                Ok(Some(ApprovalDecision::Deny))
+            ),
+            "pending row must be denied when the parked future is dropped"
+        );
+    }
+
+    // ── caller park bound (issue #4756) ──────────────────────────────
+    //
+    // A caller (composio_connect) can cap the park via
+    // `intercept_audited_bounded`. When the bound elapses before the gate's own
+    // TTL the gate must abandon the park cancellation-safely: return `None`,
+    // clear the thread→request routing so a later reply is not mis-routed (the
+    // codex concern), yet LEAVE the `pending_approvals` row open so a later
+    // card-click still resolves it in the DB.
+    #[tokio::test]
+    async fn intercept_audited_bounded_abandons_park_and_leaves_row_pending() {
+        let (gate, _dir) = test_gate(); // boot-time TTL = 2s
+        let gate = Arc::new(gate);
+
+        let g = gate.clone();
+        let ctx = ApprovalChatContext {
+            thread_id: "thread-bound".into(),
+            client_id: "client-1".into(),
+        };
+        let origin = AgentTurnOrigin::WebChat {
+            thread_id: "thread-bound".into(),
+            client_id: "client-1".into(),
+            request_id: Some("req-bound".into()),
+        };
+        // 100ms caller bound — far below the 2s gate TTL — so the bound is what
+        // elapses, not the gate's own timeout.
+        let handle = tokio::spawn(async move {
+            turn_origin::with_origin(
+                origin,
+                APPROVAL_CHAT_CONTEXT.scope(
+                    ctx,
+                    g.intercept_audited_bounded(
+                        "shell",
+                        "run ls",
+                        serde_json::json!({}),
+                        Some(Duration::from_millis(100)),
+                    ),
+                ),
+            )
+            .await
+        });
+
+        // While parked, the thread → request mapping is queryable.
+        let mut tries = 0;
+        let request_id = loop {
+            if let Some(r) = gate.pending_for_thread("thread-bound") {
+                break r;
+            }
+            tries += 1;
+            assert!(tries < 50, "thread mapping never appeared");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        // The bound elapses → `None`, so the caller renders its own fast path
+        // instead of the park resolving to a Deny.
+        let resolved = handle.await.unwrap();
+        assert!(
+            resolved.is_none(),
+            "caller park bound must surface as None, not a resolved outcome"
+        );
+
+        // Routing is cleared so a later reply is not mis-routed to the abandoned
+        // request (the codex #4756 concern).
+        assert!(
+            gate.pending_for_thread("thread-bound").is_none(),
+            "thread → request mapping must be cleared on caller-bound abandon"
+        );
+
+        // The row is LEFT open — a later human card-click still resolves it.
+        let decided = gate
+            .decide(&request_id, ApprovalDecision::ApproveOnce)
+            .unwrap();
+        assert!(
+            decided.is_some(),
+            "pending row must survive the abandon so a later card-click resolves it"
+        );
     }
 
     /// Tests for `effective_ttl` env-override parsing.
@@ -1330,6 +2515,148 @@ mod tests {
             Duration::from_secs(2),
             "unset OPENHUMAN_APPROVAL_TTL_SECS must fall back to boot-time TTL"
         );
+    }
+
+    /// Tests for `resolve_park_ttl` — the pure clamp-selection helper behind
+    /// the copilot-streaming TTL shortening (fix/flows-copilot-approval-ttl).
+    /// Exercised directly (rather than by actually parking + waiting out a
+    /// multi-minute TTL) so the assertions stay fast and deterministic.
+    mod resolve_park_ttl_tests {
+        use super::*;
+
+        #[test]
+        fn default_park_keeps_the_full_ttl() {
+            let default_ttl = DEFAULT_APPROVAL_TTL;
+            assert_eq!(
+                ApprovalGate::resolve_park_ttl(default_ttl, false, false),
+                default_ttl,
+                "a plain park (no in-call, no copilot stream) must not be clamped"
+            );
+        }
+
+        #[test]
+        fn copilot_stream_shortens_a_default_ten_minute_park() {
+            let default_ttl = DEFAULT_APPROVAL_TTL;
+            assert_eq!(
+                ApprovalGate::resolve_park_ttl(default_ttl, false, true),
+                COPILOT_APPROVAL_TTL,
+                "a flows_build copilot-streaming park must clamp to COPILOT_APPROVAL_TTL"
+            );
+            assert!(
+                COPILOT_APPROVAL_TTL < DEFAULT_APPROVAL_TTL,
+                "the copilot clamp must actually be shorter than the default TTL"
+            );
+        }
+
+        #[test]
+        fn in_call_clamp_is_unaffected_by_the_copilot_flag() {
+            let default_ttl = DEFAULT_APPROVAL_TTL;
+            assert_eq!(
+                ApprovalGate::resolve_park_ttl(default_ttl, true, false),
+                IN_CALL_APPROVAL_TTL,
+                "an in-call meeting park must keep clamping to IN_CALL_APPROVAL_TTL, unchanged \
+                 by this fix"
+            );
+        }
+
+        #[test]
+        fn a_clamp_never_extends_a_shorter_boot_time_ttl() {
+            // Mirrors production's env-override guard: a clamp may only
+            // narrow, never widen, the gate's own effective TTL (e.g. a
+            // debug-only `OPENHUMAN_APPROVAL_TTL_SECS=60` override that is
+            // already shorter than either clamp).
+            let short_ttl = Duration::from_secs(60);
+            assert_eq!(
+                ApprovalGate::resolve_park_ttl(short_ttl, false, true),
+                short_ttl,
+                "copilot clamp must not extend a boot-time TTL that is already shorter"
+            );
+            assert_eq!(
+                ApprovalGate::resolve_park_ttl(short_ttl, true, false),
+                short_ttl,
+                "in-call clamp must not extend a boot-time TTL that is already shorter"
+            );
+        }
+
+        #[test]
+        fn both_flags_active_takes_the_tighter_clamp() {
+            // Not expected in production (different call sites), but the
+            // helper must not panic or pick the wrong side if it ever
+            // happens — the tighter of the two clamps should win either way.
+            let default_ttl = DEFAULT_APPROVAL_TTL;
+            let tighter = IN_CALL_APPROVAL_TTL.min(COPILOT_APPROVAL_TTL);
+            assert_eq!(
+                ApprovalGate::resolve_park_ttl(default_ttl, true, true),
+                tighter
+            );
+        }
+    }
+
+    /// Integration regression test for the streaming-to-gate contract
+    /// (CodeRabbit review on PR #5112): `resolve_park_ttl` is covered directly
+    /// above, but that alone doesn't prove `intercept_audited_inner` actually
+    /// persists the clamped TTL when the copilot-streaming context is scoped.
+    /// Builds a gate with the full `DEFAULT_APPROVAL_TTL` boot TTL (unlike
+    /// `test_gate()`'s 2s, which is already shorter than either clamp and
+    /// would make this assertion vacuous), scopes
+    /// `APPROVAL_COPILOT_STREAM_CONTEXT` alongside the chat context + WebChat
+    /// origin the way `flows::ops::flows_build` does in production, and
+    /// inspects the persisted `expires_at` on the pending row.
+    #[tokio::test]
+    async fn copilot_streaming_park_persists_the_clamped_expiry() {
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let session = format!("session-{}", uuid::Uuid::new_v4());
+        let gate = ApprovalGate::new(config, session, DEFAULT_APPROVAL_TTL);
+        let gate = Arc::new(gate);
+
+        let before = chrono::Utc::now();
+        let g = gate.clone();
+        let handle = tokio::spawn(async move {
+            turn_origin::with_origin(
+                web_origin(),
+                APPROVAL_CHAT_CONTEXT.scope(
+                    chat_ctx(),
+                    APPROVAL_COPILOT_STREAM_CONTEXT.scope(
+                        (),
+                        g.intercept("composio", "send slack", serde_json::json!({})),
+                    ),
+                ),
+            )
+            .await
+        });
+
+        let pending = loop {
+            if let Some(p) = gate.list_pending().unwrap().into_iter().next() {
+                break p;
+            }
+            tokio::task::yield_now().await;
+        };
+
+        let expires_at = pending
+            .expires_at
+            .expect("a parked approval always sets expires_at");
+        let ttl_persisted = expires_at - before;
+        assert!(
+            ttl_persisted
+                <= chrono::Duration::from_std(COPILOT_APPROVAL_TTL).unwrap()
+                    + chrono::Duration::seconds(5),
+            "copilot-streaming park must persist an expires_at clamped to COPILOT_APPROVAL_TTL \
+             (180s), not the gate's full {:?} boot TTL — got a {ttl_persisted} window",
+            DEFAULT_APPROVAL_TTL
+        );
+        assert!(
+            ttl_persisted < chrono::Duration::from_std(DEFAULT_APPROVAL_TTL).unwrap(),
+            "sanity: the persisted expiry must be shorter than the unclamped default TTL"
+        );
+
+        gate.decide(&pending.request_id, ApprovalDecision::ApproveOnce)
+            .unwrap();
+        let outcome = handle.await.unwrap();
+        assert!(matches!(outcome, GateOutcome::Allow));
     }
 
     #[test]
@@ -1673,5 +3000,316 @@ mod tests {
             first_id.is_some(),
             "the prompting call still persists a row"
         );
+    }
+
+    // ── flow-approval-surface (source_context, flow_tool_trust, surfacing) ──
+
+    /// A `Workflow`-origin turn for the flow-correlation tests below.
+    fn flow_origin(flow_id: &str, require_approval: bool) -> AgentTurnOrigin {
+        AgentTurnOrigin::TrustedAutomation {
+            job_id: flow_id.to_string(),
+            source: TrustedAutomationSource::Workflow { require_approval },
+        }
+    }
+
+    #[tokio::test]
+    async fn flow_origin_park_populates_source_context_with_flow_and_run_id() {
+        // A `require_approval: true` flow still parks (same shape as before
+        // this change) but the persisted row must now carry the flow/run
+        // correlation the `APPROVAL_FLOW_RUN_CONTEXT` task-local supplies —
+        // the origin alone only carries `flow_id`, not `run_id`.
+        let (gate, _dir) = test_gate();
+        let gate = Arc::new(gate);
+
+        let g = gate.clone();
+        let handle = tokio::spawn(async move {
+            turn_origin::with_origin(
+                flow_origin("flow-1", true),
+                APPROVAL_FLOW_RUN_CONTEXT.scope(
+                    FlowRunContext {
+                        flow_id: "flow-1".to_string(),
+                        run_id: "run-1".to_string(),
+                    },
+                    g.intercept_audited("composio", "post to slack", serde_json::json!({})),
+                ),
+            )
+            .await
+        });
+
+        let pending = loop {
+            if let Some(p) = gate.list_pending().unwrap().into_iter().next() {
+                break p;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        match &pending.source_context {
+            Some(super::super::types::ApprovalSourceContext::Flow {
+                flow_id,
+                run_id,
+                node_id,
+            }) => {
+                assert_eq!(flow_id, "flow-1");
+                assert_eq!(run_id, "run-1");
+                assert!(
+                    node_id.is_none(),
+                    "node_id is not yet threaded down to the gate"
+                );
+            }
+            other => panic!("expected Flow source_context, got {other:?}"),
+        }
+
+        gate.decide(&pending.request_id, ApprovalDecision::Deny)
+            .unwrap();
+        let _ = handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chat_origin_park_has_no_source_context() {
+        // Regression guard: the plain chat-routed path (unaffected by this
+        // change) must never gain a `source_context` — only Workflow-origin
+        // parks populate it.
+        let (gate, _dir) = test_gate();
+        let gate = Arc::new(gate);
+
+        let g = gate.clone();
+        let handle = tokio::spawn(async move {
+            turn_origin::with_origin(
+                web_origin(),
+                APPROVAL_CHAT_CONTEXT.scope(
+                    chat_ctx(),
+                    g.intercept_audited("composio", "send slack", serde_json::json!({})),
+                ),
+            )
+            .await
+        });
+
+        let pending = loop {
+            if let Some(p) = gate.list_pending().unwrap().into_iter().next() {
+                break p;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(
+            pending.source_context.is_none(),
+            "chat-origin parks must not carry a source_context"
+        );
+
+        gate.decide(&pending.request_id, ApprovalDecision::ApproveOnce)
+            .unwrap();
+        let (outcome, _id) = handle.await.unwrap();
+        assert!(matches!(outcome, GateOutcome::Allow));
+    }
+
+    #[tokio::test]
+    async fn flow_tool_trust_auto_allows_before_parking() {
+        // A prior `ApproveAlwaysForFlow` grant for (flow_id, tool_name) must
+        // short-circuit to `Allow` even for a `require_approval: true` flow —
+        // that is the whole point of "approve always for this workflow": no
+        // pending row is created and the call never parks.
+        let (gate, _dir) = test_gate();
+        store::insert_flow_trust(&gate.config, "flow-trusted", "composio").unwrap();
+
+        let outcome = turn_origin::with_origin(
+            flow_origin("flow-trusted", true),
+            APPROVAL_FLOW_RUN_CONTEXT.scope(
+                FlowRunContext {
+                    flow_id: "flow-trusted".to_string(),
+                    run_id: "run-1".to_string(),
+                },
+                gate.intercept("composio", "post to slack", serde_json::json!({})),
+            ),
+        )
+        .await;
+
+        assert!(matches!(outcome, GateOutcome::Allow));
+        assert!(
+            gate.list_pending().unwrap().is_empty(),
+            "a trusted (flow, tool) pair must not persist a pending row"
+        );
+
+        // A different tool on the same trusted flow is unaffected — it still
+        // parks (TTL-denies on the 2s test gate).
+        let untrusted_outcome = turn_origin::with_origin(
+            flow_origin("flow-trusted", true),
+            APPROVAL_FLOW_RUN_CONTEXT.scope(
+                FlowRunContext {
+                    flow_id: "flow-trusted".to_string(),
+                    run_id: "run-1".to_string(),
+                },
+                gate.intercept("pushover", "send push", serde_json::json!({})),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(untrusted_outcome, GateOutcome::Deny { .. }),
+            "trust must be scoped to the exact tool granted, not the whole flow"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_approve_always_for_flow_then_insert_flow_trust_composes_to_auto_allow() {
+        // Exercises the two building blocks the `approval_decide` RPC handler
+        // composes for `ApproveAlwaysForFlow` (see `approval::rpc`): the gate
+        // resolves the parked call and returns the decided row (carrying
+        // `source_context`), and the RPC layer then calls
+        // `ApprovalGate::insert_flow_trust` using that row's flow id. This
+        // test exercises both steps directly against a local (non-global)
+        // gate — the RPC handler itself reads the process-wide
+        // `ApprovalGate::try_global()` singleton, which tests must not touch
+        // (it would leak state into every other test in this binary).
+        let (gate, _dir) = test_gate();
+        let gate = Arc::new(gate);
+
+        let g = gate.clone();
+        let handle = tokio::spawn(async move {
+            turn_origin::with_origin(
+                flow_origin("flow-2", true),
+                APPROVAL_FLOW_RUN_CONTEXT.scope(
+                    FlowRunContext {
+                        flow_id: "flow-2".to_string(),
+                        run_id: "run-2".to_string(),
+                    },
+                    g.intercept_audited("composio", "post to slack", serde_json::json!({})),
+                ),
+            )
+            .await
+        });
+
+        let pending = loop {
+            if let Some(p) = gate.list_pending().unwrap().into_iter().next() {
+                break p;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        let decided = gate
+            .decide(&pending.request_id, ApprovalDecision::ApproveAlwaysForFlow)
+            .unwrap()
+            .expect("decided row");
+
+        assert!(!gate.is_flow_tool_trusted("flow-2", "composio").unwrap());
+
+        match &decided.source_context {
+            Some(super::super::types::ApprovalSourceContext::Flow { flow_id, .. }) => {
+                gate.insert_flow_trust(flow_id, &decided.tool_name).unwrap();
+            }
+            other => panic!("expected Flow source_context, got {other:?}"),
+        }
+
+        assert!(gate.is_flow_tool_trusted("flow-2", "composio").unwrap());
+
+        let (outcome, _id) = handle.await.unwrap();
+        assert!(matches!(outcome, GateOutcome::Allow));
+    }
+
+    #[tokio::test]
+    async fn flow_origin_park_publishes_flow_approval_request_and_notification() {
+        // The silent-deadlock bug this whole PR fixes: a flow-origin park has
+        // no chat thread/client, so the generic `ApprovalRequested` event's
+        // web-channel bridge silently drops it. This test asserts the two new
+        // surfaces fire instead — the `flow_approval_request` DomainEvent
+        // (bridged to a broadcast Socket.IO event by `core::socketio`) and
+        // the `flow-gate-approval` CoreNotification with its three actions.
+        crate::core::event_bus::init_global(crate::core::event_bus::DEFAULT_CAPACITY);
+        let mut event_rx = crate::core::event_bus::global()
+            .expect("event bus initialized above")
+            .raw_receiver();
+        let mut notif_rx = crate::openhuman::notifications::bus::subscribe_core_notifications();
+
+        let (gate, _dir) = test_gate();
+        let gate = Arc::new(gate);
+
+        let g = gate.clone();
+        let handle = tokio::spawn(async move {
+            turn_origin::with_origin(
+                flow_origin("flow-9", true),
+                APPROVAL_FLOW_RUN_CONTEXT.scope(
+                    FlowRunContext {
+                        flow_id: "flow-9".to_string(),
+                        run_id: "run-9".to_string(),
+                    },
+                    g.intercept_audited("composio", "post to slack", serde_json::json!({})),
+                ),
+            )
+            .await
+        });
+
+        let (request_id, run_id, tool_name) = tokio::time::timeout(
+            Duration::from_secs(5),
+            find_flow_approval_requested(&mut event_rx, "flow-9"),
+        )
+        .await
+        .expect("timed out waiting for FlowApprovalRequested");
+        assert_eq!(run_id, "run-9");
+        assert_eq!(tool_name, "composio");
+
+        let notif = tokio::time::timeout(
+            Duration::from_secs(5),
+            find_flow_gate_notification(&mut notif_rx, &request_id),
+        )
+        .await
+        .expect("timed out waiting for the flow-gate-approval notification");
+        assert_eq!(notif.id, format!("flow-gate-approval:{request_id}"));
+        let actions = notif.actions.expect("notification must declare actions");
+        let action_ids: Vec<_> = actions.iter().map(|a| a.action_id.as_str()).collect();
+        assert_eq!(
+            action_ids,
+            vec!["approve_once", "approve_always_for_flow", "deny"]
+        );
+
+        gate.decide(&request_id, ApprovalDecision::Deny).unwrap();
+        let _ = handle.await.unwrap();
+    }
+
+    /// Drain `rx` until a `FlowApprovalRequested` for `expected_flow_id`
+    /// arrives. The event bus is process-wide and other tests in this file
+    /// (and elsewhere) publish on it concurrently — including other
+    /// `FlowApprovalRequested` events for *different* flow ids — so this must
+    /// filter by flow id, not just by variant, and tolerate both unrelated
+    /// events and broadcast lag rather than returning the first match.
+    async fn find_flow_approval_requested(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::core::event_bus::DomainEvent>,
+        expected_flow_id: &str,
+    ) -> (String, String, String) {
+        loop {
+            match rx.recv().await {
+                Ok(crate::core::event_bus::DomainEvent::FlowApprovalRequested {
+                    request_id,
+                    flow_id,
+                    run_id,
+                    tool_name,
+                    ..
+                }) if flow_id == expected_flow_id => return (request_id, run_id, tool_name),
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("event bus closed before FlowApprovalRequested arrived")
+                }
+            }
+        }
+    }
+
+    /// Drain `rx` until the `flow-gate-approval` notification for
+    /// `request_id` arrives — the notification bus is process-wide, so
+    /// unrelated notifications from other concurrently-running tests are
+    /// tolerated and skipped.
+    async fn find_flow_gate_notification(
+        rx: &mut tokio::sync::broadcast::Receiver<
+            crate::openhuman::notifications::types::CoreNotificationEvent,
+        >,
+        request_id: &str,
+    ) -> crate::openhuman::notifications::types::CoreNotificationEvent {
+        let expected_id = format!("flow-gate-approval:{request_id}");
+        loop {
+            match rx.recv().await {
+                Ok(event) if event.id == expected_id => return event,
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("notification bus closed before the flow-gate-approval notification arrived")
+                }
+            }
+        }
     }
 }

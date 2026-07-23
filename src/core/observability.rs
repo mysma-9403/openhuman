@@ -151,6 +151,23 @@ pub enum ExpectedErrorKind {
     /// SQLite lock text, so unrelated DB lock errors in other domains still
     /// reach Sentry.
     WhatsAppDataSqliteBusy,
+    /// WhatsApp structured-ingest write hit a `SQLITE_CORRUPT` malformed on-disk
+    /// image ("database disk image is malformed" / "file is not a database").
+    ///
+    /// This is **defense-in-depth after** the store's own quarantine + rebuild
+    /// recovery (`whatsapp_data::store::WhatsAppDataStore::recover_corrupt_db`),
+    /// never instead of it: the store detects the corrupt image, reports it to
+    /// Sentry exactly once (process-wide latch), quarantines the damaged file,
+    /// and rebuilds an empty schema so ingest resumes. This classifier only
+    /// demotes the residual noise that can leak in the narrow window between
+    /// detection and a successful rebuild, or when a rebuild keeps failing on a
+    /// wedged host filesystem the app can't fix. Without both, one corrupt file
+    /// re-pages on every 2–30s scan tick (Sentry TAURI-RUST-KNH: 1,813
+    /// escalating events from a single host).
+    ///
+    /// Anchored to the whatsapp ingest failure envelope plus the malformed-image
+    /// text, so unrelated corruption in other domains still reaches Sentry.
+    WhatsAppDataSqliteCorrupt,
     /// Host disk is full — the filesystem returned `ENOSPC` to a write,
     /// `mkdir`, or `open` syscall. The user cannot recover from this without
     /// freeing space on their machine, and Sentry has no remediation path
@@ -194,7 +211,7 @@ pub enum ExpectedErrorKind {
     /// `agent::run_single` already suppresses the **agent-layer** Sentry
     /// event for this condition via the typed
     /// `AgentError::EmptyProviderResponse` + `AgentError::skips_sentry()`
-    /// (PR #2790, TAURI-RUST-4JX). But `channels::providers::web::
+    /// (PR #2790, TAURI-RUST-4JX). But `web_chat::
     /// run_chat_task` **re-reports** the same failure under
     /// `domain=web_channel operation=run_chat_task` after the typed error
     /// has been flattened to a `String` at the native-bus boundary — so the
@@ -258,7 +275,7 @@ pub enum ExpectedErrorKind {
     /// contention (handled by the store's busy-retry loop) and unrelated DB
     /// failures in other domains still reach Sentry.
     SubconsciousSchemaUnavailable,
-    /// The user invoked "Import Codex CLI login" (Settings → AI → Codex auth)
+    /// The user invoked "Import Codex CLI login" (Connections → API keys → LLM → Codex auth)
     /// but the Codex CLI auth at `~/.codex/auth.json` is absent or unusable:
     /// the file doesn't exist (the user never ran `codex login`), can't be
     /// parsed, or carries no tokens / no access token. The import RPC already
@@ -285,7 +302,7 @@ pub enum ExpectedErrorKind {
     /// (`api_error`) already demotes its own per-attempt event; this catches
     /// the **re-report** when the same flattened error is raised again under
     /// `domain=web_channel` / `agent` (the path
-    /// `channels::providers::web::run_chat_task` →
+    /// `web_chat::run_chat_task` →
     /// `report_error_or_expected`). The FE surfaces actionable copy via
     /// `classify_inference_error`; Sentry must not double-report (F2/F4).
     ///
@@ -588,6 +605,12 @@ pub fn expected_error_kind(message: &str) -> Option<ExpectedErrorKind> {
     if is_memory_store_breaker_open(&lower) {
         return Some(ExpectedErrorKind::MemoryStoreBreakerOpen);
     }
+    // Corruption is checked before the busy matcher: the two envelopes are
+    // mutually exclusive by their SQLite text (malformed-image vs locked), but
+    // ordering keeps the more-specific on-disk-damage signal unambiguous.
+    if is_whatsapp_data_sqlite_corrupt_message(&lower) {
+        return Some(ExpectedErrorKind::WhatsAppDataSqliteCorrupt);
+    }
     if is_whatsapp_data_sqlite_busy_message(&lower) {
         return Some(ExpectedErrorKind::WhatsAppDataSqliteBusy);
     }
@@ -651,7 +674,7 @@ pub fn expected_error_kind(message: &str) -> Option<ExpectedErrorKind> {
 /// disk-full condition during its own page bookkeeping (journal/WAL extension)
 /// before the next syscall surfaces an errno, rusqlite renders the `SQLITE_FULL`
 /// result code as `"database or disk is full"` (Sentry TAURI-RUST-B6N, hit at
-/// `memory_store::unified::documents::tx.commit()` during
+/// `memory_store::namespace_store::documents::tx.commit()` during
 /// `openhuman.memory_doc_ingest`). `SQLITE_FULL` has only two causes:
 /// genuine ENOSPC/ERROR_DISK_FULL (always the case in practice — the same
 /// burst always produces an os-error-28/112 sibling event) or a
@@ -660,7 +683,7 @@ pub fn expected_error_kind(message: &str) -> Option<ExpectedErrorKind> {
 /// rusqlite renders `SQLITE_FULL` in one of two shapes. The **bare** shape is
 /// the five words `"database or disk is full"` — Our local memory-store write
 /// call-sites wrap it with `format!("<verb>: {e}")` (e.g. `"commit tx: ..."` /
-/// `"clear_namespace commit tx: ..."` in `memory_store::unified::documents`),
+/// `"clear_namespace commit tx: ..."` in `memory_store::namespace_store::documents`),
 /// so the phrase lands as the **suffix** of the local emit. The **extended**
 /// shape carries the full error-code envelope, `"database or disk is full:
 /// Error code 13: Insertion failed because database is full"` (Sentry
@@ -791,6 +814,39 @@ fn is_whatsapp_data_sqlite_busy_message(lower: &str) -> bool {
         || lower.contains("error code 5")
 }
 
+/// Match whatsapp structured-ingest failures caused by a `SQLITE_CORRUPT`
+/// malformed on-disk image. Scoped to the whatsapp ingest envelope plus an
+/// upsert write frame, so unrelated malformed-image errors in other domains
+/// still reach Sentry.
+///
+/// This is defense-in-depth **after** the store's quarantine + rebuild recovery
+/// (see [`ExpectedErrorKind::WhatsAppDataSqliteCorrupt`]) — the store already
+/// reports the first hit once and rebuilds the DB; this only demotes residual
+/// noise. The `upsert wa_chat` / `upsert wa_message` frames are matched because
+/// the observed Sentry symptom (TAURI-RUST-KNH) fired on the
+/// `upsert wa_chat <jid>@lid` path; the `prune` frame is matched because the
+/// same ingest RPC also runs the 90-day auto-prune under the same corrupt-DB
+/// recovery wrapper, and a malformed image surfaced from the prune step (its
+/// error context carries the word `prune`, e.g. `prune old wa_messages`) would
+/// otherwise reach Sentry unfiltered. All three still require the
+/// `[whatsapp_data] ingest failed:` envelope so unrelated malformed-image
+/// errors in other domains keep paging.
+fn is_whatsapp_data_sqlite_corrupt_message(lower: &str) -> bool {
+    if !lower.contains("[whatsapp_data] ingest failed:") {
+        return false;
+    }
+    let has_write_frame = lower.contains("upsert wa_message")
+        || lower.contains("upsert wa_chat")
+        || lower.contains("prune");
+    if !has_write_frame {
+        return false;
+    }
+    lower.contains("disk image is malformed")
+        || lower.contains("file is not a database")
+        || lower.contains("error code 11")
+        || lower.contains("error code 26")
+}
+
 /// Match subconscious-engine SQLite schema-init failures caused by the host
 /// filesystem being unable to open the DB file (`SQLITE_CANTOPEN` /
 /// `SQLITE_IOERR_SHMMAP`). Anchored to the subconscious open/DDL envelope so it
@@ -840,7 +896,9 @@ fn is_embedding_backend_auth_failure(lower: &str) -> bool {
 /// `embeddings::rpc::update_settings` as the save-time hard-block signal so the
 /// two never drift.
 pub(crate) fn is_embedding_endpoint_absent(lower: &str) -> bool {
-    lower.contains("embedding api error") && (lower.contains("(404") || lower.contains("(405"))
+    (lower.contains("embedding api error") && (lower.contains("(404") || lower.contains("(405")))
+        || (lower.contains("embeddings returned http")
+            && (lower.contains("http 404") || lower.contains("http 405")))
 }
 
 /// Detect a custom/cloud embeddings endpoint that IS an embeddings API but
@@ -917,7 +975,7 @@ fn is_memory_store_breaker_open(lower: &str) -> bool {
 /// - `"OpenHuman API error (401 Unauthorized): {…\"Session expired. Please
 ///   log in again.\"…}"` — emitted by `providers::ops::api_error` from the
 ///   OpenHuman backend and re-raised through `agent::run_single` /
-///   `channels::providers::web::run_chat_task` (OPENHUMAN-TAURI-26). The
+///   `web_chat::run_chat_task` (OPENHUMAN-TAURI-26). The
 ///   `"session expired"` substring anchors the match to the OpenHuman
 ///   backend's session-renewal body, not the bare numeric status.
 /// - `"OpenHuman API error (401 Unauthorized): {…\"error\":\"Invalid token\"…}"`
@@ -1132,9 +1190,8 @@ fn is_loopback_unavailable(lower: &str) -> bool {
 /// the local Ollama daemon — pure user-state errors the UI already surfaces
 /// (toast / settings page warning) where Sentry has no remediation path.
 ///
-/// Several canonical wire shapes are covered, all emitted by
-/// `openhuman::embeddings::ollama::OllamaEmbedding::embed` and the embed
-/// service fallback path:
+/// Several canonical wire shapes are covered, all emitted by the TinyAgents
+/// Ollama embedder and the host embed service fallback path:
 ///
 /// - **TAURI-RUST-XS** (~376 events on self-hosted Sentry): user pointed the
 ///   embedder at a chat / vision model id with a temperature suffix (e.g.
@@ -1640,6 +1697,27 @@ fn is_provider_user_state_message(lower: &str) -> bool {
         return true;
     }
 
+    // TAURI-RUST-K27 — the set-key sibling of X9. `composio_set_api_key`'s
+    // validate-before-store probe (added in #4318) rejects an obviously invalid
+    // BYO key *before* persisting it and returns its own user-facing prose,
+    // `COMPOSIO_INVALID_API_KEY_USER_MESSAGE` ("Invalid Composio API key. Re-enter
+    // a valid key in Connections > Composio."). That string carries
+    // neither the `[composio-direct]` prefix nor an `HTTP 401` token, and the word
+    // "Composio" splits the `invalid … api key` sequence — so the X9 arm above
+    // never claims it and the RPC-boundary `report_error` leaked as a Sentry error
+    // (473 events / 53 users, starting ~5 h after #4318 merged). Same user-state as
+    // X9: an invalid/revoked BYO key with zero client-side lever to make it valid;
+    // the Settings UI already surfaces the actionable re-entry copy. Anchor on the
+    // distinctive `COMPOSIO_INVALID_API_KEY_ANCHOR` phrase — it can only be produced
+    // by our own const (a genuine set-path defect renders a different `store_…
+    // failed` / `save config failed` body that still pages). Keyed off the shared
+    // anchor const (not a copied literal) and coupled to the typed source by
+    // `demotes_composio_set_key_invalid_key_rejection` so a reword that drops the
+    // phrase fails CI instead of silently re-opening the leak.
+    if lower.contains(crate::openhuman::composio::direct_auth::COMPOSIO_INVALID_API_KEY_ANCHOR) {
+        return true;
+    }
+
     // TAURI-RUST-34H — composio backend endpoint (e.g.
     // `/agent-integrations/composio/connections`) wraps an upstream
     // Cloudflare anti-bot challenge as `Backend returned 500 Internal
@@ -1791,7 +1869,7 @@ fn is_filesystem_user_path_invalid_message(lower: &str) -> bool {
 /// `text_chars=0 thinking_chars=0 tool_calls=0`.
 ///
 /// This catches the **web-channel re-report** (Sentry TAURI-RUST-4Z1):
-/// `channels::providers::web::run_chat_task` wraps the failure as
+/// `web_chat::run_chat_task` wraps the failure as
 /// `"run_chat_task failed client_id=… error=The model returned an empty
 /// response. Please try again."` and routes it through
 /// `report_error_or_expected` after the typed
@@ -2097,6 +2175,14 @@ fn report_expected_message(kind: ExpectedErrorKind, message: &str, domain: &str,
                 "[observability] {domain}.{operation} skipped expected whatsapp_data sqlite busy/locked error"
             );
         }
+        ExpectedErrorKind::WhatsAppDataSqliteCorrupt => {
+            tracing::warn!(
+                domain = domain,
+                operation = operation,
+                kind = "whatsapp_data_sqlite_corrupt",
+                "[observability] {domain}.{operation} skipped expected whatsapp_data sqlite corrupt error (store quarantines + rebuilds the DB and reports once)"
+            );
+        }
         ExpectedErrorKind::FilesystemUserPathInvalid => {
             // User-input validation failure surfaced at the RPC
             // boundary — e.g. `openhuman.vault_create` called with a
@@ -2307,6 +2393,17 @@ pub(crate) fn report_error_message(
     operation: &str,
     extra: &[Tag<'_>],
 ) {
+    // Redact secret-looking spans (bearer tokens, API keys, `sk-` keys) before
+    // `message` reaches any log sink or Sentry event. The parallel `tracing`
+    // log line below is emitted in every build — including slim builds with no
+    // `crash-reporting` `before_send` hook — so scrub once, up front.
+    let scrubbed = crate::core::log_redaction::scrub_secrets(message);
+    let message = scrubbed.as_str();
+    // Sentry-touching behaviour is gated behind `crash-reporting`. The
+    // diagnostic `tracing::error!` stays compiled in both builds (see the
+    // `#[cfg(not(...))]` companion below) so stderr / file appenders keep the
+    // record even in a sentry-free build.
+    #[cfg(feature = "crash-reporting")]
     sentry::with_scope(
         |scope| {
             scope.set_tag("domain", domain);
@@ -2332,6 +2429,20 @@ pub(crate) fn report_error_message(
             );
         },
     );
+    #[cfg(not(feature = "crash-reporting"))]
+    {
+        // Sentry compiled out: `extra` tags have no scope to attach to, so
+        // discard them explicitly to avoid an unused-variable warning while
+        // still emitting the diagnostic log line.
+        let _ = extra;
+        tracing::error!(
+            target: REPORT_ERROR_TRACING_TARGET,
+            domain = domain,
+            operation = operation,
+            error = %message,
+            "[observability] {domain}.{operation} failed: {message}"
+        );
+    }
 }
 
 /// Capture a message to Sentry at **warning** severity with structured tags.
@@ -2349,12 +2460,24 @@ pub(crate) fn report_error_message(
 /// `sentry::capture_message` rather than the `sentry-tracing` bridge; the
 /// accompanying diagnostic line is tagged with [`REPORT_ERROR_TRACING_TARGET`]
 /// so the production layer ignores it and we never double-report.
+// Its sole caller is the `http-server`-gated RPC handler (unrecognised-method
+// reporting, #3567), so it has no caller in a slim build (#5048). Kept compiled
+// for the crash-reporting carve-out; the allow keeps the disabled build quiet.
+#[cfg_attr(not(feature = "http-server"), allow(dead_code))]
 pub(crate) fn report_warning_message(
     message: &str,
     domain: &str,
     operation: &str,
     extra: &[Tag<'_>],
 ) {
+    // Redact secret-looking spans before `message` reaches any log sink or
+    // Sentry event — see the note in `report_error_message`.
+    let scrubbed = crate::core::log_redaction::scrub_secrets(message);
+    let message = scrubbed.as_str();
+    // Sentry-touching behaviour is gated behind `crash-reporting`; the
+    // diagnostic `tracing::warn!` stays compiled in both builds (see the
+    // `#[cfg(not(...))]` companion below).
+    #[cfg(feature = "crash-reporting")]
     sentry::with_scope(
         |scope| {
             scope.set_tag("domain", domain);
@@ -2374,6 +2497,17 @@ pub(crate) fn report_warning_message(
             );
         },
     );
+    #[cfg(not(feature = "crash-reporting"))]
+    {
+        let _ = extra;
+        tracing::warn!(
+            target: REPORT_ERROR_TRACING_TARGET,
+            domain = domain,
+            operation = operation,
+            message = %message,
+            "[observability] {domain}.{operation} warning: {message}"
+        );
+    }
 }
 
 /// Returns true when a Sentry event is a per-attempt provider HTTP failure
@@ -2393,6 +2527,7 @@ pub(crate) fn report_warning_message(
 ///   for its own reasons doesn't get silently dropped
 /// - tag `failure == "non_2xx"` (the marker set by `ops::api_error`)
 /// - tag `status` parses to one of [`TRANSIENT_PROVIDER_HTTP_STATUSES`]
+#[cfg(feature = "crash-reporting")]
 pub fn is_transient_provider_http_failure(event: &sentry::protocol::Event<'_>) -> bool {
     let tags = &event.tags;
     if tags.get("domain").map(String::as_str) != Some("llm_provider") {
@@ -2420,6 +2555,7 @@ pub fn is_transient_provider_http_failure(event: &sentry::protocol::Event<'_>) -
 /// single-source [`crate::openhuman::inference::provider::managed_error_skips_sentry`]
 /// (managed-envelope gated, so a BYO payload carrying an `errorCode`-shaped
 /// field is not wrongly dropped) so the layers can't drift.
+#[cfg(feature = "crash-reporting")]
 pub fn is_backend_error_code_event(event: &sentry::protocol::Event<'_>) -> bool {
     let direct = event.message.as_deref();
     let from_logentry = event.logentry.as_ref().map(|log| log.message.as_str());
@@ -2447,6 +2583,7 @@ pub fn is_backend_error_code_event(event: &sentry::protocol::Event<'_>) -> bool 
 /// suppressed. A non-streaming `domain=llm_provider, failure=transport` event
 /// carries a different `operation` tag and must keep paging, so the
 /// observability blind spot stays as narrow as F7 intends.
+#[cfg(feature = "crash-reporting")]
 pub fn is_transient_provider_transport_failure(event: &sentry::protocol::Event<'_>) -> bool {
     let tags = &event.tags;
     if tags.get("domain").map(String::as_str) != Some("llm_provider") {
@@ -2472,6 +2609,7 @@ pub fn is_transient_provider_transport_failure(event: &sentry::protocol::Event<'
 /// where the aggregate body starts with the reliable-provider exhaustion
 /// prefix and contains transient HTTP/transport wording already classified by
 /// [`is_transient_message_failure`].
+#[cfg(feature = "crash-reporting")]
 pub fn is_all_transient_provider_exhaustion_event(event: &sentry::protocol::Event<'_>) -> bool {
     let tags = &event.tags;
     if tags.get("domain").map(String::as_str) != Some("llm_provider") {
@@ -2490,6 +2628,7 @@ pub fn is_all_transient_provider_exhaustion_event(event: &sentry::protocol::Even
         .any(all_provider_attempts_are_transient)
 }
 
+#[cfg(feature = "crash-reporting")]
 fn all_provider_attempts_are_transient(message: &str) -> bool {
     let Some(attempts) = message.strip_prefix("All providers/models failed. Attempts:") else {
         return false;
@@ -2511,7 +2650,7 @@ fn all_provider_attempts_are_transient(message: &str) -> bool {
 /// Defense-in-depth filter for the Sentry `before_send` hook: the primary
 /// suppression lives at the call sites in `agent::harness::session::
 /// runtime::run_single`, `channels::runtime::dispatch`, and
-/// `channels::providers::web::run_chat_task`, all of which now skip
+/// `web_chat::run_chat_task`, all of which now skip
 /// `report_error` when this variant is detected. This filter catches any
 /// future call site that re-emits the message without going through those
 /// funnels — e.g. a new wrapper that calls `tracing::error!` directly with
@@ -2523,6 +2662,7 @@ fn all_provider_attempts_are_transient(message: &str) -> bool {
 /// the last exception's `value` (the shape `sentry-tracing` produces when
 /// stacktraces are attached). Both fields are checked for the canonical
 /// prefix so the filter stays robust to future Sentry plumbing changes.
+#[cfg(feature = "crash-reporting")]
 pub fn is_max_iterations_event(event: &sentry::protocol::Event<'_>) -> bool {
     let direct = event.message.as_deref();
     let from_exception = event.exception.last().and_then(|e| e.value.as_deref());
@@ -2546,6 +2686,7 @@ pub fn is_max_iterations_event(event: &sentry::protocol::Event<'_>) -> bool {
 /// Scope: only the three domains that surface session-expired today
 /// (`llm_provider`, `backend_api`, `rpc`). Composio's OAuth-state 401
 /// is excluded — that's actionable and must reach Sentry.
+#[cfg(feature = "crash-reporting")]
 pub fn is_session_expired_event(event: &sentry::protocol::Event<'_>) -> bool {
     let tags = &event.tags;
     let Some(domain) = tags.get("domain").map(String::as_str) else {
@@ -2608,6 +2749,7 @@ pub fn is_session_expired_event(event: &sentry::protocol::Event<'_>) -> bool {
 /// - `event.message` (or last exception `value`) trims to **exactly**
 ///   `"GET /auth/me"` — strict equality, not `contains`, so a body with
 ///   the chain appended still surfaces.
+#[cfg(feature = "crash-reporting")]
 pub fn is_auth_get_me_opaque_transport_event(event: &sentry::protocol::Event<'_>) -> bool {
     let tags = &event.tags;
     if tags.get("domain").map(String::as_str) != Some("rpc") {
@@ -2656,6 +2798,7 @@ pub fn is_updater_transient_message(message: &str) -> bool {
         .any(|phrase| lower.contains(phrase))
 }
 
+#[cfg(feature = "crash-reporting")]
 fn event_has_transient_transport_phrase(event: &sentry::protocol::Event<'_>) -> bool {
     event
         .message
@@ -2673,6 +2816,7 @@ fn event_has_transient_transport_phrase(event: &sentry::protocol::Event<'_>) -> 
         })
 }
 
+#[cfg(feature = "crash-reporting")]
 fn event_has_updater_transient_message(event: &sentry::protocol::Event<'_>) -> bool {
     event
         .message
@@ -2690,6 +2834,7 @@ fn event_has_updater_transient_message(event: &sentry::protocol::Event<'_>) -> b
         })
 }
 
+#[cfg(feature = "crash-reporting")]
 fn event_has_updater_domain(event: &sentry::protocol::Event<'_>) -> bool {
     matches!(
         event.tags.get("domain").map(String::as_str),
@@ -2697,6 +2842,7 @@ fn event_has_updater_domain(event: &sentry::protocol::Event<'_>) -> bool {
     )
 }
 
+#[cfg(feature = "crash-reporting")]
 fn is_transient_domain_failure(event: &sentry::protocol::Event<'_>, domain: &str) -> bool {
     let tags = &event.tags;
     if tags.get("domain").map(String::as_str) != Some(domain) {
@@ -2714,6 +2860,7 @@ fn is_transient_domain_failure(event: &sentry::protocol::Event<'_>, domain: &str
 
 /// Transient backend API failures (gateway hiccups, scheduled downtime).
 /// Match by event tags written by report_error at the authed_json call site.
+#[cfg(feature = "crash-reporting")]
 pub fn is_transient_backend_api_failure(event: &sentry::protocol::Event<'_>) -> bool {
     is_transient_domain_failure(event, "backend_api")
 }
@@ -2724,6 +2871,7 @@ pub fn is_transient_backend_api_failure(event: &sentry::protocol::Event<'_>) -> 
 /// path is missing, private, or otherwise unavailable to that user. The install
 /// RPC still returns the error so the UI can surface it, but Sentry should keep
 /// reporting server-side and transport failures only.
+#[cfg(feature = "crash-reporting")]
 pub fn is_skill_install_user_fetch_failure(event: &sentry::protocol::Event<'_>) -> bool {
     let tags = &event.tags;
     if tags.get("domain").map(String::as_str) != Some("skills") {
@@ -2754,6 +2902,7 @@ pub fn is_skill_install_user_fetch_failure(event: &sentry::protocol::Event<'_>) 
 /// would otherwise escape the integrations-scoped filter (OPENHUMAN-TAURI-35
 /// ~139ev, -2H ~26ev: `[composio] list_connections failed: Backend returned
 /// 502 …` events that landed in Sentry under `domain=composio`).
+#[cfg(feature = "crash-reporting")]
 pub fn is_transient_integrations_failure(event: &sentry::protocol::Event<'_>) -> bool {
     is_transient_domain_failure(event, "integrations")
         || is_transient_domain_failure(event, "composio")
@@ -2771,6 +2920,7 @@ pub fn is_transient_integrations_failure(event: &sentry::protocol::Event<'_>) ->
 /// `domain=skills`, `failure=non_2xx`, and a 4xx `status`. A 5xx is a genuine
 /// remote failure and stays reportable. Drops TAURI-RUST-CGE (~1,446 events /
 /// 72 users on `openhuman@0.57.53`).
+#[cfg(feature = "crash-reporting")]
 pub fn is_skills_install_client_error_event(event: &sentry::protocol::Event<'_>) -> bool {
     let tags = &event.tags;
     if tags.get("domain").map(String::as_str) != Some("skills") {
@@ -2792,6 +2942,7 @@ pub fn is_skills_install_client_error_event(event: &sentry::protocol::Event<'_>)
 /// `"failed to check for updates: error sending request for url (...latest.json)"`.
 /// Match both shapes, but never drop an arbitrary update-domain event unless
 /// it also has a transient status/transport marker.
+#[cfg(feature = "crash-reporting")]
 pub fn is_updater_transient_event(event: &sentry::protocol::Event<'_>) -> bool {
     if event_has_updater_transient_message(event) {
         return true;
@@ -2880,6 +3031,7 @@ pub fn is_suppressed_usage_probe_backoff(msg: &str) -> bool {
 /// the emit-site classifier — any non_2xx/400 event that carries the
 /// budget-exhausted phrasing is dropped regardless of which domain produced
 /// it, so a future re-emitter under a different tag still gets filtered.
+#[cfg(feature = "crash-reporting")]
 pub fn is_budget_event(event: &sentry::protocol::Event<'_>) -> bool {
     let tags = &event.tags;
     if tags.get("failure").map(String::as_str) != Some("non_2xx") {
@@ -2946,6 +3098,7 @@ pub fn is_insufficient_credits_message(text: &str) -> bool {
 ///   failure (`"402"` or `"payment required"`), AND
 /// - that same text carries an insufficient-credits phrase
 ///   (`provider::body_indicates_insufficient_credits`).
+#[cfg(feature = "crash-reporting")]
 pub fn is_insufficient_credits_event(event: &sentry::protocol::Event<'_>) -> bool {
     if event
         .message
@@ -2986,6 +3139,7 @@ pub fn is_quota_exhausted_message(text: &str) -> bool {
 /// that catches all of them, keyed on the formatted message rather than tags so
 /// it matches regardless of which path emitted it (and regardless of whether
 /// the upstream wrapped the 402 in a 500 envelope).
+#[cfg(feature = "crash-reporting")]
 pub fn is_quota_exhausted_event(event: &sentry::protocol::Event<'_>) -> bool {
     if event
         .message
@@ -3030,6 +3184,7 @@ pub fn is_ollama_cloud_internal_500_message_any(text: &str) -> bool {
 /// net for any other compatible-provider path (`chat_with_system`,
 /// `chat_with_history`, the non-native cascades) that reports the same body,
 /// keyed on the message rather than tags so it matches regardless of emitter.
+#[cfg(feature = "crash-reporting")]
 pub fn is_ollama_cloud_internal_500_event(event: &sentry::protocol::Event<'_>) -> bool {
     if event
         .message
@@ -3058,6 +3213,7 @@ pub fn is_ollama_cloud_internal_500_event(event: &sentry::protocol::Event<'_>) -
 /// - tag `status == "404"`
 /// - tag `method == "PATCH"` or `"DELETE"`
 /// - event message or exception value contains both `"/channels/"` and `"/messages/"`
+#[cfg(feature = "crash-reporting")]
 pub fn is_channel_message_not_found_event(event: &sentry::protocol::Event<'_>) -> bool {
     let tags = &event.tags;
     if tags.get("domain").map(String::as_str) != Some("backend_api") {
@@ -3076,6 +3232,7 @@ pub fn is_channel_message_not_found_event(event: &sentry::protocol::Event<'_>) -
     event_contains_channel_message_path(event)
 }
 
+#[cfg(feature = "crash-reporting")]
 fn event_contains_channel_message_path(event: &sentry::protocol::Event<'_>) -> bool {
     let has_pattern = |s: &str| s.contains("/channels/") && s.contains("/messages/");
     if event.message.as_deref().is_some_and(has_pattern) {
@@ -3088,6 +3245,7 @@ fn event_contains_channel_message_path(event: &sentry::protocol::Event<'_>) -> b
         .any(|exc| exc.value.as_deref().is_some_and(has_pattern))
 }
 
+#[cfg(feature = "crash-reporting")]
 fn event_contains_budget_exhausted_message(event: &sentry::protocol::Event<'_>) -> bool {
     if event
         .message
@@ -4091,7 +4249,7 @@ mod tests {
             // SQLITE_FULL rendering from rusqlite — engine-level disk-full
             // detection during page-bookkeeping (journal/WAL extension) that
             // beats the next syscall to the errno. Production hit at
-            // `memory_store::unified::documents::tx.commit()` during
+            // `memory_store::namespace_store::documents::tx.commit()` during
             // `openhuman.memory_doc_ingest`, in the same burst that emits
             // os-error-112 siblings (Sentry TAURI-RUST-B6N).
             "commit tx: database or disk is full",
@@ -4326,6 +4484,81 @@ mod tests {
                 expected_error_kind(raw),
                 Some(ExpectedErrorKind::WhatsAppDataSqliteBusy),
                 "should classify whatsapp_data sqlite busy/locked: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_whatsapp_data_sqlite_corrupt_errors() {
+        for raw in [
+            // The observed TAURI-RUST-KNH symptom: corruption on the wa_chat path.
+            r#"[whatsapp_data] ingest failed: upsert wa_chat 207897942335683@lid: database disk image is malformed: Error code 11: The database disk image is malformed"#,
+            // The wa_message path — same on-disk damage class.
+            r#"[whatsapp_data] ingest failed: upsert wa_message chat=120363402402350155@g.us msg=abc: file is not a database: Error code 26: File opened that is not a database file"#,
+            // Wrapped in outer RPC context — classifier runs on the full chain.
+            r#"rpc.invoke_method failed: [whatsapp_data] ingest failed: upsert wa_chat 207897942335683@lid: database disk image is malformed"#,
+        ] {
+            assert_eq!(
+                expected_error_kind(raw),
+                Some(ExpectedErrorKind::WhatsAppDataSqliteCorrupt),
+                "should classify whatsapp_data sqlite corrupt: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_whatsapp_data_prune_path_sqlite_corrupt_errors() {
+        // The same ingest RPC runs the 90-day auto-prune under the store's
+        // corrupt-DB recovery wrapper. A malformed image surfaced from the prune
+        // step carries a `prune` frame (e.g. `prune old wa_messages`) instead of
+        // an `upsert` frame, and must still be demoted — otherwise a boot-time
+        // prune corruption re-floods Sentry on every scan tick (Finding 3).
+        for raw in [
+            r#"[whatsapp_data] ingest failed: prune old wa_messages: database disk image is malformed: Error code 11: The database disk image is malformed"#,
+            r#"[whatsapp_data] ingest failed: prune old wa_messages: scan affected chats: database disk image is malformed"#,
+            r#"[whatsapp_data] ingest failed: refresh chat stats after prune: chat@c.us: file is not a database: Error code 26"#,
+            r#"rpc.invoke_method failed: [whatsapp_data] ingest failed: prune old wa_messages: database disk image is malformed"#,
+        ] {
+            assert_eq!(
+                expected_error_kind(raw),
+                Some(ExpectedErrorKind::WhatsAppDataSqliteCorrupt),
+                "should classify whatsapp_data prune-path sqlite corrupt: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_prune_errors_as_whatsapp_corrupt() {
+        for raw in [
+            // A `prune` word outside the whatsapp ingest envelope must still page.
+            "memory queue prune failed: database disk image is malformed",
+            // whatsapp prune-path lock contention is the *busy* bucket, not corrupt.
+            "[whatsapp_data] ingest failed: prune old wa_messages: database is locked",
+            // whatsapp prune-path constraint/logic error is a real bug, not on-disk damage.
+            "[whatsapp_data] ingest failed: prune old wa_messages: no such table: wa_messages",
+        ] {
+            assert_ne!(
+                expected_error_kind(raw),
+                Some(ExpectedErrorKind::WhatsAppDataSqliteCorrupt),
+                "must not classify as whatsapp_data sqlite corrupt: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_corrupt_messages_as_whatsapp_corrupt() {
+        for raw in [
+            // Malformed image outside the whatsapp ingest envelope must still page.
+            "memory queue write failed: database disk image is malformed",
+            // Read-path whatsapp failure (no upsert frame) is not the ingest write.
+            "[whatsapp_data] list_messages failed: database disk image is malformed",
+            // whatsapp ingest lock contention is the *busy* bucket, not corrupt.
+            "[whatsapp_data] ingest failed: upsert wa_message chat=x msg=y: database is locked",
+        ] {
+            assert_ne!(
+                expected_error_kind(raw),
+                Some(ExpectedErrorKind::WhatsAppDataSqliteCorrupt),
+                "must not classify as whatsapp_data sqlite corrupt: {raw}"
             );
         }
     }
@@ -5498,6 +5731,60 @@ mod tests {
         );
     }
 
+    // ── TAURI-RUST-K27: composio set-key validation prose (sibling of X9) ──
+
+    #[test]
+    fn demotes_composio_set_key_invalid_key_rejection() {
+        // Drift coupler: assert the classifier demotes the EXACT const the
+        // `composio_set_api_key` validate-before-store probe returns. Keying
+        // off the shared const (not a copied literal) means any reword that
+        // drops the `"Invalid Composio API key"` anchor fails this test in CI
+        // instead of silently re-opening the TAURI-RUST-K27 leak.
+        assert_eq!(
+            expected_error_kind(
+                crate::openhuman::composio::direct_auth::COMPOSIO_INVALID_API_KEY_USER_MESSAGE
+            ),
+            Some(ExpectedErrorKind::ProviderUserState),
+            "composio_set_api_key invalid-key rejection must demote to ProviderUserState"
+        );
+    }
+
+    #[test]
+    fn composio_set_key_anchor_is_substring_of_message() {
+        // Contract coupler: the classifier keys on the shared
+        // `COMPOSIO_INVALID_API_KEY_ANCHOR`; it is only correct if that anchor is a
+        // genuine lowercase substring of the message the probe returns. Assert the
+        // two consts stay in sync so neither can be reworded independently.
+        use crate::openhuman::composio::direct_auth::{
+            COMPOSIO_INVALID_API_KEY_ANCHOR, COMPOSIO_INVALID_API_KEY_USER_MESSAGE,
+        };
+        assert!(
+            COMPOSIO_INVALID_API_KEY_USER_MESSAGE
+                .to_lowercase()
+                .contains(COMPOSIO_INVALID_API_KEY_ANCHOR),
+            "the K27 anchor must be a lowercase substring of the user message"
+        );
+    }
+
+    #[test]
+    fn does_not_classify_composio_set_key_store_failure_as_user_state() {
+        // Discrimination: a genuine defect on the set path — the key validated
+        // but persistence/config-save failed — renders a different body and
+        // MUST still page. The K27 arm keys on "invalid composio api key",
+        // which these do not contain, so they fall through to `None`.
+        let store_fail = "[composio-direct] store_composio_api_key failed: \
+                          keyring write denied (os error 5)";
+        let save_fail = "[composio-direct] save config failed: \
+                         config file is read-only";
+        for msg in [store_fail, save_fail] {
+            assert_eq!(
+                expected_error_kind(msg),
+                None,
+                "genuine composio set-path failure must still reach Sentry: {msg}"
+            );
+        }
+    }
+
     #[test]
     fn does_not_classify_composio_direct_500_as_user_state() {
         // Real bug shapes — a 500 from the direct v3 path with no auth
@@ -6070,6 +6357,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     fn event_with_tags(pairs: &[(&str, &str)]) -> sentry::protocol::Event<'static> {
         let mut event = sentry::protocol::Event::default();
         let mut tags: std::collections::BTreeMap<String, String> =
@@ -6081,6 +6369,7 @@ mod tests {
         event
     }
 
+    #[cfg(feature = "crash-reporting")]
     fn event_with_tags_and_message(
         pairs: &[(&str, &str)],
         message: &str,
@@ -6090,6 +6379,7 @@ mod tests {
         event
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn transient_filter_drops_429_408_502_503_504() {
         for status in ["429", "408", "502", "503", "504"] {
@@ -6105,6 +6395,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn custom_openai_502_event_shape_is_transient_provider_http() {
         let event = event_with_tags_and_message(
@@ -6122,6 +6413,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn transient_filter_keeps_permanent_failures() {
         for status in ["400", "401", "403", "404", "500"] {
@@ -6137,6 +6429,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn transient_filter_keeps_aggregate_all_exhausted() {
         let event = event_with_tags(&[
@@ -6150,6 +6443,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn transient_filter_keeps_events_with_no_status_tag() {
         let event = event_with_tags(&[("domain", "llm_provider"), ("failure", "non_2xx")]);
@@ -6166,6 +6460,7 @@ mod tests {
     // "llm_provider", ..)` so the domain tag is consistent), but the broader
     // point is: any future caller that re-uses the same tag set for a
     // different domain must NOT be silently dropped by this filter.
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn transient_filter_keeps_events_with_no_domain_tag() {
         let event = event_with_tags(&[("failure", "non_2xx"), ("status", "503")]);
@@ -6175,6 +6470,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn transient_filter_keeps_events_from_other_domains() {
         let event = event_with_tags(&[
@@ -6188,6 +6484,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn backend_api_filter_drops_transient_statuses() {
         for status in TRANSIENT_HTTP_STATUSES {
@@ -6203,6 +6500,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn backend_api_filter_drops_transient_transport_phrases() {
         for phrase in TRANSIENT_TRANSPORT_PHRASES {
@@ -6217,6 +6515,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn backend_api_filter_keeps_non_transient_failures() {
         for status in ["404", "500"] {
@@ -6251,6 +6550,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn skills_install_fetch_filter_drops_client_error_statuses() {
         for status in ["400", "401", "403", "404", "410", "499"] {
@@ -6267,6 +6567,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn skills_install_fetch_filter_keeps_server_and_wrong_shape_failures() {
         for status in ["500", "502", "503"] {
@@ -6310,6 +6611,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn integrations_filter_drops_transient_statuses() {
         for status in TRANSIENT_HTTP_STATUSES {
@@ -6325,6 +6627,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn integrations_filter_drops_transient_transport_phrases() {
         for phrase in TRANSIENT_TRANSPORT_PHRASES {
@@ -6339,6 +6642,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn integrations_filter_keeps_non_transient_failures() {
         for status in ["404", "500"] {
@@ -6382,6 +6686,7 @@ mod tests {
     /// `SKILL.md`) is expected user-input state — the before_send net must drop
     /// it, while a genuine 5xx remote failure and unrelated domains stay
     /// reportable.
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn skills_install_client_error_filter_drops_4xx_keeps_5xx() {
         // 4xx (esp. 404/410) = missing skill / wrong URL → dropped.
@@ -6430,6 +6735,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn composio_domain_routes_through_integrations_filter() {
         // OPENHUMAN-TAURI-35 (~139 events) / -2H (~26 events):
@@ -6481,6 +6787,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn composio_list_connections_503_504_wrappers_stay_filtered() {
         for (status, reason) in [("503", "Service Unavailable"), ("504", "Gateway Timeout")] {
@@ -6522,6 +6829,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn updater_transient_403_is_dropped() {
         let event = event_with_tags_and_message(
@@ -6539,6 +6847,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn updater_github_403_message_only_shapes_are_dropped() {
         for event in [
@@ -6552,6 +6861,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn updater_transient_502_is_dropped() {
         let event = event_with_tags_and_message(
@@ -6568,6 +6878,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn updater_real_panic_still_reported() {
         let event = event_with_tags_and_message(
@@ -6580,6 +6891,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn updater_endpoint_non_success_message_is_dropped() {
         // TAURI-RUST-CD (~151 events / 9 days, Windows): `tauri-plugin-updater`
@@ -6601,6 +6913,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn updater_endpoint_non_success_anchor_does_not_silence_unrelated_errors() {
         // The new anchor is the literal plugin string. Other updater failures
@@ -6671,6 +6984,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn budget_filter_drops_budget_message_on_tagged_400() {
         let event = event_with_tags_and_message(
@@ -6681,6 +6995,7 @@ mod tests {
         assert!(is_budget_event(&event));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn budget_filter_drops_budget_exception_on_tagged_400() {
         let mut event = event_with_tags(&[("failure", "non_2xx"), ("status", "400")]);
@@ -6692,6 +7007,7 @@ mod tests {
         assert!(is_budget_event(&event));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn budget_filter_keeps_non_budget_400() {
         let event = event_with_tags_and_message(
@@ -6702,6 +7018,7 @@ mod tests {
         assert!(!is_budget_event(&event));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn budget_filter_requires_non_2xx_failure_and_400_status() {
         let message = "Budget exceeded — add credits to continue";
@@ -6748,12 +7065,14 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     fn event_with_message(msg: &str) -> sentry::protocol::Event<'static> {
         let mut event = sentry::protocol::Event::default();
         event.message = Some(msg.to_string());
         event
     }
 
+    #[cfg(feature = "crash-reporting")]
     fn event_with_exception_value(value: &str) -> sentry::protocol::Event<'static> {
         let mut event = sentry::protocol::Event::default();
         event.exception = vec![sentry::protocol::Exception {
@@ -6764,6 +7083,7 @@ mod tests {
         event
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn quota_exhausted_filter_matches_500_wrapped_kiro_event() {
         // TAURI-RUST-C9A: verbatim message as formatted by the provider emit
@@ -6778,6 +7098,7 @@ mod tests {
         assert!(is_quota_exhausted_message(body));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn quota_exhausted_filter_matches_responses_usage_limit_reached_event() {
         // TAURI-RUST-AFE: verbatim message as formatted by the `chat_via_responses`
@@ -6797,6 +7118,7 @@ mod tests {
         assert!(is_quota_exhausted_message(body));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn quota_exhausted_filter_ignores_generic_500_and_rate_limit() {
         // A generic 500 outage and a 429 rate-limit are not plan-quota
@@ -6809,6 +7131,7 @@ mod tests {
         )));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn insufficient_credits_filter_matches_message_path() {
         // Verbatim TAURI-RUST-C62 message as formatted by the provider emit
@@ -6820,6 +7143,7 @@ mod tests {
         assert!(is_insufficient_credits_event(&event));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn insufficient_credits_filter_matches_exception_path() {
         let event = event_with_exception_value(
@@ -6828,6 +7152,7 @@ mod tests {
         assert!(is_insufficient_credits_event(&event));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn insufficient_credits_filter_requires_both_402_and_credit_phrase() {
         // A 402 with no credit phrase must NOT be swallowed (could be another
@@ -6842,6 +7167,7 @@ mod tests {
         )));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn insufficient_credits_filter_ignores_402_digits_in_a_non_402_body() {
         // A non-402 error whose body merely contains the digits "402" and a
@@ -6896,6 +7222,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn is_insufficient_credits_event_delegates_to_message_matcher() {
         // Parity: the event-level filter is now a thin wrapper over the
@@ -6925,6 +7252,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn ollama_cloud_internal_500_before_send_matches_raw_and_reraised_shapes() {
         // The outermost net catches BOTH the raw emit body (any compatible
@@ -6954,6 +7282,7 @@ mod tests {
         )));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn session_expired_before_send_matches_core_401_events() {
         let msg = "SESSION_EXPIRED: backend session not active — sign in to resume LLM work";
@@ -6973,6 +7302,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn session_expired_before_send_stays_domain_scoped() {
         let event = event_with_tags_and_message(
@@ -6985,6 +7315,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn max_iterations_filter_matches_message_path() {
         // `report_error_message` calls `sentry::capture_message`, which
@@ -6994,6 +7325,7 @@ mod tests {
         assert!(is_max_iterations_event(&event));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn max_iterations_filter_matches_exception_path() {
         // sentry-tracing with attach_stacktrace=true populates the
@@ -7005,6 +7337,7 @@ mod tests {
         assert!(is_max_iterations_event(&event));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn max_iterations_filter_keeps_unrelated_events() {
         assert!(!is_max_iterations_event(&event_with_message(
@@ -7016,6 +7349,7 @@ mod tests {
 
     // ── is_channel_message_not_found_event (TAURI-R7) ────────────────────────
 
+    #[cfg(feature = "crash-reporting")]
     fn channel_message_404_event(method: &str) -> sentry::protocol::Event<'static> {
         let mut event = sentry::protocol::Event::default();
         event.tags.insert("domain".into(), "backend_api".into());
@@ -7029,6 +7363,7 @@ mod tests {
         event
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn channel_message_not_found_filter_matches_patch() {
         // Canonical TAURI-R7 shape: PATCH 404 on a channel-message path.
@@ -7037,6 +7372,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn channel_message_not_found_filter_matches_delete() {
         assert!(is_channel_message_not_found_event(
@@ -7044,6 +7380,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn channel_message_not_found_filter_ignores_get_404() {
         // GET 404 on a channel-message path is NOT an expected state — must keep Sentry signal.
@@ -7052,6 +7389,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn channel_message_not_found_filter_ignores_non_channel_path() {
         let mut event = channel_message_404_event("PATCH");
@@ -7059,6 +7397,7 @@ mod tests {
         assert!(!is_channel_message_not_found_event(&event));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn channel_message_not_found_filter_ignores_wrong_status() {
         let mut event = channel_message_404_event("PATCH");
@@ -7066,6 +7405,7 @@ mod tests {
         assert!(!is_channel_message_not_found_event(&event));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn channel_message_not_found_filter_ignores_wrong_domain() {
         let mut event = channel_message_404_event("PATCH");
@@ -7073,6 +7413,7 @@ mod tests {
         assert!(!is_channel_message_not_found_event(&event));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn channel_message_not_found_filter_matches_exception_path() {
         // sentry-tracing with attach_stacktrace=true populates exception list.
@@ -7493,6 +7834,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn expected_kind_ignores_byo_errors_that_carry_an_error_code_token() {
         // CodeRabbit: a BYO / direct-provider envelope whose body happens to
@@ -7511,6 +7853,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn before_send_filter_drops_backend_owned_error_code_events() {
         for code in [
@@ -7544,6 +7887,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn before_send_filter_keeps_malformed_bad_request_event() {
         let event = event_with_message(
@@ -7556,12 +7900,14 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn before_send_filter_matches_error_code_in_exception_value() {
         let event = event_with_exception_value(&managed_body("500", "INTERNAL_ERROR"));
         assert!(is_backend_error_code_event(&event));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn transient_provider_transport_filter_drops_flaky_network_blips() {
         // F7: a streaming transport timeout/reset under
@@ -7590,6 +7936,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn transient_provider_transport_filter_keeps_non_transient_transport() {
         // A genuine, non-transient transport failure (e.g. an unexpected
@@ -7605,6 +7952,7 @@ mod tests {
         assert!(!is_transient_provider_transport_failure(&event));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn transient_provider_transport_filter_scoped_to_streaming_operations() {
         // CodeRabbit: a NON-streaming llm_provider transport failure with the
@@ -7631,6 +7979,7 @@ mod tests {
         assert!(!is_transient_provider_transport_failure(&no_op));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn transient_provider_transport_filter_scoped_to_llm_provider() {
         // Same shape under a different domain must not be claimed by this
@@ -7654,6 +8003,7 @@ mod tests {
     // `openhuman::credentials::ops::auth_get_me` for the broader
     // context.
 
+    #[cfg(feature = "crash-reporting")]
     fn auth_get_me_tags() -> Vec<(&'static str, &'static str)> {
         vec![
             ("domain", "rpc"),
@@ -7663,6 +8013,7 @@ mod tests {
         ]
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn auth_get_me_opaque_filter_drops_bare_method_path_message() {
         let event = event_with_tags_and_message(&auth_get_me_tags(), "GET /auth/me");
@@ -7672,6 +8023,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn auth_get_me_opaque_filter_tolerates_surrounding_whitespace() {
         let event = event_with_tags_and_message(&auth_get_me_tags(), "  GET /auth/me  ");
@@ -7681,6 +8033,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn auth_get_me_opaque_filter_keeps_full_anyhow_chain_message() {
         // Post-fix shape from `auth_get_me` now using `format!("{e:#}")`.
@@ -7696,6 +8049,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn auth_get_me_opaque_filter_keeps_other_rpc_methods() {
         // Same opaque shape but for a different RPC must NOT be dropped —
@@ -7721,6 +8075,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn auth_get_me_opaque_filter_requires_rpc_invoke_method_domain() {
         // Wrong domain → must surface.
@@ -7740,6 +8095,7 @@ mod tests {
         assert!(!is_auth_get_me_opaque_transport_event(&event));
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn auth_get_me_opaque_filter_matches_exception_value_path() {
         // sentry-tracing path: message empty, exception last value carries
@@ -7755,6 +8111,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crash-reporting")]
     #[test]
     fn auth_get_me_opaque_filter_ignores_empty_and_unrelated() {
         // No message and no exception → false.

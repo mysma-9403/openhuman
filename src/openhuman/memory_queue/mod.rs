@@ -28,11 +28,8 @@
 //! This queue used to live under `openhuman::memory::jobs`; it now has a
 //! dedicated top-level home (`openhuman::memory_queue`) because it is an
 //! execution/runtime concern rather than a leaf of the memory policy API.
-//! `openhuman::memory` re-exports it as `memory::jobs` during the migration.
 
-pub(crate) mod handlers;
 mod ops;
-mod redact;
 pub mod scheduler;
 pub mod store;
 pub mod testing;

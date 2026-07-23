@@ -75,7 +75,16 @@ impl Tool for SpawnSubagentTool {
 
     fn description(&self) -> &str {
         "Delegate a task to a specialised sub-agent only when direct \
-         response or direct tools are insufficient. See the Delegation \
+         response or direct tools are insufficient. Handles ONE delegated task \
+         per call: by default it runs as a reusable async worker and returns \
+         immediately — pass `blocking: true` to run it inline and get the \
+         sub-agent's final output back in this turn. To run several independent \
+         workers at once (e.g. \"a separate researcher for each X\", a council \
+         of opinions, or \"fan out over N items\"), use `spawn_parallel_agents` \
+         with one task per worker — a SINGLE call that launches them \
+         concurrently. Do NOT call this tool in a loop to fan out: repeated \
+         `spawn_subagent` calls each delegate a single task and never launch \
+         workers concurrently, which serializes the whole request. See the Delegation \
          Guide in the system prompt for available agent_ids and when to \
          use each. When delegating to `integrations_agent`, you MUST also pass \
          `toolkit=\"<name>\"` naming the Composio integration the \
@@ -422,7 +431,25 @@ impl Tool for SpawnSubagentTool {
             }
         }
 
-        if !blocking {
+        // Async-by-default only holds where the finished result has somewhere
+        // to land. `spawn_async_subagent` delivers thread-addressed (see
+        // `background_delivery`), so outside a chat turn (flow `agent` node,
+        // CLI, cron) it now refuses outright (B40). Self-heal to blocking
+        // dispatch here rather than forwarding into that guard: the caller
+        // asked to delegate, and running the sub-agent inline is the one mode
+        // that both executes it and returns its output. Mirrors the
+        // `has_delivery_thread` fallback the `delegate_*` tools already do in
+        // `dispatch.rs::dispatch_subagent`.
+        let has_delivery_thread =
+            crate::openhuman::inference::provider::thread_context::current_thread_id().is_some();
+        if !blocking && !has_delivery_thread {
+            log::info!(
+                "[spawn_subagent] async delegation requested for '{}' but no delivery thread \
+                 (flow node / CLI / cron context) — falling back to blocking dispatch",
+                definition.id
+            );
+        }
+        if !blocking && has_delivery_thread {
             let mut async_args = args;
             if let Some(obj) = async_args.as_object_mut() {
                 obj.insert(
@@ -493,6 +520,7 @@ impl Tool for SpawnSubagentTool {
                     mode: "typed".to_string(),
                     dedicated_thread,
                     prompt_chars: prompt.chars().count(),
+                    prompt: prompt.clone(),
                     worker_thread_id: worker_thread_id.clone(),
                     display_name: Some(definition.display_name().to_string()),
                 })
@@ -582,6 +610,7 @@ impl Tool for SpawnSubagentTool {
                                     elapsed_ms: outcome.elapsed.as_millis() as u64,
                                     iterations: outcome.iterations as u32,
                                     output_chars: outcome.output.chars().count(),
+                                    output: outcome.output.clone(),
                                     worktree_path: None,
                                     changed_files: Vec::new(),
                                     dirty_status: None,
@@ -653,6 +682,7 @@ impl Tool for SpawnSubagentTool {
                                     elapsed_ms: outcome.elapsed.as_millis() as u64,
                                     iterations: outcome.iterations as u32,
                                     output_chars: outcome.output.chars().count(),
+                                    output: outcome.output.clone(),
                                     worktree_path: None,
                                     changed_files: Vec::new(),
                                     dirty_status: None,
@@ -851,7 +881,7 @@ fn render_worker_thread_result(
 ///
 /// Returns text the model reads literally; the orchestrator paraphrases
 /// it into a user-facing reply. Keep the *intent* stable across
-/// rewordings — the "Settings → Connections → {toolkit}" path is
+/// rewordings — the "Connections → {toolkit}" path is
 /// load-bearing for the UI navigation tests.
 pub(crate) fn describe_unconnected_state(toolkit: &str, status: Option<&str>) -> String {
     // Keep the original (trimmed) status separately so the
@@ -866,14 +896,14 @@ pub(crate) fn describe_unconnected_state(toolkit: &str, status: Option<&str>) ->
         Some("INITIATED") | Some("INITIALIZING") | Some("PENDING") => format!(
             "Integration '{toolkit}' has an OAuth flow in progress but it hasn't reached \
              ACTIVE yet. Do NOT retry this spawn. Tell the user the authorization is \
-             pending and ask them to finish the browser OAuth flow (Settings → \
-             Connections → '{toolkit}') before retrying. If they already closed the \
-             browser tab, they can restart the connection from the same Settings page."
+             pending and ask them to finish the browser OAuth flow (Connections → \
+             '{toolkit}') before retrying. If they already closed the \
+             browser tab, they can restart the connection from the same Connections page."
         ),
         Some("EXPIRED") => format!(
             "Integration '{toolkit}' is connected but the OAuth token has expired. \
              Do NOT retry this spawn. Tell the user the connection expired and ask \
-             them to reconnect '{toolkit}' at Settings → Connections → '{toolkit}' \
+             them to reconnect '{toolkit}' at Connections → '{toolkit}' \
              before retrying the original request."
         ),
         Some("FAILED") | Some("ERROR") => {
@@ -885,7 +915,7 @@ pub(crate) fn describe_unconnected_state(toolkit: &str, status: Option<&str>) ->
             format!(
                 "Integration '{toolkit}' has a previous OAuth attempt in a `{raw}` state. \
                  Do NOT retry this spawn. Tell the user the connection failed and ask them \
-                 to reconnect '{toolkit}' at Settings → Connections → '{toolkit}' before \
+                 to reconnect '{toolkit}' at Connections → '{toolkit}' before \
                  retrying the original request."
             )
         }
@@ -898,13 +928,13 @@ pub(crate) fn describe_unconnected_state(toolkit: &str, status: Option<&str>) ->
                 "Integration '{toolkit}' has a connection row but its status is `{raw}`, \
                  which is not yet usable. Do NOT retry this spawn. Tell the user the \
                  connection is in an unusable state and ask them to reconnect '{toolkit}' \
-                 at Settings → Connections → '{toolkit}'."
+                 at Connections → '{toolkit}'."
             )
         }
         _ => format!(
             "Integration '{toolkit}' is available but the user has not authorized it \
              yet. Do NOT retry this spawn. Tell the user the integration is available \
-             and ask them to authorize '{toolkit}' in Settings → Connections → \
+             and ask them to authorize '{toolkit}' in Connections → \
              '{toolkit}' before retrying the original request."
         ),
     }
@@ -933,7 +963,8 @@ mod tests {
 
     #[test]
     fn build_worker_thread_title_collapses_whitespace_and_caps_length() {
-        let prompt = "  draft\n a very long\tplan that\nrambles ".to_string() + &"x".repeat(200);
+        let prompt =
+            "  draft\n a very long\tplan that\nrambles ".to_string() + "x".repeat(200).as_str();
         let title = build_worker_thread_title(&prompt);
         assert!(title.starts_with("draft a very long plan"));
         assert!(title.chars().count() <= WORKER_THREAD_TITLE_MAX_CHARS + 1);
@@ -1134,7 +1165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_archetype_alias_is_forwarded_to_async_default_path() {
+    async fn legacy_archetype_alias_is_normalized_to_agent_id() {
         let _ = AgentDefinitionRegistry::init_global_builtins();
         let tool = SpawnSubagentTool;
         let result = tool
@@ -1145,17 +1176,49 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(
-            result
-                .output()
-                .contains("spawn_async_subagent called outside of an agent turn"),
-            "{}",
-            result.output()
-        );
+        // The alias resolved: the call got past argument validation and only
+        // failed later, on the missing parent turn.
         assert!(
             !result.output().contains("agent_id is required"),
             "{}",
             result.output()
+        );
+        assert!(
+            result.output().contains("called outside of an agent turn"),
+            "{}",
+            result.output()
+        );
+    }
+
+    /// B40: with no chat thread bound, async-by-default delegation has nowhere
+    /// to deliver a result, so `spawn_subagent` must self-heal to blocking
+    /// dispatch rather than forwarding into `spawn_async_subagent`'s
+    /// thread-less guard — otherwise the guard's own advice ("use
+    /// `spawn_subagent`") would loop straight back into the guard. Asserted
+    /// via which tool owns the downstream error.
+    #[tokio::test]
+    async fn async_default_self_heals_to_blocking_without_delivery_thread() {
+        let _ = AgentDefinitionRegistry::init_global_builtins();
+        let result = SpawnSubagentTool
+            .execute(json!({
+                "agent_id": "researcher",
+                "prompt": "work with no delivery thread",
+            }))
+            .await
+            .unwrap();
+
+        let out = result.output();
+        assert!(
+            !out.contains("spawn_async_subagent"),
+            "thread-less spawn_subagent must not route into the async tool: {out}"
+        );
+        assert!(
+            !out.contains("no parent chat thread"),
+            "thread-less spawn_subagent must not hit the async delivery guard: {out}"
+        );
+        assert!(
+            out.contains("spawn_subagent called outside of an agent turn"),
+            "expected the blocking path's own error: {out}"
         );
     }
 
@@ -1206,7 +1269,7 @@ mod tests {
             msg.contains("OAuth flow in progress"),
             "INITIATED must surface the in-progress wording: {msg}"
         );
-        assert!(msg.contains("Settings → Connections → 'gmail'"));
+        assert!(msg.contains("Connections → 'gmail'"));
         // The legacy "not authorized yet" copy must NOT leak into the
         // pending-OAuth branch — that was the user-perception bug
         // from #2365 (Settings UI showed Gmail connected, agent said
@@ -1233,6 +1296,8 @@ mod tests {
         let msg = describe_unconnected_state("gmail", Some("EXPIRED"));
         assert!(msg.contains("OAuth token has expired"));
         assert!(msg.contains("reconnect 'gmail'"));
+        assert!(msg.contains("Connections → 'gmail'"));
+        assert!(!msg.contains("Settings → Connections"));
         assert!(!msg.contains("OAuth flow in progress"));
     }
 
@@ -1246,6 +1311,8 @@ mod tests {
                 "{status} must be quoted verbatim, not collapsed to a single label: {msg}"
             );
             assert!(msg.contains("reconnect 'gmail'"));
+            assert!(msg.contains("Connections → 'gmail'"));
+            assert!(!msg.contains("Settings → Connections"));
         }
     }
 
@@ -1279,6 +1346,8 @@ mod tests {
                 msg.contains(&expected),
                 "unknown status `{raw}` must be quoted verbatim (not its uppercased form): {msg}"
             );
+            assert!(msg.contains("Connections → 'gmail'"));
+            assert!(!msg.contains("Settings → Connections"));
         }
     }
 
@@ -1310,7 +1379,7 @@ mod tests {
             msg.contains("has not authorized it yet"),
             "None must hit the legacy never-connected copy: {msg}"
         );
-        assert!(msg.contains("Settings → Connections → 'gmail'"));
+        assert!(msg.contains("Connections → 'gmail'"));
     }
 
     #[test]

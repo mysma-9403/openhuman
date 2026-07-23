@@ -51,6 +51,10 @@ describe('NAV_TABS', () => {
     ]);
   });
 
+  it('no longer contains a top-level orchestration tab (folded under Brain)', () => {
+    expect(NAV_TABS.find(t => t.id === 'orchestration')).toBeUndefined();
+  });
+
   it('no longer contains home or settings tabs (moved to the sidebar header)', () => {
     expect(NAV_TABS.find(t => t.id === 'home')).toBeUndefined();
     expect(NAV_TABS.find(t => t.id === 'settings')).toBeUndefined();
@@ -97,5 +101,11 @@ describe('AVATAR_MENU_ITEMS', () => {
   it('billing uses openUrl; all others use navigate', () => {
     const openUrlItems = AVATAR_MENU_ITEMS.filter(i => i.kind === 'openUrl').map(i => i.id);
     expect(openUrlItems).toEqual(['billing']);
+  });
+
+  it('opens billing on the authenticated dashboard', () => {
+    expect(AVATAR_MENU_ITEMS.find(i => i.id === 'billing')?.target).toBe(
+      'https://tinyhumans.ai/dashboard'
+    );
   });
 });

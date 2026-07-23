@@ -16,6 +16,7 @@ use crate::openhuman::inference::provider::{
     ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
 };
 use crate::openhuman::memory::{Memory, MemoryCategory, MemoryEntry, NamespaceSummary, RecallOpts};
+use crate::openhuman::tools::traits::ToolTimeout;
 use crate::openhuman::tools::{PermissionLevel, Tool, ToolResult};
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -290,7 +291,7 @@ fn parent_context_with_provider(
         ]
         .into_iter()
         .collect(),
-        provider,
+        turn_model_source: crate::openhuman::tinyagents::TurnModelSource::new(provider),
         all_tools: Arc::new(Vec::new()),
         all_tool_specs: Arc::new(Vec::new()),
         visible_tool_names: std::collections::HashSet::new(),
@@ -366,6 +367,11 @@ fn definition_with_tool_scope(
 
 #[tokio::test]
 async fn rejects_more_tasks_than_parent_parallel_limit() {
+    // The parallel-limit check now runs inside the execution graph, which is
+    // reached only after the registry lookup — so this test needs the global
+    // builtins initialised (as its siblings already do) rather than relying on
+    // whichever test happened to initialise them first.
+    let _ = AgentDefinitionRegistry::init_global_builtins();
     let tool = SpawnParallelAgentsTool::new();
     let parent = parent_context(2);
     let result = with_parent_context(parent, async {
@@ -381,7 +387,11 @@ async fn rejects_more_tasks_than_parent_parallel_limit() {
     .await
     .expect("tool result");
     assert!(result.is_error);
-    assert!(result.output().contains("max_parallel_tools"));
+    assert!(
+        result.output().contains("max_parallel_tools"),
+        "{}",
+        result.output()
+    );
 }
 
 #[tokio::test]
@@ -897,5 +907,17 @@ async fn agent_turn_runs_long_parallel_subagent_flow_with_many_nested_tool_calls
         iterations,
         vec![4, 4],
         "each subagent should run three tool calls plus a final completion iteration"
+    );
+}
+
+#[test]
+fn spawn_parallel_agents_opts_out_of_the_global_tool_timeout() {
+    // A fan-out of N long sub-agents must not be hard-killed at the single-tool
+    // wall-clock default (120s): that truncates every worker and bounds the whole
+    // group at one worker's budget. The tool governs its own lifetime via its
+    // internal max_concurrency, cancellation token, and per-sub-agent caps.
+    assert_eq!(
+        SpawnParallelAgentsTool::new().timeout_policy(&json!({})),
+        ToolTimeout::Unbounded,
     );
 }

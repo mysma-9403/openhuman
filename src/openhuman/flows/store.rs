@@ -15,7 +15,9 @@
 //! `checkpoints.db` (see `src/openhuman/tinyflows/mod.rs::open_flow_checkpointer`).
 
 use crate::openhuman::config::Config;
-use crate::openhuman::flows::types::{FlowRun, FlowRunStep};
+use crate::openhuman::flows::types::{
+    FlowRevision, FlowRun, FlowRunStep, FlowSuggestion, SuggestionStatus,
+};
 use crate::openhuman::flows::Flow;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -75,7 +77,36 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             FOREIGN KEY (flow_id) REFERENCES flow_definitions(id) ON DELETE CASCADE
          );
          CREATE INDEX IF NOT EXISTS idx_flow_runs_flow_id ON flow_runs(flow_id);
-         CREATE INDEX IF NOT EXISTS idx_flow_runs_started_at ON flow_runs(started_at);",
+         CREATE INDEX IF NOT EXISTS idx_flow_runs_started_at ON flow_runs(started_at);
+
+         CREATE TABLE IF NOT EXISTS flow_suggestions (
+            id                     TEXT PRIMARY KEY,
+            title                  TEXT NOT NULL,
+            one_liner              TEXT NOT NULL,
+            rationale              TEXT NOT NULL,
+            trigger_hint           TEXT,
+            steps_json             TEXT NOT NULL DEFAULT '[]',
+            connections_json       TEXT NOT NULL DEFAULT '[]',
+            slugs_json             TEXT NOT NULL DEFAULT '[]',
+            build_prompt           TEXT NOT NULL,
+            confidence             REAL NOT NULL DEFAULT 0,
+            status                 TEXT NOT NULL DEFAULT 'new',
+            created_at             TEXT NOT NULL,
+            source_run_id          TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_flow_suggestions_status ON flow_suggestions(status);
+         CREATE INDEX IF NOT EXISTS idx_flow_suggestions_created_at ON flow_suggestions(created_at);
+
+         CREATE TABLE IF NOT EXISTS flow_revisions (
+            id               TEXT PRIMARY KEY,
+            flow_id          TEXT NOT NULL,
+            graph_json       TEXT NOT NULL,
+            name             TEXT NOT NULL,
+            require_approval INTEGER NOT NULL DEFAULT 0,
+            created_at       TEXT NOT NULL,
+            FOREIGN KEY (flow_id) REFERENCES flow_definitions(id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_flow_revisions_flow_id ON flow_revisions(flow_id, created_at);",
     )
     .context("Failed to initialize flows schema")?;
 
@@ -167,19 +198,51 @@ pub fn upsert_flow(config: &Config, flow: &Flow) -> Result<()> {
     })
 }
 
+/// Duplicates an existing [`Flow`] into a fresh row: same graph +
+/// `require_approval`, a new id/timestamps, the given `new_name`, and
+/// **`enabled = false`** so the copy never auto-fires (no schedule/app_event
+/// trigger is bound while disabled — the caller relies on this to keep a
+/// duplicate inert until explicitly enabled). `last_run_at`/`last_status` are
+/// reset to `None` — run history does not carry over. Returns the persisted
+/// copy.
+pub fn insert_duplicate_flow(config: &Config, source: &Flow, new_name: String) -> Result<Flow> {
+    let now = Utc::now().to_rfc3339();
+    let flow = Flow {
+        id: Uuid::new_v4().to_string(),
+        name: new_name,
+        enabled: false,
+        graph: source.graph.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+        last_run_at: None,
+        last_status: None,
+        require_approval: source.require_approval,
+    };
+    upsert_flow(config, &flow)?;
+    tracing::debug!(target: "flows", source_id = %source.id, new_id = %flow.id, "[flows] inserted duplicate flow (disabled)");
+    Ok(flow)
+}
+
 /// Creates a brand-new [`Flow`] row from a name + validated graph, stamping
 /// fresh id/timestamps, and returns the persisted record.
+///
+/// `enabled` is decided by the caller ([`crate::openhuman::flows::ops::flows_create`],
+/// issue B29 — save/enable safety): a graph with an automatic trigger
+/// (`schedule` / `app_event` / `webhook`) is created disabled so it cannot
+/// silently arm itself live and unattended; a `manual`-triggered graph is
+/// created enabled since it only ever runs on explicit `flows_run`.
 pub fn create_flow(
     config: &Config,
     name: String,
     graph: tinyflows::model::WorkflowGraph,
     require_approval: bool,
+    enabled: bool,
 ) -> Result<Flow> {
     let now = Utc::now().to_rfc3339();
     let flow = Flow {
         id: Uuid::new_v4().to_string(),
         name,
-        enabled: true,
+        enabled,
         graph,
         created_at: now.clone(),
         updated_at: now,
@@ -274,38 +337,194 @@ pub fn set_enabled(config: &Config, id: &str, enabled: bool) -> Result<Flow> {
     get_flow(config, id)?.ok_or_else(|| anyhow::anyhow!("flow '{id}' not found after update"))
 }
 
-/// Replaces a flow's name/graph/`require_approval` (re-validated by the
-/// caller before this is invoked) in place, bumping `updated_at`.
+/// How many revision snapshots to retain per flow (audit F6). Older ones are
+/// pruned on each new capture.
+const MAX_REVISIONS_PER_FLOW: usize = 20;
+
+/// Failure modes of [`update_flow_graph`] that the caller must distinguish:
+/// a genuine not-found, an optimistic-concurrency conflict (carrying the
+/// current server flow so the UI can diff/reload), or a store error.
+#[derive(Debug)]
+pub enum FlowUpdateError {
+    /// No flow with that id exists.
+    NotFound,
+    /// The flow changed since `expected_updated_at` was observed — the write
+    /// was refused to avoid clobbering. Carries the current server flow.
+    Conflict(Box<Flow>),
+    /// An underlying store failure.
+    Store(anyhow::Error),
+}
+
+impl std::fmt::Display for FlowUpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "flow not found"),
+            Self::Conflict(_) => write!(f, "flow changed since it was loaded"),
+            Self::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Replaces a flow's name/graph/`require_approval` (re-validated by the caller
+/// before this is invoked) in place, bumping `updated_at`, capturing the prior
+/// graph as a revision, and enforcing optimistic concurrency.
+///
+/// When `expected_updated_at` is `Some`, the write is refused with
+/// [`FlowUpdateError::Conflict`] (carrying the current server flow) if the
+/// flow's `updated_at` no longer matches — so an agent save and a concurrent
+/// canvas save can't silently clobber each other. `None` keeps the prior
+/// last-write-wins behaviour for callers that don't track a version.
+///
+/// `enabled_override`, when `Some`, forces the persisted `enabled` flag to
+/// that value in the *same* guarded `UPDATE` as the graph/name/
+/// `require_approval` write — used by `ops::flows_update`'s B29 Rule 1
+/// analogue (auto-disarming a flow whose trigger just changed from manual to
+/// automatic) so the disarm can never race a concurrent read/write of
+/// `enabled` (a separate `set_enabled` call after this one would leave a
+/// TOCTOU window). `None` leaves `enabled` untouched, matching the previous
+/// behaviour for every other caller.
 pub fn update_flow_graph(
     config: &Config,
     id: &str,
     name: String,
     graph: tinyflows::model::WorkflowGraph,
     require_approval: bool,
-) -> Result<Flow> {
-    let graph_json = serde_json::to_string(&graph).context("Failed to serialize graph")?;
+    enabled_override: Option<bool>,
+    expected_updated_at: Option<&str>,
+) -> std::result::Result<Flow, FlowUpdateError> {
+    let current = get_flow(config, id)
+        .map_err(FlowUpdateError::Store)?
+        .ok_or(FlowUpdateError::NotFound)?;
+
+    // Optimistic-concurrency check: refuse if the flow moved on since the
+    // caller observed `expected_updated_at`.
+    if let Some(expected) = expected_updated_at {
+        if current.updated_at != expected {
+            return Err(FlowUpdateError::Conflict(Box::new(current)));
+        }
+    }
+
+    let graph_json = serde_json::to_string(&graph)
+        .context("Failed to serialize graph")
+        .map_err(FlowUpdateError::Store)?;
+    let prior_graph_json =
+        serde_json::to_string(&current.graph).unwrap_or_else(|_| "null".to_string());
     let now = Utc::now().to_rfc3339();
-    // Targeted UPDATE of only the editable columns, so a concurrent
-    // `set_enabled` / `record_run` isn't clobbered by writing back a stale
-    // `enabled` / `last_run_at` / `last_status` from a read-modify-write.
-    let changed = with_connection(config, |conn| {
+    let new_enabled = enabled_override.unwrap_or(current.enabled);
+
+    with_connection(config, |conn| {
+        // Guarded UPDATE keyed on the observed updated_at (race-safe even
+        // without an explicit expected version) — a concurrent writer that
+        // moved updated_at makes this match 0 rows. Targeted columns only, so a
+        // concurrent set_enabled/record_run isn't clobbered (unless this call
+        // itself carries an `enabled_override`, in which case `enabled` is
+        // one of the targeted columns by design).
+        let changed = conn
+            .execute(
+                "UPDATE flow_definitions SET name = ?1, graph_json = ?2, updated_at = ?3, \
+                 require_approval = ?4, enabled = ?5 WHERE id = ?6 AND updated_at = ?7",
+                params![
+                    name,
+                    graph_json,
+                    now,
+                    if require_approval { 1 } else { 0 },
+                    if new_enabled { 1 } else { 0 },
+                    id,
+                    current.updated_at,
+                ],
+            )
+            .context("Failed to update flow")?;
+        if changed == 0 {
+            // Someone raced us between the read and the write.
+            anyhow::bail!("__conflict__");
+        }
+        // Capture the prior graph as a revision, then prune to the cap.
+        let rev_id = Uuid::new_v4().to_string();
         conn.execute(
-            "UPDATE flow_definitions SET name = ?1, graph_json = ?2, updated_at = ?3, \
-             require_approval = ?4 WHERE id = ?5",
+            "INSERT INTO flow_revisions (id, flow_id, graph_json, name, require_approval, \
+             created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                name,
-                graph_json,
+                rev_id,
+                id,
+                prior_graph_json,
+                current.name,
+                if current.require_approval { 1 } else { 0 },
                 now,
-                if require_approval { 1 } else { 0 },
-                id
             ],
         )
-        .context("Failed to update flow")
+        .context("Failed to record flow revision")?;
+        conn.execute(
+            "DELETE FROM flow_revisions WHERE flow_id = ?1 AND id NOT IN (\
+                SELECT id FROM flow_revisions WHERE flow_id = ?1 \
+                ORDER BY created_at DESC, id DESC LIMIT ?2)",
+            params![id, MAX_REVISIONS_PER_FLOW as i64],
+        )
+        .context("Failed to prune flow revisions")?;
+        Ok(())
+    })
+    .map_err(|e| {
+        if e.to_string().contains("__conflict__") {
+            // Re-read to hand back the current state.
+            match get_flow(config, id) {
+                Ok(Some(f)) => FlowUpdateError::Conflict(Box::new(f)),
+                Ok(None) => FlowUpdateError::NotFound,
+                Err(e) => FlowUpdateError::Store(e),
+            }
+        } else {
+            FlowUpdateError::Store(e)
+        }
     })?;
-    if changed == 0 {
-        anyhow::bail!("flow '{id}' not found");
-    }
-    get_flow(config, id)?.ok_or_else(|| anyhow::anyhow!("flow '{id}' not found"))
+
+    get_flow(config, id)
+        .map_err(FlowUpdateError::Store)?
+        .ok_or(FlowUpdateError::NotFound)
+}
+
+/// Lists a flow's revision snapshots, newest first, up to `limit`.
+pub fn list_revisions(config: &Config, flow_id: &str, limit: usize) -> Result<Vec<FlowRevision>> {
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, flow_id, graph_json, name, require_approval, created_at \
+             FROM flow_revisions WHERE flow_id = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![flow_id, limit as i64], map_revision_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+}
+
+/// Fetches one revision by id (scoped to `flow_id`), or `None`.
+pub fn revision_by_id(
+    config: &Config,
+    flow_id: &str,
+    revision_id: &str,
+) -> Result<Option<FlowRevision>> {
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, flow_id, graph_json, name, require_approval, created_at \
+             FROM flow_revisions WHERE flow_id = ?1 AND id = ?2",
+        )?;
+        let mut rows = stmt.query_map(params![flow_id, revision_id], map_revision_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    })
+}
+
+fn map_revision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlowRevision> {
+    let graph_str: String = row.get(2)?;
+    let graph: serde_json::Value =
+        serde_json::from_str(&graph_str).unwrap_or(serde_json::Value::Null);
+    Ok(FlowRevision {
+        id: row.get(0)?,
+        flow_id: row.get(1)?,
+        graph,
+        name: row.get(3)?,
+        require_approval: row.get::<_, i64>(4)? != 0,
+        created_at: row.get(5)?,
+    })
 }
 
 /// Records the outcome of a `flows_run` invocation onto the flow's summary
@@ -399,6 +618,18 @@ pub fn kv_set(
 const FLOW_RUN_COLUMNS: &str = "id, flow_id, thread_id, status, started_at, finished_at, \
      steps_json, pending_approvals_json, error";
 
+/// Default per-flow run-history retention cap: how many of the most-recent runs
+/// a single flow keeps before older *terminal* runs are pruned on the next
+/// insert (and by the manual `flows_prune_runs` sweep). Bounds unbounded
+/// `flow_runs` growth for a hot, frequently-triggered flow while keeping enough
+/// history for the run-history inspector.
+///
+/// Non-terminal runs (`running`, `pending_approval`) are **never** pruned — a
+/// parked `pending_approval` run must survive so a later `flows_resume` can find
+/// it — so the effective row count for a flow may briefly exceed this cap by the
+/// number of live/parked runs. See [`prune_flow_runs`].
+pub const MAX_FLOW_RUNS_PER_FLOW: usize = 100;
+
 /// Inserts the initial `"running"` row for a new `flows_run` / `flows_resume`
 /// invocation. `id` and `thread_id` are the same value in practice (the
 /// tinyflows checkpointer thread id doubles as the run's stable identifier),
@@ -418,8 +649,54 @@ pub fn insert_flow_run(
             params![id, flow_id, thread_id, started_at],
         )
         .context("Failed to insert flow run")?;
+        // Retention: prune older terminal runs for this flow on every new-run
+        // insert, so `flow_runs` stays bounded for a hot flow. Same connection
+        // as the insert — atomic w.r.t. this write. A pruning failure is not
+        // fatal to the insert (the run itself matters more than trimming
+        // history), so it's logged and swallowed.
+        if let Err(e) = prune_flow_runs_conn(conn, flow_id, MAX_FLOW_RUNS_PER_FLOW) {
+            tracing::warn!(target: "flows", flow_id, error = %e, "[flows] insert_flow_run: retention prune failed (insert kept)");
+        }
         Ok(())
     })
+}
+
+/// Prunes a flow's run history down to at most `keep` of its most-recent runs,
+/// deleting only **terminal** rows (`completed` / `failed` / `cancelled`) that
+/// fall outside the newest-`keep` window. Non-terminal runs (`running`,
+/// `pending_approval`) are never deleted — a parked `pending_approval` run must
+/// never be pruned out from under a pending `flows_resume`, and a `running` row
+/// belongs to a live task. Returns the number of rows deleted.
+///
+/// `keep` is clamped to at least 1. Exposed for the manual `flows_prune_runs`
+/// sweep; the new-run insert path calls the connection-scoped helper directly.
+pub fn prune_flow_runs(config: &Config, flow_id: &str, keep: usize) -> Result<usize> {
+    with_connection(config, |conn| prune_flow_runs_conn(conn, flow_id, keep))
+}
+
+/// Connection-scoped core of [`prune_flow_runs`] — see its doc. Kept separate so
+/// the new-run insert path can prune inside its own `with_connection` block
+/// without reopening the database.
+fn prune_flow_runs_conn(conn: &Connection, flow_id: &str, keep: usize) -> Result<usize> {
+    let keep = i64::try_from(keep.max(1)).context("Run retention cap overflow")?;
+    let deleted = conn
+        .execute(
+            "DELETE FROM flow_runs
+              WHERE flow_id = ?1
+                AND status NOT IN ('running', 'pending_approval')
+                AND id NOT IN (
+                    SELECT id FROM flow_runs
+                     WHERE flow_id = ?1
+                     ORDER BY started_at DESC, id DESC
+                     LIMIT ?2
+                )",
+            params![flow_id, keep],
+        )
+        .context("Failed to prune flow runs")?;
+    if deleted > 0 {
+        tracing::debug!(target: "flows", flow_id, deleted, keep, "[flows] pruned old terminal flow runs past retention cap");
+    }
+    Ok(deleted)
 }
 
 /// Finalizes a flow run row: settles its terminal `status`, `finished_at`,
@@ -447,6 +724,153 @@ pub fn finish_flow_run(
         )
         .context("Failed to finish flow run")?;
         Ok(())
+    })
+}
+
+/// Incrementally upserts a single [`FlowRunStep`] onto a live `flow_runs`
+/// row's `steps_json`, keyed by `node_id` — used by the run observer
+/// (`flows::observability::FlowRunObserver`) to persist each node's step **as
+/// it finishes** (issue G2, live run observation) rather than only rebuilding
+/// the whole step list at settle.
+///
+/// Read-modify-write under a single connection (the WAL + `busy_timeout=5000`
+/// this store opens with tolerates the concurrent settle write). A re-run of
+/// the same `node_id` (a retry, or a resumed run re-touching a node) replaces
+/// its prior entry rather than duplicating it, so the persisted list stays one
+/// entry per node. No-op if the run's start row hasn't been inserted yet
+/// (nothing to update) — mirrors the best-effort contract of the run-row
+/// writers in `flows::ops`.
+pub fn upsert_flow_run_step(config: &Config, run_id: &str, step: &FlowRunStep) -> Result<()> {
+    use rusqlite::OptionalExtension;
+    with_connection(config, |conn| {
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT steps_json FROM flow_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read flow run steps for incremental upsert")?;
+        let Some(raw) = existing else {
+            tracing::debug!(target: "flows", run_id, node = %step.node_id, "[flows] upsert_flow_run_step: no run row yet — skipping incremental step persist");
+            return Ok(());
+        };
+        let mut steps: Vec<FlowRunStep> =
+            serde_json::from_str(&raw).context("Failed to deserialize existing flow run steps")?;
+        match steps.iter_mut().find(|s| s.node_id == step.node_id) {
+            Some(slot) => *slot = step.clone(),
+            None => steps.push(step.clone()),
+        }
+        let steps_json =
+            serde_json::to_string(&steps).context("Failed to serialize flow run steps")?;
+        conn.execute(
+            "UPDATE flow_runs SET steps_json = ?1 WHERE id = ?2",
+            params![steps_json, run_id],
+        )
+        .context("Failed to persist incremental flow run step")?;
+        tracing::debug!(target: "flows", run_id, node = %step.node_id, step_count = steps.len(), "[flows] persisted incremental flow run step");
+        Ok(())
+    })
+}
+
+/// Expires every parked `pending_approval` run whose "parked since" timestamp
+/// (`COALESCE(finished_at, started_at)` — a run's `finished_at` is stamped when
+/// it pauses at a gate) is strictly older than `cutoff` (an RFC3339 instant),
+/// transitioning it to a terminal `"cancelled"` status stamped `now` with
+/// `error_msg`. Returns the `(run_id, flow_id)` of each swept run so the caller
+/// can update the flow summary + drop the durable checkpoint (issue G4 —
+/// parked-run TTL).
+///
+/// RFC3339 timestamps produced by `chrono::Utc::…to_rfc3339()` all carry the
+/// same `+00:00` offset, so a lexicographic `<` is a valid chronological
+/// comparison here. Best-effort by contract at the call site: the update runs
+/// under the same WAL + `busy_timeout` connection as every other write.
+pub fn expire_parked_runs(
+    config: &Config,
+    cutoff: &str,
+    now: &str,
+    error_msg: &str,
+) -> Result<Vec<(String, String)>> {
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, flow_id FROM flow_runs
+             WHERE status = 'pending_approval'
+               AND COALESCE(finished_at, started_at) < ?1",
+        )?;
+        let stale: Vec<(String, String)> = stmt
+            .query_map(params![cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+
+        for (run_id, _flow_id) in &stale {
+            // Re-check the status in the WHERE so a run resumed/cancelled
+            // between the SELECT and here is not clobbered.
+            conn.execute(
+                "UPDATE flow_runs SET status = 'cancelled', finished_at = ?1, error = ?2 \
+                 WHERE id = ?3 AND status = 'pending_approval'",
+                params![now, error_msg, run_id],
+            )
+            .context("Failed to expire parked flow run")?;
+        }
+        if !stale.is_empty() {
+            tracing::info!(target: "flows", swept = stale.len(), "[flows] expired parked pending_approval runs past TTL");
+        }
+        Ok(stale)
+    })
+}
+
+/// Lists the `(id, flow_id)` of every run persisted at `status = 'running'`
+/// whose `started_at` is strictly **before** `started_before` (RFC3339). Used by
+/// the boot-time orphan sweep (bug B42): after a crash/restart no in-process
+/// task is executing these rows, so
+/// [`crate::openhuman::flows::ops::sweep_orphaned_running_runs_on_boot`]
+/// reconciles each one that isn't backed by a live in-flight run to a terminal
+/// `'interrupted'` via [`mark_run_interrupted`].
+///
+/// The `started_before` floor is what makes the sweep provably unable to touch
+/// a run **this** process started: the sweep passes the instant this process
+/// first entered the flow-run lifecycle, and every row this process inserts is
+/// stamped at or after that instant. Without it, the sweep's only guard is the
+/// in-flight registry, which a row briefly escapes between `start_flow_run_row`
+/// and `run_registry::register`. `started_at` is a fixed-shape UTC RFC3339
+/// string, so the lexicographic `<` matches chronological order (same
+/// comparison the parked-run TTL sweep already relies on).
+pub fn list_running_run_ids(
+    config: &Config,
+    started_before: &str,
+) -> Result<Vec<(String, String)>> {
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, flow_id FROM flow_runs WHERE status = 'running' AND started_at < ?1",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![started_before], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    })
+}
+
+/// Reconciles a single orphaned `'running'` run row to a terminal
+/// `'interrupted'` status stamped `now` (RFC3339) with `reason`, guarded by a
+/// `status = 'running'` predicate so a run that settled or was resumed
+/// concurrently is never clobbered. Returns `true` when a row was actually
+/// flipped (bug B42 — cancellation-safe finalizer + boot sweep). Best-effort by
+/// contract at the call site.
+pub fn mark_run_interrupted(config: &Config, id: &str, now: &str, reason: &str) -> Result<bool> {
+    with_connection(config, |conn| {
+        let changed = conn
+            .execute(
+                "UPDATE flow_runs SET status = 'interrupted', finished_at = ?1, error = ?2 \
+                 WHERE id = ?3 AND status = 'running'",
+                params![now, reason, id],
+            )
+            .context("Failed to reconcile orphaned running flow run")?;
+        if changed > 0 {
+            tracing::info!(target: "flows", run_id = id, "[flows] reconciled orphaned 'running' flow run to 'interrupted'");
+        }
+        Ok(changed > 0)
     })
 }
 
@@ -481,6 +905,25 @@ pub fn list_flow_runs(config: &Config, flow_id: &str, limit: usize) -> Result<Ve
     })
 }
 
+/// List the most recent runs across ALL flows, newest first (the "All runs"
+/// page). Uses the `idx_flow_runs_started_at` index for the ordering. Each
+/// [`FlowRun`] carries its own `flow_id`, so the UI can group/label by flow.
+pub fn list_all_flow_runs(config: &Config, limit: usize) -> Result<Vec<FlowRun>> {
+    with_connection(config, |conn| {
+        let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {FLOW_RUN_COLUMNS} FROM flow_runs \
+             ORDER BY started_at DESC, id DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map(params![lim], map_flow_run_row)?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    })
+}
+
 fn map_flow_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlowRun> {
     let steps_raw: String = row.get(6)?;
     let steps: Vec<FlowRunStep> = serde_json::from_str(&steps_raw).map_err(sql_conversion_error)?;
@@ -498,6 +941,160 @@ fn map_flow_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlowRun> {
         steps,
         pending_approvals,
         error: row.get(8)?,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// flow_suggestions — discovery-agent workflow suggestions (Flow Scout)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Shared column list for every `flow_suggestions` SELECT — keeps
+/// [`map_suggestion_row`]'s positional `row.get(N)` calls in sync with the query.
+const FLOW_SUGGESTION_COLUMNS: &str = "id, title, one_liner, rationale, trigger_hint, steps_json, \
+     connections_json, slugs_json, build_prompt, confidence, status, created_at, source_run_id";
+
+/// Inserts a batch of freshly discovered suggestions.
+///
+/// **Dedupe-preserving upsert.** Each suggestion's `id` is a stable content
+/// hash (see `discovery_tools`), so a re-run that re-proposes an identical idea
+/// hits `ON CONFLICT(id)` and refreshes the *pitch* fields — **without**
+/// resetting a `status` the user already set. This is the invariant that keeps a
+/// dismissed idea dismissed and a built idea built across repeated discovery
+/// runs: the `status` and `created_at` columns are deliberately excluded from
+/// the `DO UPDATE SET` list. Returns the number of rows written.
+pub fn upsert_suggestions(config: &Config, suggestions: &[FlowSuggestion]) -> Result<usize> {
+    if suggestions.is_empty() {
+        return Ok(0);
+    }
+    with_connection(config, |conn| {
+        let mut written = 0usize;
+        for s in suggestions {
+            let steps_json = serde_json::to_string(&s.steps_outline)
+                .context("Failed to serialize suggestion steps")?;
+            let connections_json = serde_json::to_string(&s.suggested_connections)
+                .context("Failed to serialize suggestion connections")?;
+            let slugs_json = serde_json::to_string(&s.suggested_slugs)
+                .context("Failed to serialize suggestion slugs")?;
+            conn.execute(
+                "INSERT INTO flow_suggestions
+                    (id, title, one_liner, rationale, trigger_hint, steps_json,
+                     connections_json, slugs_json, build_prompt, confidence, status,
+                     created_at, source_run_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(id) DO UPDATE SET
+                    title = excluded.title,
+                    one_liner = excluded.one_liner,
+                    rationale = excluded.rationale,
+                    trigger_hint = excluded.trigger_hint,
+                    steps_json = excluded.steps_json,
+                    connections_json = excluded.connections_json,
+                    slugs_json = excluded.slugs_json,
+                    build_prompt = excluded.build_prompt,
+                    confidence = excluded.confidence,
+                    source_run_id = excluded.source_run_id",
+                params![
+                    s.id,
+                    s.title,
+                    s.one_liner,
+                    s.rationale,
+                    s.trigger_hint,
+                    steps_json,
+                    connections_json,
+                    slugs_json,
+                    s.build_prompt,
+                    s.confidence,
+                    s.status.as_str(),
+                    s.created_at,
+                    s.source_run_id,
+                ],
+            )
+            .context("Failed to upsert flow suggestion")?;
+            written += 1;
+        }
+        tracing::debug!(count = written, "[flows] upserted flow suggestions");
+        Ok(written)
+    })
+}
+
+/// Lists persisted suggestions, newest first, highest-confidence first within a
+/// timestamp. When `status` is `Some`, only rows in that lifecycle state are
+/// returned (the UI passes `New` to render the active "Suggested for you"
+/// cards); `None` returns every status.
+pub fn list_suggestions(
+    config: &Config,
+    status: Option<SuggestionStatus>,
+    limit: usize,
+) -> Result<Vec<FlowSuggestion>> {
+    with_connection(config, |conn| {
+        let lim = i64::try_from(limit.max(1)).context("Suggestion limit overflow")?;
+        let mut out = Vec::new();
+        match status {
+            Some(st) => {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {FLOW_SUGGESTION_COLUMNS} FROM flow_suggestions WHERE status = ?1 \
+                     ORDER BY created_at DESC, confidence DESC, id ASC LIMIT ?2"
+                ))?;
+                let rows = stmt.query_map(params![st.as_str(), lim], map_suggestion_row)?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            None => {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {FLOW_SUGGESTION_COLUMNS} FROM flow_suggestions \
+                     ORDER BY created_at DESC, confidence DESC, id ASC LIMIT ?1"
+                ))?;
+                let rows = stmt.query_map(params![lim], map_suggestion_row)?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Updates one suggestion's lifecycle status (dismiss / mark built). Returns
+/// `true` when a row matched, `false` when the id was unknown (already pruned).
+pub fn set_suggestion_status(config: &Config, id: &str, status: SuggestionStatus) -> Result<bool> {
+    with_connection(config, |conn| {
+        let changed = conn
+            .execute(
+                "UPDATE flow_suggestions SET status = ?1 WHERE id = ?2",
+                params![status.as_str(), id],
+            )
+            .context("Failed to update flow suggestion status")?;
+        tracing::debug!(suggestion_id = %id, status = %status.as_str(), changed, "[flows] set suggestion status");
+        Ok(changed > 0)
+    })
+}
+
+fn map_suggestion_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlowSuggestion> {
+    let steps_raw: String = row.get(5)?;
+    let steps_outline: Vec<String> =
+        serde_json::from_str(&steps_raw).map_err(sql_conversion_error)?;
+    let connections_raw: String = row.get(6)?;
+    let suggested_connections: Vec<String> =
+        serde_json::from_str(&connections_raw).map_err(sql_conversion_error)?;
+    let slugs_raw: String = row.get(7)?;
+    let suggested_slugs: Vec<String> =
+        serde_json::from_str(&slugs_raw).map_err(sql_conversion_error)?;
+    let status_raw: String = row.get(10)?;
+
+    Ok(FlowSuggestion {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        one_liner: row.get(2)?,
+        rationale: row.get(3)?,
+        trigger_hint: row.get(4)?,
+        steps_outline,
+        suggested_connections,
+        suggested_slugs,
+        build_prompt: row.get(8)?,
+        confidence: row.get(9)?,
+        status: SuggestionStatus::from_str_lossy(&status_raw),
+        created_at: row.get(11)?,
+        source_run_id: row.get(12)?,
     })
 }
 

@@ -5,6 +5,7 @@
  * This module is pure data — no JSX, no React imports.  Icons are owned by
  * BottomTabBar.tsx and mapped from tab.id.
  */
+import { BILLING_DASHBOARD_URL } from '../utils/links';
 
 // ── Tab bar ──────────────────────────────────────────────────────────────────
 
@@ -20,8 +21,12 @@ export interface NavTab {
 }
 
 /**
- * Ordered list of sidebar nav entries. Four entries:
- *   chat → human → brain → connections
+ * Ordered list of sidebar nav entries:
+ *   chat → human → brain → flows → agent-world → connections
+ *
+ * Orchestration (TinyPlace multi-agent coordination) is no longer a top-level
+ * tab — it was folded back under Brain as the `/brain?tab=orchestration`
+ * sub-tab, so the sidebar stays lean.
  *
  * Settings has no primary tab — it's reached via the gear icon in the sidebar
  * header. Chat is the default landing and the merged Home surface: its empty
@@ -93,8 +98,7 @@ export const AVATAR_MENU_ITEMS: AvatarMenuItem[] = [
   {
     id: 'billing',
     labelKey: 'nav.avatarMenu.billing',
-    // Resolved at runtime via BILLING_DASHBOARD_URL; placeholder keeps typing clean.
-    target: 'https://tinyhumans.ai/dashboard',
+    target: BILLING_DASHBOARD_URL,
     kind: 'openUrl',
     cloudOnly: true,
   },

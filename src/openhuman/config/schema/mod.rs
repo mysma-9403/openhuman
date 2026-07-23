@@ -9,6 +9,8 @@ pub use cloud_providers::{
     generate_provider_id, is_slug_reserved, migrate_legacy_fields, AuthStyle, CloudProviderCreds,
     CloudProviderType,
 };
+pub mod subconscious;
+pub use subconscious::{MedullaLocalConfig, SubconsciousConfig, SubconsciousEngine};
 mod accessibility;
 mod agent;
 mod autocomplete;
@@ -39,6 +41,7 @@ mod privacy;
 mod proxy;
 mod routes;
 mod runtime;
+mod runtime_pool;
 mod runtime_python;
 mod scheduler_gate;
 mod storage_memory;
@@ -50,16 +53,16 @@ mod update;
 pub use accessibility::ScreenIntelligenceConfig;
 pub use agent::{
     AgentConfig, DelegateAgentConfig, MemoryContextWindow, MemoryWindowLimits,
-    OrchestratorModelConfig, TeamModelConfig,
+    OrchestratorModelConfig, RequiredOutputContract, TeamModelConfig,
 };
 pub use autocomplete::AutocompleteConfig;
 pub use autonomy::AutonomyConfig;
 pub use capability_providers::{CapabilityProviderConfig, CapabilityProviderTrustState};
 pub use channels::{
-    AuditConfig, ChannelsConfig, DingTalkConfig, DiscordConfig, IMessageConfig, IrcConfig,
-    LarkConfig, LarkReceiveMode, MatrixConfig, MattermostConfig, QQConfig, ResourceLimitsConfig,
-    SandboxBackend, SandboxConfig, SecurityConfig, SignalConfig, SlackConfig, StreamMode,
-    TelegramConfig, WebhookConfig, WhatsAppConfig,
+    AuditConfig, ChannelsConfig, DingTalkConfig, DiscordConfig, EmailConfig, IMessageConfig,
+    IrcConfig, LarkConfig, LarkReceiveMode, LinqConfig, MatrixConfig, MattermostConfig, QQConfig,
+    ResourceLimitsConfig, SandboxBackend, SandboxConfig, SecurityConfig, SignalConfig, SlackConfig,
+    StreamMode, TelegramConfig, WebhookConfig, WhatsAppConfig, YuanbaoConfig,
 };
 pub use context::ContextConfig;
 pub use dashboard::{DashboardConfig, DiagramViewerConfig, EventStreamConfig, ModelHealthConfig};
@@ -71,7 +74,10 @@ pub use local_ai::{LocalAiConfig, LocalAiUsage};
 pub use meet::{AutoJoinPolicy, AutoSummarizePolicy, CalendarProvider, MeetConfig};
 pub use node::NodeConfig;
 pub use observability::{AgentTracingBackend, AgentTracingConfig, ObservabilityConfig};
-pub use orchestration::OrchestrationConfig;
+pub use orchestration::{
+    MedullaClientConfig, MedullaCycleConfig, MedullaCycleLimits, MedullaPromptOverrides,
+    MedullaVerification, OrchestrationConfig,
+};
 pub use privacy::{PrivacyConfig, PrivacyMode};
 pub use proxy::{
     apply_runtime_proxy_to_builder, build_runtime_proxy_client,
@@ -82,6 +88,7 @@ pub use routes::{EmbeddingRouteConfig, ModelRouteConfig};
 pub use runtime::{
     DockerRuntimeConfig, ReliabilityConfig, RuntimeConfig, SchedulerConfig, ShellConfig,
 };
+pub use runtime_pool::{RuntimePoolConfig, RuntimePoolLangConfig};
 pub use runtime_python::RuntimePythonConfig;
 pub use scheduler_gate::{SchedulerGateConfig, SchedulerGateMode};
 pub use storage_memory::{

@@ -5,21 +5,19 @@ from generic namespace memory and from `learning::tool_tracker` statistics.
 
 ## Namespace convention
 
-Each tool gets its own namespace `tool-{tool_name}`. Build the string via
-[`types::tool_memory_namespace`] — never hard-code it.
+Each tool gets its own namespace `tool-{tool_name}`. Build the string via the
+`tool_memory_namespace` re-export — never hard-code it.
 
 ## Layout
 
 | Path | Role |
 | --- | --- |
 | [`mod.rs`](mod.rs) | Module root + public re-exports. |
-| [`types.rs`](types.rs) | `ToolMemoryRule` (id, tool_name, rule text, priority, source, tags, created_at, updated_at) + `ToolMemoryPriority` (Normal / High / Critical) + `ToolMemorySource` (UserExplicit / PostTurn / Programmatic) + `tool_memory_namespace(tool_name)`. |
-| [`store.rs`](store.rs) | `ToolMemoryStore` over `Arc<dyn Memory>`: `put_rule`, `get_rule`, `list_rules`, `delete_rule`, `rules_for_prompt`, `list_tool_names`, `record`, `list_rules_json`. |
-| [`store_tests.rs`](store_tests.rs) | Store coverage against the `MockMemory` from `test_helpers`. |
-| [`capture.rs`](capture.rs) | `ToolMemoryCaptureHook` — `PostTurnHook` impl that captures user edicts and repeated tool failures into the store. |
-| [`prompt.rs`](prompt.rs) | `ToolMemoryRulesSection` + `render_tool_memory_rules` — prompt section that pins Critical / High rules into the system prompt so they survive compression. `TOOL_MEMORY_HEADING` + `TOOL_MEMORY_PROMPT_CAP` constants. |
+| [`mod.rs`](mod.rs) | Re-exports crate types/store and defines `tool_memory_store(Arc<dyn Memory>)`. |
+| [`capture.rs`](capture.rs) | `ToolMemoryCaptureHook` — `PostTurnHook` impl that captures user edicts and repeated tool failures into the store (host-retained). |
+| [`prompt.rs`](prompt.rs) | **Shim** — re-exports the crate `ToolMemoryRulesSection` + `render_tool_memory_rules` + `TOOL_MEMORY_HEADING`, and keeps the host `PromptSection` impl that plugs the section into the system-prompt builder. |
 | [`tools/`](tools/) | Agent-facing read/write tools: `MemoryToolsListTool` (list rules for a tool), `MemoryToolsPutTool` (upsert a rule). |
-| [`test_helpers.rs`](test_helpers.rs) | `#[cfg(test)]` `MockMemory` used by `store_tests` + `capture::tests`. |
+| [`test_helpers.rs`](test_helpers.rs) | `#[cfg(test)]` `MockMemory` used by `capture::tests` (the store engine's own coverage lives in the crate). |
 
 ## How it fits
 
@@ -36,6 +34,5 @@ The agent harness:
 - No upward dependencies — only `memory::Memory` trait (via `Arc<dyn Memory>`)
   and project-wide primitives (`tools::traits::Tool`, `serde_json`).
 - `MockMemory` is `#[cfg(test)]`-only — never available outside test builds.
-- Re-exports in `mod.rs` are the public surface; the underlying submodules
-  are `pub` so test code can reach in but consumers should go through the
-  re-exports.
+- Re-exports in `mod.rs` are the public surface. Crate-owned type and store
+  forwarding files were removed; consumers should use the domain root.

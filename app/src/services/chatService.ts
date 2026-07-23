@@ -17,6 +17,8 @@ const chatLog = debug('realtime:chat');
 export interface ChatToolCallEvent {
   thread_id: string;
   request_id?: string;
+  /** Per-request monotonic ordering key stamped by the core progress bridge. */
+  seq?: number;
   tool_name: string;
   skill_id: string;
   args: Record<string, unknown>;
@@ -42,6 +44,8 @@ export interface ChatToolCallEvent {
 export interface ChatToolResultEvent {
   thread_id: string;
   request_id?: string;
+  /** Per-request monotonic ordering key stamped by the core progress bridge. */
+  seq?: number;
   tool_name: string;
   skill_id: string;
   output: string;
@@ -85,6 +89,8 @@ export interface TurnUsageWire {
 export interface ChatDoneEvent {
   thread_id: string;
   request_id?: string;
+  /** Per-request monotonic ordering key stamped by the core progress bridge. */
+  seq?: number;
   full_response: string;
   rounds_used: number;
   /**
@@ -126,6 +132,8 @@ export interface ChatSegmentEvent {
    */
   full_response: string;
   request_id: string;
+  /** Per-request monotonic ordering key stamped by the core progress bridge. */
+  seq?: number;
   segment_index: number;
   segment_total: number;
   reaction_emoji?: string | null;
@@ -135,6 +143,23 @@ export interface ChatSegmentEvent {
 /** Return the segment text from a {@link ChatSegmentEvent} (avoids the misleading wire name). */
 export function segmentText(event: ChatSegmentEvent): string {
   return event.full_response;
+}
+
+/**
+ * The parent agent's leading narration for one round, flushed mid-turn when a
+ * tool/subagent call closes that round. Emitted (`chat_interim`) so the
+ * narration persists as its own interleaved chat bubble instead of vanishing
+ * when the turn settles. `round` is the 1-based iteration it belongs to and
+ * makes a stable per-turn dedup key (one interim per round).
+ */
+export interface ChatInterimEvent {
+  thread_id: string;
+  request_id: string;
+  /** Per-request monotonic ordering key stamped by the core progress bridge. */
+  seq?: number;
+  /** Wire name is `full_response`; carries only this round's narration text. */
+  full_response: string;
+  round: number;
 }
 
 export interface ChatErrorEvent {
@@ -427,6 +452,13 @@ export interface ChatSubagentToolResultEvent {
    * `subagent.elapsed_ms`.
    */
   output?: string;
+  /**
+   * Optional structured failure explanation for a FAILED child tool call
+   * (#4459), present only when `success` is false. Parsed via
+   * `parseToolFailure` and stored on the child row so the "why / next" copy
+   * survives live (previously it was dropped until a snapshot reload).
+   */
+  failure?: unknown;
   subagent?: SubagentProgressDetail;
 }
 
@@ -441,6 +473,8 @@ export interface ChatSubagentToolResultEvent {
 export interface ChatSubagentTextDeltaEvent {
   thread_id: string;
   request_id: string;
+  /** Per-request monotonic ordering key stamped by the core progress bridge. */
+  seq?: number;
   /** Parent iteration index (inherited from the parent context). */
   round: number;
   /** Text fragment from the sub-agent. */
@@ -456,6 +490,8 @@ export interface ChatSubagentTextDeltaEvent {
 export interface ChatSubagentThinkingDeltaEvent {
   thread_id: string;
   request_id: string;
+  /** Per-request monotonic ordering key stamped by the core progress bridge. */
+  seq?: number;
   round: number;
   delta: string;
   subagent?: SubagentProgressDetail;
@@ -469,6 +505,8 @@ export interface ChatSubagentThinkingDeltaEvent {
 export interface ChatTextDeltaEvent {
   thread_id: string;
   request_id: string;
+  /** Per-request monotonic ordering key stamped by the core progress bridge. */
+  seq?: number;
   /** 1-based iteration index the chunk belongs to. */
   round: number;
   /** Text fragment; may be a single token or a few characters. */
@@ -484,6 +522,8 @@ export interface ChatTextDeltaEvent {
 export interface ChatThinkingDeltaEvent {
   thread_id: string;
   request_id: string;
+  /** Per-request monotonic ordering key stamped by the core progress bridge. */
+  seq?: number;
   round: number;
   delta: string;
 }
@@ -497,6 +537,8 @@ export interface ChatThinkingDeltaEvent {
 export interface ChatToolArgsDeltaEvent {
   thread_id: string;
   request_id: string;
+  /** Per-request monotonic ordering key stamped by the core progress bridge. */
+  seq?: number;
   round: number;
   tool_call_id: string;
   tool_name: string;
@@ -525,6 +567,7 @@ export interface ChatEventListeners {
   onSubagentTextDelta?: (event: ChatSubagentTextDeltaEvent) => void;
   onSubagentThinkingDelta?: (event: ChatSubagentThinkingDeltaEvent) => void;
   onSegment?: (event: ChatSegmentEvent) => void;
+  onInterim?: (event: ChatInterimEvent) => void;
   onTextDelta?: (event: ChatTextDeltaEvent) => void;
   onThinkingDelta?: (event: ChatThinkingDeltaEvent) => void;
   onToolArgsDelta?: (event: ChatToolArgsDeltaEvent) => void;
@@ -540,8 +583,16 @@ export interface ChatEventListeners {
 }
 
 export function subscribeChatEvents(listeners: ChatEventListeners): () => void {
-  const socket = socketService.getSocket();
-  if (!socket) return () => {};
+  // Register through the socketService wrapper (not the raw socket instance)
+  // so chat listeners get the same lifecycle guarantees as every other
+  // subscription: queued while the socket is still connecting (the raw-socket
+  // path silently no-opped when `getSocket()` was null, dropping the whole
+  // chat event stream until the next re-subscribe) and re-attached when the
+  // service flushes pending listeners on (re)connect.
+  const socket = {
+    on: (event: string, cb: (...args: unknown[]) => void) => socketService.on(event, cb),
+    off: (event: string, cb: (...args: unknown[]) => void) => socketService.off(event, cb),
+  };
 
   const handlers: Array<[string, (...args: unknown[]) => void]> = [];
   // Canonical convention for web-channel events is snake_case.
@@ -563,6 +614,7 @@ export function subscribeChatEvents(listeners: ChatEventListeners): () => void {
     subagentTextDelta: 'subagent_text_delta',
     subagentThinkingDelta: 'subagent_thinking_delta',
     segment: 'chat_segment',
+    interim: 'chat_interim',
     textDelta: 'text_delta',
     thinkingDelta: 'thinking_delta',
     toolArgsDelta: 'tool_args_delta',
@@ -823,6 +875,22 @@ export function subscribeChatEvents(listeners: ChatEventListeners): () => void {
     handlers.push([EVENTS.segment, cb]);
   }
 
+  if (listeners.onInterim) {
+    const cb = (payload: unknown) => {
+      const e = payload as ChatInterimEvent;
+      chatLog(
+        '%s thread_id=%s request_id=%s round=%d',
+        EVENTS.interim,
+        e.thread_id,
+        e.request_id,
+        e.round
+      );
+      listeners.onInterim?.(e);
+    };
+    socket.on(EVENTS.interim, cb);
+    handlers.push([EVENTS.interim, cb]);
+  }
+
   if (listeners.onTextDelta) {
     const cb = (payload: unknown) => {
       const e = payload as ChatTextDeltaEvent;
@@ -918,7 +986,7 @@ export function subscribeChatEvents(listeners: ChatEventListeners): () => void {
   }
 
   // Artifact lifecycle events (#2779). The Rust subscriber in
-  // `channels/providers/web::ArtifactSurfaceSubscriber` packs the
+  // `web_chat::ArtifactSurfaceSubscriber` packs the
   // artifact payload into the generic `args` field of the wire
   // envelope (kept the WebChannelEvent struct shape stable to avoid
   // touching ~10 existing call sites with `..Default::default()`).

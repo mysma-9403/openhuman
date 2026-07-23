@@ -25,10 +25,15 @@ vi.mock('../../lib/orchestration/orchestrationClient', async importOriginal => {
     ...actual,
     orchestrationClient: {
       sessionsList: vi.fn(),
+      sessionsCreate: vi.fn(),
       messagesList: vi.fn(),
       sendMasterMessage: vi.fn(),
       markRead: vi.fn(),
       status: vi.fn(),
+      selfIdentity: vi.fn(),
+      publishIdentity: vi.fn(),
+      relayInfo: vi.fn(),
+      attention: vi.fn(),
     },
   };
 });
@@ -39,11 +44,19 @@ vi.mock('../../services/socketService', () => {
 
 vi.mock('../../lib/i18n/I18nContext', () => ({ useT: () => ({ t: (k: string) => k }) }));
 
+vi.mock('../../utils/tauriCommands/subconscious', () => ({
+  subconsciousTrigger: vi.fn(async () => ({ result: { triggered: true }, logs: [] })),
+}));
+
 const sessionsListMock = vi.mocked(orchestrationClient.sessionsList);
+const sessionsCreateMock = vi.mocked(orchestrationClient.sessionsCreate);
 const messagesListMock = vi.mocked(orchestrationClient.messagesList);
 const sendMasterMock = vi.mocked(orchestrationClient.sendMasterMessage);
 const markReadMock = vi.mocked(orchestrationClient.markRead);
 const statusMock = vi.mocked(orchestrationClient.status);
+const selfIdentityMock = vi.mocked(orchestrationClient.selfIdentity);
+const relayInfoMock = vi.mocked(orchestrationClient.relayInfo);
+const attentionMock = vi.mocked(orchestrationClient.attention);
 
 const pairingListMock = vi.mocked(apiClient.orchestrationPairing.list);
 const pairingLinkMock = vi.mocked(apiClient.orchestrationPairing.linkSession);
@@ -63,6 +76,7 @@ const PINNED_SESSIONS = [
     unread: 0,
     active: true,
     pinned: true,
+    status: 'idle' as const,
   },
   {
     sessionId: 'subconscious',
@@ -73,6 +87,7 @@ const PINNED_SESSIONS = [
     unread: 0,
     active: true,
     pinned: true,
+    status: 'idle' as const,
   },
 ];
 
@@ -80,10 +95,39 @@ describe('TinyPlaceOrchestrationTab', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     sessionsListMock.mockResolvedValue({ sessions: [...PINNED_SESSIONS] });
+    sessionsCreateMock.mockResolvedValue({
+      session: {
+        sessionId: 'new-sess',
+        agentId: '@peer',
+        source: 'user_created',
+        chatKind: 'session',
+        lastMessageAt: '2026-07-04T00:00:00.000Z',
+        unread: 0,
+        active: true,
+        pinned: false,
+        status: 'idle' as const,
+      },
+    });
     messagesListMock.mockResolvedValue({ messages: [] });
     sendMasterMock.mockResolvedValue({ ok: true, messageId: 'm-1' });
     markReadMock.mockResolvedValue({ ok: true });
     statusMock.mockResolvedValue({});
+    selfIdentityMock.mockResolvedValue({
+      agentId: '6wNaBJkatir4B86cw5ykHZWQ3xoNaKygX5vAU9MQbHSh',
+      handles: [{ username: 'openhuman', primary: true }],
+      primaryHandle: 'openhuman',
+      cardPublished: true,
+      keyPublished: true,
+      discoverable: true,
+    });
+    relayInfoMock.mockResolvedValue({
+      baseUrl: 'https://staging-api.tiny.place',
+      network: 'staging',
+    });
+    attentionMock.mockResolvedValue({
+      items: [],
+      counts: { total: 0, approvals: 0, needsInput: 0, unread: 0 },
+    });
     pairingListMock.mockResolvedValue({
       records: [],
       contacts: { contacts: [] },
@@ -120,6 +164,29 @@ describe('TinyPlaceOrchestrationTab', () => {
     });
   });
 
+  it('steering header shows the directive and Run review triggers a subconscious tick', async () => {
+    const { subconsciousTrigger } = await import('../../utils/tauriCommands/subconscious');
+    statusMock.mockResolvedValue({
+      steering: {
+        text: 'prioritize the billing migration',
+        createdAt: '2026-07-04T00:00:00.000Z',
+        expiresAfterCycles: 12,
+      },
+      lastTickAt: 1_700_000_000,
+    });
+
+    render(<TinyPlaceOrchestrationTab />);
+
+    // Open the pinned Subconscious window.
+    fireEvent.click(await screen.findByTestId('tinyplace-chat-subconscious'));
+
+    const header = await screen.findByTestId('tinyplace-steering-header');
+    expect(within(header).getByText('prioritize the billing migration')).toBeInTheDocument();
+
+    fireEvent.click(within(header).getByText('tinyplaceOrchestration.steeringHeader.runReview'));
+    await waitFor(() => expect(subconsciousTrigger).toHaveBeenCalledWith('all'));
+  });
+
   it('renders pinned master and subconscious chats plus app sessions', async () => {
     sessionsListMock.mockResolvedValue({
       sessions: [
@@ -134,6 +201,7 @@ describe('TinyPlaceOrchestrationTab', () => {
           unread: 0,
           active: true,
           pinned: false,
+          status: 'idle' as const,
         },
       ],
     });
@@ -144,6 +212,19 @@ describe('TinyPlaceOrchestrationTab', () => {
     expect(await screen.findAllByText('tinyplaceOrchestration.master.title')).toHaveLength(2);
     expect(screen.getByText('tinyplaceOrchestration.subconscious.title')).toBeInTheDocument();
     expect(screen.getByText('OpenHuman app session')).toBeInTheDocument();
+  });
+
+  it('keeps the relay badge visible when identity discovery fails (locked wallet)', async () => {
+    // selfIdentity() builds the tiny.place client from the wallet and can reject;
+    // relayInfo() only reads the base URL and must stay visible regardless.
+    selfIdentityMock.mockRejectedValue(new Error('wallet locked'));
+
+    render(<TinyPlaceOrchestrationTab />);
+
+    const badge = await screen.findByTestId('tinyplace-relay-badge');
+    expect(badge).toHaveAttribute('data-network', 'staging');
+    // Identity read failed → its card must not render.
+    expect(screen.queryByTestId('tinyplace-self-identity')).not.toBeInTheDocument();
   });
 
   it('loads and renders messages for the opened chat', async () => {
@@ -160,6 +241,7 @@ describe('TinyPlaceOrchestrationTab', () => {
           unread: 0,
           active: true,
           pinned: false,
+          status: 'idle' as const,
         },
       ],
     });
@@ -213,6 +295,7 @@ describe('TinyPlaceOrchestrationTab', () => {
           unread: 3,
           active: true,
           pinned: false,
+          status: 'idle' as const,
         },
       ],
     });
@@ -321,6 +404,72 @@ describe('TinyPlaceOrchestrationTab', () => {
     await waitFor(() => expect(pairingAcceptMock).toHaveBeenCalledWith('@worker-pending'));
   });
 
+  it('falls back to the contact requester address when agentId is absent', async () => {
+    // The relay's /contacts/requests payload does not always populate the
+    // top-level agentId; the counterpart address lives in contact.requester.
+    const rawAddress = '3icjiLXhn6BMv43MsHjpKKxm7hEYBk7R5rvNXB1HUk7g';
+    pairingListMock.mockResolvedValue({
+      records: [],
+      contacts: { contacts: [] },
+      requests: {
+        incoming: [
+          {
+            agentId: '',
+            status: 'pending',
+            direction: 'incoming',
+            contact: {
+              requester: rawAddress,
+              addressee: '@openhuman',
+              status: 'pending',
+              createdAt: '2026-07-01T12:00:00.000Z',
+              updatedAt: '2026-07-01T12:00:00.000Z',
+            },
+          },
+        ],
+        outgoing: [],
+      },
+      stats: { agentId: '@openhuman', contactCount: 0, pendingIncoming: 1, pendingOutgoing: 0 },
+    });
+
+    render(<TinyPlaceOrchestrationTab />);
+
+    expect(await screen.findByText(rawAddress)).toBeInTheDocument();
+    fireEvent.click(screen.getByText('tinyplaceOrchestration.pairing.accept'));
+
+    await waitFor(() => expect(pairingAcceptMock).toHaveBeenCalledWith(rawAddress));
+  });
+
+  it('lists accepted contacts (address resolved from the contact record)', async () => {
+    const rawAddress = '3icjiLXhn6BMv43MsHjpKKxm7hEYBk7R5rvNXB1HUk7g';
+    pairingListMock.mockResolvedValue({
+      records: [],
+      contacts: {
+        contacts: [
+          {
+            agentId: '',
+            status: 'accepted',
+            direction: 'incoming',
+            contact: {
+              requester: rawAddress,
+              addressee: '@openhuman',
+              status: 'accepted',
+              createdAt: '2026-07-01T12:00:00.000Z',
+              updatedAt: '2026-07-01T12:00:00.000Z',
+            },
+          },
+        ],
+      },
+      requests: { incoming: [], outgoing: [] },
+      stats: { agentId: '@openhuman', contactCount: 1, pendingIncoming: 0, pendingOutgoing: 0 },
+    });
+
+    render(<TinyPlaceOrchestrationTab />);
+
+    // The accepted contact appears in the Contacts list, not just the count.
+    expect(await screen.findByText(rawAddress)).toBeInTheDocument();
+    expect(screen.getByText('tinyplaceOrchestration.contacts')).toBeInTheDocument();
+  });
+
   it('surfaces load errors and retries', async () => {
     sessionsListMock.mockRejectedValueOnce(new Error('rpc failed'));
 
@@ -333,5 +482,140 @@ describe('TinyPlaceOrchestrationTab', () => {
 
     await waitFor(() => expect(sessionsListMock).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('tinyplaceOrchestration.noMessages')).toBeInTheDocument();
+  });
+
+  const ACCEPTED_CONTACT_ADDRESS = '3icjiLXhn6BMv43MsHjpKKxm7hEYBk7R5rvNXB1HUk7g';
+  const acceptedContactSnapshot = () => ({
+    records: [],
+    contacts: {
+      contacts: [
+        {
+          agentId: ACCEPTED_CONTACT_ADDRESS,
+          status: 'accepted' as const,
+          direction: 'incoming' as const,
+          contact: {
+            requester: ACCEPTED_CONTACT_ADDRESS,
+            addressee: '@openhuman',
+            status: 'accepted' as const,
+            createdAt: '2026-07-01T12:00:00.000Z',
+            updatedAt: '2026-07-01T12:00:00.000Z',
+          },
+        },
+      ],
+    },
+    requests: { incoming: [], outgoing: [] },
+    stats: { agentId: '@openhuman', contactCount: 1, pendingIncoming: 0, pendingOutgoing: 0 },
+  });
+
+  it('creates a new session under an expanded contact', async () => {
+    pairingListMock.mockResolvedValue(acceptedContactSnapshot());
+
+    render(<TinyPlaceOrchestrationTab />);
+
+    // Expand the contact row (exposes state to assistive tech), then create.
+    const contactToggle = await screen.findByTestId(
+      `tinyplace-contact-${ACCEPTED_CONTACT_ADDRESS}`
+    );
+    expect(contactToggle).toHaveAttribute('aria-expanded', 'false');
+    fireEvent.click(contactToggle);
+    expect(contactToggle).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(await screen.findByTestId(`tinyplace-new-session-${ACCEPTED_CONTACT_ADDRESS}`));
+
+    await waitFor(() =>
+      expect(sessionsCreateMock).toHaveBeenCalledWith({ agentId: ACCEPTED_CONTACT_ADDRESS })
+    );
+  });
+
+  it('renders the attention zone and routes an open-session item to that chat', async () => {
+    sessionsListMock.mockResolvedValue({
+      sessions: [
+        ...PINNED_SESSIONS,
+        {
+          sessionId: 'app-session-1',
+          agentId: '@worker-alpha',
+          source: 'openhuman-app',
+          label: 'OpenHuman app session',
+          chatKind: 'session',
+          lastMessageAt: '2026-07-01T12:02:00.000Z',
+          unread: 2,
+          active: true,
+          pinned: false,
+          status: 'idle' as const,
+        },
+      ],
+    });
+    attentionMock.mockResolvedValue({
+      items: [
+        {
+          id: 'unread:app-session-1',
+          kind: 'unread',
+          instanceId: 'app-session-1',
+          title: 'Worker Alpha',
+          count: 2,
+          action: { type: 'open-session', sessionId: 'app-session-1' },
+        },
+      ],
+      counts: { total: 1, approvals: 0, needsInput: 0, unread: 1 },
+    });
+
+    render(<TinyPlaceOrchestrationTab />);
+
+    // The zone surfaces the item; acting on it opens the target session.
+    await screen.findByTestId('attention-item-unread:app-session-1');
+    fireEvent.click(screen.getByTestId('attention-item-action'));
+
+    await waitFor(() => expect(markReadMock).toHaveBeenCalledWith('app-session-1'));
+  });
+
+  it('shows the New instance launch shell as a disabled affordance', async () => {
+    render(<TinyPlaceOrchestrationTab />);
+
+    const launch = await screen.findByTestId('tinyplace-new-instance');
+    expect(launch).toBeDisabled();
+  });
+
+  it('threads a composed message under the selected session', async () => {
+    pairingListMock.mockResolvedValue(acceptedContactSnapshot());
+    sessionsListMock.mockResolvedValue({
+      sessions: [
+        ...PINNED_SESSIONS,
+        {
+          sessionId: 'sess-x',
+          agentId: ACCEPTED_CONTACT_ADDRESS,
+          source: 'user_created',
+          label: 'Design review',
+          chatKind: 'session',
+          lastMessageAt: '2026-07-01T12:02:00.000Z',
+          unread: 0,
+          active: true,
+          pinned: false,
+          status: 'idle' as const,
+        },
+      ],
+    });
+
+    render(<TinyPlaceOrchestrationTab />);
+
+    // Expand the contact, open its nested session, then send.
+    fireEvent.click(await screen.findByTestId(`tinyplace-contact-${ACCEPTED_CONTACT_ADDRESS}`));
+    fireEvent.click(await screen.findByTestId('tinyplace-chat-sess-x'));
+
+    const input = await screen.findByTestId('tinyplace-master-composer-input');
+    fireEvent.change(input, { target: { value: 'ping under session' } });
+    fireEvent.click(screen.getByTestId('tinyplace-master-composer-send'));
+
+    await waitFor(() =>
+      expect(sendMasterMock).toHaveBeenCalledWith({
+        body: 'ping under session',
+        recipient: ACCEPTED_CONTACT_ADDRESS,
+        sessionId: 'sess-x',
+      })
+    );
+  });
+
+  it('shows the cloud-unreachable banner when the hosted brain is offline', async () => {
+    statusMock.mockResolvedValue({ cloudReachable: false });
+    render(<TinyPlaceOrchestrationTab />);
+    expect(await screen.findByText('orchestration.cloudUnreachable')).toBeInTheDocument();
   });
 });

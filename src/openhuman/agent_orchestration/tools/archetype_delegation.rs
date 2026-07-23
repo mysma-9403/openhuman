@@ -3,7 +3,7 @@ use serde_json::json;
 use serde_json::Value;
 
 use crate::openhuman::tools::traits::{
-    PermissionLevel, Tool, ToolCallOptions, ToolCategory, ToolResult,
+    PermissionLevel, Tool, ToolCallOptions, ToolCategory, ToolResult, ToolTimeout,
 };
 use tinyagents::harness::tool::ToolExecutionContext;
 
@@ -63,6 +63,10 @@ impl Tool for ArchetypeDelegationTool {
                 "model": {
                     "type": "string",
                     "description": "Optional exact model id for this delegation only. Keeps the parent provider/routing, but pins the child agent to this model instead of the agent definition's default."
+                },
+                "blocking": {
+                    "type": "boolean",
+                    "description": "Default false: the delegation runs as a durable async worker — you immediately get an [async_subagent_ref] with a subagent_session_id (steer_subagent / wait_subagent / continue_subagent / close_subagent operate on it), and the finished result is inserted into this chat as a new turn. Pass true ONLY when the sub-agent's result must gate THIS reply (e.g. verify/review X before answering)."
                 }
             }
         })
@@ -74,6 +78,22 @@ impl Tool for ArchetypeDelegationTool {
 
     fn category(&self) -> ToolCategory {
         ToolCategory::System
+    }
+
+    /// Run **without** the global per-tool wall-clock deadline. This tool is a
+    /// delegation primitive: it hands a task to a bounded sub-agent
+    /// (`tools_agent` → `delegate_tools_agent`, `code_executor` → `run_code`,
+    /// …) and awaits that agent's full run. Under the default `Inherit` policy
+    /// the whole delegation is hard-killed at the single-tool timeout (120s) —
+    /// so any sub-agent run that legitimately exceeds two minutes is truncated
+    /// mid-flight (Sentry TAURI-RUST-K29 `delegate_tools_agent` and
+    /// TAURI-RUST-8HB `run_code`: thousands of 120.000s truncations). The
+    /// child's lifetime is already bounded internally — by its `max_iterations`,
+    /// the run cancellation token, and each inner tool's own timeout — so it
+    /// governs its own duration, exactly like the sibling `spawn_parallel_agents`
+    /// fan-out and the long-running scripting tools (`shell`, `node_exec`).
+    fn timeout_policy(&self, _args: &serde_json::Value) -> ToolTimeout {
+        ToolTimeout::Unbounded
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -108,13 +128,29 @@ impl Tool for ArchetypeDelegationTool {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
+        // Async by default: the delegated specialist runs as a durable,
+        // resumable worker and its result comes back as a new chat turn.
+        // `blocking: true` is the opt-in for results that must gate this
+        // reply. (`dispatch_subagent` itself falls back to blocking when
+        // there is no chat thread to deliver an async result into.)
+        let blocking = args
+            .get("blocking")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mode = if blocking {
+            super::dispatch::DispatchMode::Blocking
+        } else {
+            super::dispatch::DispatchMode::PreferAsync
+        };
+
         super::dispatch_subagent(
             &self.agent_id,
             &self.tool_name,
             &prompt,
             None,
             model_override,
-            tool_context.and_then(|ctx| ctx.workspace.clone()),
+            tool_context,
+            mode,
         )
         .await
     }
@@ -198,6 +234,39 @@ mod tests {
         assert_eq!(tool.description(), "Use for web and docs research.");
         assert_eq!(tool.permission_level(), PermissionLevel::Execute);
         assert_eq!(tool.category(), ToolCategory::System);
+    }
+
+    #[test]
+    fn delegation_opts_out_of_the_global_tool_timeout() {
+        // A delegated sub-agent run (delegate_tools_agent / run_code / …) can
+        // legitimately outlast the single-tool wall-clock default (120s): under
+        // `Inherit` every such run is hard-killed and truncated (Sentry
+        // TAURI-RUST-K29 / TAURI-RUST-8HB). The child bounds its own lifetime
+        // via its max_iterations, the run cancellation token, and each inner
+        // tool's own timeout — so this primitive must be Unbounded, like
+        // spawn_parallel_agents and the long-running scripting tools.
+        assert_eq!(
+            sample_tool().timeout_policy(&json!({})),
+            ToolTimeout::Unbounded,
+        );
+    }
+
+    #[test]
+    fn parameters_schema_advertises_async_default_blocking_opt_in() {
+        // Delegations are async by default (durable worker + follow-up
+        // delivery turn); `blocking: true` is the explicit opt-in for
+        // results that must gate the current reply. The flag must be
+        // advertised but never required.
+        let schema = sample_tool().parameters_schema();
+        let blocking = &schema["properties"]["blocking"];
+        assert_eq!(blocking["type"], "boolean");
+        let desc = blocking["description"].as_str().unwrap_or_default();
+        assert!(desc.contains("async"), "explains the async default: {desc}");
+        assert!(
+            desc.contains("continue_subagent") && desc.contains("subagent_session_id"),
+            "points at the resume contract: {desc}"
+        );
+        assert_eq!(schema["required"], json!(["prompt"]));
     }
 
     #[test]

@@ -138,15 +138,6 @@ pub enum DomainEvent {
         source: String,
     },
 
-    /// A tiny.place harness session DM was ingested and persisted. Metadata only
-    /// — bodies stay in the workspace-internal orchestration store. Consumed by
-    /// later stages (graph run, UI socket push).
-    OrchestrationSessionMessage {
-        agent_id: String,
-        session_id: String,
-        chat_kind: String,
-    },
-
     // ── Subconscious orchestrator ───────────────────────────────────────
     /// A subconscious trigger finished gate evaluation (promote or drop).
     /// Observability only — lets dashboards see ingestion volume and the
@@ -180,6 +171,20 @@ pub enum DomainEvent {
         thread_id: String,
         cancelled_request_id: String,
     },
+    /// One or more queued steer/collect messages were delivered into a running
+    /// turn's steering handle (the harness applies them at the next iteration
+    /// checkpoint). Restores the delivery visibility the legacy
+    /// `RunQueueMessageDelivered` event provided before the TinyAgents migration
+    /// (issue #4456). `mode` is `"steer"` or `"collect"`.
+    RunQueueMessageDelivered {
+        thread_id: String,
+        mode: String,
+        delivered: usize,
+    },
+    /// Residual steer messages that the turn ended or was cancelled before
+    /// applying were drained back into the session run queue so they become the
+    /// next turn's input instead of silently vanishing (issue #4456).
+    RunQueueSteerRequeued { thread_id: String, requeued: usize },
 
     // ── Monitor ───────────────────────────────────────────────────────
     /// A background monitor changed lifecycle state.
@@ -237,7 +242,7 @@ pub enum DomainEvent {
         /// Provider slug, e.g. `"openrouter"`.
         provider: String,
         /// Human-readable, actionable explanation (update the key in
-        /// Settings → AI). See `auth_error_registry::auth_error_message`.
+        /// Connections → API keys → LLM). See `auth_error_registry::auth_error_message`.
         message: String,
     },
 
@@ -350,6 +355,9 @@ pub enum DomainEvent {
         reply_target: String,
         content: String,
         thread_ts: Option<String>,
+        /// Provider-neutral envelope projected from the inbound channel message.
+        /// Legacy publishers may omit it until they adopt TinyChannels.
+        inbound_envelope: Option<tinychannels::ChannelInboundEnvelope>,
         /// Workspace directory active when this event was published.
         /// Subscribers that persist data must reject events whose
         /// `workspace_dir` does not match their own workspace binding.
@@ -436,6 +444,70 @@ pub enum DomainEvent {
     FlowScheduleTick {
         /// Identifier of the `flows::Flow` to run.
         flow_id: String,
+    },
+    /// Live per-step progress of an in-flight `flows_run` / `flows_resume`
+    /// (issue G2, live run observation). Published from
+    /// `flows::observability::FlowRunObserver::on_step_finish` as each
+    /// non-trigger node settles, so the Workflows UI can show a run advancing
+    /// node-by-node instead of only polling the settled `flow_runs` row. The
+    /// durable `flow_runs` row (updated incrementally by the same observer and
+    /// finalized at settle) remains the source of truth — this event is a
+    /// best-effort progress feed (broadcast bridges drop on lag), which is why
+    /// the frontend keeps its 2s poller as a fallback.
+    FlowRunProgress {
+        /// The run's stable identifier (== the tinyflows checkpointer thread id).
+        run_id: String,
+        /// The node whose step just finished.
+        node_id: String,
+        /// Step outcome: `"success"` | `"error"`.
+        status: String,
+    },
+
+    /// A `flows_run` (or `flows_resume`) invocation just persisted its
+    /// `flow_runs` row, before execution begins (issue B35, runs-rail live
+    /// refresh). Published from `flows::ops::flows_run` right after
+    /// `start_flow_run_row` returns, so the UI can show "Running" immediately
+    /// instead of waiting for the blocking RPC to resolve or the first
+    /// `FlowRunProgress` step. Covers every run source (Rpc/Schedule/AppEvent/
+    /// Resume, incl. copilot live-run) since they all funnel through
+    /// `start_flow_run_row`.
+    FlowRunStarted {
+        /// The affected flow's id.
+        flow_id: String,
+        /// The run's stable identifier (== the tinyflows checkpointer thread id).
+        run_id: String,
+    },
+
+    /// The terminal companion to [`FlowRunStarted`] (issue B35 follow-up, runs
+    /// rail live finish). Published from `flows::ops::finish_flow_run_row`
+    /// right after `store::finish_flow_run` persists the terminal
+    /// `flow_runs` row, so the UI can flip a run to Completed/Failed live
+    /// instead of relying on a poll to notice the settled row.
+    FlowRunFinished {
+        /// The affected flow's id.
+        flow_id: String,
+        /// The run's stable identifier (== the tinyflows checkpointer thread id).
+        run_id: String,
+        /// Terminal status: `"completed"` | `"failed"` |
+        /// `"completed_with_warnings"` | `"cancelled"`.
+        status: String,
+    },
+
+    /// A saved flow's definition changed (created / updated / deleted /
+    /// enable-toggled). Bridged to a `flow:changed` socket event so an open
+    /// Workflows list or canvas refetches instead of silently showing stale
+    /// state — most importantly, so an agent `save_workflow` becomes visible in
+    /// a canvas the user has open (audit F6). Best-effort (broadcast bridges
+    /// drop on lag); the UI's own refetch-on-focus remains the backstop.
+    FlowChanged {
+        /// The affected flow's id.
+        flow_id: String,
+        /// What happened: `"created"` | `"updated"` | `"deleted"` |
+        /// `"enabled_changed"`.
+        kind: String,
+        /// Who made the change: `"agent"` | `"user"` | `"system"` — a coarse
+        /// hint for the UI banner ("an assistant edited this flow").
+        actor: String,
     },
 
     // ── Skills ──────────────────────────────────────────────────────────
@@ -529,8 +601,63 @@ pub enum DomainEvent {
     ApprovalDecided {
         request_id: String,
         tool_name: String,
-        /// `"approve_once"`, `"approve_always_for_tool"`, or `"deny"`.
+        /// `"approve_once"`, `"approve_always_for_tool"`,
+        /// `"approve_always_for_flow"`, or `"deny"`.
         decision: String,
+    },
+    /// A `Workflow`-origin tool call parked in the `ApprovalGate` (issue
+    /// flow-approval-surface, PR2/PR3). Unlike `ApprovalRequested`, this
+    /// event carries no `thread_id`/`client_id` — a flow run has neither, so
+    /// the generic chat-routed socket bridge
+    /// (`web_chat::event_bus::ApprovalSurfaceSubscriber`)
+    /// silently drops it (that gap was the original silent-deadlock bug).
+    /// Published by `ApprovalGate::intercept_audited` alongside the existing
+    /// `ApprovalRequested`, bridged by `core::socketio` directly to a
+    /// broadcast (not per-room) `flow_approval_request` Socket.IO event so
+    /// the Workflows UI can surface and resolve the park without polling.
+    FlowApprovalRequested {
+        /// Unique id used to correlate the decision back to the parked
+        /// future — pass to `approval_decide` unchanged.
+        request_id: String,
+        /// The `flows::Flow` id whose run parked this call.
+        flow_id: String,
+        /// The run's stable identifier (== the tinyflows checkpointer
+        /// thread id).
+        run_id: String,
+        /// Tool name being gated (e.g. `"composio"`).
+        tool_name: String,
+        /// Short human-readable summary of the action (redacted, same as
+        /// `ApprovalRequested::action_summary`).
+        summary: String,
+    },
+
+    // ── Egress (privacy spine) ──────────────────────────────────────────
+    /// An external data transfer is about to leave the device. Published by
+    /// [`crate::openhuman::security::egress::emit_external_transfer`] from every
+    /// external-egress point (LLM inference, Composio tool calls, backend
+    /// integrations, network-fetch tools, cloud embeddings) *before* the
+    /// transfer, carrying an [`EgressDescriptor`](crate::openhuman::security::egress::EgressDescriptor)
+    /// that answers "what leaves, to where, why". Privacy epic S2 (#4436).
+    ///
+    /// Bridged to the `external_transfer_pending` web-channel socket event by
+    /// `EgressSurfaceSubscriber` (defined in
+    /// `src/openhuman/web_chat/event_bus.rs`) when the emitting
+    /// turn carries chat routing. `thread_id` / `client_id` come from the
+    /// ambient `APPROVAL_CHAT_CONTEXT` and are `None` for CLI / cron /
+    /// background transfers (no chat surface to route to).
+    ///
+    /// Only external transfers fire this event — local-only inference
+    /// (Ollama / LM Studio / …) never leaves the device and is not published.
+    ExternalTransferPending {
+        /// What leaves, to where, and why (plus S5 identification-risk fields,
+        /// default-empty until the detector lands).
+        descriptor: crate::openhuman::security::egress::EgressDescriptor,
+        /// Chat thread the transfer belongs to, when the turn originated from a
+        /// chat channel. `None` for non-chat callers.
+        thread_id: Option<String>,
+        /// Socket.IO client id (room) to surface the disclosure to, when known.
+        /// `None` for non-chat callers.
+        client_id: Option<String>,
     },
 
     // ── Plan review (interactive plan-mode gate) ────────────────────────
@@ -1169,6 +1296,10 @@ pub enum DomainEvent {
         command_text: String,
         recent_transcript: Vec<BackendMeetTurn>,
         timestamp_ms: u64,
+        /// Dual-mascot name addressing (#4277 follow-up): slot (0 = primary,
+        /// 1 = secondary) whose mascot name was addressed, or `None` when no
+        /// specific mascot was named. Forwarded to `bot:speak` as `mascotSlot`.
+        mascot_slot: Option<u8>,
     },
     /// Core asked the backend bot to speak into the call (`bot:speak`).
     /// Published for observability after the Socket.IO emit succeeds.
@@ -1260,10 +1391,11 @@ impl DomainEvent {
             | Self::AgentOrchestrationFailed { .. }
             | Self::AgentOrchestrationClosed { .. }
             | Self::OrchestrationPairingChanged { .. }
-            | Self::OrchestrationSessionMessage { .. }
             | Self::RunQueueMessageQueued { .. }
             | Self::RunQueueFollowupDispatched { .. }
-            | Self::RunQueueInterrupted { .. } => "agent",
+            | Self::RunQueueInterrupted { .. }
+            | Self::RunQueueMessageDelivered { .. }
+            | Self::RunQueueSteerRequeued { .. } => "agent",
 
             Self::MonitorStatusChanged { .. } | Self::MonitorLine { .. } => "monitor",
 
@@ -1293,7 +1425,11 @@ impl DomainEvent {
             | Self::CronJobCompleted { .. }
             | Self::CronDeliveryRequested { .. }
             | Self::ProactiveMessageRequested { .. }
-            | Self::FlowScheduleTick { .. } => "cron",
+            | Self::FlowScheduleTick { .. }
+            | Self::FlowRunProgress { .. }
+            | Self::FlowRunStarted { .. }
+            | Self::FlowRunFinished { .. }
+            | Self::FlowChanged { .. } => "cron",
 
             Self::WorkflowLoaded { .. }
             | Self::WorkflowStopped { .. }
@@ -1371,9 +1507,12 @@ impl DomainEvent {
             Self::ApprovalRequested { .. }
             | Self::ApprovalDecided { .. }
             | Self::ApprovalGateOverrideIgnored { .. }
-            | Self::ApprovalGateDisabled { .. } => "approval",
+            | Self::ApprovalGateDisabled { .. }
+            | Self::FlowApprovalRequested { .. } => "approval",
 
             Self::PlanReviewRequested { .. } | Self::PlanReviewDecided { .. } => "plan_review",
+
+            Self::ExternalTransferPending { .. } => "egress",
 
             Self::ArtifactReady { .. }
             | Self::ArtifactFailed { .. }
@@ -1422,11 +1561,12 @@ impl DomainEvent {
             Self::AgentOrchestrationFailed { .. } => "AgentOrchestrationFailed",
             Self::AgentOrchestrationClosed { .. } => "AgentOrchestrationClosed",
             Self::OrchestrationPairingChanged { .. } => "OrchestrationPairingChanged",
-            Self::OrchestrationSessionMessage { .. } => "OrchestrationSessionMessage",
             Self::SubconsciousTriggerProcessed { .. } => "SubconsciousTriggerProcessed",
             Self::RunQueueMessageQueued { .. } => "RunQueueMessageQueued",
             Self::RunQueueFollowupDispatched { .. } => "RunQueueFollowupDispatched",
             Self::RunQueueInterrupted { .. } => "RunQueueInterrupted",
+            Self::RunQueueMessageDelivered { .. } => "RunQueueMessageDelivered",
+            Self::RunQueueSteerRequeued { .. } => "RunQueueSteerRequeued",
             Self::MonitorStatusChanged { .. } => "MonitorStatusChanged",
             Self::MonitorLine { .. } => "MonitorLine",
             Self::MemoryStored { .. } => "MemoryStored",
@@ -1452,6 +1592,10 @@ impl DomainEvent {
             Self::CronDeliveryRequested { .. } => "CronDeliveryRequested",
             Self::ProactiveMessageRequested { .. } => "ProactiveMessageRequested",
             Self::FlowScheduleTick { .. } => "FlowScheduleTick",
+            Self::FlowRunProgress { .. } => "FlowRunProgress",
+            Self::FlowRunStarted { .. } => "FlowRunStarted",
+            Self::FlowRunFinished { .. } => "FlowRunFinished",
+            Self::FlowChanged { .. } => "FlowChanged",
             Self::WorkflowLoaded { .. } => "WorkflowLoaded",
             Self::WorkflowStopped { .. } => "WorkflowStopped",
             Self::WorkflowStartFailed { .. } => "WorkflowStartFailed",
@@ -1505,8 +1649,10 @@ impl DomainEvent {
             Self::SessionExpired { .. } => "SessionExpired",
             Self::ApprovalRequested { .. } => "ApprovalRequested",
             Self::ApprovalDecided { .. } => "ApprovalDecided",
+            Self::FlowApprovalRequested { .. } => "FlowApprovalRequested",
             Self::PlanReviewRequested { .. } => "PlanReviewRequested",
             Self::PlanReviewDecided { .. } => "PlanReviewDecided",
+            Self::ExternalTransferPending { .. } => "ExternalTransferPending",
             Self::ApprovalGateOverrideIgnored { .. } => "ApprovalGateOverrideIgnored",
             Self::ApprovalGateDisabled { .. } => "ApprovalGateDisabled",
             Self::ArtifactReady { .. } => "ArtifactReady",
@@ -1573,7 +1719,9 @@ impl DomainEvent {
             Self::WorkspaceViolation { path } => Some(path.as_str()),
             Self::RunQueueMessageQueued { thread_id, .. }
             | Self::RunQueueFollowupDispatched { thread_id, .. }
-            | Self::RunQueueInterrupted { thread_id, .. } => Some(thread_id.as_str()),
+            | Self::RunQueueInterrupted { thread_id, .. }
+            | Self::RunQueueMessageDelivered { thread_id, .. }
+            | Self::RunQueueSteerRequeued { thread_id, .. } => Some(thread_id.as_str()),
             Self::MonitorStatusChanged { thread_id, .. } | Self::MonitorLine { thread_id, .. } => {
                 thread_id.as_deref()
             }

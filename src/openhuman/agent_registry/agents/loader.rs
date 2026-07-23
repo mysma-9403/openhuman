@@ -257,18 +257,37 @@ pub const BUILTINS: &[BuiltinAgent] = &[
         prompt_fn: super::mcp_setup::prompt::build,
         graph_fn: None,
     },
+    // Connected-server execution specialist. Compiled out with the `mcp`
+    // feature, which drops the `delegate_use_mcp_server` tool from the
+    // orchestrator's synthesised belt.
+    //
+    // The orchestrator's `agent.toml` still lists `mcp_agent` in `subagents`
+    // (TOML is data — it cannot be `cfg`'d, and forking it per-feature would
+    // invite exactly the data drift this gate is meant to avoid). That
+    // dangling reference is SAFE and already handled: `collect_orchestrator_tools`
+    // logs a warn and skips subagent ids that are not in the registry, and
+    // `validate_tier_hierarchy` explicitly `continue`s past unknown ids rather
+    // than failing the boot. `orchestrator_tolerates_absent_mcp_agent` in the
+    // test module below pins that contract so a future "strict unknown
+    // subagent" change cannot silently break the slim build's boot.
+    #[cfg(feature = "mcp")]
     BuiltinAgent {
         id: "mcp_agent",
         toml: include_str!("mcp_agent/agent.toml"),
         prompt_fn: super::mcp_agent::prompt::build,
         graph_fn: None,
     },
+    // Skill agents — `#[cfg]` rather than stub: `include_str!` embeds the
+    // agent TOML from disk regardless of module gating, so the entry itself
+    // must disappear when the `skills` feature is off.
+    #[cfg(feature = "skills")]
     BuiltinAgent {
         id: "skill_setup",
         toml: include_str!("../../skill_registry/agent/skill_setup/agent.toml"),
         prompt_fn: crate::openhuman::skill_registry::agent::skill_setup::prompt::build,
         graph_fn: None,
     },
+    #[cfg(feature = "skills")]
     BuiltinAgent {
         id: "skill_executor",
         toml: include_str!("../../skill_runtime/agent/skill_executor/agent.toml"),
@@ -287,17 +306,31 @@ pub const BUILTINS: &[BuiltinAgent] = &[
         prompt_fn: crate::openhuman::subconscious::agent::prompt::build,
         graph_fn: None,
     },
+    // Workflow-authoring specialist (Phase 5a): builds tinyflows automation
+    // graphs from natural language and returns a validated PROPOSAL — it never
+    // persists or enables a flow. Deliberately narrow propose-or-read tool belt.
+    // Gated with `flows`: a slim build must not advertise an agent whose entire
+    // tool belt is absent, so the entry (and its `include_str!`) is stripped.
+    #[cfg(feature = "flows")]
     BuiltinAgent {
-        id: "frontend_agent",
-        toml: include_str!("../../orchestration/frontend_agent/agent.toml"),
-        prompt_fn: crate::openhuman::orchestration::frontend_agent::prompt::build,
-        graph_fn: Some(crate::openhuman::orchestration::frontend_agent::graph::graph),
+        id: "workflow_builder",
+        toml: include_str!("../../flows/agents/workflow_builder/agent.toml"),
+        prompt_fn: crate::openhuman::flows::agents::workflow_builder::prompt::build,
+        graph_fn: None,
     },
+    // Workflow-discovery specialist (the "Flow Scout"): reads the user's
+    // memory/threads/people/connections/flows read-only and ends by calling
+    // `suggest_workflows` to record concrete, buildable automation ideas for
+    // the Flows page "Suggested for you" section. It never persists or enables
+    // a flow — the read-only counterpart to `workflow_builder`, which turns a
+    // picked suggestion into a real graph proposal. Gated with `flows` (same
+    // reasoning as `workflow_builder` above).
+    #[cfg(feature = "flows")]
     BuiltinAgent {
-        id: "reasoning_agent",
-        toml: include_str!("../../orchestration/reasoning_agent/agent.toml"),
-        prompt_fn: crate::openhuman::orchestration::reasoning_agent::prompt::build,
-        graph_fn: Some(crate::openhuman::orchestration::reasoning_agent::graph::graph),
+        id: "flow_discovery",
+        toml: include_str!("../../flows/agents/flow_discovery/agent.toml"),
+        prompt_fn: crate::openhuman::flows::agents::flow_discovery::prompt::build,
+        graph_fn: None,
     },
 ];
 
@@ -307,10 +340,30 @@ pub const BUILTINS: &[BuiltinAgent] = &[
 /// baked into the binary and therefore must always be valid. Unit tests
 /// below keep that invariant honest.
 pub fn load_builtins() -> Result<Vec<AgentDefinition>> {
-    let defs: Vec<AgentDefinition> = BUILTINS.iter().map(parse_builtin).collect::<Result<_>>()?;
+    let defs: Vec<AgentDefinition> = BUILTINS
+        .iter()
+        .filter(|b| builtin_enabled(b))
+        .map(parse_builtin)
+        .collect::<Result<_>>()?;
     validate_tier_hierarchy(&defs)
         .context("built-in agents violate the spawn-hierarchy contract")?;
     Ok(defs)
+}
+
+/// Compile-time gate for built-ins whose deck/document tool is feature-gated.
+///
+/// `presentation_agent` delegates deck creation to `generate_presentation`,
+/// which only registers under the `documents` feature (see `tools::ops`). In a
+/// slim build without `documents`, the agent would still be advertised as
+/// `make_presentation` while its filtered tool surface no longer contains any
+/// tool able to produce a deck, so it is dropped from the registry in lockstep
+/// with its tool.
+fn builtin_enabled(_b: &BuiltinAgent) -> bool {
+    #[cfg(not(feature = "documents"))]
+    if _b.id == "presentation_agent" {
+        return false;
+    }
+    true
 }
 
 /// Validate the cross-agent spawn-hierarchy contract documented on
@@ -431,7 +484,35 @@ mod tests {
     #[test]
     fn all_builtins_parse() {
         let defs = load_builtins().expect("built-in TOML must parse");
-        assert_eq!(defs.len(), BUILTINS.len());
+        // `load_builtins` filters feature-gated built-ins (e.g. `presentation_agent`
+        // when `documents` is off), so compare against the same filtered count
+        // rather than the raw `BUILTINS` length.
+        let expected = BUILTINS.iter().filter(|b| builtin_enabled(b)).count();
+        assert_eq!(defs.len(), expected);
+    }
+
+    /// Pins the `presentation_agent` compile-time gate, both directions: it is
+    /// registered under the `documents` feature (its `generate_presentation`
+    /// deck tool lives there) and filtered out of the registry without it, so
+    /// slim builds never advertise `make_presentation` with no tool to fulfil it.
+    #[cfg(feature = "documents")]
+    #[test]
+    fn presentation_agent_registered_when_documents_on() {
+        let defs = load_builtins().expect("built-in TOML must parse");
+        assert!(
+            defs.iter().any(|d| d.id == "presentation_agent"),
+            "presentation_agent must register when the `documents` feature is on"
+        );
+    }
+
+    #[cfg(not(feature = "documents"))]
+    #[test]
+    fn presentation_agent_absent_when_documents_off() {
+        let defs = load_builtins().expect("built-in TOML must parse");
+        assert!(
+            !defs.iter().any(|d| d.id == "presentation_agent"),
+            "presentation_agent must be filtered from the registry when `documents` is off"
+        );
     }
 
     #[test]
@@ -605,6 +686,8 @@ mod tests {
                         personality_soul_md: None,
                         personality_memory_md: None,
                         personality_roster: vec![],
+                        agents_md_global: None,
+                        agents_md_local: None,
                     };
                     let body = build(&ctx)
                         .unwrap_or_else(|e| panic!("{} prompt build failed: {e}", def.id));
@@ -675,10 +758,21 @@ mod tests {
         assert!(matches!(def.model, ModelSpec::Hint(ref h) if h == "chat"));
         match def.tools {
             ToolScope::Named(tools) => {
-                // spawn_subagent was removed in #1141; spawn_worker_thread is the replacement
+                // spawn_subagent was removed in #1141. spawn_worker_thread is
+                // disabled pending its UI (#1624) and unregistered, so the
+                // named scope must not advertise it.
                 assert!(
-                    tools.iter().any(|t| t == "spawn_worker_thread"),
-                    "orchestrator must have spawn_worker_thread"
+                    !tools.iter().any(|t| t == "spawn_worker_thread"),
+                    "spawn_worker_thread is disabled (#1624) and must not be named"
+                );
+                // Async sub-agent control surface taught by prompt.md.
+                assert!(
+                    tools.iter().any(|t| t == "steer_subagent"),
+                    "orchestrator must have steer_subagent to steer async workers"
+                );
+                assert!(
+                    tools.iter().any(|t| t == "wait_subagent"),
+                    "orchestrator must have wait_subagent to collect async results"
                 );
                 assert!(
                     tools.iter().any(|t| t == "spawn_async_subagent"),
@@ -697,8 +791,62 @@ mod tests {
                     "spawn_subagent must not appear — removed in #1141"
                 );
                 assert!(!tools.iter().any(|t| t == "call_memory_agent"));
-                assert!(!tools.iter().any(|t| t == "shell"));
-                assert!(!tools.iter().any(|t| t == "file_write"));
+                // Write tools and shell stay OUT — the chat-tier
+                // orchestrator must not mutate files or run commands; all
+                // modification is deferred to `run_code` / owning
+                // specialists where edits live next to build/test/verify.
+                for forbidden in [
+                    "shell",
+                    "edit",
+                    "file_write",
+                    "apply_patch",
+                    "curl",
+                    "storage_set_visibility",
+                    "storage_delete_file",
+                ] {
+                    assert!(
+                        !tools.iter().any(|t| t == forbidden),
+                        "orchestrator must NOT have write/exec/lifecycle tool `{forbidden}`"
+                    );
+                }
+                // Basic READ-ONLY direct surface: quick lookups without
+                // spawning a sub-agent per touch.
+                for direct in [
+                    "file_read",
+                    "grep",
+                    "glob",
+                    "list",
+                    "web_search_tool",
+                    "web_fetch",
+                    "http_request",
+                ] {
+                    assert!(
+                        tools.iter().any(|t| t == direct),
+                        "orchestrator must have read-only direct tool `{direct}`"
+                    );
+                }
+                // Direct memory surface (#4762): recall/store are the product's
+                // core and must be first-class direct tools, not a sub-agent
+                // spawn — a trivial recall or a single "remember this" must not
+                // pay a blocking agentic round-trip (over-delegation, #4744) that
+                // can hang or return a 0-char result with persistence unconfirmed.
+                // Deep tree walks / reconciliation still delegate to
+                // `retrieve_memory` / `manage_profile_memory`.
+                for direct in ["memory_recall", "memory_store", "save_preference"] {
+                    assert!(
+                        tools.iter().any(|t| t == direct),
+                        "orchestrator must have direct memory tool `{direct}` (#4762)"
+                    );
+                }
+                // Memory-protocol close-out (#4116): a direct `memory_store` write
+                // obliges an `update_memory_md` index reconcile, so the tool that
+                // performs it must be in scope — otherwise the protocol's guidance
+                // is unsatisfiable and MEMORY.md (loaded here) drifts from the store.
+                assert!(
+                    tools.iter().any(|t| t == "update_memory_md"),
+                    "orchestrator must have `update_memory_md` to reconcile MEMORY.md \
+                     after a direct memory_store (#4762)"
+                );
             }
             ToolScope::Wildcard => panic!("orchestrator must have named tool allowlist"),
         }
@@ -758,6 +906,35 @@ mod tests {
             def.effective_tokenjuice_compression(),
             AgentTokenjuiceCompression::Light
         );
+    }
+
+    #[test]
+    fn broad_agent_surfaces_expose_storage_transfer_not_lifecycle_tools() {
+        for id in ["code_executor", "integrations_agent", "orchestrator"] {
+            let def = find(id);
+            match &def.tools {
+                ToolScope::Named(tools) => {
+                    for required in [
+                        "storage_upload_file",
+                        "storage_download_file",
+                        "storage_list_files",
+                        "storage_get_link",
+                    ] {
+                        assert!(
+                            tools.iter().any(|t| t == required),
+                            "{id} must expose storage transfer tool `{required}`"
+                        );
+                    }
+                    for forbidden in ["storage_set_visibility", "storage_delete_file"] {
+                        assert!(
+                            !tools.iter().any(|t| t == forbidden),
+                            "{id} must not expose storage lifecycle tool `{forbidden}`"
+                        );
+                    }
+                }
+                ToolScope::Wildcard => panic!("{id} must have Named tool scope"),
+            }
+        }
     }
 
     #[test]
@@ -897,38 +1074,212 @@ mod tests {
         assert!(matches!(def.tools, ToolScope::Wildcard));
     }
 
+    // Both flows agents are `#[cfg(feature = "flows")]` entries in `BUILTINS`
+    // (#4797), so these tests only apply when the gate is on.
+    #[cfg(feature = "flows")]
     #[test]
-    fn frontend_agent_is_registered_on_chat_tier_with_decision_tools() {
-        // Quick-tier verification (stage 4): the orchestration front end must
-        // resolve via `hint:chat` (fast, remote for TTFT) and expose exactly the
-        // two domain-owned decision tools the two-pass graph routes on.
-        let def = find("frontend_agent");
+    fn workflow_builder_is_registered_worker_with_bounded_authoring_scope() {
+        // Phase 5a/5b: the workflow-builder must be a Worker-tier leaf whose
+        // tool scope is EXACTLY the bounded authoring/read + Composio
+        // discovery/connect belt. Creation is limited to `create_workflow`
+        // and `duplicate_flow`, which always produce disabled flows; the raw
+        // flows_create/update/set_enabled tools remain unavailable, as do
+        // shell, file writes, channel sends, and composio_execute. It can list
+        // toolkits/connections,
+        // raise the inline connect card, `run_flow` a flow the user already
+        // SAVED to test it (a real run the prompt gates behind user
+        // confirmation), and `save_workflow` a built graph onto a flow the host
+        // ALREADY created (the prompt bar's instant-create path) — but it can
+        // never enable a flow or perform an arbitrary raw integration action.
+        // One narrow, deliberate carve-out (B12): `get_tool_output_sample`
+        // DOES make a real Composio call, but only ever a Read-scope one
+        // (hard-refused otherwise, regardless of the user's scope preference)
+        // against an already-connected toolkit — see `builder_tools.rs`'s
+        // module doc. This pins the invariant in the agent definition itself,
+        // not just the tool implementations. It also has read-only grounding
+        // in the user's memory via `memory_recall` (direct lookups) and
+        // `memory_hybrid_search` (keyword/lexical lookups — pairs with
+        // `memory_recall` the same way the sibling `flow_discovery` agent
+        // does) — no `memory_store`, so it can look up context but never
+        // write it.
+        let def = find("workflow_builder");
+        assert_eq!(def.agent_tier, AgentTier::Worker);
+        assert_eq!(def.delegate_name.as_deref(), Some("build_workflow"));
+        assert_eq!(def.sandbox_mode, SandboxMode::None);
+        // Graph authoring is multi-step structured reasoning — reasoning tier.
         assert!(
-            matches!(def.model, ModelSpec::Hint(ref h) if h == "chat"),
-            "frontend_agent must run on the quick chat tier, got {:?}",
-            def.model
+            matches!(def.model, ModelSpec::Hint(ref h) if h == "reasoning"),
+            "workflow_builder should use the reasoning tier"
         );
-        assert_eq!(def.agent_tier, AgentTier::Chat);
+        // Worker leaf: no onward delegation.
+        assert!(
+            def.subagents.is_empty(),
+            "workflow_builder is a leaf and must not list subagents"
+        );
         match &def.tools {
-            ToolScope::Named(tools) => {
-                for required in ["defer_to_orchestrator", "reply_to_channel"] {
+            ToolScope::Named(names) => {
+                // Reconciled against `agent.toml`'s current `[tools].named`
+                // after the workflow-tools expansion PR widened the belt to
+                // agent-native editing/creation/run-control (`edit_workflow`,
+                // `validate_workflow`, `create_workflow`, `duplicate_flow`,
+                // `list_node_kinds`, `get_node_kind_contract`,
+                // `get_flow_history`, `list_flow_runs`, `resume_flow_run`,
+                // `cancel_flow_run`, `list_connectable_toolkits`) — these are
+                // the agent's own scoped tool surface, not the raw `flows_*`
+                // controller RPCs banned below, so the "no flow
+                // creation/enable via the raw controller" invariant still
+                // holds via the forbidden list.
+                let expected = [
+                    "propose_workflow",
+                    "revise_workflow",
+                    "edit_workflow",
+                    "validate_workflow",
+                    "save_workflow",
+                    "list_flows",
+                    "get_flow",
+                    "get_flow_history",
+                    "get_flow_run",
+                    "list_flow_connections",
+                    "search_tool_catalog",
+                    "get_tool_contract",
+                    "get_tool_output_sample",
+                    "list_agent_profiles",
+                    "list_connectable_toolkits",
+                    "list_node_kinds",
+                    "get_node_kind_contract",
+                    "dry_run_workflow",
+                    "list_flow_runs",
+                    "resume_flow_run",
+                    "cancel_flow_run",
+                    "create_workflow",
+                    "duplicate_flow",
+                    "run_flow",
+                    "composio_list_toolkits",
+                    "composio_list_connections",
+                    "composio_connect",
+                    "memory_recall",
+                    "memory_hybrid_search",
+                ];
+                for required in expected {
                     assert!(
-                        tools.iter().any(|t| t == required),
-                        "frontend_agent must expose `{required}`"
+                        names.iter().any(|n| n == required),
+                        "workflow_builder tool list missing `{required}`"
                     );
                 }
-                // No broad surface — it triages and phrases, it does not act.
-                for forbidden in ["shell", "file_write", "spawn_subagent"] {
+                assert_eq!(
+                    names.len(),
+                    expected.len(),
+                    "workflow_builder scope must be EXACTLY the bounded authoring belt (got {names:?})"
+                );
+                // Hard exclusions: no unrestricted flow mutation, raw
+                // integration actions, or host access. Creation is exposed
+                // only through the bounded tools above; raw `flows_update`
+                // could rename or re-gate arbitrary flows, so it stays out.
+                for forbidden in [
+                    "flows_create",
+                    "flows_update",
+                    "flows_set_enabled",
+                    "shell",
+                    "file_write",
+                    "edit",
+                    "apply_patch",
+                    "composio_execute",
+                    "spawn_subagent",
+                    // Memory access must stay read-only: no write tool.
+                    "memory_store",
+                ] {
                     assert!(
-                        !tools.iter().any(|t| t == forbidden),
-                        "frontend_agent must not expose `{forbidden}`"
+                        !names.iter().any(|n| n == forbidden),
+                        "workflow_builder must NOT have unrestricted tool `{forbidden}`"
                     );
                 }
             }
-            ToolScope::Wildcard => panic!("frontend_agent must have a Named tool scope"),
+            ToolScope::Wildcard => panic!("workflow_builder must have a Named tool scope"),
         }
-        // Leaf reflex: no onward delegation.
-        assert!(def.subagents.is_empty());
+
+        // Reachable by delegation from the orchestrator (Phase 5 routing).
+        let orchestrator = find("orchestrator");
+        assert!(
+            orchestrator.subagents.iter().any(
+                |entry| matches!(entry, SubagentEntry::AgentId(id) if id == "workflow_builder")
+            ),
+            "orchestrator must allow `workflow_builder` so build_workflow can spawn it"
+        );
+    }
+
+    #[cfg(feature = "flows")]
+    #[test]
+    fn flow_discovery_is_registered_readonly_reasoning_scout() {
+        // The Flow Scout must be a read-only reasoning leaf: it reads the
+        // user's data and ends by emitting `suggest_workflows`. It must NOT
+        // carry any tool that persists/enables/runs a flow, sends a message,
+        // writes memory, or mutates the workspace — it can run on
+        // prompt-injectable content, so a write tool would be an injection
+        // foothold.
+        let def = find("flow_discovery");
+        assert_eq!(def.agent_tier, AgentTier::Reasoning);
+        assert_eq!(def.delegate_name.as_deref(), Some("discover_workflows"));
+        assert_eq!(def.sandbox_mode, SandboxMode::ReadOnly);
+        assert!(
+            def.subagents.is_empty(),
+            "flow_discovery is a leaf and must not list subagents"
+        );
+        match &def.tools {
+            ToolScope::Named(names) => {
+                // The one write it is allowed: its terminal emit sink.
+                assert!(
+                    names.iter().any(|n| n == "suggest_workflows"),
+                    "flow_discovery must have its `suggest_workflows` emit sink"
+                );
+                // A representative slice of the read-only gathering surface.
+                for required in [
+                    "memory_recall",
+                    "transcript_search",
+                    "thread_list",
+                    "list_flows",
+                    "list_flow_connections",
+                    "search_tool_catalog",
+                    "web_search_tool",
+                ] {
+                    assert!(
+                        names.iter().any(|n| n == required),
+                        "flow_discovery tool list missing read tool `{required}`"
+                    );
+                }
+                // Hard exclusions: nothing that persists, executes, sends, or
+                // writes user data.
+                for forbidden in [
+                    "flows_create",
+                    "flows_update",
+                    "flows_set_enabled",
+                    "flows_run",
+                    "propose_workflow",
+                    "shell",
+                    "file_write",
+                    "edit",
+                    "memory_store",
+                    "thread_message_append",
+                    "spawn_subagent",
+                ] {
+                    assert!(
+                        !names.iter().any(|n| n == forbidden),
+                        "flow_discovery must NOT have `{forbidden}` — read + suggest only"
+                    );
+                }
+            }
+            ToolScope::Wildcard => panic!("flow_discovery must have a Named tool scope"),
+        }
+
+        // Reachable by delegation from the orchestrator so `discover_workflows`
+        // can spawn it.
+        let orchestrator = find("orchestrator");
+        assert!(
+            orchestrator
+                .subagents
+                .iter()
+                .any(|entry| matches!(entry, SubagentEntry::AgentId(id) if id == "flow_discovery")),
+            "orchestrator must allow `flow_discovery` so discover_workflows can spawn it"
+        );
     }
 
     #[test]
@@ -1002,18 +1353,25 @@ mod tests {
             other => panic!("scheduler_agent must use Named tool scope, got {other:?}"),
         }
 
-        let presentation = find("presentation_agent");
-        match &presentation.tools {
-            ToolScope::Named(names) => {
-                assert!(names.iter().any(|name| name == "generate_presentation"));
-                assert!(!names.iter().any(|name| name == "call_memory_agent"));
-                assert!(names.iter().any(|name| name == "web_search_tool"));
+        // `presentation_agent` is only registered under the `documents` feature
+        // (its deck tool `generate_presentation` is gated there and the agent is
+        // filtered from the registry in lockstep — see `builtin_enabled`), so
+        // skip its assertions in slim builds where it is intentionally absent.
+        #[cfg(feature = "documents")]
+        {
+            let presentation = find("presentation_agent");
+            match &presentation.tools {
+                ToolScope::Named(names) => {
+                    assert!(names.iter().any(|name| name == "generate_presentation"));
+                    assert!(!names.iter().any(|name| name == "call_memory_agent"));
+                    assert!(names.iter().any(|name| name == "web_search_tool"));
+                }
+                other => panic!("presentation_agent must use Named tool scope, got {other:?}"),
             }
-            other => panic!("presentation_agent must use Named tool scope, got {other:?}"),
+            // Memory pre-fetch is no longer eager; `omit_memory_context = false`
+            // still gives the deck builder the cheap per-turn recall.
+            assert_eq!(presentation.trigger_memory_agent, TriggerMemoryAgent::Never);
         }
-        // Memory pre-fetch is no longer eager; `omit_memory_context = false`
-        // still gives the deck builder the cheap per-turn recall.
-        assert_eq!(presentation.trigger_memory_agent, TriggerMemoryAgent::Never);
 
         let desktop = find("desktop_control_agent");
         match &desktop.tools {
@@ -1257,7 +1615,7 @@ mod tests {
     fn orchestrator_does_not_get_curl() {
         // Per design: curl is a `Write` permission tool that writes
         // to the workspace. The orchestrator delegates rather than
-        // executing — code_executor / researcher own actual downloads.
+        // executing — code_executor / tools_agent own actual downloads.
         let def = find("orchestrator");
         if let ToolScope::Named(tools) = &def.tools {
             assert!(
@@ -1367,9 +1725,11 @@ mod tests {
                     "spawn_subagent",
                     "spawn_worker_thread",
                     "delegate_to_integrations_agent",
-                    "delegate_run_code",
-                    "delegate_research",
-                    "delegate_plan",
+                    // Synthesised delegation tools use the unprefixed
+                    // `delegate_name` overrides — forbid those names too.
+                    "run_code",
+                    "research",
+                    "plan",
                 ] {
                     assert!(
                         !tools.iter().any(|t| t == forbidden),
@@ -1463,9 +1823,11 @@ mod tests {
                     "spawn_subagent",
                     "spawn_worker_thread",
                     "delegate_to_integrations_agent",
-                    "delegate_run_code",
-                    "delegate_research",
-                    "delegate_plan",
+                    // Synthesised delegation tools use the unprefixed
+                    // `delegate_name` overrides — forbid those names too.
+                    "run_code",
+                    "research",
+                    "plan",
                     "wallet_execute_prepared",
                     "wallet_prepare_transfer",
                     "web3_swap_execute",
@@ -1566,6 +1928,71 @@ mod tests {
         );
     }
 
+    /// The `mcp` gate's load-bearing safety contract (#4799).
+    ///
+    /// `agent.toml` is DATA — it cannot be `#[cfg]`'d, so the orchestrator goes
+    /// on listing `mcp_agent` in `subagents` even in builds where the `mcp`
+    /// feature dropped `mcp_agent` from [`BUILTINS`]. That leaves a subagent id
+    /// that resolves to nothing, and the whole gate rests on the loader
+    /// TOLERATING it rather than failing the boot.
+    ///
+    /// Two independent sites provide that tolerance today:
+    /// * `orchestrator_tools::collect_orchestrator_tools` warns + skips
+    ///   subagent ids absent from the registry;
+    /// * [`validate_tier_hierarchy`] `continue`s past unknown ids instead of
+    ///   reporting a tier error.
+    ///
+    /// This test pins the second one (the boot-blocking one) from BOTH build
+    /// configurations, so a future "unknown subagent ids are a hard error"
+    /// change fails here loudly instead of silently breaking the slim build's
+    /// boot — the failure mode would otherwise only appear in a
+    /// `--no-default-features` run, which CI's `cargo check` lane cannot catch.
+    #[test]
+    fn orchestrator_tolerates_unresolvable_subagent_id() {
+        let mut def = find("orchestrator");
+        def.subagents.push(SubagentEntry::AgentId(
+            "definitely_not_a_compiled_in_agent".into(),
+        ));
+
+        validate_tier_hierarchy(&[def]).expect(
+            "validate_tier_hierarchy must tolerate an unresolvable subagent id — the `mcp` \
+             feature gate relies on it (orchestrator's agent.toml lists `mcp_agent` even in \
+             builds that compile `mcp_agent` out)",
+        );
+    }
+
+    /// Companion to the above, asserting the real gated shape rather than a
+    /// synthetic id: with `mcp` compiled out, `mcp_agent` is genuinely absent
+    /// from the loaded set while the orchestrator still lists it — and
+    /// `load_builtins` (which runs `validate_tier_hierarchy` internally) must
+    /// still succeed, i.e. the core boots.
+    #[test]
+    #[cfg(not(feature = "mcp"))]
+    fn orchestrator_tolerates_absent_mcp_agent() {
+        let defs = load_builtins().expect(
+            "load_builtins must succeed with `mcp` compiled out — the orchestrator's dangling \
+             `mcp_agent` subagent reference must not fail the boot",
+        );
+
+        assert!(
+            !defs.iter().any(|d| d.id == "mcp_agent"),
+            "`mcp_agent` must be compiled out when the `mcp` feature is off"
+        );
+
+        let orchestrator = defs
+            .iter()
+            .find(|d| d.id == "orchestrator")
+            .expect("orchestrator must still load");
+        assert!(
+            orchestrator.subagents.iter().any(|e| matches!(
+                e,
+                SubagentEntry::AgentId(id) if id == "mcp_agent"
+            )),
+            "orchestrator.agent.toml is data and still lists `mcp_agent` — this dangling \
+             reference is exactly what the loader must tolerate"
+        );
+    }
+
     /// The orchestrator gets lightweight MCP discovery (`mcp_registry_status`,
     /// like `composio_list_connections`) but must NOT carry the per-server
     /// enumerate/execute tools — those belong to `mcp_agent`, keeping the
@@ -1596,7 +2023,11 @@ mod tests {
     /// the discover + call surface and a stable `use_mcp_server` delegate name,
     /// but must NOT hold the secret-handling install/uninstall tools (those are
     /// `mcp_setup`'s) or any shell/file/network capability.
+    ///
+    /// Gated: `find` panics on a missing id, and the `mcp` feature drops
+    /// `mcp_agent` from [`BUILTINS`] entirely.
     #[test]
+    #[cfg(feature = "mcp")]
     fn mcp_agent_drives_connected_servers_without_install_or_shell() {
         let def = find("mcp_agent");
         assert_eq!(def.agent_tier, AgentTier::Worker);
@@ -1743,14 +2174,14 @@ mod tests {
         for def in load_builtins().unwrap() {
             if matches!(
                 def.id.as_str(),
-                "orchestrator" | "planner" | "subconscious" | "frontend_agent" | "reasoning_agent"
+                "orchestrator" | "planner" | "subconscious" | "flow_discovery"
             ) {
                 continue;
             }
             assert_eq!(
                 def.agent_tier,
                 AgentTier::Worker,
-                "{} should default to worker tier (only orchestrator/planner/subconscious/frontend_agent/reasoning_agent are non-worker today)",
+                "{} should default to worker tier (only orchestrator/planner/subconscious/flow_discovery are non-worker today)",
                 def.id
             );
         }

@@ -39,6 +39,7 @@ fn test_job(command: &str) -> CronJob {
         session_target: SessionTarget::Isolated,
         model: None,
         agent_id: None,
+        profile_id: None,
         enabled: true,
         delivery: DeliveryConfig::default(),
         delete_after_run: false,
@@ -48,6 +49,150 @@ fn test_job(command: &str) -> CronJob {
         last_status: None,
         last_output: None,
     }
+}
+
+#[tokio::test]
+async fn resolve_cron_profile_present_and_deleted_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp).await;
+
+    // A job attributed to profile "alice".
+    let mut job = test_job("");
+    job.job_type = JobType::Agent;
+    job.profile_id = Some("alice".into());
+
+    // Profile does not exist yet → None (the deleted-profile fallback path;
+    // the scheduler runs the job without a profile rather than failing it).
+    assert!(
+        resolve_cron_profile(&config, &job).unwrap().is_none(),
+        "missing profile must resolve to None"
+    );
+
+    // Seed the profile → it now resolves.
+    let mut profile = crate::openhuman::profiles::store::built_in_default_profile();
+    profile.id = "alice".into();
+    profile.name = "Alice".into();
+    profile.built_in = false;
+    profile.is_master = false;
+    crate::openhuman::profiles::store::AgentProfileStore::new(config.workspace_dir.clone())
+        .upsert(profile)
+        .expect("seed profile");
+    let resolved = resolve_cron_profile(&config, &job)
+        .expect("profile store loads")
+        .expect("profile resolves");
+    assert_eq!(resolved.id, "alice");
+
+    // A job with no attribution is always None.
+    let plain = test_job("");
+    assert!(resolve_cron_profile(&config, &plain).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn existing_profile_agent_build_failure_does_not_fall_back_profile_less() {
+    crate::openhuman::agent::harness::definition::AgentDefinitionRegistry::init_global_builtins()
+        .expect("init built-in agent definitions");
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp).await;
+
+    let mut profile = crate::openhuman::profiles::store::built_in_default_profile();
+    profile.id = "alice".into();
+    profile.agent_id = "removed-agent-definition".into();
+    profile.built_in = false;
+    profile.is_master = false;
+    crate::openhuman::profiles::store::AgentProfileStore::new(config.workspace_dir.clone())
+        .upsert(profile)
+        .expect("seed profile");
+
+    let mut job = test_job("");
+    job.job_type = JobType::Agent;
+    job.profile_id = Some("alice".into());
+
+    let error = match build_agent_for_cron_job(&config, &job) {
+        Ok(_) => panic!("existing profile build failure must not fall back profile-less"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("under attributed profile"));
+    assert!(error.to_string().contains("removed-agent-definition"));
+}
+
+#[tokio::test]
+async fn attributed_cron_build_retains_profile_gates() {
+    crate::openhuman::agent::harness::definition::AgentDefinitionRegistry::init_global_builtins()
+        .expect("init built-in agent definitions");
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp).await;
+
+    let mut profile = crate::openhuman::profiles::store::built_in_default_profile();
+    profile.id = "alice".into();
+    profile.built_in = false;
+    profile.allowed_tools = Some(vec!["file_read".into()]);
+    profile.memory_sources = Some(vec!["slack:#eng".into()]);
+    crate::openhuman::profiles::store::AgentProfileStore::new(config.workspace_dir.clone())
+        .upsert(profile)
+        .expect("seed profile");
+
+    let mut job = test_job("");
+    job.job_type = JobType::Agent;
+    job.profile_id = Some("alice".into());
+    let built = build_agent_for_cron_job(&config, &job).expect("build attributed cron agent");
+
+    assert_eq!(
+        built.agent.visible_tool_names_for_test(),
+        &["file_read".to_string()].into_iter().collect()
+    );
+    assert_eq!(
+        built.profile.and_then(|profile| profile.memory_sources),
+        Some(vec!["slack:#eng".to_string()]),
+        "the run wrapper must retain the resolved profile for memory scoping"
+    );
+}
+
+#[tokio::test]
+async fn attributed_cron_build_applies_profile_runtime_defaults() {
+    crate::openhuman::agent::harness::definition::AgentDefinitionRegistry::init_global_builtins()
+        .expect("init built-in agent definitions");
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp).await;
+
+    let mut profile = crate::openhuman::profiles::store::built_in_default_profile();
+    profile.id = "alice-runtime".into();
+    profile.built_in = false;
+    profile.model_override = Some("profile-runtime-model".into());
+    profile.temperature = Some(0.17);
+    profile.system_prompt_suffix = Some("CRON_PROFILE_SUFFIX_SENTINEL".into());
+    crate::openhuman::profiles::store::AgentProfileStore::new(config.workspace_dir.clone())
+        .upsert(profile)
+        .expect("seed profile");
+
+    let mut job = test_job("");
+    job.job_type = JobType::Agent;
+    job.profile_id = Some("alice-runtime".into());
+    let built = build_agent_for_cron_job(&config, &job).expect("build attributed cron agent");
+
+    assert_eq!(built.agent.model_name(), "profile-runtime-model");
+    assert_eq!(built.agent.temperature(), 0.17);
+    let prompt = built
+        .agent
+        .build_system_prompt(crate::openhuman::agent::prompts::LearnedContextData::default())
+        .expect("build cron system prompt");
+    assert!(prompt.contains("CRON_PROFILE_SUFFIX_SENTINEL"));
+}
+
+#[test]
+fn cron_job_model_override_wins_over_profile_model() {
+    let config = Config {
+        default_model: Some("config-model".into()),
+        ..Config::default()
+    };
+    let mut profile = crate::openhuman::profiles::store::built_in_default_profile();
+    profile.model_override = Some("profile-model".into());
+    profile.temperature = Some(0.23);
+    let mut job = test_job("");
+    job.model = Some("job-model".into());
+
+    let effective = apply_cron_profile_runtime_defaults(&config, &job, &profile);
+    assert_eq!(effective.default_model.as_deref(), Some("job-model"));
+    assert_eq!(effective.default_temperature, 0.23);
 }
 
 #[test]
@@ -742,6 +887,48 @@ fn is_local_provider_unreachable_failure_matches_when_only_output_carries_signal
     ));
 }
 
+#[test]
+fn is_local_provider_unreachable_failure_keeps_short_loopback_send_error_retryable() {
+    let wire = "error sending request for url (http://localhost:1234/v1/chat/completions)";
+    assert!(
+        !is_local_provider_unreachable_failure(
+            &JobType::Agent,
+            Some(wire),
+            AGENT_JOB_USER_FAILURE_MESSAGE
+        ),
+        "short reqwest send errors can represent transient timeout/reset shapes and must stay retryable without a refused errno/tcp-connect signal"
+    );
+}
+
+#[test]
+fn is_local_provider_unreachable_failure_matches_raw_no_models_loaded_body() {
+    let raw = "LM Studio API error (400 Bad Request): {\"error\":\"No models loaded. \
+               Please load a model in the developer page first.\"}";
+    assert!(
+        is_local_provider_unreachable_failure(
+            &JobType::Agent,
+            Some(raw),
+            AGENT_JOB_USER_FAILURE_MESSAGE
+        ),
+        "raw OpenAI-compatible no-model body should halt without retries"
+    );
+}
+
+#[test]
+fn is_local_provider_unreachable_failure_checks_output_when_raw_is_generic() {
+    let output =
+        "Your local inference server (e.g. LM Studio) is running but has no model loaded. \
+                  Load a model, then try again.";
+    assert!(
+        is_local_provider_unreachable_failure(
+            &JobType::Agent,
+            Some(AGENT_JOB_USER_FAILURE_MESSAGE),
+            output
+        ),
+        "friendly no-model output should halt even when raw agent error is generic"
+    );
+}
+
 // Negative guard: a transient REMOTE provider / backend network error must NOT
 // halt — it may recover on retry and stays actionable in Sentry. Narrowing to
 // loopback is what keeps this guard from blinding real outages.
@@ -814,8 +1001,8 @@ async fn cron_agent_job_uses_agent_definition_tool_scope() {
     job.name = Some("morning_briefing".into());
     job.agent_id = Some("morning_briefing".into());
 
-    let agent = build_agent_for_cron_job(&config, &job).expect("build cron agent");
-    let visible = agent.visible_tool_names_for_test();
+    let built = build_agent_for_cron_job(&config, &job).expect("build cron agent");
+    let visible = built.agent.visible_tool_names_for_test();
 
     assert!(
         !visible.is_empty(),
@@ -954,6 +1141,46 @@ async fn persist_job_result_failure_disables_one_shot() {
     let updated = cron::get_job(&config, &job.id).unwrap();
     assert!(!updated.enabled);
     assert_eq!(updated.last_status.as_deref(), Some("error"));
+}
+
+#[tokio::test]
+async fn persist_job_result_disables_at_job_without_delete_flag() {
+    // Regression: an `At` job created without delete_after_run (the RPC default,
+    // and every shell `At` job) must not be rescheduled after it runs. Its `at`
+    // is a fixed instant, so reschedule_after_run would write next_run = at
+    // (now in the past) and due_jobs would re-select it on every poll, re-firing
+    // the job forever.
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp).await;
+    let at = Utc::now() + ChronoDuration::minutes(10);
+    let job = cron::add_agent_job(
+        &config,
+        Some("at-no-delete".into()),
+        crate::openhuman::cron::Schedule::At { at },
+        "Hello",
+        SessionTarget::Isolated,
+        None,
+        None,
+        false, // delete_after_run = false — the previously-buggy case
+    )
+    .unwrap();
+    let started = Utc::now();
+    let finished = started + ChronoDuration::milliseconds(10);
+
+    let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+    assert!(success);
+
+    // The row is kept (not auto-deleted) but disabled, and its run is recorded.
+    let updated = cron::get_job(&config, &job.id).unwrap();
+    assert!(!updated.enabled, "At job must be disabled after one run");
+    assert_eq!(updated.last_status.as_deref(), Some("ok"));
+
+    // It is never due again — even at a time past its `at` instant.
+    let due = cron::due_jobs(&config, at + ChronoDuration::minutes(1)).unwrap();
+    assert!(
+        !due.iter().any(|j| j.id == job.id),
+        "disabled At job must not be re-selected by due_jobs"
+    );
 }
 
 #[tokio::test]
@@ -1205,7 +1432,7 @@ fn agent_error_to_user_message_classifies_provider_non_retryable() {
     let msg = agent_error_to_user_message(&err);
     assert!(msg.contains("provider"));
     assert!(msg.contains("credentials"));
-    assert!(msg.contains("Settings"));
+    assert!(msg.contains("Connections \u{2192} API keys \u{2192} LLM"));
     assert_ne!(msg, AGENT_JOB_USER_FAILURE_MESSAGE);
 }
 
@@ -1237,7 +1464,7 @@ fn agent_error_to_user_message_classifies_max_iterations() {
     let err = AgentError::MaxIterationsExceeded { max: 10 };
     let msg = agent_error_to_user_message(&err);
     assert!(msg.contains("tool iterations"));
-    assert!(msg.contains("Settings"));
+    assert!(msg.contains("Connections \u{2192} API keys \u{2192} LLM"));
     assert_ne!(msg, AGENT_JOB_USER_FAILURE_MESSAGE);
 }
 
@@ -1258,11 +1485,11 @@ fn agent_error_to_user_message_classifies_empty_provider_response_for_3335() {
         "must not claim a local provider exists: {msg}"
     );
     assert!(
-        msg.contains("different model"),
+        msg.contains("another model"),
         "must keep the model-switch remedy: {msg}"
     );
     assert!(
-        msg.contains("Settings \u{2192} AI \u{2192} LLM"),
+        msg.contains("Connections \u{2192} API keys \u{2192} LLM"),
         "must keep the provider-config deep link: {msg}"
     );
     assert_ne!(msg, AGENT_JOB_USER_FAILURE_MESSAGE);
@@ -1787,7 +2014,7 @@ fn next_user_error(
 
 #[test]
 fn publish_cron_user_error_broadcasts_metadata_only_for_each_kind() {
-    use crate::openhuman::channels::providers::web::subscribe_web_channel_events;
+    use crate::openhuman::web_chat::subscribe_web_channel_events;
 
     // Folded from two tests that both published `api_key_missing` to the
     // process-global bus and could false-pass off each other's broadcast under
@@ -1814,21 +2041,19 @@ fn publish_cron_user_error_broadcasts_metadata_only_for_each_kind() {
 }
 
 // TAURI-RUST-12K (end-to-end) — the predicate tests above key on hand-written
-// wire strings; this test proves the REAL provider-generated error reaches and
-// trips the guard. A cron agent job is routed to a keyless local provider
-// (`AuthStyle::None`, LM Studio shape) whose server is offline: the chat
-// workload skips the credential guard, attempts the loopback HTTP connect, and
-// the OS refuses it. The resulting `last_agent_error` (the aggregated provider
-// fallback chain carrying `…localhost:1234… tcp connect error … Connection
-// refused (os error N)`) must classify as local-provider-unreachable so the
-// cron loop halts and skips the bypassing `failure=retries_exhausted` report.
+// wire strings; this test proves the REAL provider-generated error remains
+// retryable when it only preserves reqwest's short send-error prefix. A cron
+// agent job is routed to a keyless local provider (`AuthStyle::None`, LM Studio
+// shape) whose server is offline: the chat workload skips the credential guard
+// and attempts loopback HTTP. If the provider layer surfaces only
+// `error sending request for url (...)`, without the refused errno/tcp-connect
+// chain, cron must not treat it as a permanent local-provider halt because the
+// same short prefix is also used for transient timeout/reset shapes.
 #[tokio::test]
-async fn cron_agent_job_local_provider_offline_trips_halt_guard() {
+async fn cron_agent_job_short_loopback_send_error_stays_retryable() {
     use crate::openhuman::config::schema::cloud_providers::{AuthStyle, CloudProviderCreds};
     let tmp = TempDir::new().unwrap();
     let mut config = test_config(&tmp).await;
-    config.reliability.scheduler_retries = 5;
-    config.reliability.provider_backoff_ms = 1;
     // Keyless local provider (`AuthStyle::None` → no credential requirement, so
     // the request proceeds to the HTTP connect). `chat_provider` routes the
     // chat workload to it; the slug resolves to LM Studio's default endpoint.
@@ -1842,38 +2067,17 @@ async fn cron_agent_job_local_provider_offline_trips_halt_guard() {
     }];
     config.default_model = Some("lmstudio:local-model".into());
     config.chat_provider = Some("lmstudio:local-model".into());
-    let security = SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-        &config.workspace_dir,
-    );
     let mut job = test_job("");
     job.job_type = JobType::Agent;
     job.prompt = Some("Say hello".into());
 
-    // Primary (deterministic): the real provider-generated failure trips the
-    // guard — the link the string-based predicate tests cannot prove.
     let (success, output, raw) = run_agent_job(&config, &job).await;
     assert!(
         !success,
         "a cron agent job against an offline local provider must fail"
     );
     assert!(
-        is_local_provider_unreachable_failure(&JobType::Agent, raw.as_deref(), &output),
-        "provider-generated loopback connect-refused must trip the halt guard; got raw={raw:?}"
-    );
-
-    // Secondary (coarse): the full retry loop halts on the first occurrence
-    // rather than exhausting all 5 retries. Not halting would add the cron
-    // backoff sleeps (200ms floor, doubling → >6s total) on top of five extra
-    // agent runs; halting skips every cron-level sleep. A generous bound keeps
-    // this robust to agent-build jitter while still catching a regressed halt.
-    let start = std::time::Instant::now();
-    let (loop_success, _out) = execute_job_with_retry(&config, &security, &job).await;
-    let elapsed = start.elapsed();
-    assert!(!loop_success);
-    assert!(
-        elapsed < std::time::Duration::from_secs(5),
-        "loop must halt on the first loopback failure, not burn 5 retries with backoff (elapsed {elapsed:?})"
+        !is_local_provider_unreachable_failure(&JobType::Agent, raw.as_deref(), &output),
+        "provider-generated short loopback send error must stay retryable without refused errno/tcp-connect evidence; got raw={raw:?}"
     );
 }

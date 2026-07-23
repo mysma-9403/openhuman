@@ -7,6 +7,86 @@ use std::sync::Arc;
 
 use crate::openhuman::inference::provider::Provider;
 
+pub(crate) fn resolve_subagent_source(
+    spec: &crate::openhuman::agent::harness::definition::ModelSpec,
+    agent_id: &str,
+    config: Option<&crate::openhuman::config::Config>,
+    parent_source: crate::openhuman::tinyagents::TurnModelSource,
+    parent_model: String,
+    is_team_lead: bool,
+    model_override: Option<&str>,
+    temperature: f64,
+) -> (crate::openhuman::tinyagents::TurnModelSource, String) {
+    use crate::openhuman::agent::harness::definition::ModelSpec;
+    if let Some(model) = model_override
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        tracing::debug!(
+            agent_id,
+            model,
+            "[subagent_runner] using inline model override"
+        );
+        return (parent_source, model.to_string());
+    }
+    if let Some(model) = config.and_then(|cfg| cfg.configured_agent_model(agent_id, is_team_lead)) {
+        tracing::debug!(
+            agent_id,
+            model,
+            "[subagent_runner] using config-level model pin"
+        );
+        return (parent_source, model.to_string());
+    }
+    match spec {
+        ModelSpec::Hint(workload) => match config {
+            Some(config) => {
+                match crate::openhuman::inference::provider::create_chat_model_with_model_id(
+                    workload,
+                    config,
+                    temperature,
+                ) {
+                    Ok((_model, model_id)) => {
+                        tracing::info!(
+                            agent_id,
+                            role = workload,
+                            model = %model_id,
+                            "[subagent_runner] resolved crate-native workload source"
+                        );
+                        (
+                            crate::openhuman::tinyagents::TurnModelSource::new_crate_native(
+                                workload.clone(),
+                                Arc::new(config.clone()),
+                            ),
+                            model_id,
+                        )
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            agent_id,
+                            role = workload,
+                            %error,
+                            parent_model,
+                            "[subagent_runner] workload model build failed; inheriting parent source"
+                        );
+                        (parent_source, parent_model)
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    agent_id,
+                    role = workload,
+                    parent_model,
+                    "[subagent_runner] config unavailable; inheriting parent source"
+                );
+                (parent_source, parent_model)
+            }
+        },
+        ModelSpec::Inherit => (parent_source, parent_model),
+        ModelSpec::Exact(model) => (parent_source, model.clone()),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider / model resolution
 // ─────────────────────────────────────────────────────────────────────────────
@@ -154,9 +234,26 @@ pub(crate) fn user_is_signed_in_to_composio(config: &crate::openhuman::config::C
 /// [`crate::openhuman::composio::ComposioClient`] so the live
 /// `composio.mode` toggle is honoured per execute — see
 /// [`crate::openhuman::composio::ComposioActionTool`] and issue #1710.
+///
+/// ## Tool caching (#5119)
+///
+/// `resolve()` caches the built [`ComposioActionTool`] (and therefore its
+/// [`ContractGate`]) per slug so that a given action reuses the same gate
+/// instance across multiple `resolve()` calls. This is forward-looking: the
+/// `lazy_resolver` is not yet wired for production dispatch (#4249 1b), but
+/// when it is, caching prevents the fresh-gate-per-call problem that would
+/// cause every resolution to surface the contract instead of executing.
+/// Additionally, the [`ContractGate`] itself has a process-wide auto-proceed
+/// safety net that handles the re-delegation pattern even without caching.
 pub(crate) struct LazyToolkitResolver {
     pub(super) config: std::sync::Arc<crate::openhuman::config::Config>,
     pub(super) actions: Vec<crate::openhuman::context::prompt::ConnectedIntegrationTool>,
+    /// Cache of resolved tools keyed by action slug. Once a tool is built
+    /// for a slug, subsequent `resolve()` calls for the same slug reuse the
+    /// cached instance — sharing its [`ContractGate`] state (#5119).
+    #[allow(dead_code)] // used via pub(super) from tests
+    pub(super) resolved:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<dyn crate::openhuman::tools::Tool>>>,
 }
 
 /// Minimum normalized-slug length before the prefix/superstring tier in
@@ -167,16 +264,63 @@ pub(crate) struct LazyToolkitResolver {
 const TIER4_MIN_SLUG_LEN: usize = 8;
 
 impl LazyToolkitResolver {
-    pub(super) fn resolve(&self, name: &str) -> Option<Box<dyn crate::openhuman::tools::Tool>> {
+    /// Resolve a `ComposioActionTool` for `name`, caching the built tool per
+    /// slug so subsequent calls for the same slug return the same
+    /// [`ContractGate`] instance (#5119).
+    ///
+    /// ## Caching
+    ///
+    /// Tools are cached by slug in the `resolved` map. The first call for a
+    /// slug builds the tool and stores it; subsequent calls return the cached
+    /// `Arc<dyn Tool>`, sharing the [`ContractGate`] state across calls. This
+    /// prevents the fresh-gate-per-call problem: the contract is surfaced at
+    /// most once per resolver instance, and the retry proceeds normally.
+    ///
+    /// Additionally, the [`ContractGate`] has a process-wide auto-proceed
+    /// safety net that fires when too many fresh gate instances have all
+    /// surfaced the same contract without executing (#5119). This handles
+    /// the cross-spawn re-delegation pattern even when caching is bypassed.
+    pub(super) fn resolve(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<dyn crate::openhuman::tools::Tool>> {
+        // Check cache first — returns the same Arc (and therefore the same
+        // ContractGate) for repeated resolve calls on the same slug.
+        {
+            let cache = self
+                .resolved
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = cache.get(name) {
+                tracing::trace!(
+                    target: "subagent_runner",
+                    slug = %name,
+                    "[subagent_runner] returning cached composio tool"
+                );
+                return Some(cached.clone());
+            }
+        }
+
         let action = self.find_action(name)?;
-        Some(Box::new(
+        let tool: std::sync::Arc<dyn crate::openhuman::tools::Tool> = std::sync::Arc::new(
             crate::openhuman::composio::ComposioActionTool::new(
                 self.config.clone(),
                 action.name.clone(),
                 action.description.clone(),
                 action.parameters.clone(),
             ),
-        ))
+        );
+
+        // Store in cache for future lookups.
+        {
+            let mut cache = self
+                .resolved
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(action.name.clone(), tool.clone());
+        }
+
+        Some(tool)
     }
 
     /// Match a model-supplied tool name to a real toolkit action, tolerant

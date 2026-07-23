@@ -421,6 +421,17 @@ fn format_prompt_messages(messages: &[ChatMessage]) -> String {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Stable provider identifier for telemetry/tracing. Rendered by trace
+    /// exporters as the Langfuse `gen_ai.provider` and the `{provider}.{model}`
+    /// model label (e.g. `managed.chat-v1`, `openai.gpt-4o`).
+    ///
+    /// Defaults to `"custom"`; concrete providers override with their slug
+    /// (the managed backend returns `"managed"`, an OpenAI-compatible BYOK
+    /// provider its configured name, wrappers delegate to their active inner).
+    fn telemetry_provider_id(&self) -> String {
+        "custom".to_string()
+    }
+
     /// Query provider capabilities.
     ///
     /// Default implementation returns minimal capabilities (no native tool calling).
@@ -719,8 +730,10 @@ pub trait Provider: Send + Sync {
         _options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         // For default implementation, we need to convert to owned strings
-        // This is a limitation of the default implementation
-        let provider_name = "unknown".to_string();
+        // This is a limitation of the default implementation. Name the real
+        // provider via its telemetry slug so the diagnostic is actionable
+        // instead of the useless literal "unknown".
+        let provider_name = self.telemetry_provider_id();
 
         // Create a single empty chunk to indicate not supported
         let chunk = StreamChunk::error(format!("{} does not support streaming", provider_name));

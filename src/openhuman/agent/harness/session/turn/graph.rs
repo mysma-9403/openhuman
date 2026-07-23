@@ -31,7 +31,7 @@ use tokio::sync::mpsc::Sender;
 
 use crate::openhuman::agent::harness::run_queue::RunQueue;
 use crate::openhuman::agent::progress::AgentProgress;
-use crate::openhuman::inference::provider::{ChatMessage, Provider, AGENT_TURN_MAX_OUTPUT_TOKENS};
+use crate::openhuman::inference::provider::{ChatMessage, AGENT_TURN_MAX_OUTPUT_TOKENS};
 use crate::openhuman::tinyagents::{
     run_turn_via_tinyagents_shared, TinyagentsTurnOutcome, TurnContextMiddleware,
 };
@@ -43,12 +43,12 @@ use crate::openhuman::tools::Tool;
 /// arguments (no child scope, no early-exit tools, graceful cap pause, per-turn
 /// output cap) are applied inside [`run_chat_turn_graph`].
 pub(crate) struct ChatTurnGraph {
-    /// The session provider (already cloned by the caller).
-    pub provider: Arc<dyn Provider>,
+    /// The turn's crate `ChatModel` set (primary + tier routes + summarizer),
+    /// already built by the caller from the session's `TurnModelSource` (issue
+    /// #4249, Phase 3 / Motion A). The graph names crate model types only.
+    pub turn_models: crate::openhuman::tinyagents::TurnModels,
     /// The effective model id for this turn.
     pub model: String,
-    /// Sampling temperature.
-    pub temperature: f64,
     /// Provider-ready messages (system + prior history + this turn's user turn,
     /// multimodal markers already expanded).
     pub messages: Vec<ChatMessage>,
@@ -72,6 +72,12 @@ pub(crate) struct ChatTurnGraph {
     /// The agent's builder-configured tool policy + session context, enforced at
     /// the tool boundary. `None` when the session has no explicit policy.
     pub tool_policy: Option<crate::openhuman::tinyagents::ToolPolicyEnforcement>,
+    /// Optional per-profile workspace descriptor (section D of agent-profile
+    /// homes). `Some` when the session's active profile opted into a dedicated
+    /// workspace — acting tools then resolve their default cwd to
+    /// `<action_dir>/profiles/<id>` via `ToolExecutionContext.workspace`. `None`
+    /// (the common case) keeps the shared-`action_dir` cwd behaviour.
+    pub workspace_descriptor: Option<tinyagents::harness::workspace::WorkspaceDescriptor>,
 }
 
 /// Drive the chat turn graph: a thin wrapper over the shared tinyagents seam
@@ -79,13 +85,27 @@ pub(crate) struct ChatTurnGraph {
 /// ([`core`](super::core) folds usage, persists the conversation, and handles a
 /// cap-hit checkpoint).
 pub(crate) async fn run_chat_turn_graph(graph: ChatTurnGraph) -> Result<TinyagentsTurnOutcome> {
+    // Fail-closed allowlist plumbing (issue #4452): the shared seam now takes an
+    // `Option<HashSet<String>>` where `None` = no filter (all visible tools) and
+    // `Some(set)` = exactly those tools. The chat path's historical convention is
+    // "empty `visible_tool_names` = every visible tool", so map an empty set to
+    // `None` to preserve that behavior; a populated set stays an explicit filter.
+    let visible_tool_names = if graph.visible_tool_names.is_empty() {
+        None
+    } else {
+        Some(graph.visible_tool_names)
+    };
+    // The turn's crate `ChatModel` set was built by the caller from the session's
+    // `TurnModelSource` (issue #4249, Phase 3 / Motion A); the telemetry id rides
+    // on the bundle.
+    let provider_id = graph.turn_models.provider_id().to_string();
     run_turn_via_tinyagents_shared(
-        graph.provider,
+        graph.turn_models,
+        provider_id,
         &graph.model,
-        graph.temperature,
         graph.messages,
         vec![graph.tools],
-        graph.visible_tool_names,
+        visible_tool_names,
         graph.max_iterations,
         // Mirror the harness event stream onto this session's progress sink.
         graph.on_progress,
@@ -107,11 +127,19 @@ pub(crate) async fn run_chat_turn_graph(graph: ChatTurnGraph) -> Result<Tinyagen
         graph.context_mw,
         // Builder-configured tool policy enforcement (session chat path).
         graph.tool_policy,
-        // Top-level chat turns do not yet carry SDK workspace descriptors.
-        None,
+        // Per-profile dedicated workspace descriptor (section D). `None` for the
+        // common shared-`action_dir` case; `Some` binds acting tools' default
+        // cwd to `<action_dir>/profiles/<id>` for a `dedicated_workspace` profile.
+        graph.workspace_descriptor,
         // Interactive chat turn — response caching MUST stay off so a live user
         // turn is never served a cached model response (correctness/safety).
         false,
+        // #4457 (defect C): defer the terminal `TurnCompleted` to the caller.
+        // The session path (`run_turn_impl` in `turn/core.rs`) runs its cap/#4093
+        // wrap-up (`summarize_turn_wrapup`) *after* this seam returns and then
+        // emits the single `TurnCompleted` itself — a seam-level emit here would
+        // fire before that checkpoint streams and duplicate the event.
+        true,
     )
     .await
 }

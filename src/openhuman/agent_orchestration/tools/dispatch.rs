@@ -6,8 +6,25 @@ use crate::openhuman::agent::harness::subagent_runner::{
     run_subagent, SubagentRunOptions, SubagentRunStatus,
 };
 use crate::openhuman::agent::progress::AgentProgress;
-use crate::openhuman::tools::traits::ToolResult;
-use tinyagents::harness::workspace::WorkspaceDescriptor;
+use crate::openhuman::tools::traits::{Tool as _, ToolCallOptions, ToolResult};
+use tinyagents::harness::tool::ToolExecutionContext;
+
+/// How a delegated sub-agent run should be scheduled relative to the parent
+/// turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchMode {
+    /// Run the sub-agent as a durable async worker (the default for
+    /// interactive archetype delegations): the tool returns immediately with
+    /// an `[async_subagent_ref]` carrying `task_id` + `subagent_session_id`,
+    /// and the finished result is delivered back into the parent chat as a
+    /// new system-injected turn (`background_delivery`). Falls back to
+    /// [`DispatchMode::Blocking`] when there is no parent agent turn or no
+    /// current chat thread to deliver the result into (cron/CLI contexts) —
+    /// an async result with nowhere to land would be silently lost.
+    PreferAsync,
+    /// Run the sub-agent inline and return its final output in this turn.
+    Blocking,
+}
 
 pub(crate) async fn dispatch_subagent(
     agent_id: &str,
@@ -15,8 +32,10 @@ pub(crate) async fn dispatch_subagent(
     prompt: &str,
     skill_filter: Option<&str>,
     model_override: Option<&str>,
-    parent_workspace_descriptor: Option<WorkspaceDescriptor>,
+    tool_context: Option<&ToolExecutionContext>,
+    mode: DispatchMode,
 ) -> anyhow::Result<ToolResult> {
+    let parent_workspace_descriptor = tool_context.and_then(|ctx| ctx.workspace.clone());
     let registry = match AgentDefinitionRegistry::global() {
         Some(reg) => reg,
         None => {
@@ -90,6 +109,66 @@ pub(crate) async fn dispatch_subagent(
         }
     };
 
+    // ── Async-by-default delegation (#continuity) ─────────────────────────
+    // Interactive delegations route through the durable async sub-agent
+    // machinery: the parent gets an immediate `[async_subagent_ref]` with a
+    // stable `subagent_session_id` it can steer/wait/continue by, the session
+    // (including full history) is persisted in the per-workspace
+    // `subagent_sessions` store, and the finished result is inserted into the
+    // parent thread as a NEW turn via `background_completions` +
+    // `background_delivery`. This is what keeps a `build_workflow` proposal
+    // resumable on the next user turn instead of respawning a fresh,
+    // stateless builder (the "day 0 context" bug).
+    if mode == DispatchMode::PreferAsync {
+        let has_parent_turn = parent_ctx.is_some();
+        let has_delivery_thread =
+            crate::openhuman::inference::provider::thread_context::current_thread_id().is_some();
+        if has_parent_turn && has_delivery_thread {
+            let mut async_args = serde_json::json!({
+                "agent_id": definition.id.clone(),
+                "prompt": prompt,
+                "task_title":
+                    crate::openhuman::agent_orchestration::subagent_sessions::task_title_from_prompt(
+                        prompt,
+                    ),
+            });
+            if let (Some(obj), Some(model)) = (async_args.as_object_mut(), model_override) {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(model.to_string()),
+                );
+            }
+            if let (Some(obj), Some(toolkit)) = (async_args.as_object_mut(), skill_filter) {
+                obj.insert(
+                    "toolkit".to_string(),
+                    serde_json::Value::String(toolkit.to_string()),
+                );
+            }
+            log::info!(
+                "[agent] routing {tool_name} delegation of '{}' to durable async sub-agent \
+                 (result will be delivered as a follow-up turn)",
+                definition.id
+            );
+            // Box the forwarded future: `SpawnAsyncSubagentTool`'s
+            // `execute_with_context` future is large, and embedding it inline
+            // in every delegation tool's future (which itself nests inside
+            // agent-turn futures) overflows the test-thread stack on deep
+            // parallel-delegation flows.
+            return Box::pin(async move {
+                super::spawn_async_subagent::SpawnAsyncSubagentTool::new()
+                    .execute_with_context(async_args, ToolCallOptions::default(), tool_context)
+                    .await
+            })
+            .await;
+        }
+        log::info!(
+            "[agent] {tool_name}: async delegation requested but parent_turn={} \
+             delivery_thread={} — falling back to blocking dispatch",
+            has_parent_turn,
+            has_delivery_thread
+        );
+    }
+
     let parent_session = parent_ctx
         .as_ref()
         .map(|p| p.session_id.clone())
@@ -114,6 +193,7 @@ pub(crate) async fn dispatch_subagent(
                 mode: "typed".to_string(),
                 dedicated_thread: false,
                 prompt_chars: prompt.chars().count(),
+                prompt: prompt.to_string(),
                 worker_thread_id: None,
                 display_name: Some(definition.display_name().to_string()),
             })
@@ -212,6 +292,30 @@ pub(crate) async fn dispatch_subagent(
                     outcome.output.chars().count(),
                     outcome.iterations,
                 );
+                // Also send to the per-request progress sink (mirrors
+                // `spawn_subagent.rs`) so the web channel bridge emits
+                // `subagent_done` to the frontend. Without this the delegated
+                // subagent's timeline row (created on `SubagentSpawned` above)
+                // stays "running" forever — `publish_subagent_completed` only
+                // fires the internal DomainEvent bus, not the per-request
+                // progress channel the UI's timeline is driven from.
+                if let Some(progress) = current_parent().and_then(|p| p.on_progress.clone()) {
+                    let _ = progress
+                        .send(AgentProgress::SubagentCompleted {
+                            agent_id: outcome.agent_id.clone(),
+                            task_id: outcome.task_id.clone(),
+                            elapsed_ms: outcome.elapsed.as_millis() as u64,
+                            iterations: outcome.iterations as u32,
+                            output_chars: outcome.output.chars().count(),
+                            output: outcome.output.clone(),
+                            // Synchronous delegate dispatch has no worktree
+                            // isolation (that is a `spawn_subagent` concept).
+                            worktree_path: None,
+                            changed_files: Vec::new(),
+                            dirty_status: None,
+                        })
+                        .await;
+                }
                 log::info!(
                     "[agent] {} completed via {} iterations={} output_chars={}",
                     agent_id,
@@ -235,6 +339,24 @@ pub(crate) async fn dispatch_subagent(
                     outcome.output.chars().count(),
                     outcome.iterations,
                 );
+                // Same progress-sink mirror as the `Completed` arm above —
+                // an incomplete stop is still lifecycle-completed, so the
+                // timeline row must be released from "running" here too.
+                if let Some(progress) = current_parent().and_then(|p| p.on_progress.clone()) {
+                    let _ = progress
+                        .send(AgentProgress::SubagentCompleted {
+                            agent_id: outcome.agent_id.clone(),
+                            task_id: outcome.task_id.clone(),
+                            elapsed_ms: outcome.elapsed.as_millis() as u64,
+                            iterations: outcome.iterations as u32,
+                            output_chars: outcome.output.chars().count(),
+                            output: outcome.output.clone(),
+                            worktree_path: None,
+                            changed_files: Vec::new(),
+                            dirty_status: None,
+                        })
+                        .await;
+                }
                 log::info!(
                     "[agent] {} stopped incomplete via {} (task_id={}) iterations={} — \
                      returning partial-progress envelope, not a finished result",
@@ -330,6 +452,7 @@ mod tests {
             None,
             None,
             None,
+            DispatchMode::Blocking,
         )
         .await
         .expect("dispatch_subagent should not return Err on these inputs");

@@ -28,7 +28,8 @@ use tokio::sync::mpsc::Sender;
 use crate::openhuman::agent::harness::run_queue::RunQueue;
 use crate::openhuman::agent::harness::subagent_runner::SubagentRunError;
 use crate::openhuman::agent::progress::AgentProgress;
-use crate::openhuman::inference::provider::{ChatMessage, Provider};
+use crate::openhuman::inference::provider::ChatMessage;
+use crate::openhuman::tinyagents::TurnModelSource;
 use crate::openhuman::tools::{Tool, ToolSpec};
 
 /// The assembled inputs for one sub-agent turn, handed to a custom
@@ -38,7 +39,9 @@ use crate::openhuman::tools::{Tool, ToolSpec};
 /// future without borrowing the caller's stack — mirrors the positional
 /// arguments the default `run_subagent_via_graph` takes.
 pub struct AgentTurnRequest {
-    pub provider: Arc<dyn Provider>,
+    /// The turn's model source — builds the sub-agent's tiered crate `ChatModel`
+    /// set (issue #4249, Phase 3 / Motion A). Replaces the raw `Arc<dyn Provider>`.
+    pub turn_model_source: TurnModelSource,
     pub model: String,
     pub temperature: f64,
     /// Full working transcript for the turn (system + prior + this user turn).
@@ -62,6 +65,11 @@ pub struct AgentTurnRequest {
     pub provider_label: String,
     pub(crate) handoff_cache:
         Option<Arc<crate::openhuman::agent::harness::subagent_runner::ResultHandoffCache>>,
+    /// Agent-level TokenJuice compaction profile
+    /// (`definition.effective_tokenjuice_compression()`), threaded into the
+    /// sub-agent `TurnContextMiddleware` so tool outputs compact like the chat
+    /// path instead of taking a blunt byte-cap truncation (#4466).
+    pub tokenjuice_compression: crate::openhuman::tokenjuice::AgentTokenjuiceCompression,
 }
 
 /// Token/cost totals a custom runner reports back. Mirrors the runner's internal
@@ -85,6 +93,9 @@ pub struct AgentTurnResult {
     pub early_exit_tool: Option<String>,
     /// `true` when the run stopped at the model-call cap with work still pending.
     pub hit_cap: bool,
+    /// Set (with the halt reason) when the repeated-failure / repeat-progress
+    /// circuit breaker halted the run; the runner reports `Incomplete` (#4466).
+    pub breaker_halt: Option<String>,
 }
 
 /// A per-agent custom turn-graph runner: given the assembled [`AgentTurnRequest`],
@@ -96,18 +107,13 @@ pub type AgentGraphRunner =
 
 /// How an agent's turn is driven. Selected per-agent via each folder's
 /// `graph.rs::graph()` and injected onto [`AgentDefinition`][super::definition::AgentDefinition].
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum AgentGraph {
     /// Run the shared default sub-agent turn graph (`run_subagent_via_graph`).
+    #[default]
     Default,
     /// Run this agent's bespoke graph.
     Custom(AgentGraphRunner),
-}
-
-impl Default for AgentGraph {
-    fn default() -> Self {
-        AgentGraph::Default
-    }
 }
 
 impl AgentGraph {

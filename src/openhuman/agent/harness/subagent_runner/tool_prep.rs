@@ -52,11 +52,14 @@ pub(super) fn top_k_for_toolkit(toolkit: &str) -> usize {
 
 // ── Text-mode protocol block ────────────────────────────────────────────
 
-/// Format an XML tool-use protocol block appended to the system prompt in text
-/// mode. Mirrors
-/// [`crate::openhuman::agent::dispatcher::XmlToolDispatcher::prompt_instructions`]
-/// — same `<tool_call>{…}</tool_call>` format so the existing
-/// `parse_tool_calls` helper understands what the model emits.
+/// Format the tool-use protocol block appended to the system prompt in text
+/// mode. Teaches **P-Format** first (the same protocol
+/// [`crate::openhuman::agent::dispatcher::PFormatToolDispatcher`] renders and
+/// the tinyagents adapter parses via `parse_tool_calls_with_pformat`), with
+/// the legacy JSON-in-tag form as the documented fallback for nested
+/// arguments. The `## Tools` catalogue already renders `Call as:` p-format
+/// signatures for every tool, so teaching JSON here contradicted the
+/// catalogue and threw away the p-format token savings.
 ///
 /// Per-parameter rendering is intentionally **compact**: name, type, a
 /// "required" marker, and a short one-line description if present. We
@@ -81,12 +84,23 @@ pub(crate) fn build_text_mode_tool_instructions() -> String {
     let mut out = String::new();
     out.push_str("## Tool Use Protocol\n\n");
     out.push_str(
-        "To use a tool, wrap a JSON object in <tool_call></tool_call> tags. \
-         Do not nest tags. Emit one tag per call; you can emit multiple tags \
-         in the same response if you need to run calls in parallel.\n\n",
+        "Tool calls use **P-Format** (Parameter-Format): compact, positional, \
+         pipe-delimited syntax wrapped in `<tool_call>` tags.\n\n",
     );
+    out.push_str("```\n<tool_call>\nGMAIL_FETCH_EMAILS[ca_123||10]\n</tool_call>\n```\n\n");
     out.push_str(
-        "```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n",
+        "**Rules:**\n\
+         - Form: `name[arg1|arg2|...|argN]`. Arguments are positional and must match the \
+           order shown in each tool's `Call as:` signature in the `## Tools` section \
+           (alphabetical by parameter name). Leave a slot empty to omit that argument.\n\
+         - Empty calls: `name[]` for zero-arg tools.\n\
+         - Escapes inside argument values: `\\|` for a literal `|`, `\\]` for `]`, `\\\\` for `\\`.\n\
+         - Do not nest tags. Emit one tag per call; you can emit multiple tags in the same \
+           response to run calls in parallel.\n\
+         - When an argument needs a nested object or array that p-format cannot express, \
+           fall back to the JSON form in the same tags: \
+           `<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>`. \
+           Prefer p-format for everything else.\n",
     );
     out
 }
@@ -118,10 +132,29 @@ pub(crate) fn build_text_mode_tool_instructions() -> String {
 /// this function and the corresponding generator in
 /// `orchestrator_tools.rs` together.
 pub(super) fn is_subagent_spawn_tool(name: &str) -> bool {
-    name == "spawn_subagent"
+    if name == "spawn_subagent"
         || name.starts_with("delegate_")
         || name == "use_tinyplace"
         || name == "agent_prepare_context"
+    {
+        return true;
+    }
+    // Synthesised delegation tools are named by the target agent's
+    // `delegate_name` override, which mostly does NOT carry the `delegate_`
+    // prefix (`plan`, `run_code`, `research`, `review_code`, `do_crypto`,
+    // `schedule_task`, …). The prefix check above misses every one of them,
+    // which let wildcard-scoped children inherit the orchestrator's spawn
+    // surface. Resolve the override names via the registry so the strip
+    // stays in lockstep with `collect_orchestrator_tools`'s naming.
+    if let Some(registry) =
+        crate::openhuman::agent::harness::definition::AgentDefinitionRegistry::global()
+    {
+        return registry
+            .list()
+            .iter()
+            .any(|def| def.delegate_name.as_deref() == Some(name));
+    }
+    false
 }
 
 /// Returns indices into `parent_tools` for the tools the sub-agent may
@@ -172,6 +205,20 @@ pub(super) fn filter_tool_indices(
         .collect()
 }
 
+/// Intersect a child definition's tool indices with the tools the parent turn
+/// actually exposes. An empty parent set is the legacy "unknown/unrestricted"
+/// sentinel used by internal callers and older tests.
+pub(super) fn retain_parent_visible_tool_indices(
+    indices: &mut Vec<usize>,
+    parent_tools: &[Box<dyn Tool>],
+    parent_visible: &std::collections::HashSet<String>,
+) {
+    if parent_visible.is_empty() {
+        return;
+    }
+    indices.retain(|&index| parent_visible.contains(parent_tools[index].name()));
+}
+
 pub(super) fn disallowed_tool_matches(disallowed: &[String], name: &str) -> bool {
     disallowed.iter().any(|entry| {
         if let Some(prefix) = entry.strip_suffix('*') {
@@ -196,6 +243,50 @@ mod tests {
         // parent context. See #3949 review.
         assert!(is_subagent_spawn_tool("agent_prepare_context"));
         assert!(!is_subagent_spawn_tool("tinyplace_directory_resolve"));
+    }
+
+    #[test]
+    fn unprefixed_delegate_name_overrides_are_treated_as_spawn_tools() {
+        // Most synthesised delegation tools use an unprefixed
+        // `delegate_name` override (`plan`, `run_code`, `research`, …).
+        // They must be stripped from every sub-agent surface, exactly like
+        // the `delegate_*`-prefixed defaults.
+        let tmp = tempfile::TempDir::new().unwrap();
+        crate::openhuman::agent::harness::definition::AgentDefinitionRegistry::init_global(
+            tmp.path(),
+        )
+        .unwrap();
+        for delegate in [
+            "plan",
+            "run_code",
+            "research",
+            "review_code",
+            "do_crypto",
+            "do_prediction_markets",
+            "schedule_task",
+            "make_presentation",
+            "archive_session",
+            // `use_mcp_server` is `mcp_agent`'s `delegate_name`; the agent —
+            // and therefore this delegate tool — is compiled out with the
+            // `mcp` feature (#4799). `setup_mcp_server` belongs to
+            // `mcp_setup`, which stays registered in both builds.
+            #[cfg(feature = "mcp")]
+            "use_mcp_server",
+            "setup_mcp_server",
+        ] {
+            assert!(
+                is_subagent_spawn_tool(delegate),
+                "`{delegate}` is a synthesised delegation tool and must be \
+                 stripped from sub-agent tool surfaces"
+            );
+        }
+        // Ordinary worker tools stay visible.
+        for plain in ["shell", "file_read", "web_fetch", "todo"] {
+            assert!(
+                !is_subagent_spawn_tool(plain),
+                "`{plain}` must not be classified as a spawn tool"
+            );
+        }
     }
 }
 
@@ -262,6 +353,17 @@ mod recovery_visibility_tests {
             None,
         );
         assert!(!names(&idx, &t).contains(&RECOVERY_TOOL_NAME.to_string()));
+    }
+
+    #[test]
+    fn parent_visibility_caps_wildcard_child_scope() {
+        let t = tools();
+        let mut idx = filter_tool_indices(&t, &ToolScope::Wildcard, &[], None);
+        let parent_visible = ["current_time".to_string()].into_iter().collect();
+
+        retain_parent_visible_tool_indices(&mut idx, &t, &parent_visible);
+
+        assert_eq!(names(&idx, &t), vec!["current_time".to_string()]);
     }
 }
 

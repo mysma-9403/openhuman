@@ -5,6 +5,7 @@ import { useSubconscious } from '../useSubconscious';
 
 const mockStatus = {
   result: {
+    instance: 'memory',
     enabled: true,
     mode: 'simple',
     provider_available: true,
@@ -80,6 +81,21 @@ describe('useSubconscious', () => {
     expect(result.current.status).not.toBeNull();
   });
 
+  it('does not fetch or poll when disabled', async () => {
+    const { subconsciousStatus, openhumanHeartbeatSettingsGet } =
+      await import('../../utils/tauriCommands');
+    const { result } = renderHook(() => useSubconscious(false));
+
+    await act(async () => {
+      // Advance well past the 5s poll interval — still no RPCs.
+      await vi.advanceTimersByTimeAsync(12000);
+    });
+
+    expect(subconsciousStatus).not.toHaveBeenCalled();
+    expect(openhumanHeartbeatSettingsGet).not.toHaveBeenCalled();
+    expect(result.current.status).toBeNull();
+  });
+
   it('setMode calls heartbeat settings set', async () => {
     const { openhumanHeartbeatSettingsSet } = await import('../../utils/tauriCommands');
     const { result } = renderHook(() => useSubconscious());
@@ -124,5 +140,39 @@ describe('useSubconscious', () => {
     });
 
     expect(subconsciousTrigger).toHaveBeenCalled();
+  });
+
+  it('triggerTick passes the kind through (no-arg = memory)', async () => {
+    const { subconsciousTrigger } = await import('../../utils/tauriCommands');
+    const { result } = renderHook(() => useSubconscious());
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    await act(async () => {
+      await result.current.triggerTick('all');
+    });
+    expect(subconsciousTrigger).toHaveBeenLastCalledWith('all');
+
+    await act(async () => {
+      await result.current.triggerTick();
+    });
+    // A no-arg call maps to the legacy memory-only trigger.
+    expect(subconsciousTrigger).toHaveBeenLastCalledWith(undefined);
+  });
+
+  it('derives a memory instance row when the core omits instances[]', async () => {
+    const { result } = renderHook(() => useSubconscious());
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(result.current.instances).toHaveLength(1);
+    expect(result.current.instances[0].instance).toBe('memory');
+    // No kind is in flight initially.
+    expect(result.current.isTriggering('memory')).toBe(false);
+    expect(result.current.isTriggering('all')).toBe(false);
   });
 });

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 impl ArchivistHook {
     /// Read every entry recorded for `session_id`, preferring the
-    /// md-backed `memory_archivist::store` when `self.config` is set and
+    /// crate-owned md-backed archivist store when `self.config` is set and
     /// falling back to the legacy FTS5 episodic table otherwise.
     ///
     /// Returns `EpisodicEntry` so the existing call sites (segment
@@ -23,7 +23,10 @@ impl ArchivistHook {
         session_id: &str,
     ) -> Vec<EpisodicEntry> {
         if let Some(cfg) = self.config.as_ref() {
-            match crate::openhuman::memory_archivist::store::session_entries(cfg, session_id) {
+            let engine_config =
+                crate::openhuman::tinycortex::memory_config_from(cfg, cfg.workspace_dir.clone());
+            match tinycortex::memory::archivist::store::session_entries(&engine_config, session_id)
+            {
                 Ok(turns) => {
                     return turns
                         .into_iter()
@@ -64,6 +67,7 @@ impl ArchivistHook {
     /// - NEVER mutates DB state (no `segment_set_summary`, no embedding).
     /// - NEVER closes a segment.
     /// - Safe to call on both open and closed segments.
+    ///
     /// Summarize a set of episodic entries into a recap string.
     ///
     /// Returns `(text, produced_by_llm)`. `produced_by_llm == false` means the
@@ -117,6 +121,9 @@ impl ArchivistHook {
             tree_kind: TreeKind::Source,
             target_level: 0,
             token_budget: 2_000,
+            input_token_budget: tinycortex::memory::config::INPUT_TOKEN_BUDGET,
+            overhead_reserve_tokens: tinycortex::memory::config::SUMMARY_OVERHEAD_RESERVE_TOKENS,
+            ask: None,
         };
 
         let first = entries.first().map(|e| e.content.as_str()).unwrap_or("");

@@ -2,7 +2,9 @@ use super::*;
 use crate::core::event_bus::{global, init_global, DomainEvent};
 use crate::openhuman::agent::dispatcher::XmlToolDispatcher;
 use crate::openhuman::agent::error::AgentError;
-use crate::openhuman::inference::provider::{ChatMessage, ChatRequest, ChatResponse, UsageInfo};
+use crate::openhuman::inference::provider::{
+    ChatMessage, ChatRequest, ChatResponse, Provider, UsageInfo,
+};
 use crate::openhuman::memory::Memory;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -323,7 +325,7 @@ fn accessors_and_history_reset_expose_agent_runtime_state() {
     });
     let mut agent = make_agent(provider);
     agent.history = vec![ConversationMessage::Chat(ChatMessage::system("sys"))];
-    agent.workflows = vec![crate::openhuman::workflows::Workflow {
+    agent.workflows = vec![crate::openhuman::skills::Workflow {
         name: "demo".into(),
         ..Default::default()
     }];

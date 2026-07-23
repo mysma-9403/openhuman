@@ -294,19 +294,19 @@ impl SecretStore {
             };
 
             let hex_key = read_result.with_context(|| {
+                // `mut` is only exercised inside the #[cfg(windows)] block below.
+                #[cfg_attr(not(windows), allow(unused_mut))]
                 let mut msg = format!(
                     "Failed to read secret key file at {}",
                     self.key_path.display()
                 );
                 #[cfg(windows)]
-                {
-                    msg.push_str(
-                        "\n\nThis is often caused by incorrect file permissions on Windows. \
-                         Try repairing ACLs on the .openhuman directory:\n\
-                         icacls \"%USERPROFILE%\\.openhuman\" /reset /t /c\n\
-                         icacls \"%USERPROFILE%\\.openhuman\\.secret_key\" /reset /c",
-                    );
-                }
+                let msg = format!(
+                    "{msg}\n\nThis is often caused by incorrect file permissions on Windows. \
+                     Try repairing ACLs on the .openhuman directory:\n\
+                     icacls \"%USERPROFILE%\\.openhuman\" /reset /t /c\n\
+                     icacls \"%USERPROFILE%\\.openhuman\\.secret_key\" /reset /c"
+                );
                 msg
             })?;
             let key = decode_key_hex(hex_key.trim())?;

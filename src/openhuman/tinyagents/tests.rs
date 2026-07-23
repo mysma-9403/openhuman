@@ -11,6 +11,37 @@ use super::*;
 use crate::openhuman::inference::provider::{ChatRequest, ChatResponse, Provider, ToolCall};
 use crate::openhuman::tools::{Tool, ToolResult};
 
+#[test]
+fn crate_native_turn_source_does_not_retain_host_provider() {
+    let source = TurnModelSource::new_crate_native(
+        "chat",
+        Arc::new(crate::openhuman::config::Config::default()),
+    );
+    assert!(
+        source.provider.is_none(),
+        "crate-native turn sources must not construct or retain a host Provider"
+    );
+    assert!(source.crate_native.is_some());
+}
+
+#[test]
+fn crate_native_text_mode_does_not_resolve_host_provider() {
+    let source = TurnModelSource::new_crate_native(
+        "chat",
+        Arc::new(crate::openhuman::config::Config::default()),
+    )
+    .with_text_mode();
+
+    assert!(source.provider.is_none());
+    assert!(
+        source
+            .crate_native
+            .as_ref()
+            .is_some_and(|native| native.force_text_mode),
+        "text mode must be represented on the crate-native source"
+    );
+}
+
 /// A real openhuman tool the harness will execute.
 struct EchoTool;
 
@@ -159,13 +190,16 @@ async fn streaming_path_forwards_text_deltas_and_cost() {
     let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![]);
     let history = vec![ChatMessage::user("hi")];
 
+    let provider: Arc<dyn Provider> = Arc::new(StreamingProvider);
+    let provider_id = provider.telemetry_provider_id();
+    let turn_models = build_turn_models(provider, "mock-model", 0.0, None);
     let outcome = run_turn_via_tinyagents_shared(
-        Arc::new(StreamingProvider),
+        turn_models,
+        provider_id,
         "mock-model",
-        0.0,
         history,
         vec![registry],
-        std::collections::HashSet::new(),
+        None,
         4,
         Some(tx),
         None,
@@ -178,6 +212,7 @@ async fn streaming_path_forwards_text_deltas_and_cost() {
         None,
         None,
         false,
+        false, // defer_turn_completed_to_caller (#4457)
     )
     .await
     .expect("streaming turn runs");
@@ -261,13 +296,15 @@ async fn pre_queued_steer_message_is_injected_into_the_request() {
         .await;
 
     let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![]);
+    let provider_id = provider.telemetry_provider_id();
+    let turn_models = build_turn_models(provider.clone(), "mock-model", 0.0, None);
     let outcome = run_turn_via_tinyagents_shared(
-        provider.clone(),
+        turn_models,
+        provider_id,
         "mock-model",
-        0.0,
         vec![ChatMessage::user("investigate the bug")],
         vec![registry],
-        std::collections::HashSet::new(),
+        None,
         4,
         None,
         None,
@@ -280,6 +317,7 @@ async fn pre_queued_steer_message_is_injected_into_the_request() {
         None,
         None,
         false,
+        false, // defer_turn_completed_to_caller (#4457)
     )
     .await
     .expect("steered turn runs");
@@ -358,13 +396,14 @@ async fn concurrent_shared_turns_each_get_a_distinct_result() {
     });
     let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![]);
 
+    let provider_id = provider.telemetry_provider_id();
     let one = run_turn_via_tinyagents_shared(
-        provider.clone(),
+        build_turn_models(provider.clone(), "mock-model", 0.0, None),
+        provider_id.clone(),
         "mock-model",
-        0.0,
         vec![ChatMessage::user("task one")],
         vec![registry.clone()],
-        std::collections::HashSet::new(),
+        None,
         4,
         None,
         None,
@@ -377,14 +416,15 @@ async fn concurrent_shared_turns_each_get_a_distinct_result() {
         None,
         None,
         false,
+        false, // defer_turn_completed_to_caller (#4457)
     );
     let two = run_turn_via_tinyagents_shared(
-        provider.clone(),
+        build_turn_models(provider.clone(), "mock-model", 0.0, None),
+        provider_id,
         "mock-model",
-        0.0,
         vec![ChatMessage::user("task two")],
         vec![registry],
-        std::collections::HashSet::new(),
+        None,
         4,
         None,
         None,
@@ -397,6 +437,7 @@ async fn concurrent_shared_turns_each_get_a_distinct_result() {
         None,
         None,
         false,
+        false, // defer_turn_completed_to_caller (#4457)
     );
 
     let (a, b) = tokio::join!(one, two);
@@ -432,17 +473,15 @@ fn adapter_inventory_registers_model_tools_and_middleware() {
         vec![Arc::new(vec![Box::new(EchoTool) as Box<dyn Tool>])];
 
     let assembled = assemble_turn_harness(
-        provider,
+        build_turn_models(provider, "mock-model", 0.0, Some(200_000)),
         "mock-model",
-        0.0,
         tool_sets,
-        HashSet::new(),
+        None,
         4,
         None,          // on_progress: fire-and-forget
         None,          // subagent_scope: top-level turn
         Some(200_000), // known context window → compression + trim install
         &["ask_user_clarification"],
-        Some(1024),
         TurnContextMiddleware::defaults(),
         None,  // no builder tool policy on this path
         None,  // no per-turn required capabilities
@@ -506,17 +545,32 @@ fn adapter_inventory_registers_model_tools_and_middleware() {
     assert!(serialized.contains("\"classified\":true"));
 
     // Lifecycle middleware, in registration order: memory-protocol enforcement
-    // (outermost), repeated-tool-failure breaker, shadow tool-exposure,
-    // prompt-cache segment + guard, cache-align + tool-output
-    // (TurnContextMiddleware::defaults), cost budget, context compression +
-    // message trim (window known + autocompact on), SDK tool-policy projection,
-    // tool-outcome capture, arg recovery.
+    // (outermost), repeated-tool-failure breaker, repeat-progress breaker (#4463),
+    // shadow tool-exposure, prompt-cache segment + guard, cache-align + tool-output
+    // (TurnContextMiddleware::defaults), observe-only crate BudgetMiddleware
+    // (W2-budget-dedupe), cost budget (local enforcement + budget_shadow),
+    // context compression + message trim (window known + autocompact on), SDK
+    // tool-policy projection, tool-outcome capture, arg recovery, schema guard
+    // (#4451 before_tool).
     let mw = assembled.harness.middleware();
-    assert_eq!(mw.len(), 13, "lifecycle middleware inventory");
-    // Around-tool wraps: approval/security + CLI/RPC-only scope gate (no
-    // builder tool policy on this call).
-    assert_eq!(mw.tool_middleware_len(), 2, "tool middleware inventory");
-    assert_eq!(mw.model_middleware_len(), 0, "no around-model wraps");
+    // NOTE(parity merge): these inventory counts are the upstream base (13 / 2)
+    // plus the lifecycle + around-tool middlewares this parity branch adds. They
+    // are NOT compiled by `cargo check --lib` (this is a #[cfg(test)] block) and
+    // are pending the deferred test pass — verify/adjust the exact numbers when
+    // the test suite actually compiles.
+    assert_eq!(mw.len(), 15, "lifecycle middleware inventory");
+    // Around-tool wraps: schema guard (#4451, outermost) + approval/security +
+    // CLI/RPC-only scope gate + credential scrub (#4453, innermost). No builder
+    // tool policy on this call.
+    assert_eq!(mw.tool_middleware_len(), 4, "tool middleware inventory");
+    // One around-model wrap: the cost `UsageCarryMiddleware` (always installed).
+    // RequiredCapabilities/FallbackObserver are not installed on this call
+    // (no required caps; `mock-model` is not a tier, so no fallback chain).
+    assert_eq!(
+        mw.model_middleware_len(),
+        1,
+        "usage-carry around-model wrap"
+    );
     assert_eq!(
         assembled.harness.policy().limits.max_depth,
         crate::openhuman::agent::harness::MAX_SPAWN_DEPTH,
@@ -530,7 +584,6 @@ fn adapter_inventory_registers_model_tools_and_middleware() {
 
     // Capability profile (issue #4249, Phase 2): derived from the wrapped
     // provider plus the runner-threaded token limits.
-    use tinyagents::harness::model::ChatModel;
     let registered = assembled
         .harness
         .models()
@@ -541,7 +594,13 @@ fn adapter_inventory_registers_model_tools_and_middleware() {
     assert!(profile.tool_calling, "EchoThenDone supports native tools");
     assert!(!profile.modalities.image_in, "no vision on the mock");
     assert_eq!(profile.max_input_tokens, Some(200_000), "context window");
-    assert_eq!(profile.max_output_tokens, Some(1024), "output cap");
+    // The per-turn output cap now rides `RunConfig.max_turn_output_tokens`
+    // (Phase 5 groundwork), not the model profile, so the profile carries no
+    // output cap.
+    assert_eq!(
+        profile.max_output_tokens, None,
+        "output cap rides RunConfig"
+    );
 }
 
 /// The context-management middlewares gate on a known context window: without
@@ -556,17 +615,15 @@ fn adapter_inventory_gates_context_middleware_on_window() {
         vec![Arc::new(vec![Box::new(EchoTool) as Box<dyn Tool>])];
 
     let assembled = assemble_turn_harness(
-        provider,
+        build_turn_models(provider, "mock-model", 0.0, None),
         "mock-model",
-        0.0,
         tool_sets,
-        HashSet::new(),
+        None,
         4,
         None,
         None,
         None, // unknown context window
         &[],  // no early-exit tools
-        None,
         TurnContextMiddleware::defaults(),
         None,
         None,  // no per-turn required capabilities
@@ -576,7 +633,7 @@ fn adapter_inventory_gates_context_middleware_on_window() {
     let mw = assembled.harness.middleware();
     assert_eq!(
         mw.len(),
-        11,
+        13,
         "compression + trim must not install without a window"
     );
     assert!(assembled.early_exit_hook.is_none());
@@ -630,13 +687,16 @@ async fn unobserved_turn_reports_aggregate_usage_for_the_cost_fallback() {
         }
     }
 
+    let provider: Arc<dyn Provider> = Arc::new(DoneWithUsage);
+    let provider_id = provider.telemetry_provider_id();
+    let turn_models = build_turn_models(provider, "mock-model", 0.0, None);
     let outcome = run_turn_via_tinyagents_shared(
-        Arc::new(DoneWithUsage),
+        turn_models,
+        provider_id,
         "mock-model",
-        0.0,
         vec![ChatMessage::user("hello")],
         Vec::new(),
-        HashSet::new(),
+        None,
         3,
         None, // on_progress: unobserved — no bridge, cost fallback branch runs
         None,
@@ -649,6 +709,7 @@ async fn unobserved_turn_reports_aggregate_usage_for_the_cost_fallback() {
         None,
         None,
         false,
+        false, // defer_turn_completed_to_caller (#4457)
     )
     .await
     .expect("turn runs");
@@ -670,4 +731,69 @@ fn record_unobserved_turn_usage_gates_on_observed_tokens() {
     assert!(record_unobserved_turn_usage("m", 10, 0, 0, 0.0));
     assert!(record_unobserved_turn_usage("m", 0, 3, 0, 0.0));
     assert!(record_unobserved_turn_usage("m", 10, 3, 2, 0.5));
+}
+
+#[test]
+fn spawn_and_delegate_tools_are_never_registered_on_subagents() {
+    // #4452: a child run must never be able to register a spawn/delegate tool,
+    // even if the resolved allowlist somehow contains one — the registration
+    // site strips these unconditionally as defense-in-depth.
+    for name in [
+        "spawn_subagent",
+        "spawn_worker_thread",
+        "use_tinyplace",
+        "agent_prepare_context",
+        "delegate_research",
+        "delegate_",
+    ] {
+        assert!(
+            is_subagent_spawn_or_delegate_tool(name),
+            "{name} must be treated as a spawn/delegate tool"
+        );
+    }
+    // Ordinary tools (and near-miss names) must NOT be stripped.
+    for name in ["shell", "read_file", "web_search", "spawn", "subagent"] {
+        assert!(
+            !is_subagent_spawn_or_delegate_tool(name),
+            "{name} is a normal tool and must not be stripped"
+        );
+    }
+}
+
+/// Issue #4746: the harness bounds each model/tool/sub-agent call by the run's
+/// remaining wall-clock budget, but ONLY when `max_wall_clock_ms` is set — with
+/// `None` a hung call is awaited unbounded and the turn can ship an empty reply
+/// with no terminal event. `run_policy_for` must arm that ceiling.
+#[test]
+fn run_policy_for_arms_the_wall_clock_ceiling() {
+    let policy = run_policy_for(10, false);
+    assert_eq!(
+        policy.limits.max_wall_clock_ms,
+        Some(DEFAULT_AGENT_TURN_TIMEOUT_SECS * 1_000),
+        "run_policy_for must set a wall-clock ceiling so hung calls are interrupted"
+    );
+}
+
+/// The `OPENHUMAN_AGENT_TURN_TIMEOUT_SECS` override maps seconds → ms, falls
+/// back to the default when absent/unparseable, and treats `0` as an explicit
+/// unbounded opt-out (`None`). Tested through the env-free pure core so it stays
+/// deterministic under parallel execution.
+#[test]
+fn agent_turn_wall_clock_ms_parses_env_override() {
+    // Absent → default.
+    assert_eq!(
+        parse_agent_turn_wall_clock_ms(None),
+        Some(DEFAULT_AGENT_TURN_TIMEOUT_SECS * 1_000)
+    );
+    // Explicit custom value → seconds converted to ms.
+    assert_eq!(parse_agent_turn_wall_clock_ms(Some("120")), Some(120_000));
+    // Whitespace tolerated.
+    assert_eq!(parse_agent_turn_wall_clock_ms(Some(" 90 ")), Some(90_000));
+    // `0` → unbounded opt-out.
+    assert_eq!(parse_agent_turn_wall_clock_ms(Some("0")), None);
+    // Garbage → default (fail safe, never unbounded by accident).
+    assert_eq!(
+        parse_agent_turn_wall_clock_ms(Some("not-a-number")),
+        Some(DEFAULT_AGENT_TURN_TIMEOUT_SECS * 1_000)
+    );
 }

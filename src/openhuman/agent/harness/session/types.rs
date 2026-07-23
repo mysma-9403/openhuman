@@ -16,8 +16,9 @@ use crate::openhuman::agent_memory::memory_loader::MemoryLoader;
 use crate::openhuman::agent_tool_policy::ToolPolicySession;
 use crate::openhuman::context::prompt::SystemPromptBuilder;
 use crate::openhuman::context::ContextManager;
-use crate::openhuman::inference::provider::{ChatMessage, ConversationMessage, Provider};
+use crate::openhuman::inference::provider::{ChatMessage, ConversationMessage};
 use crate::openhuman::memory::Memory;
+use crate::openhuman::tinyagents::TurnModelSource;
 use crate::openhuman::tools::{Tool, ToolSpec};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,7 +29,10 @@ use std::sync::Arc;
 /// executes tools based on model requests, and interacts with the memory
 /// system to maintain context across turns.
 pub struct Agent {
-    pub(super) provider: Arc<dyn Provider>,
+    /// The turn's model source — builds this agent's tiered crate `ChatModel`
+    /// set per turn (issue #4249, Phase 3 / Motion A). Replaces the raw
+    /// `Arc<dyn Provider>`; the harness names crate model types only.
+    pub(super) turn_model_source: TurnModelSource,
     /// Full tool registry. Sub-agents pull from this via
     /// [`ParentExecutionContext::all_tools`].
     pub(super) tools: Arc<Vec<Box<dyn Tool>>>,
@@ -40,12 +44,16 @@ pub struct Agent {
     /// provider in the main agent's chat requests.
     pub(super) visible_tool_specs: Arc<Vec<ToolSpec>>,
     /// When non-empty, only these tool names are visible in the main
-    /// agent's prompt and callable by the main agent. Sub-agents ignore
-    /// this filter — they apply per-definition whitelists in the runner.
+    /// agent's prompt and callable by the main agent. Sub-agents intersect
+    /// their per-definition scopes with the effective parent-visible set.
     /// Empty = no filter (all tools visible, backward compat).
     pub(super) visible_tool_names: std::collections::HashSet<String>,
     pub(super) tool_policy_session: ToolPolicySession,
     pub(super) memory: Arc<dyn Memory>,
+    /// Shared memory store retained alongside a dedicated profile store so live
+    /// experience recall can merge unstamped legacy guidance. `None` for the
+    /// shared/default memory path.
+    pub(super) shared_experience_memory: Option<Arc<dyn Memory>>,
     // `Arc` (not `Box`) so the tinyagents turn path can hold a cheap clone of
     // the dispatcher without borrowing the `Agent` while session state mutates.
     pub(super) tool_dispatcher: Arc<dyn ToolDispatcher>,
@@ -60,7 +68,13 @@ pub struct Agent {
     pub(super) temperature: f64,
     pub(super) workspace_dir: std::path::PathBuf,
     pub(super) action_dir: std::path::PathBuf,
-    pub(super) workflows: Vec<crate::openhuman::workflows::Workflow>,
+    /// Optional per-profile workspace descriptor. When set (a profile with
+    /// `dedicated_workspace` opted in), it is threaded into the top-level chat
+    /// turn so acting tools (shell/file/git) resolve their default cwd to
+    /// `<action_dir>/profiles/<id>` instead of the shared `action_dir`. `None`
+    /// (the common case) preserves the shared-cwd behaviour unchanged.
+    pub(super) workspace_descriptor: Option<tinyagents::harness::workspace::WorkspaceDescriptor>,
+    pub(super) workflows: Vec<crate::openhuman::skills::Workflow>,
     /// Agent workflows discovered at session start.
     pub(super) auto_save: bool,
     /// Last memory context loaded for the current turn. Stored so it can
@@ -76,6 +90,16 @@ pub struct Agent {
     /// the first turn completes.
     pub(super) last_turn_usage_totals:
         Option<crate::openhuman::agent::harness::turn_subagent_usage::LastTurnUsage>,
+    /// Whether the most recent turn's tinyagents loop paused because it hit
+    /// `max_tool_iterations` (`TinyagentsTurnOutcome::hit_cap`), rather than
+    /// finishing naturally. `false` until the first turn completes, and reset
+    /// on every subsequent turn — so it only ever reflects the LAST turn, not
+    /// "any turn ever". Consumed by callers that run a single headless turn
+    /// via [`run_single`](super::runtime) (e.g. `flows_build`) and need to
+    /// distinguish "the agent paused mid-work" from "the agent asked a
+    /// question" or "the agent finished" — `run_single` only returns the
+    /// checkpoint/final text, with no other signal for which case occurred.
+    pub(super) last_turn_hit_cap: bool,
     pub(super) history: Vec<ConversationMessage>,
     pub(super) post_turn_hooks: Vec<Arc<dyn PostTurnHook>>,
     pub(super) learning_enabled: bool,
@@ -107,10 +131,43 @@ pub struct Agent {
     ///
     /// [`AgentDefinitionRegistry`]: crate::openhuman::agent::harness::definition::AgentDefinitionRegistry
     pub(super) agent_definition_id: String,
+    /// Id of the agent profile this session runs under, when the turn was
+    /// launched with an active profile (`profiles` domain). `None` for the
+    /// default (profile-less) session — the byte-identical legacy path.
+    ///
+    /// Set once at build time from the resolved [`AgentProfile`] and never
+    /// rewritten. Consumed by the profile-scoped agent-experience capture +
+    /// retrieval (1c): records are stamped with this id and only records
+    /// matching it (plus unstamped legacy records) are recalled. The same
+    /// active id also arms the tool-layer sibling-workspace guard, regardless
+    /// of whether this profile uses a dedicated cwd.
+    pub(super) active_profile_id: Option<String>,
+    /// Profile-local SOUL.md resolved when the session is built. When set,
+    /// IdentitySection uses it instead of the workspace-root identity.
+    pub(super) personality_soul_md: Option<String>,
+    /// Profile-local curated MEMORY.md resolved when the session is built.
+    /// `None` preserves the workspace-root MEMORY.md fallback.
+    pub(super) personality_memory_md: Option<String>,
+    /// Profile-selected memory subtree name (`memory`, `memory-<id>`, or a
+    /// legacy numeric suffix). Used for memory-tree reads and paired with the
+    /// profile-specific transcript directory below.
+    pub(super) memory_subdir: String,
+    /// Profile-selected JSONL transcript subdirectory (`session_raw` or
+    /// `session_raw-<id>`). It is resolved against the current `workspace_dir`
+    /// at I/O time so relocating an agent does not leave transcripts pinned to
+    /// its original workspace while dedicated-memory profiles remain isolated.
+    pub(super) session_raw_subdir: String,
     /// Resolved filesystem path for this session's transcript file.
-    /// Set on first write, reused for subsequent overwrites within the
+    /// Set on first write, reused for subsequent **appends** within the
     /// same session.
     pub(super) session_transcript_path: Option<PathBuf>,
+    /// The logical message set most recently persisted to
+    /// `session_transcript_path`, tracked in memory so the append-only writer
+    /// can diff each turn's messages against it (pure extension → append tail;
+    /// reduction → compaction record) without re-reading the growing file.
+    /// Empty until the first persist. Each process writes its own transcript
+    /// file, so this in-memory state is always aligned with the file it owns.
+    pub(super) persisted_transcript_messages: Vec<ChatMessage>,
     /// Unique transcript key for this session, formatted as
     /// `"{unix_ts}_{agent_id}"`. Generated once at agent-build time so
     /// every transcript write in this session uses the same filename
@@ -310,11 +367,12 @@ pub struct Agent {
 
 /// A builder for creating `Agent` instances with custom configuration.
 pub struct AgentBuilder {
-    pub(super) provider: Option<Arc<dyn Provider>>,
+    pub(super) turn_model_source: Option<TurnModelSource>,
     pub(super) tools: Option<Vec<Box<dyn Tool>>>,
     /// When set, restricts which tools the main agent sees/calls.
     pub(super) visible_tool_names: Option<std::collections::HashSet<String>>,
     pub(super) memory: Option<Arc<dyn Memory>>,
+    pub(super) shared_experience_memory: Option<Arc<dyn Memory>>,
     pub(super) prompt_builder: Option<SystemPromptBuilder>,
     pub(super) tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     pub(super) memory_loader: Option<Box<dyn MemoryLoader>>,
@@ -329,7 +387,10 @@ pub struct AgentBuilder {
     pub(super) temperature: Option<f64>,
     pub(super) workspace_dir: Option<std::path::PathBuf>,
     pub(super) action_dir: Option<std::path::PathBuf>,
-    pub(super) workflows: Option<Vec<crate::openhuman::workflows::Workflow>>,
+    /// Optional per-profile workspace descriptor forwarded to [`Agent`] at build
+    /// time. Defaults to `None` (shared `action_dir` cwd).
+    pub(super) workspace_descriptor: Option<tinyagents::harness::workspace::WorkspaceDescriptor>,
+    pub(super) workflows: Option<Vec<crate::openhuman::skills::Workflow>>,
     /// Agent workflows to surface in the prompt. Populated from `load_workflows`
     /// at session start; defaults to empty when not explicitly set.
     pub(super) auto_save: Option<bool>,
@@ -339,6 +400,16 @@ pub struct AgentBuilder {
     pub(super) event_session_id: Option<String>,
     pub(super) event_channel: Option<String>,
     pub(super) agent_definition_name: Option<String>,
+    /// Forwarded to [`Agent::active_profile_id`] at `build()` time. `None`
+    /// (default) means the profile-less session; the profile-launching callers
+    /// (web chat, task dispatcher, cron) set the active profile id here.
+    pub(super) active_profile_id: Option<String>,
+    /// Forwarded to [`Agent::personality_soul_md`] at build time.
+    pub(super) personality_soul_md: Option<String>,
+    /// Forwarded to [`Agent::personality_memory_md`] at build time.
+    pub(super) personality_memory_md: Option<String>,
+    pub(super) memory_subdir: Option<String>,
+    pub(super) session_raw_subdir: Option<String>,
     /// Directory chain of parent session keys for a sub-agent. `None`
     /// (default) means this is a root session — its transcript lands
     /// flat in `session_raw/DDMMYYYY/{session_key}.jsonl`. Populated
@@ -386,7 +457,7 @@ mod tests {
 
         assert_eq!(builder.learning_enabled, default_builder.learning_enabled);
         assert_eq!(builder.auto_save, default_builder.auto_save);
-        assert!(builder.provider.is_none());
+        assert!(builder.turn_model_source.is_none());
         assert!(builder.tools.is_none());
         assert!(builder.memory.is_none());
         assert!(builder.event_session_id.is_none());

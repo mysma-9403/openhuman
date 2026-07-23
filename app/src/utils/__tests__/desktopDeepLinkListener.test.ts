@@ -10,10 +10,14 @@ import {
 } from '../../store/deepLinkAuthState';
 import { getStoredCoreMode } from '../configPersistence';
 import {
+  authStoreFailureUserMessage,
   classifyAuthStoreFailure,
+  handleDeepLinkUrls,
   registerAuthDeepLinkState,
   setupDesktopDeepLinkListener,
 } from '../desktopDeepLinkListener';
+import { BILLING_DASHBOARD_URL } from '../links';
+import { openUrl } from '../openUrl';
 import { storeSession } from '../tauriCommands';
 
 vi.mock('../configPersistence', () => ({ getStoredCoreMode: vi.fn() }));
@@ -21,6 +25,7 @@ vi.mock('../../services/coreRpcClient', () => ({
   clearCoreRpcUrlCache: vi.fn(),
   clearCoreRpcTokenCache: vi.fn(),
 }));
+vi.mock('../openUrl', () => ({ openUrl: vi.fn() }));
 
 // Build an `openhuman://auth` deep link bound to a freshly registered state
 // nonce, mirroring how the real OAuth button registers the loopback/deep-link
@@ -82,10 +87,25 @@ describe('desktopDeepLinkListener', () => {
     vi.mocked(getStoredCoreMode).mockReturnValue(null);
     vi.mocked(clearCoreRpcUrlCache).mockClear();
     vi.mocked(clearCoreRpcTokenCache).mockClear();
+    vi.mocked(openUrl).mockReset();
+    vi.mocked(openUrl).mockResolvedValue(undefined);
     windowControls.show.mockClear();
     windowControls.unminimize.mockClear();
     windowControls.setFocus.mockClear();
     completeDeepLinkAuthProcessing();
+  });
+
+  it('returns successful payment deep links to the billing dashboard', async () => {
+    await handleDeepLinkUrls(['openhuman://payment/success?session_id=checkout-session']);
+
+    expect(openUrl).toHaveBeenCalledWith(BILLING_DASHBOARD_URL);
+    expect(BILLING_DASHBOARD_URL).toBe('https://tinyhumans.ai/dashboard');
+  });
+
+  it('returns cancelled payment deep links to the billing dashboard', async () => {
+    await handleDeepLinkUrls(['openhuman://payment/cancel']);
+
+    expect(openUrl).toHaveBeenCalledWith(BILLING_DASHBOARD_URL);
   });
 
   it('turns Twitter OAuth error deep links into actionable UI and event diagnostics', async () => {
@@ -394,5 +414,38 @@ describe('classifyAuthStoreFailure', () => {
     // The bare prefix is still recognized via the auth/me anchor — NOT 'other'.
     expect(classifyAuthStoreFailure(bare)).toBe('auth_me_other');
     expect(classifyAuthStoreFailure(bare)).not.toBe('other');
+  });
+});
+
+describe('authStoreFailureUserMessage (issue #3025)', () => {
+  const CLOUD_KINDS = [
+    'auth_me_timeout',
+    'auth_me_unauthorized',
+    'auth_me_gateway',
+    'network',
+    'other',
+  ];
+
+  // Local / unset mode always keeps the plain retry message — the failure there
+  // is a transient embedded-core/backend blip that retrying can clear.
+  it.each(['local', null] as const)('stays generic for mode=%s', mode => {
+    for (const kind of CLOUD_KINDS) {
+      expect(authStoreFailureUserMessage(kind, mode)).toBe('Sign-in failed. Please try again.');
+    }
+  });
+
+  it('points cloud-mode users at the remote runtime, not a dead-end retry', () => {
+    for (const kind of CLOUD_KINDS) {
+      const msg = authStoreFailureUserMessage(kind, 'cloud');
+      expect(msg).not.toBe('Sign-in failed. Please try again.');
+      expect(msg.toLowerCase()).toContain('remote');
+    }
+  });
+
+  it('gives kind-specific cloud hints (401 token, gateway/timeout BACKEND_URL)', () => {
+    expect(authStoreFailureUserMessage('auth_me_unauthorized', 'cloud')).toContain('RPC token');
+    expect(authStoreFailureUserMessage('auth_me_gateway', 'cloud')).toContain('BACKEND_URL');
+    expect(authStoreFailureUserMessage('auth_me_timeout', 'cloud')).toContain('BACKEND_URL');
+    expect(authStoreFailureUserMessage('network', 'cloud')).toContain('online');
   });
 });

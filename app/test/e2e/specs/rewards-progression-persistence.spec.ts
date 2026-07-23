@@ -56,7 +56,7 @@ async function navigateToRewards(): Promise<void> {
   });
   await browser.pause(1_000);
   await browser.execute(() => {
-    window.location.hash = '/rewards';
+    window.location.hash = '/rewards?view=main';
   });
   await browser.pause(2_000);
 }
@@ -98,6 +98,9 @@ async function getRewardsMetricValue(label: string): Promise<string | null> {
 
 describe('Rewards progression & persistence', () => {
   before(async function beforeSuite() {
+    // resetApp bring-up can run ~25-30s and race the default 30s Mocha hook
+    // budget; raise it.
+    this.timeout(90_000);
     if (!supportsExecuteScript()) {
       stepLog('Skipping suite on Mac2 — Rewards bottom-tab label not mapped for Appium');
       this.skip();

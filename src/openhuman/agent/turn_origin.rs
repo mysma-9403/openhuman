@@ -4,7 +4,7 @@
 //! consistent decisions across web, channel, subconscious, and cron entry
 //! points without relying on the *absence* of other task-locals as a signal.
 //!
-//! Every entry point that drives the agent loop ([`crate::openhuman::channels::providers::web`],
+//! Every entry point that drives the agent loop ([`crate::openhuman::web_chat`],
 //! [`crate::openhuman::channels::runtime::dispatch`], [`crate::openhuman::subconscious`],
 //! [`crate::openhuman::cron`], CLI) MUST scope a real [`AgentTurnOrigin`]
 //! around its `run_turn` invocation. Any path that fails to do so is treated
@@ -27,6 +27,10 @@ pub enum AgentTurnOrigin {
     WebChat {
         thread_id: String,
         client_id: String,
+        /// Per-turn request id, when the caller has one. Used by internal
+        /// observers to correlate a live progress bridge with the durable
+        /// tinyagents journal stream for the same turn.
+        request_id: Option<String>,
     },
     /// Inbound message from a non-web channel (Telegram / Discord / Slack /
     /// Yuanbao / etc.). External-effect tools must persist a
@@ -99,6 +103,29 @@ pub enum TrustedAutomationSource {
     },
 }
 
+impl AgentTurnOrigin {
+    /// A PII-free classification label safe for `info`-level logs and audit
+    /// trails — the variant name (and, for `TrustedAutomation`, its `source`
+    /// sub-kind), never an identifying field. Use this instead of `{:?}` /
+    /// `?origin` anywhere the log line isn't gated to `debug`/`trace`:
+    /// `WebChat.thread_id`/`client_id`, `ExternalChannel.sender`/
+    /// `reply_target`/`message_id`, and `TrustedAutomation.job_id` can carry
+    /// user- or channel-identifying data that must not land at `info`.
+    pub fn class(&self) -> String {
+        match self {
+            AgentTurnOrigin::WebChat { .. } => "WebChat".to_string(),
+            AgentTurnOrigin::ExternalChannel { channel, .. } => {
+                format!("ExternalChannel({channel})")
+            }
+            AgentTurnOrigin::TrustedAutomation { source, .. } => {
+                format!("TrustedAutomation({source:?})")
+            }
+            AgentTurnOrigin::Cli => "Cli".to_string(),
+            AgentTurnOrigin::Unknown => "Unknown".to_string(),
+        }
+    }
+}
+
 tokio::task_local! {
     /// Per-turn agent origin. Scoped by entry points (web channel, channel
     /// runtime dispatch, subconscious loop, cron scheduler, CLI) around the
@@ -128,6 +155,18 @@ pub async fn with_origin<F: std::future::Future>(origin: AgentTurnOrigin, fut: F
 /// [`AgentTurnOrigin::Unknown`] / fail-closed).
 pub fn current() -> Option<AgentTurnOrigin> {
     AGENT_TURN_ORIGIN.try_with(|o| o.clone()).ok()
+}
+
+/// Read the ambient web-chat `request_id` for the current turn, when one was
+/// scoped by an [`AgentTurnOrigin::WebChat`] entry point. `None` for every
+/// other origin (channel / cron / CLI / sub-agent) and outside any scope —
+/// those turns are not request-scoped, so their transcript lines carry no
+/// turn-boundary marker.
+pub fn current_request_id() -> Option<String> {
+    match current() {
+        Some(AgentTurnOrigin::WebChat { request_id, .. }) => request_id,
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +200,7 @@ mod tests {
             AgentTurnOrigin::WebChat {
                 thread_id: "outer".into(),
                 client_id: "c-outer".into(),
+                request_id: Some("req-outer".into()),
             },
             async {
                 with_origin(

@@ -17,6 +17,7 @@ use crate::openhuman::agent_orchestration::subagent_sessions::{
     SubagentSessionUpsert,
 };
 use crate::openhuman::inference::provider::ChatMessage;
+use crate::openhuman::memory_conversations::{self as conversations, ConversationMessage};
 use crate::openhuman::tools::traits::{PermissionLevel, Tool, ToolCallOptions, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
@@ -47,7 +48,12 @@ impl Tool for SpawnAsyncSubagentTool {
          Use sparingly, only when the user does not need the result in the current \
          response, such as best-effort memory archiving, cleanup, or background \
          investigation. Do not use for user-visible answers, code changes, external \
-         service writes, financial actions, or anything that may need clarification."
+         service writes, financial actions, or anything that may need clarification. \
+         Never use it when the sub-agent's result must gate your final answer (e.g. \
+         review/critique/verify/approve X BEFORE finalizing): this returns immediately \
+         and the turn finalizes before the result lands. For those, run a synchronous \
+         awaited sub-agent instead — a blocking delegate_* specialist or \
+         spawn_parallel_agents (which collects results before returning)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -219,6 +225,40 @@ impl Tool for SpawnAsyncSubagentTool {
         let progress_sink = parent.on_progress.clone();
         let parent_thread_id =
             crate::openhuman::inference::provider::thread_context::current_thread_id();
+
+        // Async delivery is thread-addressed: the finished result is inserted
+        // back into the parent chat thread as a follow-up turn
+        // (`background_delivery`). Outside a chat turn (flow `agent` nodes,
+        // CLI, cron) there is no `current_thread_id()` to deliver into, so
+        // `background_delivery::deliver_batch` logs "dropping headless batch"
+        // and the (possibly real, completed) work is silently discarded — the
+        // caller sees "Accepted" and never learns the result never arrived.
+        // Fail loudly instead: the caller has a synchronous alternative
+        // (`spawn_subagent` with `blocking: true`, or a `delegate_*` tool).
+        // Both of those self-heal to blocking dispatch in this situation
+        // rather than reaching this guard — see the `has_delivery_thread`
+        // checks in `spawn_subagent.rs` and `dispatch.rs::dispatch_subagent`.
+        // Only a *direct* `spawn_async_subagent` call lands here.
+        if parent_thread_id.is_none() {
+            log::warn!(
+                "[spawn_async_subagent] refusing fire-and-forget spawn with no delivery thread \
+                 parent={} requested={} — directing caller to synchronous delegation (flow node / \
+                 CLI / cron context, background result would be discarded)",
+                parent.agent_definition_id,
+                definition.id
+            );
+            return Ok(ToolResult::error(
+                "spawn_async_subagent: no parent chat thread available to deliver the result \
+                 into (this looks like a flow node, CLI, or cron run rather than an interactive \
+                 chat turn). Fire-and-forget delegation has nowhere to land its result here and \
+                 the sub-agent's work would be silently discarded. Use synchronous delegation \
+                 instead: call `spawn_subagent` with `blocking: true`, or use a `delegate_*` \
+                 tool — both run the sub-agent inline and hand you its output in this turn. \
+                 For parallel work, model it as parallel flow nodes rather than background \
+                 sub-agents.",
+            ));
+        }
+
         let store = SubagentSessionStore::new(parent.workspace_dir.clone());
         let workspace_descriptor = tool_context.and_then(|ctx| ctx.workspace.clone());
         let effective_action_root = workspace_descriptor
@@ -445,6 +485,7 @@ impl Tool for SpawnAsyncSubagentTool {
                     mode: "async".to_string(),
                     dedicated_thread: worker_thread_id.is_some(),
                     prompt_chars: prompt.chars().count(),
+                    prompt: prompt.clone(),
                     worker_thread_id: worker_thread_id.clone(),
                     display_name: Some(definition.display_name().to_string()),
                 })
@@ -460,6 +501,7 @@ impl Tool for SpawnAsyncSubagentTool {
         let (status_tx, status_rx) = running_subagents::status_channel();
 
         let background_parent = parent.clone();
+        let background_workspace_dir = parent.workspace_dir.clone();
         let background_definition = definition.clone();
         let background_agent_id = definition.id.clone();
         let background_task_id = task_id.clone();
@@ -541,6 +583,20 @@ impl Tool for SpawnAsyncSubagentTool {
                             output: outcome.output.clone(),
                             iterations: outcome.iterations,
                         });
+                        // A workflow proposal produced inside the child's tool
+                        // history is durable state, not prose: persist it into
+                        // the parent chat thread (survives reload / reconnect —
+                        // the old socket-only delivery could silently drop it)
+                        // and carry the full payload in the delivery notice so
+                        // the follow-up turn can present it faithfully.
+                        let delivery_summary = attach_workflow_proposal(
+                            &background_workspace_dir,
+                            background_parent_thread_id.as_deref(),
+                            &outcome.task_id,
+                            &outcome.agent_id,
+                            &outcome.final_history,
+                            outcome.output.clone(),
+                        );
                         // Queue the finished result for idle-gated, batched
                         // delivery back into the parent chat (the session
                         // runtime drains this when the session is next idle).
@@ -548,7 +604,7 @@ impl Tool for SpawnAsyncSubagentTool {
                             background_parent_session.clone(),
                             outcome.task_id.clone(),
                             outcome.agent_id.clone(),
-                            outcome.output.clone(),
+                            delivery_summary,
                             background_parent_thread_id.clone(),
                         );
                         crate::openhuman::agent_orchestration::subagent_events::publish_subagent_completed(
@@ -567,6 +623,7 @@ impl Tool for SpawnAsyncSubagentTool {
                                     elapsed_ms: outcome.elapsed.as_millis() as u64,
                                     iterations: outcome.iterations as u32,
                                     output_chars: outcome.output.chars().count(),
+                                    output: outcome.output.clone(),
                                     worktree_path: None,
                                     changed_files: Vec::new(),
                                     dirty_status: None,
@@ -603,6 +660,16 @@ impl Tool for SpawnAsyncSubagentTool {
                             output: framed.clone(),
                             iterations: outcome.iterations,
                         });
+                        // An incomplete run may still have produced a full
+                        // proposal before stalling — preserve it durably too.
+                        let framed = attach_workflow_proposal(
+                            &background_workspace_dir,
+                            background_parent_thread_id.as_deref(),
+                            &outcome.task_id,
+                            &outcome.agent_id,
+                            &outcome.final_history,
+                            framed,
+                        );
                         crate::openhuman::agent_orchestration::background_completions::record_completion(
                             background_parent_session.clone(),
                             outcome.task_id.clone(),
@@ -626,6 +693,7 @@ impl Tool for SpawnAsyncSubagentTool {
                                     elapsed_ms: outcome.elapsed.as_millis() as u64,
                                     iterations: outcome.iterations as u32,
                                     output_chars: outcome.output.chars().count(),
+                                    output: outcome.output.clone(),
                                     worktree_path: None,
                                     changed_files: Vec::new(),
                                     dirty_status: None,
@@ -654,6 +722,18 @@ impl Tool for SpawnAsyncSubagentTool {
                         });
                         let error = format!(
                             "async sub-agent requested user clarification and was not continued: {question}"
+                        );
+                        // #4896: a detached child that pauses for input won't
+                        // continue on its own — queue a framed notice so the
+                        // parent chat learns the delegated task needs input,
+                        // instead of finalizing silently on "Accepted". Rides the
+                        // same idle-gated background_delivery path as a success.
+                        crate::openhuman::agent_orchestration::background_completions::record_awaiting_input(
+                            background_parent_session.clone(),
+                            outcome.task_id.clone(),
+                            outcome.agent_id.clone(),
+                            question,
+                            background_parent_thread_id.clone(),
                         );
                         crate::openhuman::agent_orchestration::subagent_events::publish_subagent_failed(
                             background_parent_session,
@@ -691,6 +771,18 @@ impl Tool for SpawnAsyncSubagentTool {
                     let _ = status_tx.send(SubagentStatus::Failed {
                         error: error.clone(),
                     });
+                    // #4896: a detached child that errors previously only
+                    // published an event — nothing reached chat, so the parent
+                    // turn finalized on "Accepted" and the failure was lost.
+                    // Queue a framed failure notice so background_delivery
+                    // surfaces it as a follow-up chat turn.
+                    crate::openhuman::agent_orchestration::background_completions::record_failure(
+                        background_parent_session.clone(),
+                        background_task_id.clone(),
+                        background_agent_id.clone(),
+                        &error,
+                        background_parent_thread_id.clone(),
+                    );
                     crate::openhuman::agent_orchestration::subagent_events::publish_subagent_failed(
                         background_parent_session,
                         background_task_id.clone(),
@@ -876,6 +968,97 @@ fn durable_task_key_source(
     }
 }
 
+/// Scan a finished child's history for the LAST `workflow_proposal` tool
+/// result (the workflow_builder's `propose_workflow` / `revise_workflow` /
+/// `edit_workflow` all return `{"type":"workflow_proposal", ...}` JSON).
+/// Returns the parsed payload, or `None` when the run produced no proposal.
+/// Lives here (not in `flows`) so the always-on orchestration path has no
+/// dependency on the feature-gated flows domain — it is a generic scan for a
+/// structured tool payload.
+pub(crate) fn extract_workflow_proposal_from_history(
+    history: &[ChatMessage],
+) -> Option<serde_json::Value> {
+    history
+        .iter()
+        .rev()
+        .filter(|message| message.role == "tool")
+        .find_map(|message| {
+            let value: serde_json::Value = serde_json::from_str(message.content.trim()).ok()?;
+            (value.get("type").and_then(|t| t.as_str()) == Some("workflow_proposal"))
+                .then_some(value)
+        })
+}
+
+/// Durably surface a workflow proposal found in a finished child's history:
+/// persist it as a parent-thread conversation message (metadata carries the
+/// full payload so the UI can rehydrate the proposal card after reload) and
+/// append a `[workflow_proposal]` envelope to the delivery summary so the
+/// follow-up turn presents it faithfully. Returns the (possibly extended)
+/// summary; on any persistence error the summary still carries the envelope —
+/// losing durability must not lose delivery.
+fn attach_workflow_proposal(
+    workspace_dir: &std::path::Path,
+    parent_thread_id: Option<&str>,
+    task_id: &str,
+    agent_id: &str,
+    final_history: &[ChatMessage],
+    summary: String,
+) -> String {
+    let Some(proposal) = extract_workflow_proposal_from_history(final_history) else {
+        return summary;
+    };
+    let proposal_json = match serde_json::to_string(&proposal) {
+        Ok(json) => json,
+        Err(err) => {
+            log::warn!(
+                "[spawn_async_subagent] workflow proposal re-serialize failed task_id={task_id} error={err}"
+            );
+            return summary;
+        }
+    };
+    let name = proposal
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("Untitled workflow");
+    log::info!(
+        "[spawn_async_subagent] extracted workflow proposal '{name}' task_id={task_id} \
+         ({} chars) — persisting to parent thread {:?}",
+        proposal_json.len(),
+        parent_thread_id
+    );
+    if let Some(thread_id) = parent_thread_id {
+        let persisted = conversations::append_message(
+            workspace_dir.to_path_buf(),
+            thread_id,
+            ConversationMessage {
+                id: format!("workflow-proposal:{task_id}"),
+                content: format!("Workflow proposal ready: {name}"),
+                message_type: "text".to_string(),
+                extra_metadata: json!({
+                    "scope": "workflow_proposal",
+                    "proposal": proposal,
+                    "task_id": task_id,
+                    "agent_id": agent_id,
+                }),
+                sender: "agent".to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+        if let Err(err) = persisted {
+            log::warn!(
+                "[spawn_async_subagent] workflow proposal persistence failed \
+                 thread_id={thread_id} task_id={task_id} error={err} — proposal still \
+                 rides the delivery notice"
+            );
+        }
+    }
+    format!(
+        "{summary}\n\n[workflow_proposal]\n{proposal_json}\n[/workflow_proposal]\n\
+         (The full proposal above was also saved to the chat thread; present it to the \
+         user for review — do not re-run the builder unless they ask for changes.)"
+    )
+}
+
 fn reusable_follow_up_message(prompt: &str, context: Option<&str>) -> String {
     let mut message = String::from("[Follow-up instruction for reusable sub-agent]\n");
     if let Some(context) = context.map(str::trim).filter(|s| !s.is_empty()) {
@@ -891,6 +1074,19 @@ fn reusable_follow_up_message(prompt: &str, context: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openhuman::agent::harness::definition::AgentDefinitionRegistry;
+    use crate::openhuman::agent::harness::fork_context::{
+        with_parent_context, ParentExecutionContext,
+    };
+    use crate::openhuman::config::AgentConfig;
+    use crate::openhuman::context::prompt::ToolCallFormat;
+    use crate::openhuman::inference::provider::Provider;
+    use crate::openhuman::memory::{
+        Memory, MemoryCategory, MemoryEntry, NamespaceSummary, RecallOpts,
+    };
+    use std::collections::HashSet;
+    use std::path::Path;
+    use std::sync::Arc;
 
     #[test]
     fn parameters_schema_advertises_fire_and_forget_fields() {
@@ -1016,6 +1212,103 @@ mod tests {
         assert!(rendered.contains("[Task]\nContinue the audit"));
     }
 
+    #[test]
+    fn extract_workflow_proposal_finds_last_proposal_tool_result() {
+        let history = vec![
+            ChatMessage::user("build me a workflow"),
+            ChatMessage::tool(r#"{"type":"something_else","x":1}"#),
+            ChatMessage::tool(
+                r#"{"type":"workflow_proposal","persisted":false,"name":"Old Draft"}"#,
+            ),
+            ChatMessage::assistant("revising…"),
+            ChatMessage::tool(
+                r#"{"type":"workflow_proposal","persisted":false,"name":"Daily X Trending Email"}"#,
+            ),
+            ChatMessage::assistant("Here's the proposed workflow."),
+        ];
+        let proposal =
+            extract_workflow_proposal_from_history(&history).expect("proposal extracted");
+        // The LAST proposal wins — later revisions supersede earlier drafts.
+        assert_eq!(proposal["name"], "Daily X Trending Email");
+    }
+
+    #[test]
+    fn extract_workflow_proposal_ignores_non_proposal_history() {
+        let history = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::tool("plain text tool output, not json"),
+            ChatMessage::assistant("done"),
+        ];
+        assert!(extract_workflow_proposal_from_history(&history).is_none());
+    }
+
+    #[test]
+    fn attach_workflow_proposal_persists_thread_message_and_extends_summary() {
+        use crate::openhuman::memory_conversations::CreateConversationThread;
+        let temp = tempfile::tempdir().expect("tempdir");
+        conversations::ensure_thread(
+            temp.path().to_path_buf(),
+            CreateConversationThread {
+                id: "thread-parent".into(),
+                title: "Main chat".into(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                parent_thread_id: None,
+                labels: None,
+                personality_id: None,
+            },
+        )
+        .expect("thread created");
+
+        let history = vec![ChatMessage::tool(
+            r#"{"type":"workflow_proposal","persisted":false,"name":"Daily X Trending Email","graph":{"nodes":[],"edges":[]}}"#,
+        )];
+        let summary = attach_workflow_proposal(
+            temp.path(),
+            Some("thread-parent"),
+            "sub-task-1",
+            "workflow_builder",
+            &history,
+            "Here's the proposed workflow.".to_string(),
+        );
+
+        // Delivery notice carries the machine-readable envelope.
+        assert!(summary.starts_with("Here's the proposed workflow."));
+        assert!(summary.contains("[workflow_proposal]"));
+        assert!(summary.contains("\"name\":\"Daily X Trending Email\""));
+        assert!(summary.contains("[/workflow_proposal]"));
+
+        // Proposal is durably persisted in the parent thread with rehydratable
+        // metadata (this is what survives reload / a dropped socket event).
+        let messages = conversations::get_messages(temp.path().to_path_buf(), "thread-parent")
+            .expect("messages");
+        let proposal_msg = messages
+            .iter()
+            .find(|m| m.id == "workflow-proposal:sub-task-1")
+            .expect("proposal message persisted");
+        assert_eq!(proposal_msg.sender, "agent");
+        assert!(proposal_msg.content.contains("Daily X Trending Email"));
+        assert_eq!(proposal_msg.extra_metadata["scope"], "workflow_proposal");
+        assert_eq!(
+            proposal_msg.extra_metadata["proposal"]["name"],
+            "Daily X Trending Email"
+        );
+        assert_eq!(proposal_msg.extra_metadata["task_id"], "sub-task-1");
+    }
+
+    #[test]
+    fn attach_workflow_proposal_without_proposal_returns_summary_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let summary = attach_workflow_proposal(
+            temp.path(),
+            Some("thread-x"),
+            "sub-task-2",
+            "researcher",
+            &[ChatMessage::tool("no proposal here")],
+            "research done".to_string(),
+        );
+        assert_eq!(summary, "research done");
+    }
+
     #[tokio::test]
     async fn missing_agent_id_returns_error() {
         let tool = SpawnAsyncSubagentTool::new();
@@ -1033,5 +1326,179 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.output().contains("prompt"));
+    }
+
+    /// B40 / Gap 4: a delegating agent (orchestrator/subconscious) calling
+    /// `spawn_async_subagent` directly from a thread-less context (flow
+    /// `agent` node, CLI, cron) must get a clear, actionable error instead of
+    /// silently accepting the spawn and later dropping its result in
+    /// `background_delivery`'s "headless batch" path. Sets up a real parent
+    /// turn context (so the call gets past the `current_parent()` /
+    /// allowlist / registry checks) but deliberately does NOT wrap the call
+    /// in `with_thread_id`, so `current_thread_id()` is None — the exact
+    /// condition that used to sail through to `tokio::spawn` and lose the
+    /// result.
+    #[tokio::test]
+    async fn errors_clearly_when_no_parent_thread_for_delivery() {
+        let _ = AgentDefinitionRegistry::init_global_builtins();
+        let workspace = tempfile::TempDir::new().expect("workspace");
+
+        let result = with_parent_context(parent_context(workspace.path()), async {
+            SpawnAsyncSubagentTool::new()
+                .execute(json!({
+                    "agent_id": "researcher",
+                    "prompt": "investigate x",
+                }))
+                .await
+        })
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let out = result.output();
+        assert!(out.contains("no parent chat thread"), "{out}");
+        // The recommended escape hatch must name `blocking: true` — plain
+        // `spawn_subagent` defaults to async and would otherwise be steered
+        // straight back into this same guard.
+        assert!(out.contains("spawn_subagent"), "{out}");
+        assert!(out.contains("blocking: true"), "{out}");
+        assert!(out.contains("delegate_"), "{out}");
+    }
+
+    /// The positive half of the branch above: with a chat thread bound, the
+    /// guard must NOT fire. This asserts only that the call gets *past* the
+    /// `parent_thread_id.is_none()` check — driving the full spawn/session
+    /// machinery to a successful "Accepted" is out of scope for a unit test,
+    /// so a later failure is acceptable; a "no parent chat thread" failure is
+    /// not. Pins that the guard keys on thread presence and nothing else.
+    #[tokio::test]
+    async fn guard_does_not_fire_when_parent_thread_is_bound() {
+        let _ = AgentDefinitionRegistry::init_global_builtins();
+        let workspace = tempfile::TempDir::new().expect("workspace");
+
+        let result = with_parent_context(parent_context(workspace.path()), async {
+            crate::openhuman::inference::provider::thread_context::with_thread_id(
+                "t-parent",
+                async {
+                    SpawnAsyncSubagentTool::new()
+                        .execute(json!({
+                            "agent_id": "researcher",
+                            "prompt": "investigate x",
+                        }))
+                        .await
+                },
+            )
+            .await
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !result.output().contains("no parent chat thread"),
+            "guard fired despite a bound parent thread: {}",
+            result.output()
+        );
+    }
+
+    fn parent_context(workspace_dir: &Path) -> ParentExecutionContext {
+        ParentExecutionContext {
+            workspace_descriptor: None,
+            agent_definition_id: "orchestrator".into(),
+            allowed_subagent_ids: HashSet::from(["researcher".to_string()]),
+            turn_model_source: crate::openhuman::tinyagents::TurnModelSource::new(Arc::new(
+                NoopProvider,
+            )),
+            all_tools: Arc::new(Vec::new()),
+            all_tool_specs: Arc::new(Vec::new()),
+            visible_tool_names: std::collections::HashSet::new(),
+            model_name: "test-model".into(),
+            temperature: 0.0,
+            workspace_dir: workspace_dir.to_path_buf(),
+            memory: Arc::new(NoopMemory),
+            agent_config: AgentConfig::default(),
+            workflows: Arc::new(Vec::new()),
+            memory_context: Arc::new(None),
+            session_id: "parent-session".into(),
+            channel: "test".into(),
+            connected_integrations: Vec::new(),
+            tool_call_format: ToolCallFormat::Native,
+            session_key: "parent-key".into(),
+            session_parent_prefix: None,
+            on_progress: None,
+            run_queue: None,
+        }
+    }
+
+    struct NoopProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for NoopProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    struct NoopMemory;
+
+    #[async_trait::async_trait]
+    impl Memory for NoopMemory {
+        fn name(&self) -> &str {
+            "noop"
+        }
+
+        async fn store(
+            &self,
+            _namespace: &str,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _opts: RecallOpts<'_>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _namespace: &str, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _namespace: Option<&str>,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _namespace: &str, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn namespace_summaries(&self) -> anyhow::Result<Vec<NamespaceSummary>> {
+            Ok(Vec::new())
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
     }
 }

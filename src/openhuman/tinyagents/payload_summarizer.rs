@@ -28,7 +28,7 @@
 //! pass-through, do nothing) when:
 //!
 //! * The raw payload is below
-//!   [`SubagentPayloadSummarizer::threshold_tokens`] (default 500 000
+//!   [`SubagentPayloadSummarizer::threshold_tokens`] (config default 4 000
 //!   tokens — small payloads aren't worth an extra LLM round-trip).
 //!   Token count is estimated as `chars / 4`, matching
 //!   `tree_summarizer::estimate_tokens`.
@@ -120,7 +120,7 @@ pub struct SubagentPayloadSummarizer {
     /// Lower bound, in **estimated tokens** (`chars / 4`): tool results
     /// smaller than this are passed through untouched. Default is
     /// `summarizer_payload_threshold_tokens` from
-    /// [`crate::openhuman::config::ContextConfig`] (500 000 tokens).
+    /// [`crate::openhuman::config::ContextConfig`] (default 4 000 tokens).
     threshold_tokens: usize,
     /// Upper bound, in **estimated tokens**: tool results larger than
     /// this are also passed through (no LLM call) and fall through to
@@ -261,14 +261,15 @@ impl SubagentPayloadSummarizer {
             anyhow!("payload summarizer cannot use invoke_in_parent without ParentExecutionContext")
         })?;
         let config_loaded = crate::openhuman::config::Config::load_or_init().await;
-        let (provider, model) = subagent_runner::resolve_subagent_provider(
+        let (source, model) = subagent_runner::resolve_subagent_source(
             &self.definition.model,
             &self.definition.id,
             config_loaded.as_ref().ok(),
-            parent.provider.clone(),
+            parent.turn_model_source.clone(),
             parent.model_name.clone(),
             false,
             None,
+            self.definition.temperature,
         );
         let max_output_tokens = self
             .definition
@@ -284,9 +285,10 @@ impl SubagentPayloadSummarizer {
 
         let mut harness: AgentHarness<()> = AgentHarness::new();
         harness.with_policy(policy);
-        let provider_model =
-            super::model::ProviderModel::new(provider, model.clone(), self.definition.temperature)
-                .with_max_tokens(max_output_tokens);
+        let provider_model = super::model::MaxTokensModel::new(
+            source.build_summarizer(&model, self.definition.temperature)?,
+            max_output_tokens,
+        );
         harness
             .register_model(&model, Arc::new(provider_model))
             .set_default_model(&model);
@@ -297,7 +299,34 @@ impl SubagentPayloadSummarizer {
             Arc::new(harness),
         )
         .with_system_prompt(system_prompt);
-        let run = child.invoke_in_parent(&(), (), parent_ctx, prompt).await?;
+        // Run the summarizer UNARY (non-streaming), not via `invoke_in_parent`.
+        //
+        // `invoke_in_parent` inherits `parent.streaming`, which is `true` for a
+        // chat turn, so the child runs the streaming loop and its per-token
+        // deltas land on the shared `EventSink` as parent `AgentProgress::
+        // TextDelta`. The web bridge buffers those into `pending_narration`
+        // and `flush_interim_narration` publishes them as a `chat_interim`
+        // bubble, which is persisted as an `isInterim` agent message — so the
+        // internal "[Tool output summary — <tool>]" text was rendered to the
+        // user as if it were part of the answer. That defeats the point of the
+        // summarizer: it exists to compress a payload for the ORCHESTRATOR'S
+        // CONTEXT, and its only consumer here is `run.text()` below.
+        //
+        // `invoke_with_events` runs the child through the unary path
+        // (`run_child(.., streaming = false)`), which per its own contract
+        // "leav[es] the parent's event stream unchanged", while still sharing
+        // the sink so the sub-agent lifecycle events (started/completed) keep
+        // reaching observers. Mirrors `reprompt_for_required_block`, which is
+        // likewise deliberately silent about an internal repair call.
+        //
+        // Two bits of config that `invoke_in_parent` threaded are dropped by
+        // this entry point and neither matters here: the child `thread_id` (only
+        // used to attribute events we no longer stream) and the inherited
+        // `max_turn_output_tokens` (already enforced independently by the
+        // `MaxTokensModel` wrapper above).
+        let run = child
+            .invoke_with_events(&(), (), parent_ctx.depth(), prompt, &parent_ctx.events)
+            .await?;
         Ok(run.text().unwrap_or_default())
     }
 
@@ -329,6 +358,18 @@ impl SubagentPayloadSummarizer {
             personality_soul_md: None,
             personality_memory_md: None,
             personality_roster: vec![],
+            // AGENTS.md layers are intentionally excluded from the payload
+            // summarizer. This is a narrow internal utility that condenses an
+            // oversized tool payload into a summary — it does no project work in
+            // the action directory, so standing project instructions are pure
+            // noise here and would waste the tight token budget this summary
+            // path is trying to reclaim. Unlike the user-facing agents it also
+            // builds its dynamic prompt directly (not via
+            // `SystemPromptBuilder::from_dynamic`), so it is deliberately outside
+            // the AGENTS.md injection contract that the main + sub-agent prompt
+            // paths honour.
+            agents_md_global: None,
+            agents_md_local: None,
         };
 
         let system_prompt = match &self.definition.system_prompt {
@@ -377,11 +418,11 @@ impl SubagentPayloadSummarizer {
                 self.record_success();
                 let summary_bytes = summary.len();
                 let original_bytes = raw.len();
-                let reduction_pct = if original_bytes == 0 {
-                    0
-                } else {
-                    100usize.saturating_sub(summary_bytes.saturating_mul(100) / original_bytes)
-                };
+                let used_pct = summary_bytes
+                    .saturating_mul(100)
+                    .checked_div(original_bytes)
+                    .unwrap_or(0);
+                let reduction_pct = 100usize.saturating_sub(used_pct);
                 info!(
                     tool = tool_name,
                     original_bytes = original_bytes,

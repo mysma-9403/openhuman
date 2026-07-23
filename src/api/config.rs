@@ -311,6 +311,7 @@ pub fn looks_like_local_ai_endpoint(url: &str) -> bool {
 const INFERENCE_PROVIDER_DOMAINS: &[&str] = &[
     "openrouter.ai",
     "openmodel.ai",
+    "atlascloud.ai",
     "openai.com",
     "anthropic.com",
     "groq.com",
@@ -1189,6 +1190,7 @@ mod tests {
 
         let falls_back: &[&str] = &[
             "https://openrouter.ai/api/v1",
+            "https://api.atlascloud.ai/v1",
             "https://api.openai.com/v1",
             "https://api.groq.com/openai/v1",
             "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -1202,9 +1204,10 @@ mod tests {
         }
 
         // Our own hosted backend still passes through (is_openhuman short-circuit),
-        // and an UNKNOWN custom backend at a bare `/v1` keeps its pass-through so
-        // we don't reroute real self-hosted backends (the deliberate non-match
-        // documented on `looks_like_local_ai_endpoint`).
+        // but an UNKNOWN custom backend at a bare `/v1` base is now classified as
+        // an OpenAI-compatible inference base (#4153, Signal 2) and falls back so
+        // control-plane calls are not misrouted. A self-hosted backend must use a
+        // non-`/v1` base (see the `my-openhuman.example.com` case) to keep routing.
         assert_eq!(
             effective_backend_api_url(&Some("https://api.tinyhumans.ai/v1".to_string())),
             "https://api.tinyhumans.ai",
@@ -1212,8 +1215,8 @@ mod tests {
         );
         assert_eq!(
             effective_backend_api_url(&Some("https://my-backend.example/v1".to_string())),
-            "https://my-backend.example",
-            "unknown custom backend must keep pass-through"
+            fallback,
+            "unknown bare-/v1 base is an inference base and must fall back"
         );
     }
 
@@ -1256,6 +1259,9 @@ mod tests {
         ));
         assert!(looks_like_inference_provider_endpoint(
             "https://api.openmodel.ai/v1"
+        ));
+        assert!(looks_like_inference_provider_endpoint(
+            "https://api.atlascloud.ai/v1"
         ));
         // Other managed providers, apex and subdomain.
         assert!(looks_like_inference_provider_endpoint(
@@ -1314,6 +1320,10 @@ mod tests {
         );
         assert_eq!(
             effective_backend_api_url(&Some("https://api.openmodel.ai/v1".to_string())),
+            expected
+        );
+        assert_eq!(
+            effective_backend_api_url(&Some("https://api.atlascloud.ai/v1".to_string())),
             expected
         );
     }

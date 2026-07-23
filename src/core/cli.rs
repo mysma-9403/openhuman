@@ -7,16 +7,13 @@
 use anyhow::Result;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 
 use crate::core::all;
 use crate::core::autocomplete_cli_adapter;
 use crate::core::jsonrpc::{default_state, invoke_method, parse_json_params};
 use crate::core::logging::CliLogDefault;
 use crate::core::{ControllerSchema, TypeSchema};
-
-/// Debug/e2e agent paths can build deep async poll stacks while assembling
-/// prompts, provider requests, and sub-agent tool loops.
-const CLI_RUNTIME_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 /// The ASCII banner displayed when the CLI starts.
 const CLI_BANNER: &str = r#"
@@ -48,12 +45,36 @@ Contribute & Star us on GitHub: https://github.com/tinyhumansai/openhuman
 /// Returns an error if the command fails, parameters are invalid, or if
 /// the subcommand/namespace is unknown.
 pub fn run_from_cli_args(args: &[String]) -> Result<()> {
-    // Print the welcome banner to stderr to keep stdout clean for JSON output.
-    if !matches!(args.first().map(String::as_str), Some("mcp" | "mcp-server")) {
-        eprint!("{CLI_BANNER}");
+    load_dotenv_for_cli()?;
+
+    let host = crate::core::types::HostKind::detect_standalone();
+    if args == ["--tui"]
+        || should_auto_launch_tui(
+            args,
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+            host,
+            cfg!(feature = "tui"),
+        )
+    {
+        return crate::openhuman::tui::run_from_cli(&[]);
     }
 
-    load_dotenv_for_cli()?;
+    // `--no-tui` is a global opt-out, not a synthetic subcommand. Strip it
+    // before normal dispatch so `openhuman --no-tui --help` and
+    // `openhuman --no-tui run ...` retain their ordinary CLI meaning.
+    let args = strip_no_tui(args);
+    // Print the welcome banner to stderr to keep stdout clean for JSON output.
+    // `mcp`/`mcp-server` speak JSON-RPC on stdout; `tui`/`chat` own the whole
+    // terminal (alternate screen + raw mode) — a banner on either would corrupt
+    // the stream / the UI, so both suppress it. The `matches!` is on the raw
+    // string, so it stays valid even when the `tui` feature is compiled out.
+    if !matches!(
+        args.first().map(String::as_str),
+        Some("mcp" | "mcp-server" | "tui" | "chat")
+    ) {
+        eprint!("{CLI_BANNER}");
+    }
 
     let grouped = grouped_schemas();
     if args.is_empty() || is_help(&args[0]) {
@@ -65,6 +86,11 @@ pub fn run_from_cli_args(args: &[String]) -> Result<()> {
     match args[0].as_str() {
         "run" | "serve" => run_server_command(&args[1..]),
         "mcp" | "mcp-server" => crate::openhuman::mcp_server::run_stdio_from_cli(&args[1..]),
+        // Terminal chat UI. Un-`#[cfg]`'d on purpose: in a slim build this
+        // resolves to `tui::stub::run_from_cli`, which bails with a build-fact
+        // error (see `src/openhuman/tui/stub.rs`) rather than falling through to
+        // `unknown namespace: tui`.
+        "tui" | "chat" => crate::openhuman::tui::run_from_cli(&args[1..]),
         "call" => run_call_command(&args[1..]),
         // Domain-specific CLI adapters that don't follow the generic namespace pattern.
         "screen-intelligence" => {
@@ -93,6 +119,31 @@ pub fn run_from_cli_args(args: &[String]) -> Result<()> {
     }
 }
 
+/// Pure launch policy for the bare `openhuman` command. Explicit subcommands
+/// are never rewritten. Docker and redirected/CI sessions keep the headless
+/// CLI behavior; `openhuman tui` remains an explicit override everywhere.
+fn should_auto_launch_tui(
+    args: &[String],
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+    host: crate::core::types::HostKind,
+    tui_compiled: bool,
+) -> bool {
+    args.is_empty()
+        && stdin_is_terminal
+        && stdout_is_terminal
+        && host == crate::core::types::HostKind::Cli
+        && tui_compiled
+}
+
+fn strip_no_tui(args: &[String]) -> &[String] {
+    if args.first().map(String::as_str) == Some("--no-tui") {
+        &args[1..]
+    } else {
+        args
+    }
+}
+
 /// Handles the `sentry-test` subcommand used to verify Sentry wiring end-to-end.
 ///
 /// Captures an Error-level event against the currently initialized Sentry
@@ -105,6 +156,12 @@ pub fn run_from_cli_args(args: &[String]) -> Result<()> {
 /// alias) or baked into the binary at build time via `option_env!`. Absent a
 /// DSN, the command exits non-zero with a diagnostic instead of silently
 /// producing no telemetry.
+///
+/// Only compiled with the `crash-reporting` feature; the `#[cfg(not(...))]`
+/// companion below returns a disabled-build error (mirrors the `mcp` CLI
+/// precedent, where the subcommand arm + top-level help stay compiled and the
+/// handler reports the build fact rather than a bogus "unknown command").
+#[cfg(feature = "crash-reporting")]
 fn run_sentry_test_command(args: &[String]) -> Result<()> {
     let mut message: Option<String> = None;
     let mut do_panic = false;
@@ -189,6 +246,17 @@ fn run_sentry_test_command(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Disabled-build stand-in for [`run_sentry_test_command`]. Same signature as
+/// the `crash-reporting` version; reports that the probe is unavailable in a
+/// build compiled without the feature rather than pretending to succeed.
+#[cfg(not(feature = "crash-reporting"))]
+fn run_sentry_test_command(_args: &[String]) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "sentry-test unavailable: built without the crash-reporting feature — \
+         rebuild with `--features crash-reporting`"
+    ))
+}
+
 /// Loads key/value pairs from a `.env` file into the process environment.
 ///
 /// This is used for all CLI entrypoints so direct namespace commands pick up
@@ -224,6 +292,7 @@ fn run_server_command(args: &[String]) -> Result<()> {
     let mut port: Option<u16> = None;
     let mut host: Option<String> = None;
     let mut socketio_enabled = true;
+    let mut headless_api = false;
     let mut verbose = false;
     let mut log_scope = CliLogDefault::Global;
     let mut i = 0usize;
@@ -253,6 +322,11 @@ fn run_server_command(args: &[String]) -> Result<()> {
                 socketio_enabled = false;
                 i += 1;
             }
+            "--headless-api" => {
+                socketio_enabled = false;
+                headless_api = true;
+                i += 1;
+            }
             "-v" | "--verbose" => {
                 verbose = true;
                 i += 1;
@@ -263,7 +337,7 @@ fn run_server_command(args: &[String]) -> Result<()> {
                 i += 1;
             }
             "-h" | "--help" => {
-                println!("Usage: openhuman run [--host <addr>] [--port <u16>] [--jsonrpc-only] [--autocomplete-logs] [-v|--verbose]");
+                println!("Usage: openhuman run [--host <addr>] [--port <u16>] [--jsonrpc-only|--headless-api] [--autocomplete-logs] [-v|--verbose]");
                 println!();
                 println!(
                     "  --host <addr>    Bind address (default: 127.0.0.1 or OPENHUMAN_CORE_HOST)"
@@ -272,6 +346,7 @@ fn run_server_command(args: &[String]) -> Result<()> {
                     "  --port <u16>     Listen address port (default: 7788 or OPENHUMAN_CORE_PORT)"
                 );
                 println!("  --jsonrpc-only   HTTP JSON-RPC only; disable Socket.IO");
+                println!("  --headless-api   HTTP JSON-RPC only; disable all background services");
                 autocomplete_cli_adapter::print_run_scope_help_line();
                 println!("  -v, --verbose    Shorthand for RUST_LOG=debug when RUST_LOG is unset");
                 println!();
@@ -296,9 +371,14 @@ fn run_server_command(args: &[String]) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(crate::core::runtime::AGENT_WORKER_STACK_BYTES)
+        .max_blocking_threads(crate::core::runtime::MAX_BLOCKING_THREADS)
         .build()?;
     rt.block_on(async {
-        crate::core::jsonrpc::run_server(host.as_deref(), port, socketio_enabled).await
+        if headless_api {
+            crate::core::jsonrpc::run_server_headless(host.as_deref(), port).await
+        } else {
+            crate::core::jsonrpc::run_server(host.as_deref(), port, socketio_enabled).await
+        }
     })?;
     Ok(())
 }
@@ -349,6 +429,7 @@ fn run_call_command(args: &[String]) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(crate::core::runtime::AGENT_WORKER_STACK_BYTES)
+        .max_blocking_threads(crate::core::runtime::MAX_BLOCKING_THREADS)
         .build()?;
     let value = rt
         .block_on(async { invoke_method(default_state(), &method, params).await })
@@ -430,6 +511,7 @@ fn run_namespace_command(
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(crate::core::runtime::AGENT_WORKER_STACK_BYTES)
+        .max_blocking_threads(crate::core::runtime::MAX_BLOCKING_THREADS)
         .build()?;
     let value = rt
         .block_on(async { invoke_method(default_state(), &method, Value::Object(params)).await })
@@ -437,14 +519,6 @@ fn run_namespace_command(
 
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
-}
-
-fn build_cli_runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .thread_stack_size(CLI_RUNTIME_THREAD_STACK_SIZE)
-        .enable_all()
-        .build()
-        .map_err(Into::into)
 }
 
 /// Parses command-line arguments into a JSON map based on a function's schema.
@@ -557,10 +631,14 @@ fn grouped_schemas() -> BTreeMap<String, Vec<ControllerSchema>> {
 fn print_general_help(grouped: &BTreeMap<String, Vec<ControllerSchema>>) {
     println!("OpenHuman core CLI\n");
     println!("Usage:");
+    println!("  openhuman [--no-tui]                    (tabbed terminal UI on interactive hosts)");
     println!("  openhuman run [--host <addr>] [--port <u16>] [--jsonrpc-only] [--verbose]");
     println!("  openhuman call --method <name> [--params '<json>']");
     println!(
         "  openhuman mcp [-v|--verbose]              (stdio MCP server; read-only memory tools)"
+    );
+    println!(
+        "  openhuman tui [--thread <id>|--new]        (force tabbed terminal UI, alias: chat)"
     );
     println!("  openhuman skills <subcommand> [options]   (skill development runtime)");
     println!("  openhuman agent <subcommand> [options]    (inspect agent definitions & prompts)");

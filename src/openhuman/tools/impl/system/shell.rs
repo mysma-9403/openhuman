@@ -349,6 +349,20 @@ impl ShellTool {
             return (false, ToolResult::error(reason));
         }
 
+        // Cross-profile write guard (1b), shell call site. File tools enforce
+        // the same boundary per-path in `SecurityPolicy::validate_path`; shell
+        // commands never funnel through that, so scan the command's path-shaped
+        // tokens against the profile's own workspace (its cwd). No-op unless the
+        // session runs under a dedicated-workspace profile. See
+        // `profiles::guard::scan_command_for_cross_profile` for the containment
+        // rationale (the cwd is already rooted at the profile's own dir).
+        let cwd = self.effective_action_dir_for_context(context);
+        if let Err(reason) =
+            super::check_cross_profile_command(self.security.as_ref(), command, &cwd, "shell")
+        {
+            return (false, ToolResult::error(reason));
+        }
+
         if self.security.is_rate_limited() {
             return (
                 false,
@@ -635,13 +649,13 @@ fn prepend_path_dirs<'a>(
 fn shell_command_needs_python_runtime(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     lower
-        .split(|ch| matches!(ch, ';' | '&' | '|' | '\n' | '\r'))
+        .split([';', '&', '|', '\n', '\r'])
         .any(segment_starts_with_python_command)
 }
 
 fn segment_starts_with_python_command(segment: &str) -> bool {
-    let mut tokens = segment.split_whitespace().peekable();
-    while let Some(token) = tokens.next() {
+    let tokens = segment.split_whitespace().peekable();
+    for token in tokens {
         let token = token.trim_matches(|ch| matches!(ch, '(' | ')' | '<' | '>'));
         if token.is_empty() {
             continue;

@@ -1,6 +1,6 @@
 //! Background skill run spawning and outcome polling.
 //!
-//! `spawn_workflow_run_background` is re-used by both the `workflows_run`
+//! `spawn_workflow_run_background` is re-used by both the `skills_run`
 //! JSON-RPC controller and the `run_skill` agent tool (skill chaining).
 //! `await_run_outcome` lets the model poll a spawned run's log file for a
 //! terminal result without busy-waiting.
@@ -10,9 +10,23 @@ use serde_json::Value;
 use crate::openhuman::agent::harness::session::Agent;
 use crate::openhuman::agent::harness::subagent_runner::with_autonomous_iter_cap;
 use crate::openhuman::config::Config;
-use crate::openhuman::workflows::{preflight, registry, run_log};
+use crate::openhuman::skills::{preflight, registry, run_log};
 
-use crate::openhuman::workflows::schemas::resolve_workspace_dir;
+use crate::openhuman::skills::schemas::resolve_workspace_dir;
+
+async fn with_profile_memory_source_scope<F, T>(
+    active_profile: Option<&crate::openhuman::profiles::AgentProfile>,
+    fut: F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    crate::openhuman::memory::source_scope::with_source_scope(
+        active_profile.and_then(|profile| profile.memory_sources.clone()),
+        fut,
+    )
+    .await
+}
 
 /// Iteration cap for an autonomous skill run (orchestrator + sub-agents). High
 /// enough to "run until done", while the repeated-failure circuit breaker still
@@ -29,7 +43,7 @@ pub struct WorkflowRunStarted {
 }
 
 /// Spawn a single autonomous workflow_run as a detached `tokio::spawn`. Used by
-/// both the `openhuman.workflows_run` JSON-RPC controller and the `run_skill`
+/// both the `openhuman.skills_run` JSON-RPC controller and the `run_skill`
 /// agent tool (which lets the orchestrator chain one skill into another —
 /// e.g. `github-issue-crusher` → `pr-review-shepherd` once the draft PR is
 /// open).
@@ -42,9 +56,29 @@ pub async fn spawn_workflow_run_background(
     skill_id_param: String,
     inputs_param: Option<Value>,
 ) -> Result<WorkflowRunStarted, String> {
+    spawn_workflow_run_background_with_profile(skill_id_param, inputs_param, None, None).await
+}
+
+/// Like [`spawn_workflow_run_background`], but resolves the target skill against
+/// the active profile's private skills root too
+/// (`<workspace>/personalities/<id>/skills/`) when `profile_skills_root` is
+/// supplied — so `run_workflow` under profile P can run P's private skills, with
+/// profile-local winning same-name collisions. `None` is byte-identical to
+/// [`spawn_workflow_run_background`]. The root is passed by value (owned) so it
+/// can cross the resolution boundary without borrowing across the spawn.
+pub async fn spawn_workflow_run_background_with_profile(
+    skill_id_param: String,
+    inputs_param: Option<Value>,
+    profile_skills_root: Option<std::path::PathBuf>,
+    active_profile: Option<crate::openhuman::profiles::AgentProfile>,
+) -> Result<WorkflowRunStarted, String> {
     let workspace = resolve_workspace_dir().await;
-    let skill = registry::get_workflow(&workspace, &skill_id_param)
-        .ok_or_else(|| format!("workflow_run: unknown skill '{skill_id_param}'"))?;
+    let skill = registry::get_workflow_with_profile(
+        &workspace,
+        &skill_id_param,
+        profile_skills_root.as_deref(),
+    )
+    .ok_or_else(|| format!("workflow_run: unknown skill '{skill_id_param}'"))?;
     let inputs = inputs_param.unwrap_or(Value::Null);
     let missing = registry::missing_required_inputs(&skill.inputs, &inputs);
     if !missing.is_empty() {
@@ -87,12 +121,13 @@ pub async fn spawn_workflow_run_background(
                  gate decision: FAILED ({tag})\n\
                  detail: {body}"
             );
-            if let Err(e) = run_log::write_header(
+            if let Err(e) = run_log::write_header_with_profile(
                 &gate_log_path,
                 &skill.definition.id,
                 &gate_run_id,
                 &inputs,
                 &header_prompt,
+                active_profile.as_ref().map(|profile| profile.id.as_str()),
             )
             .await
             {
@@ -147,7 +182,7 @@ pub async fn spawn_workflow_run_background(
 
     // Detached: build the orchestrator Agent inside the spawn so config /
     // toolchain are loaded fresh per run; the parent returns the handle
-    // immediately. Same flow handle_workflows_run used to inline — extracted
+    // immediately. Same flow handle_skills_run used to inline — extracted
     // so the `run_skill` agent tool can re-use it for skill chaining.
     let inherited_origin = crate::openhuman::agent::turn_origin::current()
         .unwrap_or(crate::openhuman::agent::turn_origin::AgentTurnOrigin::Cli);
@@ -157,9 +192,18 @@ pub async fn spawn_workflow_run_background(
         let inputs = inputs.clone();
         let log_path = log_path.clone();
         let inherited_origin = inherited_origin.clone();
+        let active_profile = active_profile.clone();
+        let run_profile_id = active_profile.as_ref().map(|profile| profile.id.clone());
         tokio::spawn(async move {
-            if let Err(e) =
-                run_log::write_header(&log_path, &workflow_id, &run_id, &inputs, &task_prompt).await
+            if let Err(e) = run_log::write_header_with_profile(
+                &log_path,
+                &workflow_id,
+                &run_id,
+                &inputs,
+                &task_prompt,
+                run_profile_id.as_deref(),
+            )
+            .await
             {
                 tracing::warn!(run_id = %run_id, error = %e, "[skills] workflow_run: header write failed");
             }
@@ -176,14 +220,21 @@ pub async fn spawn_workflow_run_background(
                     return;
                 }
             };
-            config.agent.max_tool_iterations = WORKFLOW_RUN_MAX_ITERATIONS;
             // Only apply the permissive wildcard default when the operator
             // hasn't configured an explicit allow-list — preserve any
             // configured egress policy instead of unconditionally widening it.
             if config.http_request.allowed_domains.is_empty() {
                 config.http_request.allowed_domains = vec!["*".to_string()];
             }
-            let mut agent = match Agent::from_config_for_agent(&config, "orchestrator") {
+            let mut agent = match Agent::from_config_for_agent_with_profile(
+                &config,
+                "orchestrator",
+                None,
+                active_profile
+                    .as_ref()
+                    .and_then(|profile| profile.system_prompt_suffix.clone()),
+                active_profile.as_ref(),
+            ) {
                 Ok(a) => a,
                 Err(e) => {
                     let _ = run_log::write_footer(
@@ -196,6 +247,19 @@ pub async fn spawn_workflow_run_background(
                     return;
                 }
             };
+            // Issue #4868 — apply the workflow-run iteration budget AFTER
+            // construction. The session builder now stamps `orchestrator`'s
+            // definition cap (15) onto the agent; a full workflow run
+            // intentionally needs a much larger budget (200), so this must be
+            // a post-construction override rather than a pre-set on `config`
+            // (which the builder would otherwise clobber).
+            agent.set_max_tool_iterations(WORKFLOW_RUN_MAX_ITERATIONS);
+            tracing::debug!(
+                run_id = %run_id,
+                max_tool_iterations = WORKFLOW_RUN_MAX_ITERATIONS,
+                "[skills] workflow_run: pinned iteration budget post-construction (overrides \
+                 the session builder's orchestrator definition cap)"
+            );
             agent.set_event_context(run_id.clone(), "skill");
             agent.set_agent_definition_name(format!(
                 "orchestrator-skill-{}",
@@ -206,7 +270,7 @@ pub async fn spawn_workflow_run_background(
             let bridge = tokio::spawn(run_log::drain_to_log(rx, log_path.clone()));
 
             // Register the cancellation token now (after the run can actually
-            // start) so `workflows_cancel` can stop it; a config/agent-build
+            // start) so `skills_cancel` can stop it; a config/agent-build
             // failure above returns before this, leaving nothing to leak.
             let cancel_token = run_log::register_run_cancel(&run_id);
 
@@ -216,18 +280,21 @@ pub async fn spawn_workflow_run_background(
             // through the approval gate. Falls back to Cli for direct
             // user-initiated RPC / CLI flows.
             //
-            // Race the run against its cancellation token: if `workflows_cancel`
+            // Race the run against its cancellation token: if `skills_cancel`
             // fires the token, the run future is dropped (cancelled at its next
             // await) and we record a CANCELLED footer. `Some(_)` ⇒ ran to a
             // natural end; `None` ⇒ cancelled.
             let result = tokio::select! {
                 biased;
                 _ = cancel_token.cancelled() => None,
-                r = crate::openhuman::agent::turn_origin::with_origin(
-                    inherited_origin,
-                    with_autonomous_iter_cap(
-                        WORKFLOW_RUN_MAX_ITERATIONS,
-                        agent.run_single(&task_prompt),
+                r = with_profile_memory_source_scope(
+                    active_profile.as_ref(),
+                    crate::openhuman::agent::turn_origin::with_origin(
+                        inherited_origin,
+                        with_autonomous_iter_cap(
+                            WORKFLOW_RUN_MAX_ITERATIONS,
+                            agent.run_single(&task_prompt),
+                        ),
                     ),
                 ) => Some(r),
             };
@@ -306,5 +373,34 @@ pub async fn await_run_outcome(
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn workflow_profile_installs_memory_source_scope() {
+        let mut profile = crate::openhuman::profiles::store::built_in_default_profile();
+        profile.memory_sources = Some(vec!["slack:#eng".into(), "github:openhuman".into()]);
+
+        let visible = with_profile_memory_source_scope(Some(&profile), async {
+            crate::openhuman::memory::source_scope::current_source_scope()
+        })
+        .await;
+
+        assert_eq!(
+            visible,
+            Some(std::collections::HashSet::from([
+                "slack:#eng".into(),
+                "github:openhuman".into(),
+            ]))
+        );
+        assert_eq!(
+            crate::openhuman::memory::source_scope::current_source_scope(),
+            None,
+            "workflow scope must not leak after the run future finishes"
+        );
     }
 }

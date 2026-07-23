@@ -11,7 +11,7 @@
 //! [`ToolFailureClass::Unknown`] (treated as recoverable so a later retry phase
 //! can give it one bounded attempt rather than surfacing a dead end).
 
-use super::types::{ClassifiedFailure, FailureCategory, ToolFailureClass};
+use super::types::{ClassifiedFailure, ToolFailureClass};
 
 /// Classify a failed tool call into a user-facing [`ClassifiedFailure`].
 ///
@@ -30,6 +30,35 @@ pub fn classify(error_text: &str, timed_out: bool) -> ClassifiedFailure {
 fn classify_class(error_text: &str, timed_out: bool) -> ToolFailureClass {
     let text = error_text.to_lowercase();
 
+    // 0. Structured policy markers win over *every* heuristic, including the
+    //    `timed out` sniff below (#4459). Both markers are emitted upstream by
+    //    the security/approval gate and survive the `Error: …` wrapping, so a
+    //    marker hit is authoritative — a TTL-expiry deny reason literally
+    //    contains "timed out", and must classify as an expired approval, never
+    //    an execution Timeout that promises an auto-retry.
+    //
+    //    `POLICY_BLOCKED_MARKER` — a hard, cross-turn block: the action is
+    //    refused by the user's safety/autonomy policy (BlockedByPolicy).
+    if text.contains(crate::openhuman::security::POLICY_BLOCKED_MARKER) {
+        tracing::debug!("[tool_status::classify] matched POLICY_BLOCKED_MARKER -> BlockedByPolicy");
+        return ToolFailureClass::BlockedByPolicy;
+    }
+    //    `POLICY_DENIED_MARKER` — a this-turn denial: the user answered "no" at
+    //    the approval prompt, the prompt's channel dropped, the origin was
+    //    subconscious-tainted, or the prompt's TTL expired. All are
+    //    non-retryable refusals (UserDeclined), split only by copy: a TTL
+    //    expiry reads "approval expired", an explicit refusal reads "declined".
+    if text.contains(crate::openhuman::security::POLICY_DENIED_MARKER) {
+        if contains_any(&text, &["timed out", "timeout", "expired"]) {
+            tracing::debug!(
+                "[tool_status::classify] matched POLICY_DENIED_MARKER + expiry phrase -> ApprovalExpired"
+            );
+            return ToolFailureClass::ApprovalExpired;
+        }
+        tracing::debug!("[tool_status::classify] matched POLICY_DENIED_MARKER -> Denied");
+        return ToolFailureClass::Denied;
+    }
+
     // 1. Timeout — the executor's explicit signal wins over any text sniffing.
     if timed_out || contains_any(&text, &["timed out", "timeout", "deadline exceeded"]) {
         return ToolFailureClass::Timeout;
@@ -39,10 +68,13 @@ fn classify_class(error_text: &str, timed_out: bool) -> ToolFailureClass {
     //    path. Checked *before* credentials so the OpenHuman-specific
     //    `forbidden path` marker wins over the bare `forbidden` that a plain
     //    external 403 body carries (routed to credentials below). Reserved for
-    //    OpenHuman policy phrasing only — a hard policy block is normally tagged
-    //    upstream with `POLICY_BLOCKED_MARKER` and never reaches this heuristic;
-    //    bare HTTP `403`/`Forbidden` is an external authz failure, not our gate.
+    //    OpenHuman policy phrasing only — a hard policy block is tagged upstream
+    //    with `POLICY_BLOCKED_MARKER` and already short-circuited above (step 0);
+    //    this heuristic only catches un-marked policy phrasing. Bare HTTP
+    //    `403`/`Forbidden` is an external authz failure, not our gate.
     //    `channel allows` is the tail of the tool-policy PermissionDenied render.
+    //    (The old `"policy denied"` needle was dead — no producer emits that
+    //     phrasing; the deny family uses `POLICY_DENIED_MARKER`, handled above.)
     if contains_any(
         &text,
         &[
@@ -52,7 +84,6 @@ fn classify_class(error_text: &str, timed_out: bool) -> ToolFailureClass {
             "not allowed by",
             "forbidden path",
             "autonomy",
-            "policy denied",
         ],
     ) {
         return ToolFailureClass::BlockedByPolicy;
@@ -195,6 +226,14 @@ pub fn describe(class: ToolFailureClass) -> ClassifiedFailure {
         ToolFailureClass::Timeout => (
             "The action took too long and was stopped.",
             "OpenHuman will try again, or you can retry it manually.",
+        ),
+        ToolFailureClass::Denied => (
+            "You declined this action.",
+            "Nothing to do — it was not run. Ask again if you change your mind.",
+        ),
+        ToolFailureClass::ApprovalExpired => (
+            "The approval request expired before anyone responded.",
+            "Ask again to run it — OpenHuman won't retry it on its own.",
         ),
         ToolFailureClass::Unknown => (
             "Something went wrong with this action.",
@@ -350,6 +389,27 @@ mod tests {
     }
 
     #[test]
+    fn policy_denied_marker_is_denied_and_not_recoverable() {
+        use crate::openhuman::security::POLICY_DENIED_MARKER;
+        let text = format!("{POLICY_DENIED_MARKER} you declined this shell action");
+        assert_eq!(class_of(&text), ToolFailureClass::Denied);
+        // UserDeclined family — never eligible for an auto-retry (#4459).
+        assert!(!classify(&text, false).recoverable);
+    }
+
+    #[test]
+    fn policy_denied_ttl_expiry_is_approval_expired_not_timeout() {
+        use crate::openhuman::security::POLICY_DENIED_MARKER;
+        // A TTL-expiry deny reason literally contains "timed out" — the policy
+        // marker must win over the timeout sniff so it classifies as an expired
+        // approval, NOT an execution Timeout that promises an auto-retry (#4459).
+        let text = format!("{POLICY_DENIED_MARKER} Approval for 'shell' timed out after 600s");
+        assert_eq!(class_of(&text), ToolFailureClass::ApprovalExpired);
+        assert_ne!(class_of(&text), ToolFailureClass::Timeout);
+        assert!(!classify(&text, false).recoverable);
+    }
+
+    #[test]
     fn numeric_status_codes_need_word_boundaries() {
         // `403`/`503` embedded in a longer digit run must NOT trip the code
         // needles — these fall through to Unknown.
@@ -412,6 +472,8 @@ mod tests {
             ToolFailureClass::BlockedByPolicy,
             ToolFailureClass::ModelConnection,
             ToolFailureClass::Timeout,
+            ToolFailureClass::Denied,
+            ToolFailureClass::ApprovalExpired,
             ToolFailureClass::Unknown,
         ] {
             let f = describe(class);

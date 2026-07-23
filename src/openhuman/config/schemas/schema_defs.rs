@@ -224,6 +224,7 @@ pub fn schemas(function: &str) -> ControllerSchema {
                     required: false,
                 },
                 optional_bool("require_task_plan_approval", "Require approval before an agent executes a task-board plan."),
+                optional_bool("auto_approve_all", "When true, auto-approve all tool calls without prompting. SubconsciousTainted and Unknown origins still denied. Hard security blocks unaffected."),
             ],
             outputs: vec![json_output("snapshot", "Updated config snapshot.")],
         },
@@ -703,7 +704,10 @@ pub fn schemas(function: &str) -> ControllerSchema {
             function: "get_data_paths",
             description:
                 "Resolve the OpenHuman data directories (current workspace, default ~/.openhuman, active workspace marker) that reset_local_data would remove. Read-only — performs no filesystem changes.",
-            inputs: vec![],
+            inputs: vec![optional_string(
+                "user_id",
+                "Resolve paths for this specific user id (users/<id>) instead of the active-user marker. Clear App Data passes this because it signs the user out — removing the marker — before deleting the data.",
+            )],
             outputs: vec![json_output(
                 "paths",
                 "Resolved data paths: current_openhuman_dir, default_openhuman_dir, active_workspace_marker_path.",

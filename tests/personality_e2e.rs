@@ -64,6 +64,8 @@ fn make_profile(id: &str, name: &str) -> AgentProfile {
         memory_dir_suffix: None,
         is_master: false,
         sort_order: None,
+        dedicated_memory: false,
+        dedicated_workspace: false,
     }
 }
 
@@ -88,6 +90,8 @@ fn empty_prompt_context<'a>(workspace_dir: &'a std::path::Path) -> PromptContext
         personality_soul_md: None,
         personality_memory_md: None,
         personality_roster: vec![],
+        agents_md_global: None,
+        agents_md_local: None,
     }
 }
 

@@ -1,9 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  buildWorkflow,
+  discoverWorkflows,
+  dismissSuggestion,
+  type FlowSuggestion,
   getFlowRun,
+  listAllFlowRuns,
   listFlowRuns,
   listFlows,
+  listSuggestions,
+  markSuggestionBuilt,
   resumeFlow,
   runFlow,
   setFlowEnabled,
@@ -117,6 +124,50 @@ describe('flowsApi', () => {
       mockCallCoreRpc.mockRejectedValue(new Error('boom'));
 
       await expect(listFlowRuns('flow-1')).rejects.toThrow('boom');
+    });
+  });
+
+  describe('listAllFlowRuns', () => {
+    it('calls openhuman.flows_list_all_runs with no params by default', async () => {
+      mockCallCoreRpc.mockResolvedValue(cliEnvelope([]));
+
+      await listAllFlowRuns();
+
+      expect(mockCallCoreRpc).toHaveBeenCalledWith({
+        method: 'openhuman.flows_list_all_runs',
+        params: {},
+      });
+    });
+
+    it('passes limit when provided and unwraps the envelope', async () => {
+      const runs = [
+        {
+          id: 't1',
+          flow_id: 'flow-1',
+          thread_id: 't1',
+          status: 'failed' as const,
+          started_at: '2026-01-01T00:00:00Z',
+          finished_at: null,
+          steps: [],
+          pending_approvals: [],
+          error: 'boom',
+        },
+      ];
+      mockCallCoreRpc.mockResolvedValue(cliEnvelope(runs));
+
+      const result = await listAllFlowRuns(50);
+
+      expect(mockCallCoreRpc).toHaveBeenCalledWith({
+        method: 'openhuman.flows_list_all_runs',
+        params: { limit: 50 },
+      });
+      expect(result).toEqual(runs);
+    });
+
+    it('propagates rejection from callCoreRpc', async () => {
+      mockCallCoreRpc.mockRejectedValue(new Error('rpc down'));
+
+      await expect(listAllFlowRuns()).rejects.toThrow('rpc down');
     });
   });
 
@@ -261,6 +312,160 @@ describe('flowsApi', () => {
       mockCallCoreRpc.mockRejectedValue(new Error('flow disabled'));
 
       await expect(runFlow('flow-1')).rejects.toThrow('flow disabled');
+    });
+  });
+
+  describe('Flow Scout suggestions', () => {
+    const suggestion: FlowSuggestion = {
+      id: 'sug_1',
+      title: 'Auto-file receipts',
+      one_liner: 'Add each Gmail receipt to your sheet.',
+      rationale: 'You forward receipts weekly.',
+      trigger_hint: 'app_event',
+      steps_outline: ['Watch Gmail', 'Append row'],
+      suggested_connections: ['composio:gmail:c1'],
+      suggested_slugs: ['GMAIL_NEW_GMAIL_MESSAGE'],
+      build_prompt: 'Build a workflow that…',
+      confidence: 0.8,
+      status: 'new',
+      created_at: '2026-07-05T00:00:00Z',
+      source_run_id: null,
+    };
+
+    it('discoverWorkflows calls flows_discover with the extended timeout', async () => {
+      mockCallCoreRpc.mockResolvedValue(cliEnvelope([suggestion]));
+
+      const result = await discoverWorkflows();
+
+      expect(mockCallCoreRpc).toHaveBeenCalledWith({
+        method: 'openhuman.flows_discover',
+        params: {},
+        timeoutMs: 610_000,
+      });
+      expect(result).toEqual([suggestion]);
+    });
+
+    it('discoverWorkflows passes thread_id when a chat thread is given', async () => {
+      mockCallCoreRpc.mockResolvedValue(cliEnvelope([suggestion]));
+
+      await discoverWorkflows('scout-thread-1');
+
+      expect(mockCallCoreRpc).toHaveBeenCalledWith({
+        method: 'openhuman.flows_discover',
+        params: { thread_id: 'scout-thread-1' },
+        timeoutMs: 610_000,
+      });
+    });
+
+    it('listSuggestions omits status when not provided', async () => {
+      mockCallCoreRpc.mockResolvedValue(cliEnvelope([]));
+
+      await listSuggestions();
+
+      expect(mockCallCoreRpc).toHaveBeenCalledWith({
+        method: 'openhuman.flows_list_suggestions',
+        params: {},
+      });
+    });
+
+    it('listSuggestions passes the status filter', async () => {
+      mockCallCoreRpc.mockResolvedValue(cliEnvelope([suggestion]));
+
+      const result = await listSuggestions('new');
+
+      expect(mockCallCoreRpc).toHaveBeenCalledWith({
+        method: 'openhuman.flows_list_suggestions',
+        params: { status: 'new' },
+      });
+      expect(result).toEqual([suggestion]);
+    });
+
+    it('dismissSuggestion returns the dismissed flag', async () => {
+      mockCallCoreRpc.mockResolvedValue(cliEnvelope({ id: 'sug_1', dismissed: true }));
+
+      const result = await dismissSuggestion('sug_1');
+
+      expect(mockCallCoreRpc).toHaveBeenCalledWith({
+        method: 'openhuman.flows_dismiss_suggestion',
+        params: { id: 'sug_1' },
+      });
+      expect(result).toBe(true);
+    });
+
+    it('markSuggestionBuilt returns the built flag', async () => {
+      mockCallCoreRpc.mockResolvedValue(cliEnvelope({ id: 'sug_1', built: true }));
+
+      const result = await markSuggestionBuilt('sug_1');
+
+      expect(mockCallCoreRpc).toHaveBeenCalledWith({
+        method: 'openhuman.flows_mark_suggestion_built',
+        params: { id: 'sug_1' },
+      });
+      expect(result).toBe(true);
+    });
+
+    it('propagates rejection from callCoreRpc', async () => {
+      mockCallCoreRpc.mockRejectedValue(new Error('boom'));
+
+      await expect(discoverWorkflows()).rejects.toThrow('boom');
+    });
+  });
+
+  describe('buildWorkflow', () => {
+    const proposalPayload = {
+      type: 'workflow_proposal',
+      name: 'Digest',
+      graph: { schema_version: 1, name: 'g', nodes: [], edges: [] },
+      require_approval: true,
+      summary: { trigger: 'manual', steps: [] },
+    };
+
+    it('calls flows_build with the structured request and no thread_id when omitted', async () => {
+      mockCallCoreRpc.mockResolvedValue(
+        cliEnvelope({ proposal: proposalPayload, assistant_text: 'here you go', error: null })
+      );
+
+      const result = await buildWorkflow({ mode: 'create', instruction: 'email me a digest' });
+
+      expect(mockCallCoreRpc).toHaveBeenCalledWith({
+        method: 'openhuman.flows_build',
+        params: {
+          mode: 'create',
+          instruction: 'email me a digest',
+          graph: null,
+          flow_id: null,
+          run_id: null,
+          error: null,
+          failing_node_ids: [],
+        },
+        timeoutMs: 610_000,
+      });
+      expect(result.assistantText).toBe('here you go');
+      expect(result.proposal?.name).toBe('Digest');
+      expect(result.error).toBeNull();
+    });
+
+    it('threads the chat thread_id into flows_build params when provided', async () => {
+      mockCallCoreRpc.mockResolvedValue(
+        cliEnvelope({ proposal: null, assistant_text: '', error: null })
+      );
+
+      await buildWorkflow({ mode: 'revise', instruction: 'add a Slack step' }, 'builder-thread-9');
+
+      expect(mockCallCoreRpc).toHaveBeenCalledWith({
+        method: 'openhuman.flows_build',
+        params: {
+          mode: 'revise',
+          instruction: 'add a Slack step',
+          graph: null,
+          flow_id: null,
+          run_id: null,
+          error: null,
+          failing_node_ids: [],
+          thread_id: 'builder-thread-9',
+        },
+        timeoutMs: 610_000,
+      });
     });
   });
 });
