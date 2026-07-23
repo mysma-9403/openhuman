@@ -133,9 +133,11 @@ pub(crate) struct DelegationState {
     #[serde(default)]
     pub(crate) denied: bool,
     /// On-disk schema version, stamped [`CURRENT_SCHEMA_VERSION`] on a fresh run
-    /// and defaulting to `0` for pre-versioned checkpoints. A resume uses it (and
-    /// a hard deserialize failure) to expire incompatible checkpoints instead of
-    /// misreading them.
+    /// and defaulting to `0` for pre-versioned checkpoints.
+    /// [`run_or_resume_delegation`] expires any checkpoint whose version is below
+    /// `CURRENT_SCHEMA_VERSION` (and any that fails to deserialize) instead of
+    /// resuming or returning it — so a shape change that stays structurally
+    /// decodable is still not misread.
     #[serde(default)]
     pub(crate) schema_version: u32,
 }
@@ -385,6 +387,22 @@ where
     };
 
     match cp.get(tid.as_str(), None).await {
+        // A checkpoint written under an older state schema (e.g. a pre-#3884
+        // record whose `executions` happened to be empty and so still decoded
+        // into `Vec<StepRecord>`) is expired rather than resumed/returned — its
+        // semantics may not match the current graph. This is what makes
+        // `schema_version` an actual guard, not just documentation, and closes
+        // the empty-`executions` gap that a decode failure alone cannot catch.
+        Ok(Some(checkpoint)) if checkpoint.state.schema_version < CURRENT_SCHEMA_VERSION => {
+            tracing::warn!(
+                thread_id = %tid,
+                schema_version = checkpoint.state.schema_version,
+                current = CURRENT_SCHEMA_VERSION,
+                "[delegation] checkpoint predates the current state schema; pruning and starting fresh"
+            );
+            prune_thread(cp.as_ref(), &tid).await;
+            run_delegation_durable(config, run_stage).await
+        }
         Ok(Some(checkpoint)) if checkpoint_is_resumable(&checkpoint) => {
             tracing::info!(
                 thread_id = %tid,
@@ -395,13 +413,32 @@ where
             resume_graph(config, Command::default(), run_stage).await
         }
         Ok(Some(checkpoint)) => {
-            tracing::info!(
-                thread_id = %tid,
-                "[delegation] thread already terminal; returning finalized state without re-running"
-            );
+            // Terminal: return the finalized state without re-running. Defensive:
+            // if this checkpoint still carried an unconsumed interrupt, surface it
+            // instead of silently dropping it. The current routing never produces
+            // this (an interrupt boundary schedules its node and is classified
+            // resumable above), but a future schedule could, and a dropped pause
+            // would strand a run.
+            let pending = checkpoint.interrupts.first().map(|i| PendingApproval {
+                interrupt_id: i.id.clone(),
+                node: i.node.as_str().to_string(),
+                payload: i.payload.clone(),
+                thread_id: tid.clone(),
+            });
+            if pending.is_some() {
+                tracing::warn!(
+                    thread_id = %tid,
+                    "[delegation] terminal-classified checkpoint carried a pending interrupt; surfacing it"
+                );
+            } else {
+                tracing::info!(
+                    thread_id = %tid,
+                    "[delegation] thread already terminal; returning finalized state without re-running"
+                );
+            }
             Ok(DelegationOutcome {
                 state: checkpoint.state,
-                pending: None,
+                pending,
             })
         }
         Ok(None) => {
@@ -411,23 +448,53 @@ where
             );
             run_delegation_durable(config, run_stage).await
         }
-        Err(e) => {
+        // Only a *decode / shape-incompatibility* read error expires the
+        // checkpoint. An operational error (SQLite busy / I/O / poisoned lock)
+        // must NOT silently restart a valid resumable run — it is propagated so
+        // durable work is retried by the caller, not dropped.
+        Err(e) if is_incompatible_checkpoint_error(&e) => {
             tracing::warn!(
                 thread_id = %tid,
                 error = %e,
-                "[delegation] stale/incompatible checkpoint; pruning and starting fresh"
+                "[delegation] undecodable/incompatible checkpoint; pruning and starting fresh"
             );
-            // Best-effort: drop the dead thread so it is not re-probed forever.
-            if let Err(prune_err) = cp.delete_thread(tid.as_str()).await {
-                tracing::debug!(
-                    thread_id = %tid,
-                    error = %prune_err,
-                    "[delegation] could not prune stale checkpoint thread (non-fatal)"
-                );
-            }
+            prune_thread(cp.as_ref(), &tid).await;
             run_delegation_durable(config, run_stage).await
         }
+        Err(e) => {
+            tracing::error!(
+                thread_id = %tid,
+                error = %e,
+                "[delegation] checkpoint read failed (operational); not restarting — propagating error"
+            );
+            Err(format!(
+                "delegation checkpoint read failed for thread {tid}: {e}"
+            ))
+        }
     }
+}
+
+/// Best-effort prune of a dead/expired checkpoint thread so it is not re-probed
+/// forever. Failure to prune is non-fatal (logged at debug).
+async fn prune_thread(cp: &dyn Checkpointer<DelegationState>, thread_id: &str) {
+    if let Err(e) = cp.delete_thread(thread_id).await {
+        tracing::debug!(
+            thread_id = %thread_id,
+            error = %e,
+            "[delegation] could not prune checkpoint thread (non-fatal)"
+        );
+    }
+}
+
+/// Whether a `Checkpointer::get` error is a decode / shape-incompatibility (safe
+/// to expire the checkpoint) rather than an operational failure (SQLite busy /
+/// I/O / poisoned lock — must not silently restart durable work). The vendored
+/// `SqliteCheckpointer` reports both as `TinyAgentsError::Checkpoint(String)` but
+/// tags decode failures with a `"decode …"` context (`sqlite.rs`:
+/// `decode record` / `decode namespace` / `decode next_nodes`) — the only stable
+/// discriminator it exposes.
+fn is_incompatible_checkpoint_error(e: &tinyagents::TinyAgentsError) -> bool {
+    matches!(e, tinyagents::TinyAgentsError::Checkpoint(msg) if msg.contains("decode"))
 }
 
 /// Whether a loaded checkpoint still has work to resume: a non-finalized,
@@ -1315,5 +1382,143 @@ mod tests {
         assert!(outcome.state.final_output.is_some(), "fresh run completed");
         assert_eq!(outcome.state.executions.len(), 1);
         assert_eq!(outcome.state.executions[0].result, "EXEC");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_below_current_schema_version_expires_to_fresh_run() {
+        // A decodable but OLD-schema checkpoint (schema_version defaults to 0 —
+        // e.g. a pre-#3884 record whose executions happened to be empty) must be
+        // expired, not resumed: `schema_version` is a real guard, not just a doc.
+        let dir = tempfile::tempdir().unwrap();
+        let seed: tinyagents::graph::checkpoint::FileCheckpointer<DelegationState> =
+            tinyagents::graph::checkpoint::FileCheckpointer::new(dir.path());
+        let checkpoint = Checkpoint {
+            thread_id: "old-schema".to_string(),
+            checkpoint_id: "cp-old".to_string(),
+            run_id: None,
+            parent_checkpoint_id: None,
+            namespace: vec![],
+            state: DelegationState {
+                plan: Some("stale".to_string()),
+                ..Default::default()
+            },
+            next_nodes: vec![],
+            completed_tasks: vec![],
+            pending_writes: vec![],
+            interrupts: vec![],
+            pending_activations: None,
+            barrier_arrivals: vec![],
+            metadata: json!({}),
+        };
+        assert_eq!(
+            checkpoint.state.schema_version, 0,
+            "an un-stamped record is version 0"
+        );
+        seed.put(checkpoint)
+            .await
+            .expect("seed old-schema checkpoint");
+
+        let cp: Arc<dyn Checkpointer<DelegationState>> =
+            Arc::new(tinyagents::graph::checkpoint::FileCheckpointer::<
+                DelegationState,
+            >::new(dir.path()));
+        let config = DelegationConfig {
+            checkpointer: Some(cp),
+            thread_id: Some("old-schema".to_string()),
+            ..DelegationConfig::default()
+        };
+        let outcome = run_or_resume_delegation(config, flow_runner(0))
+            .await
+            .expect("expires + fresh");
+        assert!(outcome.state.final_output.is_some(), "fresh run completed");
+        assert_eq!(
+            outcome.state.schema_version, CURRENT_SCHEMA_VERSION,
+            "fresh run stamped the current version"
+        );
+        assert_eq!(
+            outcome.state.plan.as_deref(),
+            Some("PLAN"),
+            "re-planned from scratch, not resumed with the stale plan"
+        );
+    }
+
+    #[test]
+    fn incompatible_checkpoint_error_matches_decode_not_operational() {
+        use tinyagents::TinyAgentsError;
+        // Decode / shape-incompatibility → safe to expire.
+        assert!(is_incompatible_checkpoint_error(
+            &TinyAgentsError::Checkpoint(
+                "sqlite checkpointer: decode record: invalid type: string".to_string()
+            )
+        ));
+        assert!(is_incompatible_checkpoint_error(
+            &TinyAgentsError::Checkpoint("sqlite checkpointer: decode next_nodes: eof".to_string())
+        ));
+        // Operational failures must NOT be treated as incompatible (they must
+        // propagate, not silently restart durable work).
+        assert!(!is_incompatible_checkpoint_error(
+            &TinyAgentsError::Checkpoint(
+                "sqlite checkpointer: query latest checkpoint: database is locked".to_string()
+            )
+        ));
+        assert!(!is_incompatible_checkpoint_error(
+            &TinyAgentsError::Checkpoint(
+                "sqlite checkpointer: connection lock poisoned".to_string()
+            )
+        ));
+        assert!(!is_incompatible_checkpoint_error(&TinyAgentsError::Resume(
+            "no checkpoint".to_string()
+        )));
+    }
+
+    #[tokio::test]
+    async fn terminal_checkpoint_with_a_pending_interrupt_surfaces_it() {
+        // A terminal-classified checkpoint that still carries an interrupt must
+        // surface it, not silently drop `pending`. (The live routing never
+        // produces this shape; the terminal branch is defensive.)
+        let dir = tempfile::tempdir().unwrap();
+        let seed: tinyagents::graph::checkpoint::FileCheckpointer<DelegationState> =
+            tinyagents::graph::checkpoint::FileCheckpointer::new(dir.path());
+        let mut state = DelegationState::new_run();
+        state.final_output = Some("done".to_string());
+        let checkpoint = Checkpoint {
+            thread_id: "terminal-interrupt".to_string(),
+            checkpoint_id: "cp-ti".to_string(),
+            run_id: None,
+            parent_checkpoint_id: None,
+            namespace: vec![],
+            state,
+            next_nodes: vec![],
+            completed_tasks: vec![],
+            pending_writes: vec![],
+            interrupts: vec![Interrupt::with_id(
+                "intr-1",
+                "approval",
+                json!({ "kind": "delegation_review" }),
+            )],
+            pending_activations: None,
+            barrier_arrivals: vec![],
+            metadata: json!({}),
+        };
+        seed.put(checkpoint).await.expect("seed terminal+interrupt");
+
+        let cp: Arc<dyn Checkpointer<DelegationState>> =
+            Arc::new(tinyagents::graph::checkpoint::FileCheckpointer::<
+                DelegationState,
+            >::new(dir.path()));
+        let config = DelegationConfig {
+            checkpointer: Some(cp),
+            thread_id: Some("terminal-interrupt".to_string()),
+            ..DelegationConfig::default()
+        };
+        let outcome = run_or_resume_delegation(config, flow_runner(0))
+            .await
+            .expect("terminal");
+        let pending = outcome
+            .pending
+            .expect("the carried interrupt is surfaced, not dropped");
+        assert_eq!(pending.node, "approval");
+        assert_eq!(pending.interrupt_id, "intr-1");
+        assert_eq!(outcome.state.final_output.as_deref(), Some("done"));
     }
 }
