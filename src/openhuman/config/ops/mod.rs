@@ -34,9 +34,11 @@ pub(crate) use crate::openhuman::config::Config;
 #[cfg(test)]
 pub(crate) use loader::{
     active_workspace_marker_path, config_openhuman_dir, default_openhuman_dir, env_flag_enabled,
-    fallback_workspace_dir, reset_local_data_for_paths, reset_local_data_remove_error,
-    BROWSER_ALLOW_ALL_ENV, BROWSER_ALLOW_ALL_RPC_ENABLE_ENV,
+    fallback_workspace_dir, reset_local_data_for_paths, BROWSER_ALLOW_ALL_ENV,
+    BROWSER_ALLOW_ALL_RPC_ENABLE_ENV,
 };
+#[cfg(test)]
+pub(crate) use model::resolve_backend_api_url;
 #[cfg(test)]
 pub(crate) use std::path::PathBuf;
 
@@ -59,17 +61,15 @@ pub use sandbox::{
 };
 
 pub use ui::{
-    apply_analytics_settings, apply_browser_settings, apply_meet_settings,
-    apply_screen_intelligence_settings, apply_search_settings, get_dictation_settings,
-    get_onboarding_completed, get_search_settings, get_super_context_enabled,
-    get_voice_server_settings, load_and_apply_analytics_settings, load_and_apply_browser_settings,
-    load_and_apply_dictation_settings, load_and_apply_meet_settings,
-    load_and_apply_screen_intelligence_settings, load_and_apply_search_settings,
+    apply_analytics_settings, apply_browser_settings, apply_meet_settings, apply_search_settings,
+    get_dictation_settings, get_onboarding_completed, get_search_settings,
+    get_super_context_enabled, get_voice_server_settings, load_and_apply_analytics_settings,
+    load_and_apply_browser_settings, load_and_apply_dictation_settings,
+    load_and_apply_meet_settings, load_and_apply_search_settings,
     load_and_apply_voice_server_settings, set_onboarding_completed, set_super_context_enabled,
     workspace_onboarding_flag_exists, workspace_onboarding_flag_resolve,
     workspace_onboarding_flag_set, AnalyticsSettingsPatch, BrowserSettingsPatch,
-    DictationSettingsPatch, MeetSettingsPatch, ScreenIntelligenceSettingsPatch,
-    SearchSettingsPatch, VoiceServerSettingsPatch,
+    DictationSettingsPatch, MeetSettingsPatch, SearchSettingsPatch, VoiceServerSettingsPatch,
 };
 
 #[cfg(test)]

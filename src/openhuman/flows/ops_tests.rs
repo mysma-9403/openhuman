@@ -1219,6 +1219,70 @@ async fn flows_delete_unbinds_schedule_cron_job() {
 }
 
 #[tokio::test]
+async fn flows_delete_clears_flow_memory_namespace() {
+    use crate::openhuman::memory::{Memory, MemoryCategory, MemoryTaint};
+    use crate::openhuman::memory_store::MemoryClient;
+
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+
+    // A directly-constructed `MemoryClient`, injected via `flows_delete_impl`
+    // below, instead of `memory::global` — that singleton is a single
+    // process-wide `OnceLock` any other test in this binary may rebind to
+    // its own tempdir workspace, which would make this test's pass/fail
+    // depend on run order / thread interleaving rather than its own setup.
+    // See `flows_delete_impl`'s doc comment (mirrors
+    // `bus::FlowRunDigestSubscriber::with_memory`'s injection seam).
+    let memory_client: MemoryClientRef =
+        Arc::new(MemoryClient::from_workspace_dir(config.workspace_dir.clone()).unwrap());
+    let memory = memory_client.memory_handle();
+
+    let created = flows_create(
+        &config,
+        "with-memory".to_string(),
+        trigger_only_graph(),
+        false,
+    )
+    .await
+    .unwrap();
+    let flow_id = created.value.id.clone();
+
+    memory
+        .store_with_taint(
+            &flow_namespace(&flow_id),
+            "sent_item_1",
+            "Sent item 1",
+            MemoryCategory::Core,
+            None,
+            MemoryTaint::ExternalSync,
+        )
+        .await
+        .unwrap();
+    assert!(
+        memory
+            .get(&flow_namespace(&flow_id), "sent_item_1")
+            .await
+            .unwrap()
+            .is_some(),
+        "precondition: flow memory entry was stored (through the SAME client flows_delete_impl \
+         is about to clear)"
+    );
+
+    flows_delete_impl(&config, &flow_id, Some(memory_client))
+        .await
+        .unwrap();
+
+    assert!(
+        memory
+            .get(&flow_namespace(&flow_id), "sent_item_1")
+            .await
+            .unwrap()
+            .is_none(),
+        "flows_delete must clear the flow's own memory namespace"
+    );
+}
+
+#[tokio::test]
 async fn flows_update_rebinds_schedule_cron_job_when_trigger_schedule_changes() {
     let tmp = TempDir::new().unwrap();
     let config = test_config(&tmp);
@@ -3718,6 +3782,155 @@ async fn validate_required_arg_resolvability_ignores_native_and_dynamic_slugs() 
     assert!(errors.is_empty(), "{errors:?}");
 }
 
+#[tokio::test]
+async fn mock_opaque_tool_call_upstream_ref_matches_native_and_composio_upstreams() {
+    // Both a Composio curated action and a native `oh:` tool are opaque-echoed
+    // by the mock sandbox, so a null bound to EITHER is unverifiable (Some).
+    // An `agent` / `code` upstream's real output IS produced by the sandbox, and
+    // a `=`-dynamic slug is unknowable, so a null bound to those is genuine (None).
+    let g = graph(json!({
+        "nodes": [
+            { "id": "t", "kind": "trigger", "name": "Manual" },
+            { "id": "code_up", "kind": "code", "name": "Code",
+              "config": { "language": "javascript", "source": "return {};" } },
+            { "id": "agent_up", "kind": "agent", "name": "Agent",
+              "config": { "agent_ref": "researcher", "prompt": "x" } },
+            { "id": "native_up", "kind": "tool_call", "name": "Link",
+              "config": { "slug": "oh:storage_get_link", "args": { "file_id": "f" } } },
+            { "id": "composio_up", "kind": "tool_call", "name": "Profile",
+              "config": { "slug": "GMAIL_GET_PROFILE", "args": {} } },
+            { "id": "dyn_up", "kind": "tool_call", "name": "Dyn",
+              "config": { "slug": "=item.slug", "args": {} } },
+            { "id": "sink", "kind": "tool_call", "name": "Sink",
+              "config": { "slug": "GMAIL_SEND_EMAIL", "args": {} } }
+        ],
+        "edges": []
+    }));
+    let up = |expr: &str| mock_opaque_tool_call_upstream_ref(expr, &g, "sink").map(str::to_string);
+    assert_eq!(
+        up("=nodes.native_up.item.json.url").as_deref(),
+        Some("native_up")
+    );
+    assert_eq!(
+        up("=nodes.composio_up.item.json.data.emailAddress").as_deref(),
+        Some("composio_up")
+    );
+    assert_eq!(up("=nodes.agent_up.item.json.field"), None);
+    assert_eq!(up("=nodes.code_up.item.json.field"), None);
+    assert_eq!(up("=nodes.dyn_up.item.json.x"), None);
+}
+
+#[tokio::test]
+async fn validate_required_arg_resolvability_downgrades_null_from_native_tool_call_upstream() {
+    // #5148's chain: a Composio `send` binds its `attachment` to a native
+    // `oh:storage_get_link` node's `url`. That `url` is null in the echo sandbox
+    // (native tools are opaque-echoed), but the wiring is correct, so the gate
+    // must NOT reject it. Before the native-upstream carve-out it did — the loop
+    // that halted the live "fix with agent" self-repair.
+    let g = graph(json!({
+        "nodes": [
+            { "id": "t", "kind": "trigger", "name": "Manual" },
+            { "id": "prep", "kind": "code", "name": "Prep",
+              "config": { "language": "javascript", "source": "return {};" } },
+            { "id": "get_link", "kind": "tool_call", "name": "Link",
+              "config": { "slug": "oh:storage_get_link", "args": { "file_id": "f_1" } } },
+            { "id": "send", "kind": "tool_call", "name": "Send",
+              "config": { "slug": "GMAIL_SEND_EMAIL",
+                "args": { "recipient_email": "a@b.com", "subject": "hi", "body": "there",
+                          "attachment": "=nodes.get_link.item.json.url" } } }
+        ],
+        "edges": [
+            { "from_node": "t", "to_node": "prep" },
+            { "from_node": "prep", "to_node": "get_link" },
+            { "from_node": "get_link", "to_node": "send" }
+        ]
+    }));
+    let errors = validate_required_arg_resolvability(&g).await;
+    assert!(
+        errors.is_empty(),
+        "a native-upstream attachment null must be downgraded, got: {errors:?}"
+    );
+}
+
+#[tokio::test]
+async fn native_file_attachment_chain_passes_required_arg_resolvability() {
+    // Drift check that was missing pre-merge: author #5148's OWN documented
+    // `produce -> oh:storage_upload_file -> oh:storage_get_link -> send` chain
+    // and assert the null-arg gate (the exact gate that rejected it in the live
+    // "fix with agent" loop) now passes it. Targets `validate_required_arg_
+    // resolvability` directly (deterministic, no live catalog) rather than
+    // `run_builder_gates`, whose connection/contract gates need live Composio.
+    let g = graph(json!({
+        "nodes": [
+            { "id": "t", "kind": "trigger", "name": "Manual" },
+            { "id": "make_page", "kind": "code", "name": "Write",
+              "config": { "language": "javascript", "source": "return {};" } },
+            { "id": "upload", "kind": "tool_call", "name": "Upload",
+              "config": { "slug": "oh:storage_upload_file", "args": { "path": "report.html" } } },
+            { "id": "get_link", "kind": "tool_call", "name": "Link",
+              "config": { "slug": "oh:storage_get_link",
+                "args": { "file_id": "=nodes.upload.item.json.file_id", "expires_in_seconds": 900 } } },
+            { "id": "send", "kind": "tool_call", "name": "Send",
+              "config": { "slug": "GMAIL_SEND_EMAIL",
+                "args": { "recipient_email": "a@b.com", "subject": "AI trends", "body": "attached",
+                          "attachment": "=nodes.get_link.item.json.url" } } }
+        ],
+        "edges": [
+            { "from_node": "t", "to_node": "make_page" },
+            { "from_node": "make_page", "to_node": "upload" },
+            { "from_node": "upload", "to_node": "get_link" },
+            { "from_node": "get_link", "to_node": "send" }
+        ]
+    }));
+    let errors = validate_required_arg_resolvability(&g).await;
+    assert!(
+        errors.is_empty(),
+        "the documented native attachment chain must pass the null-arg gate, got: {errors:?}"
+    );
+}
+
+fn upload_graph(path: Value) -> WorkflowGraph {
+    graph(json!({
+        "nodes": [
+            { "id": "t", "kind": "trigger", "name": "Manual" },
+            { "id": "up", "kind": "tool_call", "name": "Upload",
+              "config": { "slug": "oh:storage_upload_file", "args": { "path": path } } }
+        ],
+        "edges": [ { "from_node": "t", "to_node": "up" } ]
+    }))
+}
+
+#[test]
+fn validate_upload_paths_rejects_an_absolute_path() {
+    // The live-observed bug: the model copies `/tmp/openhuman-flow/report.html`
+    // from a prior flow, which the runtime rejects (uploads are confined to the
+    // workspace). Catch it at author time with an actionable message.
+    let errors = validate_upload_paths(&upload_graph(json!("/tmp/openhuman-flow/report.html")));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("'up'"), "{}", errors[0]);
+    assert!(errors[0].contains("workspace-relative"), "{}", errors[0]);
+}
+
+#[test]
+fn validate_upload_paths_accepts_a_workspace_relative_path() {
+    assert!(validate_upload_paths(&upload_graph(json!("report.html"))).is_empty());
+    assert!(validate_upload_paths(&upload_graph(json!("out/report.html"))).is_empty());
+}
+
+#[test]
+fn validate_upload_paths_rejects_a_parent_escape() {
+    let errors = validate_upload_paths(&upload_graph(json!("../../etc/passwd")));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("escaping with `..`"), "{}", errors[0]);
+}
+
+#[test]
+fn validate_upload_paths_ignores_a_dynamic_path_expression() {
+    // A `=`-expression resolves at runtime; the author-gate can't know its value,
+    // so it must not reject it (the runtime check still applies).
+    assert!(validate_upload_paths(&upload_graph(json!("=nodes.prep.item.json.path"))).is_empty());
+}
+
 /// (Codex feedback on PR #4826) This gate sandbox-runs every graph against
 /// `json!({})` as the trigger payload, so a `tool_call` arg wired straight to
 /// the trigger's own data — `"to": "=item.email"` on a node whose only
@@ -5961,7 +6174,7 @@ async fn compute_required_connections_skips_native_and_http_nodes() {
 
 #[test]
 fn extract_workflow_proposal_survives_large_graph() {
-    use crate::openhuman::inference::provider::{ConversationMessage, ToolResultMessage};
+    use crate::openhuman::agent::messages::{ConversationMessage, ToolResultMessage};
 
     // 6 nodes, several columns each — comfortably over tinyjuice's MIN_ROWS (3)
     // and ~512-byte tabulation thresholds, so an unprotected payload would get
@@ -6013,7 +6226,7 @@ fn extract_workflow_proposal_survives_large_graph() {
 
 #[test]
 fn extract_workflow_proposal_returns_the_latest_of_multiple_results() {
-    use crate::openhuman::inference::provider::{ConversationMessage, ToolResultMessage};
+    use crate::openhuman::agent::messages::{ConversationMessage, ToolResultMessage};
 
     let first = json!({ "type": "workflow_proposal", "flow_id": "first" });
     let second = json!({ "type": "workflow_proposal", "flow_id": "second" });
@@ -6034,7 +6247,7 @@ fn extract_workflow_proposal_returns_the_latest_of_multiple_results() {
 
 #[test]
 fn extract_workflow_proposal_ignores_non_proposal_tool_results() {
-    use crate::openhuman::inference::provider::{ConversationMessage, ToolResultMessage};
+    use crate::openhuman::agent::messages::{ConversationMessage, ToolResultMessage};
 
     let history = vec![ConversationMessage::ToolResults(vec![ToolResultMessage {
         tool_call_id: "call-1".to_string(),
@@ -6052,8 +6265,9 @@ fn extract_workflow_proposal_ignores_non_proposal_tool_results() {
 fn builder_tool_call(
     id: &str,
     name: &str,
-) -> crate::openhuman::inference::provider::ConversationMessage {
-    use crate::openhuman::inference::provider::{ConversationMessage, ToolCall};
+) -> crate::openhuman::agent::messages::ConversationMessage {
+    use crate::openhuman::agent::messages::ConversationMessage;
+    use crate::openhuman::inference::provider::ToolCall;
     ConversationMessage::AssistantToolCalls {
         text: None,
         tool_calls: vec![ToolCall {
@@ -6070,8 +6284,8 @@ fn builder_tool_call(
 fn builder_tool_result(
     call_id: &str,
     content: &str,
-) -> crate::openhuman::inference::provider::ConversationMessage {
-    use crate::openhuman::inference::provider::{ConversationMessage, ToolResultMessage};
+) -> crate::openhuman::agent::messages::ConversationMessage {
+    use crate::openhuman::agent::messages::{ConversationMessage, ToolResultMessage};
     ConversationMessage::ToolResults(vec![ToolResultMessage {
         tool_call_id: call_id.to_string(),
         content: content.to_string(),

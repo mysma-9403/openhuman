@@ -11,8 +11,6 @@ import AgentEditorPage from './panels/AgentEditorPage';
 import AgentsPanel from './panels/AgentsPanel';
 import AppearancePanel from './panels/AppearancePanel';
 import ApprovalHistoryPanel from './panels/ApprovalHistoryPanel';
-import AutocompleteDebugPanel from './panels/AutocompleteDebugPanel';
-import AutocompletePanel from './panels/AutocompletePanel';
 import BillingPanel from './panels/BillingPanel';
 import CoreConnectionPanel from './panels/CoreConnectionPanel';
 import CronJobsPanel from './panels/CronJobsPanel';
@@ -32,7 +30,6 @@ import ProfileEditorPage from './panels/ProfileEditorPage';
 import ProfilesPanel from './panels/ProfilesPanel';
 import RecoveryPhrasePanel from './panels/RecoveryPhrasePanel';
 import SandboxSettingsPanel from './panels/SandboxSettingsPanel';
-import ScreenAwarenessDebugPanel from './panels/ScreenAwarenessDebugPanel';
 import SecurityPanel from './panels/SecurityPanel';
 import TeamInvitesPanel from './panels/TeamInvitesPanel';
 import TeamManagementPanel from './panels/TeamManagementPanel';
@@ -51,7 +48,7 @@ import WorkflowRunnerPanel from './panels/WorkflowRunnerPanel';
  * internal scroll; legacy panels that overflow scroll here. Either way there's
  * exactly one scrollbar.
  */
-export const WrappedSettingsPage = ({ children }: { children: ReactNode }) => {
+const WrappedSettingsPage = ({ children }: { children: ReactNode }) => {
   return <div className="h-full min-h-0 overflow-y-auto">{children}</div>;
 };
 
@@ -137,21 +134,10 @@ export function settingsRouteElements(): ReactNode {
       {/* The Integrations settings section was retired; the composio/OAuth grid
           lives on the Connections page. */}
       <Route path="integrations" element={<Navigate to="/connections" replace />} />
-      {/* Screen Awareness / Desktop Agent / Desktop Companion moved to the
-          Connections page (Desktop group). */}
-      <Route
-        path="screen-intelligence"
-        element={<Navigate to="/connections?tab=screen-intelligence" replace />}
-      />
-      <Route
-        path="desktop-agent"
-        element={<Navigate to="/connections?tab=desktop-agent" replace />}
-      />
       <Route path="tools" element={wrapSettingsPage(<ToolsPanel />)} />
       <Route path="companion" element={<Navigate to="/connections?tab=companion" replace />} />
       {/* Meeting settings moved to the Connections page (meetings tab). */}
       <Route path="meetings" element={<Navigate to="/connections?tab=meetings" replace />} />
-      <Route path="autocomplete" element={wrapSettingsPage(<AutocompletePanel />)} />
 
       {/* ── System ──────────────────────────────────────────────── */}
       {/* Core connection — promotes cloud-mode remote-core config into a
@@ -187,11 +173,6 @@ export function settingsRouteElements(): ReactNode {
       {/* Dev Workflow panel retired — superseded by Workflows (/flows). */}
       <Route path="dev-workflow" element={<Navigate to="/flows" replace />} />
       <Route path="skills-runner" element={wrapSettingsPage(<WorkflowRunnerPanel />)} />
-      <Route
-        path="screen-awareness-debug"
-        element={wrapSettingsPage(<ScreenAwarenessDebugPanel />)}
-      />
-      <Route path="autocomplete-debug" element={wrapSettingsPage(<AutocompleteDebugPanel />)} />
       {/* Voice Debug page retired. */}
       <Route path="voice-debug" element={<SettingsRedirect to="/settings/developer-options" />} />
       {/* Local Model Debug is a chip on the Connections → LLM page. */}
@@ -222,10 +203,6 @@ export function settingsRouteElements(): ReactNode {
       {/* Old hub pages */}
       <Route path="ai" element={<Navigate to="/connections?tab=llm" replace />} />
       <Route path="agents-settings" element={<SettingsRedirect to="/settings/agents" />} />
-      <Route
-        path="features"
-        element={<Navigate to="/connections?tab=screen-intelligence" replace />}
-      />
       <Route path="crypto" element={<Navigate to="/connections?tab=wallet" replace />} />
       <Route path="notifications-hub" element={<SettingsRedirect to="/settings/notifications" />} />
       {/* Composio (API key + routing) moved to Connections → API keys. */}

@@ -1,12 +1,10 @@
 import type { User } from '../types/api';
 import type { TeamInvite, TeamMember, TeamWithRole } from '../types/team';
-import type { AccessibilityStatus } from '../utils/tauriCommands/accessibility';
-import type { AutocompleteStatus } from '../utils/tauriCommands/autocomplete';
 import type { LocalAiStatus } from '../utils/tauriCommands/localAi';
 import type { ServiceStatus } from '../utils/tauriCommands/service';
 import { callCoreRpc } from './coreRpcClient';
 
-export interface OnboardingTasks {
+interface OnboardingTasks {
   accessibilityPermissionGranted: boolean;
   localModelConsentGiven: boolean;
   localModelDownloadStarted: boolean;
@@ -27,7 +25,7 @@ export interface KeyringStatus {
   backendName: string;
 }
 
-export interface UpdateCoreLocalStateParams {
+interface UpdateCoreLocalStateParams {
   encryptionKey?: string | null;
   onboardingTasks?: OnboardingTasks | null;
   keyringConsent?: KeyringConsentPreference | null;
@@ -58,12 +56,7 @@ interface AppStateSnapshotResult {
     keyringConsent?: KeyringConsentPreference | null;
   };
   keyringStatus?: KeyringStatus;
-  runtime: {
-    screenIntelligence: AccessibilityStatus;
-    localAi: LocalAiStatus;
-    autocomplete: AutocompleteStatus;
-    service: ServiceStatus;
-  };
+  runtime: { localAi: LocalAiStatus; service: ServiceStatus };
   /**
    * Process + component health, folded into this snapshot (#daemon-poll-fold)
    * so the daemon-health store hydrates from the same poll instead of a second
@@ -75,7 +68,7 @@ interface AppStateSnapshotResult {
 }
 
 /** Raw (snake_case) health payload embedded in the app-state snapshot. */
-export interface RawHealthSnapshot {
+interface RawHealthSnapshot {
   pid: number;
   updated_at: string;
   uptime_seconds: number;

@@ -255,7 +255,7 @@ pub async fn start_if_enabled(app_config: &Config) {
             log::debug!("{LOG_PREFIX} microphone capture stream ready");
         }
         Ok(Err(e)) => {
-            log::error!("{LOG_PREFIX} could not start microphone capture: {e}");
+            log::warn!("{LOG_PREFIX} could not start microphone capture: {e}");
             RUNNING.store(false, Ordering::SeqCst);
             return;
         }
@@ -505,33 +505,18 @@ async fn deliver_command(config: &Config, cmd: String) {
 }
 
 /// Execute a fast-path [`VoiceIntent`] directly (no LLM). Media transport and
-/// volume go through `osascript`; app launch reuses the `launch_app` platform
-/// launcher; "play X" runs the `automate` Music fast-path.
+/// volume go through `osascript`. App launch and "play X" have no local
+/// fast-path (the desktop-control automation backend was removed); those
+/// intents return `Err` so the caller defers to the agent (the LLM fallback) —
+/// routing can only *shortcut*, never *block*.
 async fn execute_intent(
-    config: &Config,
+    _config: &Config,
     intent: crate::openhuman::voice::command_router::VoiceIntent,
 ) -> Result<String, String> {
     use crate::openhuman::voice::command_router::VoiceIntent as VI;
     match intent {
-        VI::Play { query } => {
-            let backend =
-                crate::openhuman::accessibility::automate::RealBackend::new(config.clone());
-            let out = crate::openhuman::accessibility::automate::run(
-                "Music",
-                &format!("play {query}"),
-                &backend,
-                crate::openhuman::accessibility::automate::AutomateOptions::default(),
-            )
-            .await;
-            if out.success {
-                Ok(out.summary)
-            } else {
-                Err(out.summary)
-            }
-        }
-        VI::OpenApp { app } => {
-            crate::openhuman::tools::implementations::system::launch_platform(&app).await
-        }
+        VI::Play { .. } => Err("play has no local fast-path; defer to agent".to_string()),
+        VI::OpenApp { .. } => Err("app launch has no local fast-path; defer to agent".to_string()),
         VI::Pause => osa("tell application \"Music\" to pause")
             .await
             .map(|_| "Paused".to_string()),
@@ -689,7 +674,7 @@ fn spawn_capture_thread(tx: tokio::sync::mpsc::UnboundedSender<Vec<f32>>) -> Res
         .name("voice-always-on".into())
         .spawn(move || {
             if let Err(e) = capture_on_thread(tx, &setup_tx) {
-                log::error!("{LOG_PREFIX} capture thread error: {e}");
+                log::warn!("{LOG_PREFIX} capture thread error: {e}");
                 let _ = setup_tx.send(Err(e));
             }
         })
@@ -717,7 +702,7 @@ fn capture_on_thread(
     let permission = detect_microphone_permission();
     log::info!("{LOG_PREFIX} microphone permission: {permission:?}");
     if matches!(permission, PermissionState::Denied) {
-        log::error!("{LOG_PREFIX} microphone permission denied — always-on cannot capture audio");
+        log::warn!("{LOG_PREFIX} microphone permission denied — always-on cannot capture audio");
         return Err("microphone permission denied".to_string());
     }
 

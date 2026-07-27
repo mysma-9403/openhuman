@@ -57,6 +57,7 @@ mod cef_singleton_wait;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 mod cef_stale_reap;
 mod claude_code;
+mod companion;
 mod companion_commands;
 mod core_process;
 mod core_rpc;
@@ -93,13 +94,13 @@ mod ptt_hotkeys;
 mod ptt_overlay;
 #[cfg(target_os = "windows")]
 mod reset_reboot_schedule;
-mod screen_capture;
 mod slack_scanner;
 mod stderr_panic_hook;
 mod telegram_scanner;
 mod webview_accounts;
 mod webview_apis;
 mod wechat_scanner;
+mod whatsapp_data;
 mod whatsapp_scanner;
 mod window_state;
 mod workspace_paths;
@@ -2562,6 +2563,24 @@ pub fn run() {
                 );
                 return None;
             }
+            // Defense-in-depth: drop Windows `ERROR_FILE_SYSTEM_LIMITATION`
+            // (os error 665) — a persistent host-filesystem condition with
+            // zero local lever and no Sentry remediation path. The Tauri
+            // shell is a separate crate from the core, so the core's emit-site
+            // classifier (`expected_error_kind`) can only catch events that
+            // originate inside the core binary. Any filesystem-error event
+            // that starts in the shell (e.g. file_logging, window_state,
+            // CEF profile I/O) bypasses the core classifier and lands here;
+            // this filter is the only net for those events (TAURI-RUST-QT0:
+            // 6,050 events / 1 user).
+            if openhuman_core::core::observability::is_windows_file_system_limitation_event(&event)
+            {
+                log::debug!(
+                    "[sentry-fs-limitation-filter] dropping Windows file-system-limitation event (os error 665) event_id={:?}",
+                    event.event_id
+                );
+                return None;
+            }
             // Strip server_name (hostname) to avoid leaking machine identity.
             event.server_name = None;
             // Attach the cached account uid so Sentry can count unique users
@@ -3109,7 +3128,6 @@ pub fn run() {
     let builder = builder.manage(discord_scanner::ScannerRegistry::new());
     let builder = builder.manage(telegram_scanner::ScannerRegistry::new());
     let builder = builder.manage(wechat_scanner::ScannerRegistry::new());
-    let builder = builder.manage(screen_capture::ScreenShareState::new());
     let builder = builder.manage(meet_call::MeetCallState::new());
     let builder = builder.manage(meet_audio::MeetAudioState::new());
     let builder = builder.manage(meet_video::frame_bus::MeetVideoFrameBusState::new());
@@ -3120,6 +3138,16 @@ pub fn run() {
             // concrete `Webview<Cef>` (which `send_dev_tools_message`
             // requires) from generic `<R: Runtime>` call sites.
             cdp::set_cef_app_handle(app.handle().clone());
+
+            // Install the app handle for the desktop companion so its session
+            // state machine can emit `companion://state_changed` events.
+            companion::setup(app.handle());
+
+            // Structured WhatsApp Web data store lives shell-side. Register the
+            // in-process native handlers so the core agent tools (list/search)
+            // and the scanner ingest path can reach the SQLite store over the
+            // native request bus. No handler = graceful degradation core-side.
+            whatsapp_data::register_native_handlers();
 
             #[cfg(windows)]
             {
@@ -3484,48 +3512,6 @@ pub fn run() {
             // here would flash the pill on every launch even with always-on
             // listening disabled (the default).
 
-            // Synthetic-input main-thread executor. enigo's macOS keyboard-layout
-            // lookup (TSMGetInputSourceProperty) MUST run on the app main thread
-            // or it traps (`_dispatch_assert_queue_fail`/EXC_BREAKPOINT) and
-            // crashes the CEF host (Change 1.15, confirmed via crash report). The
-            // keyboard/mouse tools run on tokio workers, so they dispatch their
-            // enigo ops here via the native registry; we run each on the real
-            // main thread through `run_on_main_thread`.
-            {
-                use openhuman_core::core::event_bus::register_native_global;
-                use openhuman_core::openhuman::tools::{
-                    MainThreadInputOp, INPUT_ON_MAIN_THREAD_METHOD,
-                };
-                let input_app = app.handle().clone();
-                register_native_global::<MainThreadInputOp, Result<String, String>, _, _>(
-                    INPUT_ON_MAIN_THREAD_METHOD,
-                    move |req| {
-                        let input_app = input_app.clone();
-                        async move {
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            let run = req.run;
-                            input_app
-                                .run_on_main_thread(move || {
-                                    // Catch an enigo FFI panic so it can't unwind
-                                    // across the app main thread (which would be
-                                    // UB / abort). Convert it to a clean Err.
-                                    let result = std::panic::catch_unwind(
-                                        std::panic::AssertUnwindSafe(run),
-                                    )
-                                    .unwrap_or_else(|_| {
-                                        Err("synthetic input panicked on the main thread".to_string())
-                                    });
-                                    let _ = tx.send(result);
-                                })
-                                .map_err(|e| format!("run_on_main_thread dispatch failed: {e}"))?;
-                            rx.await
-                                .map_err(|_| "main-thread input op was cancelled".to_string())
-                        }
-                    },
-                );
-                log::info!("[computer] registered main-thread synthetic-input executor");
-            }
-
             // Tray icon setup moved to RunEvent::Ready (see below) — GTK is only
             // initialized after the event loop starts, so we must delay tray creation
             // until the Ready event fires. Creating the tray here would panic on
@@ -3845,6 +3831,10 @@ pub fn run() {
             // and the Save-As fallback needs it there (CodeRabbit on #4127).
             artifact_commands::save_artifact_via_dialog,
             artifact_commands::download_artifact_to_downloads,
+            // Structured WhatsApp data (store lives shell-side).
+            whatsapp_data::whatsapp_data_list_chats,
+            whatsapp_data::whatsapp_data_list_messages,
+            whatsapp_data::whatsapp_data_search_messages,
             check_core_update,
             apply_core_update,
             check_app_update,
@@ -3882,9 +3872,6 @@ pub fn run() {
             webview_accounts::webview_set_focused_account,
             notification_settings::notification_settings_get,
             notification_settings::notification_settings_set,
-            screen_capture::screen_share_begin_session,
-            screen_capture::screen_share_thumbnail,
-            screen_capture::screen_share_finalize_session,
             native_notifications::notification_permission_state,
             native_notifications::notification_permission_request,
             activate_main_window,
@@ -3904,6 +3891,11 @@ pub fn run() {
             companion_commands::register_companion_hotkey,
             companion_commands::unregister_companion_hotkey,
             companion_commands::companion_activate,
+            companion::companion_start_session,
+            companion::companion_stop_session,
+            companion::companion_status,
+            companion::companion_config_get,
+            companion::companion_config_set,
             mcp_commands::mcp_resolve_binary_path,
             mcp_commands::mcp_open_client_config,
             loopback_oauth::start_loopback_oauth_listener,

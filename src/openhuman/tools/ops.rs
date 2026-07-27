@@ -270,29 +270,6 @@ pub fn all_tools_with_runtime(
         // latest messages). `resolve_time` does the conversion and returns the
         // value ready to paste into a tool argument.
         Box::new(ResolveTimeTool::new()),
-        Box::new(LaunchAppTool::new()),
-        // `ax_interact` + `automate` are the `computer`-family tools — compiled
-        // out with the `desktop-automation` feature (same idiom as the
-        // `screen_intelligence_*` block below).
-        #[cfg(feature = "desktop-automation")]
-        Box::new(AxInteractTool::new(
-            root_config.computer_control.ax_interact_mutations,
-        )),
-        // Multi-step UI automation in one call. Shares the ax_interact opt-in
-        // (mutations) and sensitive-app denylist; runs a Rust perceive→act→verify
-        // loop with a fast model so the chat model stays out of the click loop.
-        #[cfg(feature = "desktop-automation")]
-        Box::new(AutomateTool::new(
-            root_config.computer_control.ax_interact_mutations,
-        )),
-        Box::new(CodegraphIndexTool::new(
-            config.clone(),
-            action_dir.to_path_buf(),
-        )),
-        Box::new(CodegraphSearchTool::new(
-            config.clone(),
-            action_dir.to_path_buf(),
-        )),
         Box::new(DetectToolsTool::new()),
         Box::new(InstallToolTool::new(security.clone())),
         // Orchestration session-history read tools — browse persisted
@@ -419,6 +396,20 @@ pub fn all_tools_with_runtime(
         // effect — writes only to the agent's own suggestions store.
         #[cfg(feature = "flows")]
         Box::new(SuggestWorkflowsTool::new(config.clone())),
+        // Per-flow sandboxed memory (issue #5173): lets a running flow
+        // (e.g. a scheduled newsletter-digest) remember what it already did
+        // — dedupe across runs — without ever touching the user's own
+        // memory. Namespace is derived internally from `flow_id`; there is
+        // no code path by which either tool can address a namespace other
+        // than the calling flow's own (`flow_memory_recall`'s `scope:
+        // "flows"` is read-only cross-flow visibility, not a write path).
+        #[cfg(feature = "flows")]
+        Box::new(FlowMemoryRecallTool::new(memory.clone())),
+        #[cfg(feature = "flows")]
+        Box::new(FlowMemoryRememberTool::new(
+            memory.clone(),
+            security.clone(),
+        )),
         // Wallet tools — expose wallet operations to the agent tool-call pipeline
         // so the crypto sub-agent can prepare transfers, check status, etc.
         // Gated with the `web3` feature (the wallet domain is compiled out when
@@ -454,6 +445,11 @@ pub fn all_tools_with_runtime(
         // #002: read-only self-diagnosis of the memory pipeline so the agent
         // can explain an empty/stalled wiki + the fix.
         Box::new(MemoryDoctorTool::new(config.clone())),
+        // #5172: read-only access to the compiled persona flavour profiles
+        // (communication/coding_style/stack/workflow/environment/directives/
+        // anti_preferences) that persona ingestion builds but nothing
+        // previously surfaced to the agent loop.
+        Box::new(MemoryFlavourTool::new(config.clone())),
         Box::new(MemoryQueryTool),
         // memory_search tools — vector search, chunk context, hybrid search,
         // and previously unregistered raw store tools.
@@ -484,12 +480,10 @@ pub fn all_tools_with_runtime(
         Box::new(MonitorListTool),
         Box::new(MonitorStopTool),
         Box::new(MonitorReadTool),
-        // WhatsApp data store — read-only agent surface (issue #1341).
-        // The matching `whatsapp_data_ingest` write-path stays internal-only
-        // (registered in `src/core/all.rs::build_internal_only_controllers`)
-        // and is intentionally NOT wrapped here.
-        // Gated behind the `channels` feature (the tool types live in the
-        // gated `whatsapp_data` domain).
+        // WhatsApp data store — read-only agent surface (issue #1341). The
+        // store lives in the Tauri shell; these tools reach it over the
+        // in-process native request bus. The matching ingest write-path is
+        // scanner-only (dispatched by the shell) and intentionally NOT a tool.
         #[cfg(feature = "channels")]
         Box::new(WhatsAppDataListChatsTool),
         #[cfg(feature = "channels")]
@@ -730,44 +724,10 @@ pub fn all_tools_with_runtime(
         Box::new(SessionGetUserTool::new(config.clone())),
         Box::new(OAuthConnectUrlTool::new(config.clone())),
         Box::new(OAuthListTool::new(config.clone())),
-        // Desktop perception, MCP registry, workspace persona. Observe/connect/
-        // call tools default-ON; OS permission prompts (screen_permissions),
-        // MCP install/uninstall (mcp_manage), and persona/workspace writers
+        // MCP registry and workspace persona. Observe/connect/call tools
+        // default-ON; MCP install/uninstall (mcp_manage), and persona/workspace writers
         // (workspace_manage) ship default-OFF via `tools::user_filter`.
         //
-        // The 15 `screen_intelligence_*` tools are compiled out with the
-        // `desktop-automation` feature — the per-element attrs inside the
-        // `vec![]` mirror the `mcp` idiom below.
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenStatusTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenCaptureImageRefTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenVisionRecentTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenVisionFlushTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenRefreshPermissionsTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenCaptureNowTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenCaptureTestTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenSessionStartTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenSessionStopTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenInputActionTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenGlobeStartTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenGlobePollTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenGlobeStopTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenRequestPermissionsTool),
-        #[cfg(feature = "desktop-automation")]
-        Box::new(ScreenRequestPermissionTool),
         // MCP registry (dynamic, user-installed servers) — compiled out with
         // the `mcp` feature. Per-element attrs inside the `vec![]` mirror the
         // voice idiom used earlier in this same literal.
@@ -1087,19 +1047,8 @@ pub fn all_tools_with_runtime(
         tracing::debug!("[tools::ops] registered python_exec");
     }
 
-    // Vision tools are always available
-    tools.push(Box::new(ScreenshotTool::new(security.clone())));
+    // Image metadata is always available for user-provided images.
     tools.push(Box::new(ImageInfoTool::new(security.clone())));
-
-    // Native mouse + keyboard control (disabled by default). The `MouseTool` /
-    // `KeyboardTool` are `computer`-family tools — compiled out with the
-    // `desktop-automation` feature.
-    #[cfg(feature = "desktop-automation")]
-    if root_config.computer_control.enabled {
-        tools.push(Box::new(MouseTool::new(security.clone())));
-        tools.push(Box::new(KeyboardTool::new(security.clone())));
-        tracing::debug!("[computer] mouse and keyboard tools registered");
-    }
 
     // Tool effectiveness stats (enabled when learning is on)
     tracing::debug!(
@@ -1346,7 +1295,7 @@ fn tool_group(name: &str) -> crate::core::all::DomainGroup {
     // stays callable under a custom `DomainSet { platform: true, flows: false }`,
     // leaking the flows surface past the runtime gate (#4808 review; #4797
     // maintainer review). Keep this in lockstep with the `#[cfg(feature =
-    // "flows")]` registrations in `all_tools_with_runtime` above — the same 26
+    // "flows")]` registrations in `all_tools_with_runtime` above — the same 28
     // names asserted by `default_tools_omits_flows_tools_when_feature_off`.
     const FLOWS: &[&str] = &[
         "propose_workflow",
@@ -1377,6 +1326,12 @@ fn tool_group(name: &str) -> crate::core::all::DomainGroup {
         // The `rhai_workflows` (.ragsh) tool is compile-gated with `flows` and
         // belongs to the same runtime domain — drop it when Flows is off too.
         "rhai_workflows",
+        // Per-flow sandboxed memory (issue #5173) — `flow_` prefixed, not
+        // `memory_`, so it does NOT fall under the `memory_` prefix check
+        // below and must be listed here explicitly like every other
+        // flow-owned tool.
+        "flow_memory_recall",
+        "flow_memory_remember",
     ];
     // Voice family agent tools (audio_toolkit) — no `voice_`/`tts_`/`stt_`
     // prefix, so they must be listed explicitly or they fall through to
@@ -1441,16 +1396,6 @@ fn tool_group(name: &str) -> crate::core::all::DomainGroup {
     // Threads family (harness-kept): thread_* + todo_* + per-thread goal + search.
     if name.starts_with("thread_") || name.starts_with("todo_") || THREADS_EXTRA.contains(&name) {
         return DomainGroup::Threads;
-    }
-    // Desktop-automation family: the 15 `screen_intelligence_*` tools plus the
-    // four `computer`-family tools (`ax_interact`, `automate`, `mouse`,
-    // `keyboard`). Compiled out with the `desktop-automation` feature; tagged so
-    // the runtime `DomainSet::desktop_automation` axis gates them consistently
-    // with the autocomplete/screen_intelligence/desktop_companion controllers.
-    if name.starts_with("screen_intelligence_")
-        || matches!(name, "ax_interact" | "automate" | "mouse" | "keyboard")
-    {
-        return DomainGroup::DesktopAutomation;
     }
     // Everything else — shell/file/config/security/agent/billing/… — is
     // Platform: present under full(), absent under harness()/none().
