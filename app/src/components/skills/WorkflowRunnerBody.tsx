@@ -221,7 +221,7 @@ function inferRuntimeRequirement(skill?: WorkflowSummary): 'node' | 'python' | '
 
 // ── Component ──────────────────────────────────────────────────────────
 
-export interface SkillsRunnerBodyProps {
+interface SkillsRunnerBodyProps {
   /**
    * Optional override for the descriptive header text rendered above
    * the skill picker. Defaults to the Settings-panel description so
@@ -239,7 +239,7 @@ export interface SkillsRunnerBodyProps {
   className?: string;
 }
 
-export const WorkflowRunnerBody = ({ headerText, className }: SkillsRunnerBodyProps) => {
+const WorkflowRunnerBody = ({ headerText, className }: SkillsRunnerBodyProps) => {
   const { t } = useT();
 
   // Skill catalog (loaded once on mount)
@@ -1542,7 +1542,7 @@ export const WorkflowRunnerBody = ({ headerText, className }: SkillsRunnerBodyPr
                         data-testid={`run-stop-${r.run_id}`}
                         onClick={() => void handleStopRun(r.run_id)}
                         leadingIcon={<span aria-hidden="true">◼</span>}>
-                        {t('autocomplete.stop')}
+                        {t('orchestration.detail.stop')}
                       </Button>
                     </div>
                   )}

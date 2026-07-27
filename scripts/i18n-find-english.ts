@@ -65,8 +65,6 @@ const INTENTIONAL_ENGLISH = new Set([
   "mcp.playground.argsLabel",
   "mcp.tab.source.smithery",
   "memorySources.globPatternPlaceholder",
-  "modelCouncil.editCouncilAria",
-  "modelCouncil.jurorLabel",
   "rewards.community.discordDetails", // "Discord" — brand/product name, same in every locale
   "rewards.community.rewardTokens", // "+{tokens} tokens" — "tokens" is the technical unit, kept in every locale (the recurring "/mo" variant IS translated)
   "nav.agentWorld",
@@ -74,7 +72,6 @@ const INTENTIONAL_ENGLISH = new Set([
   "memorySources.searchQueryPlaceholder",
   "migration.vendor.hermes",
   "namespaceOverview.entitiesShort",
-  "screenAwareness.debug.defaultPanicHotkey",
   "settings.ai.connectionsPerTick",
   "settings.ai.claudeCode.button", // Claude Code is a product name
   "settings.ai.claudeCode.modalTitle", // Claude Code CLI is a product name

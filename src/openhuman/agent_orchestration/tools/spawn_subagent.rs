@@ -441,7 +441,7 @@ impl Tool for SpawnSubagentTool {
         // `has_delivery_thread` fallback the `delegate_*` tools already do in
         // `dispatch.rs::dispatch_subagent`.
         let has_delivery_thread =
-            crate::openhuman::inference::provider::thread_context::current_thread_id().is_some();
+            crate::openhuman::tinyagents::thread_context::current_thread_id().is_some();
         if !blocking && !has_delivery_thread {
             log::info!(
                 "[spawn_subagent] async delegation requested for '{}' but no delivery thread \
@@ -487,7 +487,7 @@ impl Tool for SpawnSubagentTool {
         // still proceeds live-only (`worker_thread_id: None`).
         let worker_thread_id = current_parent().and_then(|p| {
             let parent_thread_id =
-                crate::openhuman::inference::provider::thread_context::current_thread_id()?;
+                crate::openhuman::tinyagents::thread_context::current_thread_id()?;
             let title: String = prompt.chars().take(60).collect();
             super::worker_thread::create_worker_thread(
                 p.workspace_dir.clone(),
@@ -593,6 +593,17 @@ impl Tool for SpawnSubagentTool {
                         Ok(ToolResult::success(envelope))
                     }
                     SubagentRunStatus::Completed => {
+                        // #3883: log the orchestrator taking delivery of each
+                        // artifact path the child handed back, so a run journal
+                        // shows both ends of every `[artifact]` pointer. The
+                        // `consumed_by_parent` stage distinguishes this from the
+                        // child's `recorded_by_child` line for the same path.
+                        crate::openhuman::agent::harness::artifact_offload::note_artifact_handoff(
+                            crate::openhuman::agent::harness::artifact_offload::HANDOFF_STAGE_CONSUMED,
+                            &outcome.agent_id,
+                            &outcome.task_id,
+                            &outcome.artifact_paths,
+                        );
                         crate::openhuman::agent_orchestration::subagent_events::publish_subagent_completed(
                             parent_session,
                             outcome.task_id.clone(),
@@ -958,6 +969,7 @@ mod tests {
             status: SubagentRunStatus::Completed,
             final_history: Vec::new(),
             usage: Default::default(),
+            artifact_paths: Vec::new(),
         }
     }
 

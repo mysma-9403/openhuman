@@ -34,23 +34,6 @@ pub fn spawn_login_gated_services(embedded_core: bool) {
                     log::debug!("[core] desktop core startup");
                 }
 
-                // Register autocomplete shutdown hook so the engine (and its
-                // Swift overlay helper) are stopped cleanly on process exit.
-                // This is unconditional — the hook should fire regardless of
-                // whether the user is currently logged in.
-                crate::core::shutdown::register(|| async {
-                    let engine = crate::openhuman::autocomplete::global_engine();
-                    let status = engine.status().await;
-                    if status.running {
-                        log::info!(
-                            "[core] stopping autocomplete engine (phase={})",
-                            status.phase
-                        );
-                        engine.stop(None).await;
-                        log::info!("[core] autocomplete engine stopped");
-                    }
-                });
-
                 // Check if a user is already logged in from a previous session.
                 let already_logged_in = crate::openhuman::config::default_root_openhuman_dir()
                     .ok()
@@ -340,8 +323,15 @@ pub fn start_bootstrap_jobs(services: ServiceSet, config: &Config) {
     log::debug!("[runtime.bootstrap] bootstrap job dispatch complete");
 }
 
-/// Starts one-shot boot background work selected by [`ServiceSet`].
-pub fn start_boot_once_jobs(services: ServiceSet, config: &Config) {
+/// Runs startup migrations, then starts one-shot boot background work selected
+/// by [`ServiceSet`].
+///
+/// The legacy goal and task-board copies must complete before any service that
+/// can read or write their crate-backed stores starts, and before the runtime
+/// publishes readiness.
+pub async fn start_boot_once_jobs(services: ServiceSet, config: &Config) {
+    run_legacy_migrations(config).await;
+
     if services.harness_init {
         let cfg_for_init = config.clone();
         tokio::spawn(async move {
@@ -366,6 +356,54 @@ pub fn start_boot_once_jobs(services: ServiceSet, config: &Config) {
     } else {
         log::debug!("[runtime] MCP boot-spawn disabled by ServiceSet");
         log::debug!("[runtime] MCP reconnect supervisor disabled by ServiceSet");
+    }
+}
+
+async fn run_legacy_migrations(config: &Config) {
+    // These used to run as detached tasks, allowing a user/API write to land
+    // between a migration's `get(None)` check and its later `put`. Await each
+    // copy in startup order so the crate stores are authoritative before
+    // writers and readiness are exposed.
+    //
+    // Both copies are idempotent and must run for each workspace so an
+    // in-process restart with a different workspace migrates that workspace.
+    match crate::openhuman::thread_goals::crate_adapter::migrate_legacy_goals_into_crate_store(
+        &config.workspace_dir,
+    )
+    .await
+    {
+        Ok(report) if report.total > 0 => {
+            log::info!(
+                "[thread_goals] legacy→crate migration: total={} copied={} skipped={}",
+                report.total,
+                report.copied,
+                report.skipped
+            );
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("[thread_goals] legacy→crate migration failed: {e}"),
+    }
+
+    // Idempotent copy of any task boards left in the retired
+    // `{workspace}/agent_task_boards/*.json` file-JSON tree into the crate
+    // `graph.todos` store, which is now authoritative. Idempotent and returns
+    // fast on an empty/absent legacy dir (the `*.runs.json` ledger stays local).
+    // As above, each core boot must inspect its own workspace.
+    match crate::openhuman::todos::crate_adapter::migrate_legacy_task_boards_into_crate_store(
+        &config.workspace_dir,
+    )
+    .await
+    {
+        Ok(report) if report.total > 0 => {
+            log::info!(
+                "[todos] legacy→crate migration: total={} copied={} skipped={}",
+                report.total,
+                report.copied,
+                report.skipped
+            );
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("[todos] legacy→crate task-board migration failed: {e}"),
     }
 }
 
@@ -424,8 +462,20 @@ pub fn spawn_socket_auto_connect(
 
 #[cfg(test)]
 mod tests {
-    use super::{bootstrap_job_plan, BootstrapJobPlan};
-    use crate::core::runtime::ServiceSet;
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_migrations_run_for_each_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut first = Config::default();
+        first.workspace_dir = tmp.path().join("first");
+        let mut second = Config::default();
+        second.workspace_dir = tmp.path().join("second");
+
+        for config in [first, second] {
+            run_legacy_migrations(&config).await;
+        }
+    }
 
     /// desktop() must enable every bootstrap job — proves the un-bundling kept
     /// the desktop job set byte-identical.

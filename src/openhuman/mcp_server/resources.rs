@@ -200,12 +200,6 @@ const RESOURCE_CATALOG: &[PromptResource] = &[
         content: include_str!("../agent_registry/agents/presentation_agent/prompt.md"),
     },
     PromptResource {
-        uri: "openhuman://prompts/agents/desktop_control_agent",
-        name: "desktop_control_agent",
-        description: "Specialist worker for desktop app launch and accessibility actions.",
-        content: include_str!("../agent_registry/agents/desktop_control_agent/prompt.md"),
-    },
-    PromptResource {
         uri: "openhuman://prompts/agents/mcp_setup",
         name: "mcp_setup",
         description: "Worker that guides the user through MCP client configuration.",
@@ -240,12 +234,6 @@ const RESOURCE_CATALOG: &[PromptResource] = &[
         name: "account_admin_agent",
         description: "Specialist worker for connected account and integration administration.",
         content: include_str!("../agent_registry/agents/account_admin_agent/prompt.md"),
-    },
-    PromptResource {
-        uri: "openhuman://prompts/agents/screen_awareness_agent",
-        name: "screen_awareness_agent",
-        description: "Specialist worker for screen context and desktop state inspection.",
-        content: include_str!("../agent_registry/agents/screen_awareness_agent/prompt.md"),
     },
     PromptResource {
         uri: "openhuman://prompts/agents/flow_discovery",

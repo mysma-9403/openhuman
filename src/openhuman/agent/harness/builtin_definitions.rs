@@ -93,7 +93,7 @@ pub(crate) fn test_main_def() -> AgentDefinition {
 /// which is exactly what the full-path spawn test needs to assert the
 /// dispatch → run_subagent → result-threading chain end to end.
 /// Provider *routing* for `Hint` sub-agents is covered separately by
-/// `subagent_runner::ops::tests::resolve_subagent_provider_*`.
+/// `subagent_runner::ops::tests::resolve_subagent_source_*`.
 #[cfg(test)]
 pub(crate) fn test_inherit_echo_def() -> AgentDefinition {
     use super::definition::{ModelSpec, PromptSource, SandboxMode, ToolScope};
@@ -258,7 +258,6 @@ mod tests {
             "settings_agent",
             "profile_memory_agent",
             "account_admin_agent",
-            "screen_awareness_agent",
             "tinyplace_agent",
             "tool_maker",
             "skill_creator",

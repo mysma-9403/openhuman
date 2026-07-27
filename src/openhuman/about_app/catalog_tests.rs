@@ -160,12 +160,50 @@ fn catalog_includes_additional_user_facing_surfaces() {
         "intelligence.memory_source_sync_controls",
         "intelligence.coding_session_memory",
         "conversation.subagent_mascots",
+        "companion.session",
     ] {
         assert!(
             ids.contains(expected),
             "missing catalog capability `{expected}`"
         );
     }
+}
+
+#[test]
+fn companion_capabilities_disclose_backend_reasoning() {
+    let capability = lookup("companion.session").expect("companion capability registered");
+    assert_eq!(capability.domain, "companion");
+    assert_eq!(capability.category, CapabilityCategory::Conversation);
+
+    let privacy = capability.privacy.expect("privacy disclosure");
+    assert!(privacy.leaves_device);
+    assert_eq!(privacy.data_kind, PrivacyDataKind::Derived);
+    assert!(privacy.destinations.contains(&"OpenHuman backend"));
+
+    assert!(
+        lookup("companion.pointing").is_none(),
+        "visual pointing depends on removed screen context and must not be catalogued"
+    );
+}
+
+#[test]
+fn screen_intelligence_is_not_a_catalog_category_or_capability() {
+    assert!(
+        "screen_intelligence".parse::<CapabilityCategory>().is_err(),
+        "removed category must not deserialize"
+    );
+    assert!(
+        CapabilityCategory::ALL
+            .iter()
+            .all(|category| category.as_str() != "screen_intelligence"),
+        "removed category must not be exposed by CapabilityCategory::ALL"
+    );
+    assert!(
+        all_capabilities()
+            .iter()
+            .all(|capability| !capability.id.starts_with("screen_intelligence.")),
+        "screen intelligence capability entries must be removed"
+    );
 }
 
 #[test]

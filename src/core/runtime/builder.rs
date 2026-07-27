@@ -175,9 +175,6 @@ pub struct DomainSet {
     /// future backing controller would stay live. Fold the media-generation
     /// controller into this group when it lands.
     pub media: bool,
-    /// Accessibility middleware, screen intelligence, inline autocomplete, the
-    /// desktop companion loop, and the `computer` agent-tool family.
-    pub desktop_automation: bool,
     /// Everything not in a named family — always on in `full()`.
     pub platform: bool,
 }
@@ -200,7 +197,6 @@ impl DomainSet {
             web3: true,
             voice: true,
             media: true,
-            desktop_automation: true,
             platform: true,
         }
     }
@@ -223,7 +219,6 @@ impl DomainSet {
             web3: false,
             voice: false,
             media: false,
-            desktop_automation: false,
             platform: false,
         }
     }
@@ -244,7 +239,6 @@ impl DomainSet {
             web3: false,
             voice: false,
             media: false,
-            desktop_automation: false,
             platform: false,
         }
     }
@@ -265,7 +259,6 @@ impl DomainSet {
             DomainGroup::Web3 => self.web3,
             DomainGroup::Voice => self.voice,
             DomainGroup::Media => self.media,
-            DomainGroup::DesktopAutomation => self.desktop_automation,
             DomainGroup::Platform => self.platform,
         }
     }
@@ -418,7 +411,7 @@ impl CoreRuntime {
         if !self.services.rpc_http {
             // No transport: just spawn the selected background services and
             // return. The caller owns the process lifetime.
-            self.start_selected_services();
+            self.start_selected_services().await;
             return Ok(());
         }
 
@@ -568,6 +561,10 @@ impl CoreRuntime {
             ),
         );
 
+        // Await startup migrations before publishing readiness or allowing
+        // background writers to touch their crate-backed stores.
+        self.start_selected_services().await;
+
         log::info!(
             "[core] OpenHuman core is ready — listening on http://{bind_addr} (version {})",
             env!("CARGO_PKG_VERSION")
@@ -585,9 +582,6 @@ impl CoreRuntime {
                 fallback_from: pick.fallback_from,
             });
         }
-
-        // Background services — gated by the ServiceSet.
-        self.start_selected_services();
 
         if let Some(shutdown_token) = shutdown_token {
             log::info!(
@@ -629,9 +623,9 @@ impl CoreRuntime {
 
     /// Spawn each selected background service. Selection is by [`ServiceSet`];
     /// each service keeps its own runtime config gate.
-    fn start_selected_services(&self) {
+    async fn start_selected_services(&self) {
         use crate::core::runtime::services;
-        jsonrpc::start_core_runtime_services(self.services, self.config.as_ref());
+        jsonrpc::start_core_runtime_services(self.services, self.config.as_ref()).await;
 
         if self.services.heartbeat {
             services::spawn_login_gated_services(self.ctx.host_kind().is_desktop_shell());
@@ -677,7 +671,6 @@ mod tests {
             DomainGroup::Web3,
             DomainGroup::Voice,
             DomainGroup::Media,
-            DomainGroup::DesktopAutomation,
             DomainGroup::Platform,
         ] {
             assert!(full.allows(group), "full() must allow {group:?}");
@@ -704,7 +697,6 @@ mod tests {
             DomainGroup::Web3,
             DomainGroup::Voice,
             DomainGroup::Media,
-            DomainGroup::DesktopAutomation,
             DomainGroup::Platform,
         ] {
             assert!(!harness.allows(off), "harness() must NOT allow {off:?}");
@@ -726,7 +718,6 @@ mod tests {
             DomainGroup::Web3,
             DomainGroup::Voice,
             DomainGroup::Media,
-            DomainGroup::DesktopAutomation,
             DomainGroup::Platform,
         ] {
             assert!(!none.allows(group), "none() must NOT allow {group:?}");
