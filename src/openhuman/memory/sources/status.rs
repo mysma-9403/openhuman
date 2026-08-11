@@ -16,6 +16,9 @@
 //! `has_uncovered_reembed_work` already use, so a settled store reports zero
 //! instead of reporting every ingested chunk as pending forever.
 
+use std::fmt::Write as _;
+
+use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::openhuman::config::Config;
@@ -127,12 +130,59 @@ pub async fn source_status(
     .map_err(|e| format!("source_status join: {e}"))?
 }
 
-/// Compute status for all configured sources (one SQL roundtrip per source).
+/// Number of sources folded into one `mem_tree_chunks` scan. Each source
+/// contributes three aggregate columns and one bound prefix; the shared
+/// signature + dropped-status binds add two more. 128 keeps both well under
+/// SQLite's default 2000-column / 999-parameter statement limits
+/// (128 × 3 = 384 columns, 130 binds).
+const STATUS_BATCH_SOURCES: usize = 128;
+
+/// Compute status for all configured sources.
+///
+/// Fast path folds every source's counts into `ceil(N / STATUS_BATCH_SOURCES)`
+/// `mem_tree_chunks` scans instead of one scan per source. The Memory Sources
+/// panel polls this every 5s (`MemorySourcesRegistry.tsx`), and every read
+/// shares the one process-wide chunk-DB connection mutex — so issuing fewer
+/// scans, not concurrency, is the only lever. If the batched query fails for any
+/// reason the per-source path still runs, so a query regression degrades
+/// latency, never correctness.
 pub async fn status_list(config: &Config) -> Result<Vec<SourceStatus>, String> {
     let sources = crate::openhuman::memory::sources::registry::list_sources().await?;
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    tracing::debug!(
+        source_count = sources.len(),
+        "[memory_sources:status] status_list: entry"
+    );
+    match batch_status(config, &sources).await {
+        Ok(statuses) => {
+            tracing::debug!(
+                source_count = statuses.len(),
+                "[memory_sources:status] status_list: batched fast path ok"
+            );
+            Ok(statuses)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                source_count = sources.len(),
+                "[memory_sources:status] batched status query failed; falling back to per-source path"
+            );
+            status_list_per_source(config, &sources).await
+        }
+    }
+}
+
+/// Per-source fallback: one `source_status` round-trip per source. A single
+/// source's failure degrades only its own row (Idle / zero), never the list.
+async fn status_list_per_source(
+    config: &Config,
+    sources: &[MemorySourceEntry],
+) -> Result<Vec<SourceStatus>, String> {
     let mut out = Vec::with_capacity(sources.len());
     for source in sources {
-        match source_status(config, &source).await {
+        match source_status(config, source).await {
             Ok(s) => out.push(s),
             Err(e) => {
                 tracing::warn!(
@@ -141,7 +191,7 @@ pub async fn status_list(config: &Config) -> Result<Vec<SourceStatus>, String> {
                     "[memory_sources:status] query failed"
                 );
                 out.push(SourceStatus {
-                    source_id: source.id,
+                    source_id: source.id.clone(),
                     chunks_synced: 0,
                     chunks_pending: 0,
                     last_chunk_at_ms: None,
@@ -151,6 +201,132 @@ pub async fn status_list(config: &Config) -> Result<Vec<SourceStatus>, String> {
         }
     }
     Ok(out)
+}
+
+/// Aggregate every source's chunk counts in single-scan batches, preserving the
+/// exact per-source semantics of [`source_status`] (see [`aggregate_prefixes`]).
+async fn batch_status(
+    config: &Config,
+    sources: &[MemorySourceEntry],
+) -> Result<Vec<SourceStatus>, String> {
+    let cfg = config.clone();
+    let prefixes: Vec<String> = sources.iter().map(source_id_prefix).collect();
+    let source_ids: Vec<String> = sources.iter().map(|s| s.id.clone()).collect();
+    tracing::debug!(
+        source_count = prefixes.len(),
+        batch_count = prefixes.len().div_ceil(STATUS_BATCH_SOURCES),
+        batch_size = STATUS_BATCH_SOURCES,
+        "[memory_sources:status] batch_status: aggregating over mem_tree_chunks in single-scan batches"
+    );
+    let rows: Vec<(i64, i64, Option<i64>)> = tokio::task::spawn_blocking(move || {
+        // Signature is scoped per active embedding model, not per source —
+        // resolve it once and reuse across every batch (matches `source_status`).
+        let signature = tree_active_signature(&cfg);
+        with_connection(&cfg, |conn| {
+            let mut out = Vec::with_capacity(prefixes.len());
+            for batch in prefixes.chunks(STATUS_BATCH_SOURCES) {
+                out.extend(aggregate_prefixes(conn, batch, &signature)?);
+            }
+            Ok(out)
+        })
+        .map_err(|e| format!("batch_status: {e}"))
+    })
+    .await
+    .map_err(|e| format!("batch_status join: {e}"))??;
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    Ok(source_ids
+        .into_iter()
+        .zip(rows)
+        .map(|(source_id, (synced, pending, last_ms))| SourceStatus {
+            source_id,
+            chunks_synced: synced.max(0) as u64,
+            chunks_pending: pending.max(0) as u64,
+            last_chunk_at_ms: last_ms,
+            freshness: FreshnessLabel::from_age_ms(last_ms, now_ms),
+        })
+        .collect())
+}
+
+/// One `mem_tree_chunks` scan yielding `(synced, pending, last_ts)` for each
+/// prefix, in order.
+///
+/// Each source contributes three aggregate columns gated by `source_id LIKE ?n`.
+/// The pending column embeds [`source_status`]'s exact resolved-predicate — a
+/// sidecar vector under the active signature, a re-embed tombstone, a dropped
+/// lifecycle, or a legacy blob — *inside* the gate's `THEN` branch. Two reasons
+/// for the nested `CASE` rather than a flat `LIKE ?n AND NOT(<predicate>)`:
+///
+/// 1. **Correctness.** `source_status` counts a row as pending whenever the
+///    predicate is false *or NULL* (`CASE WHEN <pred> THEN 0 ELSE 1`). A bare
+///    `NOT(<pred>)` maps NULL → NULL → not-counted, silently under-counting the
+///    NULL-`lifecycle_status` rows. Nesting the identical `CASE` reproduces the
+///    NULL-→-pending behaviour exactly.
+/// 2. **Cost.** SQL evaluates only the taken `CASE` branch, so the `EXISTS`
+///    sub-selects run only for a row's own source — never once per source per
+///    row — without relying on `AND` short-circuit.
+fn aggregate_prefixes(
+    conn: &Connection,
+    prefixes: &[String],
+    signature: &str,
+) -> anyhow::Result<Vec<(i64, i64, Option<i64>)>> {
+    let n = prefixes.len();
+    let sig_p = n + 1;
+    let dropped_p = n + 2;
+    let mut columns = String::new();
+    for i in 0..n {
+        let p = i + 1;
+        if i > 0 {
+            columns.push_str(", ");
+        }
+        // Writing to a `String` via `fmt::Write` is infallible; assert that here
+        // rather than threading a `?` that can never actually fire.
+        write!(
+            columns,
+            "SUM(CASE WHEN c.source_id LIKE ?{p} THEN 1 ELSE 0 END), \
+             SUM(CASE WHEN c.source_id LIKE ?{p} THEN \
+                    (CASE WHEN EXISTS ( \
+                                 SELECT 1 FROM mem_tree_chunk_embeddings e \
+                                  WHERE e.chunk_id = c.id AND e.model_signature = ?{sig_p}) \
+                              OR EXISTS ( \
+                                 SELECT 1 FROM mem_tree_chunk_reembed_skipped s \
+                                  WHERE s.chunk_id = c.id AND s.model_signature = ?{sig_p}) \
+                              OR c.lifecycle_status = ?{dropped_p} \
+                              OR c.embedding IS NOT NULL \
+                             THEN 0 ELSE 1 END) \
+                  ELSE 0 END), \
+             MAX(CASE WHEN c.source_id LIKE ?{p} THEN c.timestamp_ms END)"
+        )
+        .expect("writing to a String never fails");
+    }
+    let where_clause = (1..=n)
+        .map(|p| format!("c.source_id LIKE ?{p}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let sql = format!("SELECT {columns} FROM mem_tree_chunks c WHERE {where_clause}");
+    tracing::trace!(
+        prefix_count = n,
+        "[memory_sources:status] aggregate_prefixes: scanning mem_tree_chunks for one batch"
+    );
+
+    // Bind order matches the numbered params: prefixes ?1..?N, then the shared
+    // signature ?N+1 and dropped-status ?N+2.
+    let mut binds: Vec<String> = prefixes.to_vec();
+    binds.push(signature.to_string());
+    binds.push(CHUNK_STATUS_DROPPED.to_string());
+
+    let triples = conn.query_row(&sql, rusqlite::params_from_iter(binds.iter()), |r| {
+        let mut v = Vec::with_capacity(n);
+        for i in 0..n {
+            let base = i * 3;
+            let synced = r.get::<_, Option<i64>>(base)?.unwrap_or(0);
+            let pending = r.get::<_, Option<i64>>(base + 1)?.unwrap_or(0);
+            let last_ms = r.get::<_, Option<i64>>(base + 2)?;
+            v.push((synced, pending, last_ms));
+        }
+        Ok(v)
+    })?;
+    Ok(triples)
 }
 
 /// Build the `source_id LIKE` prefix that matches chunks belonging to a source.
@@ -360,5 +536,133 @@ mod tests {
         assert_eq!(status.chunks_pending, 0);
         assert_eq!(status.last_chunk_at_ms, None);
         assert_eq!(status.freshness, FreshnessLabel::Idle);
+    }
+
+    /// The batched fast path must be byte-for-byte equivalent to the per-source
+    /// `source_status` across every resolution state the pending predicate
+    /// distinguishes: active-signature embed, superseded-signature embed,
+    /// re-embed tombstone, dropped lifecycle, legacy blob, and genuinely pending.
+    #[tokio::test]
+    async fn batch_status_matches_per_source_counts() {
+        let (_tmp, cfg) = test_config();
+        let active = tree_active_signature(&cfg);
+
+        // src_done: every chunk embedded under the active signature → 2/0.
+        let done = seed(&cfg, "src_done", 2);
+        for c in &done {
+            set_chunk_embedding_for_signature(&cfg, &c.id, &active, &[0.5]).unwrap();
+        }
+        // src_mixed: active, stale-signature, untouched → 3/2.
+        let mixed = seed(&cfg, "src_mixed", 3);
+        set_chunk_embedding_for_signature(&cfg, &mixed[0].id, &active, &[0.1]).unwrap();
+        set_chunk_embedding_for_signature(&cfg, &mixed[1].id, "stale/model@7", &[0.3]).unwrap();
+        // src_terminal: re-embed tombstone, dropped, untouched → 3/1.
+        let terminal = seed(&cfg, "src_terminal", 3);
+        mark_chunk_reembed_skipped(&cfg, &terminal[0].id, &active, "too large").unwrap();
+        set_chunk_lifecycle_status(&cfg, &terminal[1].id, CHUNK_STATUS_DROPPED).unwrap();
+        // src_legacy: one legacy pre-sidecar embedding blob → 2/1.
+        let legacy = seed(&cfg, "src_legacy", 2);
+        with_connection(&cfg, |conn| {
+            conn.execute(
+                "UPDATE mem_tree_chunks SET embedding = X'00010203' WHERE id = ?1",
+                [&legacy[0].id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // src_plain: nothing resolved → 2/2. src_empty: no chunks → 0/0.
+        seed(&cfg, "src_plain", 2);
+
+        let sources: Vec<MemorySourceEntry> = [
+            "src_done",
+            "src_mixed",
+            "src_terminal",
+            "src_legacy",
+            "src_plain",
+            "src_empty",
+        ]
+        .iter()
+        .map(|id| source_entry(id))
+        .collect();
+
+        let batched = batch_status(&cfg, &sources).await.unwrap();
+        assert_eq!(batched.len(), sources.len());
+        for (i, source) in sources.iter().enumerate() {
+            let expected = source_status(&cfg, source).await.unwrap();
+            let got = &batched[i];
+            assert_eq!(got.source_id, expected.source_id);
+            assert_eq!(
+                got.chunks_synced, expected.chunks_synced,
+                "synced mismatch for {}",
+                source.id
+            );
+            assert_eq!(
+                got.chunks_pending, expected.chunks_pending,
+                "pending mismatch for {}",
+                source.id
+            );
+            assert_eq!(
+                got.last_chunk_at_ms, expected.last_chunk_at_ms,
+                "last_ms mismatch for {}",
+                source.id
+            );
+            assert_eq!(
+                got.freshness, expected.freshness,
+                "freshness mismatch for {}",
+                source.id
+            );
+        }
+
+        // Absolute counts too, so a bug that corrupts BOTH paths identically
+        // (and would pass the equivalence loop above) still fails here.
+        let counts: Vec<(u64, u64)> = batched
+            .iter()
+            .map(|s| (s.chunks_synced, s.chunks_pending))
+            .collect();
+        assert_eq!(counts, vec![(2, 0), (3, 2), (3, 1), (2, 1), (2, 2), (0, 0)]);
+        assert_eq!(batched[5].last_chunk_at_ms, None);
+    }
+
+    /// Exceed one query batch so the chunked scan and its index→source mapping
+    /// are exercised across a batch boundary; a mis-aligned `zip` would surface
+    /// as a per-index count mismatch.
+    #[tokio::test]
+    async fn batch_status_spans_multiple_query_batches() {
+        let (_tmp, cfg) = test_config();
+        let n = STATUS_BATCH_SOURCES + 5;
+        let mut sources = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = format!("src_{i:04}");
+            // Vary the count per source so a boundary misalignment is visible.
+            seed(&cfg, &id, (i % 3) as u32 + 1);
+            sources.push(source_entry(&id));
+        }
+
+        let batched = batch_status(&cfg, &sources).await.unwrap();
+        assert_eq!(batched.len(), n);
+        for (i, st) in batched.iter().enumerate() {
+            let expected = (i % 3) as u64 + 1;
+            assert_eq!(st.source_id, format!("src_{i:04}"));
+            assert_eq!(st.chunks_synced, expected, "synced mismatch at index {i}");
+            // Nothing was embedded, so every chunk still pends.
+            assert_eq!(st.chunks_pending, expected, "pending mismatch at index {i}");
+        }
+    }
+
+    /// No chunks at all: the `SUM`/`MAX` over a zero-row scan yield SQL NULLs,
+    /// which must decode to 0 / None rather than erroring the whole panel.
+    #[tokio::test]
+    async fn batch_status_empty_db_is_zeroed_not_errored() {
+        let (_tmp, cfg) = test_config();
+        let sources: Vec<MemorySourceEntry> =
+            ["a", "b", "c"].iter().map(|id| source_entry(id)).collect();
+        let batched = batch_status(&cfg, &sources).await.unwrap();
+        assert_eq!(batched.len(), 3);
+        for st in &batched {
+            assert_eq!(st.chunks_synced, 0);
+            assert_eq!(st.chunks_pending, 0);
+            assert_eq!(st.last_chunk_at_ms, None);
+            assert_eq!(st.freshness, FreshnessLabel::Idle);
+        }
     }
 }
