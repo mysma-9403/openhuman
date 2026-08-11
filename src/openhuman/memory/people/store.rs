@@ -25,6 +25,18 @@ type PersonRow = (
     i64,
 );
 
+/// One row from [`PeopleStore::list_drifting`]:
+/// `(id, display_name, primary_email, primary_phone, last_interaction_ts)`.
+/// A named alias keeps the 5-field shape readable and dodges clippy's
+/// `type_complexity` on the `Vec<…>` return.
+type DriftingRow = (
+    PersonId,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+);
+
 /// Process-global handle to the `PeopleStore`, tagged with the workspace it is
 /// bound to. Controller handlers are free functions with no `&self`, so they
 /// fetch the store via `get()`. Seeded at core boot and re-bound on active-user
@@ -545,6 +557,66 @@ impl PeopleStore {
             )
         })?
     }
+
+    /// Contacts whose most recent interaction is strictly older than
+    /// `cutoff_ts` (unix seconds), oldest last-touch first, capped at `limit`.
+    ///
+    /// Contacts with no interaction at all are excluded — a "relationships
+    /// going cold" surface only makes sense once contact existed. Returns
+    /// `(id, display_name, primary_email, primary_phone, last_interaction_ts)`;
+    /// the caller derives "days since" against its own clock so this stays
+    /// deterministic and testable with an explicit cutoff. `primary_phone` is
+    /// included for parity with `people.list` — many drifting contacts are
+    /// reachable by phone/iMessage rather than email.
+    ///
+    /// `limit` is clamped to `1..=500` here, not only in the caller: this fn is
+    /// `pub`, and a direct call with `limit == 0` would emit `LIMIT 0` (empty)
+    /// while a `usize` above `i64::MAX` would wrap under `as i64` to a negative,
+    /// which SQLite reads as *no limit* (returns everything).
+    pub async fn list_drifting(&self, cutoff_ts: i64, limit: usize) -> SqlResult<Vec<DriftingRow>> {
+        let limit = limit.clamp(1, 500);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> SqlResult<Vec<DriftingRow>> {
+            let guard = conn.blocking_lock();
+            let mut stmt = guard.prepare(
+                "SELECT p.id, p.display_name, p.primary_email, p.primary_phone, MAX(i.ts) AS last_ts \
+                     FROM people p \
+                     JOIN interactions i ON i.person_id = p.id \
+                     GROUP BY p.id \
+                     HAVING MAX(i.ts) < ?1 \
+                     ORDER BY last_ts ASC \
+                     LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![cutoff_ts, limit as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                let (id_str, display_name, primary_email, primary_phone, last_ts) = r?;
+                let id = uuid::Uuid::parse_str(&id_str)
+                    .map(PersonId)
+                    .map_err(|e| rusqlite::Error::InvalidColumnName(e.to_string()))?;
+                out.push((id, display_name, primary_email, primary_phone, last_ts));
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ffi::ErrorCode::SystemIoFailure,
+                    extended_code: 0,
+                },
+                Some(e.to_string()),
+            )
+        })?
+    }
 }
 
 fn load_handles(conn: &Connection, id: &PersonId) -> SqlResult<Vec<Handle>> {
@@ -649,5 +721,72 @@ mod tests {
         .unwrap();
         let ints = s.interactions_for(pid).await.unwrap();
         assert_eq!(ints.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_drifting_orders_stale_and_excludes_recent_and_never() {
+        let s = PeopleStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        let mk = |name: &str, phone: Option<&str>| Person {
+            id: PersonId::new(),
+            display_name: Some(name.to_string()),
+            primary_email: None,
+            primary_phone: phone.map(str::to_string),
+            handles: vec![],
+            created_at: now,
+            updated_at: now,
+        };
+        // `stale` carries a phone so we can assert primary_phone flows through.
+        let stale = mk("Stale", Some("+15551234567"));
+        let staler = mk("Staler", None);
+        let recent = mk("Recent", None);
+        let never = mk("Never", None);
+        for p in [&stale, &staler, &recent, &never] {
+            s.insert_person(p, &[]).await.unwrap();
+        }
+        let touch = |pid: PersonId, days_ago: i64| Interaction {
+            person_id: pid,
+            ts: now - chrono::Duration::days(days_ago),
+            is_outbound: true,
+            length: 10,
+        };
+        s.record_interaction(touch(stale.id, 100)).await.unwrap();
+        s.record_interaction(touch(staler.id, 200)).await.unwrap();
+        s.record_interaction(touch(recent.id, 5)).await.unwrap();
+
+        // Cutoff = 30 days ago: only `stale` (100d) and `staler` (200d) drift;
+        // `recent` (5d) is too fresh and `never` has nothing to drift from.
+        let cutoff = (now - chrono::Duration::days(30)).timestamp();
+        let drifting = s.list_drifting(cutoff, 100).await.unwrap();
+        let ids: Vec<PersonId> = drifting.iter().map(|(id, ..)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![staler.id, stale.id],
+            "oldest last-touch first; recent + never excluded"
+        );
+        assert!(
+            drifting[0].4 < drifting[1].4,
+            "rows ascend by last-interaction ts"
+        );
+        // primary_phone is selected and returned (parity with people.list).
+        // Order is oldest-first [staler, stale], so `stale` is index 1.
+        assert_eq!(
+            drifting[1].3.as_deref(),
+            Some("+15551234567"),
+            "primary_phone flows through the drifting row"
+        );
+
+        // A 3-day cutoff also pulls in `recent`; `never` is still excluded.
+        let cutoff_tight = (now - chrono::Duration::days(3)).timestamp();
+        assert_eq!(s.list_drifting(cutoff_tight, 100).await.unwrap().len(), 3);
+
+        // `limit` is clamped to >= 1 inside list_drifting: a limit of 0 must not
+        // degrade to `LIMIT 0` (empty) — it returns the single oldest drifter.
+        let clamped = s.list_drifting(cutoff, 0).await.unwrap();
+        assert_eq!(clamped.len(), 1, "limit 0 is clamped to 1, not LIMIT 0");
+        assert_eq!(
+            clamped[0].0, staler.id,
+            "clamped result keeps oldest-first order"
+        );
     }
 }

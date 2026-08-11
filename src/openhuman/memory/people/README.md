@@ -22,7 +22,7 @@ Contact resolution + relationship scoring (the "A5" module). Maps any of three h
 | `src/openhuman/memory/people/scorer.rs` | Pure `score(interactions, now) -> ScoreComponents`. Recency half-life, frequency window/cap, reciprocity balance, depth cap as module constants. |
 | `src/openhuman/memory/people/store.rs` | SQLite-backed `PeopleStore` (`Arc<Mutex<Connection>>`) + rebindable process-global accessor (`init_from_workspace` / `get`). CRUD, lookup, interaction read/write, batched interaction fetch. |
 | `src/openhuman/memory/people/address_book.rs` | `ContactsSource` trait + `SystemContactsSource` (macOS `CNContactStore` FFI via objc2) and non-mac stub; `MockContactsSource` for tests; `AddressBookError`. |
-| `src/openhuman/memory/people/rpc.rs` | Domain RPC handlers (`handle_list`, `handle_resolve`, `handle_score`, `handle_refresh_address_book`) returning `RpcOutcome<Value>`; callable directly in tests with a constructed `PeopleStore`. |
+| `src/openhuman/memory/people/rpc.rs` | Domain RPC handlers (`handle_list`, `handle_drifting`, `handle_resolve`, `handle_score`, `handle_refresh_address_book`) returning `RpcOutcome<Value>`; callable directly in tests with a constructed `PeopleStore`. |
 | `src/openhuman/memory/people/schemas.rs` | Controller schemas + param-parsing adapter handlers that fetch the global store and delegate to `rpc.rs`. |
 | `src/openhuman/memory/people/migrations.rs` | Idempotent migration runner (bookkeeping table `_people_migrations`, per-migration transaction). |
 | `src/openhuman/memory/people/migrations/0001_init.sql` | Schema: `people`, `handle_aliases`, `interactions` + indexes. |
@@ -44,6 +44,7 @@ Registered via the controller registry (wired in `src/core/all.rs`). Four contro
 | Method | Inputs | Output |
 | --- | --- | --- |
 | `people.list` | `limit?` (default 100, capped at 500) | `people[]` ranked by score desc — each with `person_id`, `display_name?`, `primary_email?`, `primary_phone?`, `handles[]`, `score`, `components`, `interaction_count`. |
+| `people.drifting` | `days?` (default 30), `limit?` (default 100, clamped 1–500) | `contacts[]` (oldest last-touch first), each with `person_id`, `display_name?`, `primary_email?`, `primary_phone?`, `last_interaction_at`, `days_since_last`; plus `threshold_days`. Excludes contacts never interacted with. |
 | `people.resolve` | `kind` (`imessage`/`email`/`display_name`), `value`, `create_if_missing?` | `person_id?` (null when unknown and not creating), `created`. |
 | `people.score` | `person_id` (UUID) | `person_id`, `score`, `components`, `interaction_count`. Errors if person not found. |
 | `people.refresh_address_book` | — | `seeded`, `skipped`, `permission_denied`. |

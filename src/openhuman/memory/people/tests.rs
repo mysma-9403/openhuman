@@ -44,10 +44,10 @@ fn address_book_is_empty_on_non_mac() {
     assert!(address_book::read().unwrap().is_empty());
 }
 
-/// Verify that the schema exposes four controllers now that
-/// `refresh_address_book` is wired up.
+/// Verify that the schema exposes the controllers, including
+/// `refresh_address_book` and `drifting`.
 #[test]
-fn schema_exposes_four_controllers() {
+fn schema_exposes_all_controllers() {
     use crate::openhuman::memory::people::schemas;
     let names: Vec<_> = schemas::all_controller_schemas()
         .into_iter()
@@ -57,7 +57,8 @@ fn schema_exposes_four_controllers() {
         names.contains(&"refresh_address_book"),
         "missing refresh_address_book: {names:?}"
     );
-    assert_eq!(names.len(), 4);
+    assert!(names.contains(&"drifting"), "missing drifting: {names:?}");
+    assert_eq!(names.len(), 5);
 }
 
 /// Regression for Sentry TAURI-RUST-8NM (store never seeded → `get()` always
