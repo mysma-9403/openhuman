@@ -25,6 +25,23 @@ type PersonRow = (
     i64,
 );
 
+/// A decoded `people` row, minus handles (fetched separately, in one batched
+/// query, by [`PeopleStore::list`]): `(id, display_name, primary_email,
+/// primary_phone, created_at, updated_at)`.
+///
+/// Distinct from the raw `PersonRow` used by `get()`, whose first element is the
+/// undecoded `String` id straight from SQLite; here the id is already parsed to
+/// [`PersonId`] so `list()` can collect ids for the batched handle fetch without
+/// re-parsing. Kept as a separate alias to avoid an `E0428` name clash.
+type DecodedPersonRow = (
+    PersonId,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+);
+
 /// Process-global handle to the `PeopleStore`, tagged with the workspace it is
 /// bound to. Controller handlers are free functions with no `&self`, so they
 /// fetch the store via `get()`. Seeded at core boot and re-bound on active-user
@@ -390,23 +407,46 @@ impl PeopleStore {
                     r.get::<_, i64>(5)?,
                 ))
             })?;
-            let mut out = Vec::new();
+            // Materialise the person rows, then fetch every person's handles in
+            // one batched `WHERE person_id IN (…)` query instead of a
+            // `load_handles` round-trip per person (N+1). Both run under the
+            // same lock, so batching also shortens how long `list` holds it.
+            // Mirrors `batch_interactions_for`.
+            let mut people_rows: Vec<DecodedPersonRow> = Vec::new();
             for r in rows {
                 let (id_str, display_name, primary_email, primary_phone, created, updated) = r?;
                 let id = uuid::Uuid::parse_str(&id_str)
                     .map(PersonId)
                     .map_err(|e| rusqlite::Error::InvalidColumnName(e.to_string()))?;
-                let handles = load_handles(&guard, &id)?;
-                out.push(Person {
+                people_rows.push((
                     id,
                     display_name,
                     primary_email,
                     primary_phone,
-                    handles,
-                    created_at: ts_to_dt(created),
-                    updated_at: ts_to_dt(updated),
-                });
+                    created,
+                    updated,
+                ));
             }
+            drop(stmt);
+            let ids: Vec<PersonId> = people_rows.iter().map(|row| row.0).collect();
+            let mut handles_by_id = batch_handles_conn(&guard, &ids)?;
+            let out = people_rows
+                .into_iter()
+                .map(
+                    |(id, display_name, primary_email, primary_phone, created, updated)| {
+                        let handles = handles_by_id.remove(&id).unwrap_or_default();
+                        Person {
+                            id,
+                            display_name,
+                            primary_email,
+                            primary_phone,
+                            handles,
+                            created_at: ts_to_dt(created),
+                            updated_at: ts_to_dt(updated),
+                        }
+                    },
+                )
+                .collect();
             Ok(out)
         })
         .await
@@ -547,6 +587,21 @@ impl PeopleStore {
     }
 }
 
+/// Decode a `(kind, value)` `handle_aliases` row into a [`Handle`]. Shared by
+/// [`load_handles`] and [`batch_handles_conn`] so the `kind` → variant mapping
+/// lives in exactly one place: a new `Handle` variant only has to be added here,
+/// and the single-row and batched decoders can never silently drift apart.
+fn decode_handle(kind: &str, value: String) -> SqlResult<Handle> {
+    match kind {
+        "imessage" => Ok(Handle::IMessage(value)),
+        "email" => Ok(Handle::Email(value)),
+        "display_name" => Ok(Handle::DisplayName(value)),
+        other => Err(rusqlite::Error::InvalidColumnName(format!(
+            "unknown handle kind: {other}"
+        ))),
+    }
+}
+
 fn load_handles(conn: &Connection, id: &PersonId) -> SqlResult<Vec<Handle>> {
     let mut stmt = conn.prepare(
         "SELECT kind, value FROM handle_aliases WHERE person_id = ?1 ORDER BY kind, value",
@@ -557,17 +612,53 @@ fn load_handles(conn: &Connection, id: &PersonId) -> SqlResult<Vec<Handle>> {
     let mut out = Vec::new();
     for r in rows {
         let (kind, value) = r?;
-        let h = match kind.as_str() {
-            "imessage" => Handle::IMessage(value),
-            "email" => Handle::Email(value),
-            "display_name" => Handle::DisplayName(value),
-            other => {
-                return Err(rusqlite::Error::InvalidColumnName(format!(
-                    "unknown handle kind: {other}"
-                )));
-            }
-        };
-        out.push(h);
+        out.push(decode_handle(&kind, value)?);
+    }
+    Ok(out)
+}
+
+/// Number of `person_id` binds per handle-batch query. Kept under SQLite's
+/// default 999 bound-parameter cap so `list` over an unbounded contact list
+/// never overflows a single statement.
+const HANDLE_BATCH: usize = 900;
+
+/// Batched form of [`load_handles`]: fetch handle aliases for many people in
+/// `O(ceil(n / HANDLE_BATCH))` queries instead of one per person, keyed by
+/// person id. Decodes each `kind` through the shared [`decode_handle`], so
+/// behaviour is identical to `load_handles` — only the round-trip count changes.
+/// A person with no aliases is simply absent from the map (callers use
+/// `unwrap_or_default`).
+fn batch_handles_conn(
+    conn: &Connection,
+    ids: &[PersonId],
+) -> SqlResult<HashMap<PersonId, Vec<Handle>>> {
+    let mut out: HashMap<PersonId, Vec<Handle>> = HashMap::new();
+    for window in ids.chunks(HANDLE_BATCH) {
+        let placeholders = std::iter::repeat_n("?", window.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT person_id, kind, value FROM handle_aliases \
+             WHERE person_id IN ({placeholders}) ORDER BY person_id, kind, value"
+        );
+        let id_strings: Vec<String> = window.iter().map(ToString::to_string).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(id_strings.iter()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for r in rows {
+            let (pid_str, kind, value) = r?;
+            let person_id = uuid::Uuid::parse_str(&pid_str)
+                .map(PersonId)
+                .map_err(|e| rusqlite::Error::InvalidColumnName(e.to_string()))?;
+            out.entry(person_id)
+                .or_default()
+                .push(decode_handle(&kind, value)?);
+        }
     }
     Ok(out)
 }
@@ -614,6 +705,62 @@ mod tests {
         let list = s.list().await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].handles.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_batches_handles_per_person() {
+        // Guards the batched handle fetch in `list`: each person must get
+        // exactly its own aliases and never another person's — the failure
+        // mode a single `WHERE person_id IN (…)` query risks if rows aren't
+        // keyed back correctly. A person with no aliases must come back empty,
+        // not inherit a neighbour's.
+        let s = PeopleStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        let mk = |name: &str, email: &str| Person {
+            id: PersonId::new(),
+            display_name: Some(name.to_string()),
+            primary_email: Some(email.to_string()),
+            primary_phone: None,
+            handles: vec![],
+            created_at: now,
+            updated_at: now,
+        };
+        let alice = mk("Alice", "alice@example.com");
+        let bob = mk("Bob", "bob@example.com");
+        let carol = mk("Carol", "carol@example.com");
+
+        s.insert_person(
+            &alice,
+            &[
+                Handle::Email("alice@example.com".into()),
+                Handle::DisplayName("Alice".into()),
+            ],
+        )
+        .await
+        .unwrap();
+        s.insert_person(&bob, &[]).await.unwrap();
+        s.insert_person(&carol, &[Handle::IMessage("+15550001".into())])
+            .await
+            .unwrap();
+
+        let list = s.list().await.unwrap();
+        assert_eq!(list.len(), 3);
+        let by_id: HashMap<PersonId, &Person> = list.iter().map(|p| (p.id, p)).collect();
+
+        assert_eq!(
+            by_id[&alice.id].handles.len(),
+            2,
+            "alice keeps both aliases"
+        );
+        assert!(
+            by_id[&bob.id].handles.is_empty(),
+            "bob has no aliases and must not inherit another person's"
+        );
+        assert_eq!(by_id[&carol.id].handles.len(), 1, "carol keeps her alias");
+        assert!(
+            matches!(by_id[&carol.id].handles[0], Handle::IMessage(_)),
+            "carol's alias kind is preserved"
+        );
     }
 
     #[tokio::test]
