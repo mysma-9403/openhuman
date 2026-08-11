@@ -16,6 +16,7 @@ use crate::openhuman::memory::store::types::{
 
 use super::events;
 use super::fts5;
+use super::rank_fusion;
 use super::UnifiedMemory;
 
 const GRAPH_WEIGHT: f64 = 0.55;
@@ -31,6 +32,20 @@ const KEYWORD_WEIGHT_WITH_EPISODIC: f64 = 0.10;
 const RECALL_PRIORITY_WEIGHT: f64 = 0.45;
 const RECALL_GRAPH_WEIGHT: f64 = 0.30;
 const RECALL_FRESHNESS_WEIGHT: f64 = 0.25;
+
+/// Whether Reciprocal Rank Fusion re-scoring is enabled for recall. Opt-in via
+/// `OPENHUMAN_MEMORY_RRF` (`1`/`true`/`on`/`yes`); default off. Flipping the
+/// ranking affects **every** recall, so RRF ships dark until an offline eval
+/// clears it as the default. Cached on first read.
+fn rrf_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("OPENHUMAN_MEMORY_RRF")
+            .map(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(false)
+    })
+}
 
 #[derive(Debug, Clone)]
 struct StoredChunk {
@@ -393,6 +408,20 @@ impl UnifiedMemory {
                 // surfaces per-event provenance.
                 taint: crate::openhuman::memory::MemoryTaint::Internal,
             });
+        }
+
+        // Rank-fusion re-scoring (opt-in): replace the incommensurable per-arm
+        // score blend + positional episodic/event relevance with Reciprocal Rank
+        // Fusion over each arm's ranking, so the final order rewards cross-arm
+        // agreement and uses the real FTS rank of episodic/event hits. Gated
+        // behind `OPENHUMAN_MEMORY_RRF`; default off preserves the exact prior
+        // ranking until an offline eval clears RRF as the default.
+        if rrf_enabled() {
+            Self::rank_fuse_hits(&mut hits, now);
+            tracing::debug!(
+                "[query] applied reciprocal rank fusion over {} hits",
+                hits.len()
+            );
         }
 
         hits.sort_by(|a, b| {
@@ -1144,6 +1173,90 @@ impl UnifiedMemory {
             episodic_relevance: 0.0,
             freshness: 0.0,
             final_score,
+        }
+    }
+
+    /// Re-score `hits` in place with Reciprocal Rank Fusion over each retrieval
+    /// arm's ranking, replacing the incommensurable per-arm score blend. Document
+    /// and KV hits are ranked by their own vector / keyword / graph signals;
+    /// episodic and event hits are already inserted in FTS-rank order, so their
+    /// insertion order is their arm ranking; and a **freshness arm** ranks every
+    /// hit by recency, so recency stays a real fused signal (not a tie-break) and
+    /// spans all kinds — giving otherwise single-arm episodic/event hits a second
+    /// arm.
+    ///
+    /// Factored out of [`Self::query_namespace_hits_excluding_session`] so the
+    /// fusion is unit-testable on constructed hits without a live store.
+    fn rank_fuse_hits(hits: &mut [NamespaceMemoryHit], now: f64) {
+        fn ranked_ids(
+            hits: &[NamespaceMemoryHit],
+            signal: impl Fn(&NamespaceMemoryHit) -> f64,
+        ) -> Vec<String> {
+            let mut scored: Vec<(&str, f64)> = hits
+                .iter()
+                .map(|h| (h.id.as_str(), signal(h)))
+                .filter(|(_, s)| *s > 0.0)
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.into_iter().map(|(id, _)| id.to_string()).collect()
+        }
+
+        let is_doc_kv = |h: &NamespaceMemoryHit| {
+            matches!(h.kind, MemoryItemKind::Document | MemoryItemKind::Kv)
+        };
+
+        let vector_rank = ranked_ids(hits, |h| {
+            if is_doc_kv(h) {
+                h.score_breakdown.vector_similarity
+            } else {
+                0.0
+            }
+        });
+        let keyword_rank = ranked_ids(hits, |h| {
+            if is_doc_kv(h) {
+                h.score_breakdown.keyword_relevance
+            } else {
+                0.0
+            }
+        });
+        let graph_rank = ranked_ids(hits, |h| {
+            if is_doc_kv(h) {
+                h.score_breakdown.graph_relevance
+            } else {
+                0.0
+            }
+        });
+        let episodic_rank: Vec<String> = hits
+            .iter()
+            .filter(|h| h.kind == MemoryItemKind::Episodic)
+            .map(|h| h.id.clone())
+            .collect();
+        let event_rank: Vec<String> = hits
+            .iter()
+            .filter(|h| h.kind == MemoryItemKind::Event)
+            .map(|h| h.id.clone())
+            .collect();
+        // Freshness is a first-class fusion arm, ranking EVERY hit type by
+        // recency — not a sub-epsilon tie-break. This keeps recency a real signal
+        // (KV rows previously carried ~20% freshness weight) and, because it spans
+        // all kinds, gives single-arm episodic/event hits a second arm so a
+        // document with weak signal in all three content arms no longer
+        // automatically outranks a fresh top episodic/event hit.
+        let freshness_rank = ranked_ids(hits, |h| Self::recency_score(h.updated_at, now));
+
+        let fused = rank_fusion::reciprocal_rank_fusion(&[
+            vector_rank,
+            keyword_rank,
+            graph_rank,
+            episodic_rank,
+            event_rank,
+            freshness_rank,
+        ]);
+
+        for hit in hits.iter_mut() {
+            let rrf = fused.get(&hit.id).copied().unwrap_or(0.0);
+            hit.score = rrf;
+            hit.score_breakdown.final_score = rrf;
         }
     }
 

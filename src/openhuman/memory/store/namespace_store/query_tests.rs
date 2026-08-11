@@ -999,3 +999,64 @@ async fn no_session_context_leaves_results_unchanged() {
         "a blank exclude_session_id must not filter anything"
     );
 }
+
+#[test]
+fn rank_fusion_rewards_cross_arm_agreement_over_a_single_arm_spike() {
+    use crate::openhuman::memory::store::types::{
+        MemoryItemKind, NamespaceMemoryHit, RetrievalScoreBreakdown,
+    };
+
+    fn doc_hit(id: &str, vector: f64, keyword: f64, graph: f64) -> NamespaceMemoryHit {
+        NamespaceMemoryHit {
+            id: id.to_string(),
+            kind: MemoryItemKind::Document,
+            namespace: "global".to_string(),
+            key: id.to_string(),
+            title: None,
+            content: String::new(),
+            category: "doc".to_string(),
+            source_type: None,
+            updated_at: 1_000.0,
+            score: 0.0,
+            score_breakdown: RetrievalScoreBreakdown {
+                keyword_relevance: keyword,
+                vector_similarity: vector,
+                graph_relevance: graph,
+                ..Default::default()
+            },
+            document_id: Some(id.to_string()),
+            chunk_id: None,
+            supporting_relations: Vec::new(),
+            taint: Default::default(),
+        }
+    }
+
+    // A: strong on vector + keyword, absent on graph.
+    // B: a single-arm spike — dominant on graph only.
+    // C: mediocre on every arm, but agreed on by all three.
+    let mut hits = vec![
+        doc_hit("A", 0.9, 0.9, 0.0),
+        doc_hit("B", 0.0, 0.0, 0.99),
+        doc_hit("C", 0.5, 0.5, 0.5),
+    ];
+
+    UnifiedMemory::rank_fuse_hits(&mut hits, 1_000.0);
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let order: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    // RRF rewards breadth of agreement: C (present in all three arms) tops A
+    // (two arms) and B (one arm) — the opposite of the graph-weight-dominated
+    // linear sum, which ranks the single-arm spike B first (0.99 * GRAPH_WEIGHT).
+    assert_eq!(order, ["C", "A", "B"], "RRF order was {order:?}");
+    assert!(
+        hits[0].score > hits[1].score && hits[1].score > hits[2].score,
+        "fused scores must be strictly ordered: {:?}",
+        hits.iter()
+            .map(|h| (h.id.as_str(), h.score))
+            .collect::<Vec<_>>()
+    );
+}

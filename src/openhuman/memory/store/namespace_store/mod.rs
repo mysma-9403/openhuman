@@ -33,4 +33,5 @@ mod helpers;
 mod init;
 pub mod profile;
 mod query;
+mod rank_fusion;
 pub mod segments;
