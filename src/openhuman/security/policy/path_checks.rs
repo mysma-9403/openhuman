@@ -110,10 +110,7 @@ impl SecurityPolicy {
             if Self::is_always_forbidden(&canonical) {
                 return false;
             }
-            let workspace_root = self
-                .workspace_dir
-                .canonicalize()
-                .unwrap_or_else(|_| self.workspace_dir.clone());
+            let workspace_root = self.workspace_root_sync();
             let canonical_in_trusted = self.is_within_trusted_root(&canonical, false);
             if self.workspace_only
                 && !canonical.starts_with(&workspace_root)
@@ -214,6 +211,35 @@ impl SecurityPolicy {
             })
             .await
             .clone()
+    }
+
+    /// Synchronous counterpart to [`workspace_root`], hydrating the **same**
+    /// `canonical_workspace` cache via `OnceCell`'s sync `get`/`set`.
+    ///
+    /// The sync path validators (`is_path_string_allowed`,
+    /// `is_resolved_path_allowed_for`) run on every file tool call and each
+    /// previously re-invoked `self.workspace_dir.canonicalize()` — one
+    /// `stat(2)` + symlink walk on the same immutable input per call. They
+    /// cannot `.await` [`workspace_root`], so they reach the cache through this
+    /// helper. `std::fs::canonicalize` here and `tokio::fs::canonicalize` in
+    /// the async path resolve the same input to the same canonical form, so
+    /// whichever hydrates the cell first, both paths agree on one value.
+    ///
+    /// Fallback to the raw `workspace_dir` on canonicalize failure matches the
+    /// inline behavior these callers used before, and the async `workspace_root`.
+    pub(super) fn workspace_root_sync(&self) -> PathBuf {
+        if let Some(cached) = self.canonical_workspace.get() {
+            return cached.clone();
+        }
+        let canonical = self
+            .workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_dir.clone());
+        // Ignore the race where the async initializer populated the cell
+        // first; `set` fails and we return our locally-resolved value, which
+        // equals what the async path stored (same input, same canonical form).
+        let _ = self.canonical_workspace.set(canonical.clone());
+        canonical
     }
 
     /// Validate a path for file I/O: string checks, canonicalize, workspace containment,
@@ -517,10 +543,7 @@ impl SecurityPolicy {
         if Self::is_always_forbidden(resolved) {
             return false;
         }
-        let workspace_root = self
-            .workspace_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.workspace_dir.clone());
+        let workspace_root = self.workspace_root_sync();
         resolved.starts_with(&workspace_root)
             || self.is_within_trusted_root(resolved, require_write)
     }
