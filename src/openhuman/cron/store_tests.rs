@@ -612,3 +612,59 @@ fn dedup_named_jobs_ignores_unnamed_jobs() {
     assert_eq!(removed, 0);
     assert_eq!(list_jobs(&config).unwrap().len(), 2);
 }
+
+/// Regression: gating the DDL behind a per-path "already initialized" set
+/// (see [`INITIALIZED_SCHEMAS`]) must not cost the store its self-healing.
+///
+/// Before the gate existed, the DDL ran on every `with_connection` call, so a
+/// database deleted or replaced at runtime (a workspace reset, a manual
+/// deletion, a disk-recovery restore) recovered on the very next call —
+/// `Connection::open` creates a fresh empty file and `CREATE TABLE IF NOT
+/// EXISTS` repopulates it. With a naive cache the set still reports
+/// "initialized" while the file behind it is empty, and every query afterwards
+/// fails `no such table: cron_jobs` until the process restarts. This pins the
+/// verify-on-hit in `ensure_schema_initialized` that restores it.
+#[test]
+fn schema_reinitializes_when_the_database_file_is_deleted_at_runtime() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+
+    // First use populates the per-path cache and creates the schema.
+    add_job(&config, "*/5 * * * *", "echo before-deletion").unwrap();
+    assert_eq!(
+        list_jobs(&config).unwrap().len(),
+        1,
+        "sanity: the job was persisted"
+    );
+
+    // Simulate a workspace reset / manual deletion while the process lives on.
+    let db_path = config.workspace_dir.join("cron").join("jobs.db");
+    assert!(
+        db_path.exists(),
+        "sanity: the cron db exists before deletion"
+    );
+    std::fs::remove_file(&db_path).unwrap();
+    // Defensive: drop any journal sidecars too, so SQLite cannot resurrect
+    // pages from them (cron uses the default rollback journal, not WAL, so
+    // these normally do not exist between calls — removing them is a no-op).
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-journal"));
+
+    // The cache still says this path is initialized. Without the verify-on-hit
+    // this errors with `no such table: cron_jobs`.
+    let after = list_jobs(&config)
+        .expect("a deleted database must be re-initialized, not left wedged at 'no such table'");
+    assert!(
+        after.is_empty(),
+        "the recreated database starts empty — the prior job is genuinely gone"
+    );
+
+    // And the store is fully usable again, not merely readable.
+    let recreated = add_job(&config, "*/5 * * * *", "echo after-deletion").unwrap();
+    assert_eq!(
+        get_job(&config, &recreated.id).unwrap().command,
+        "echo after-deletion"
+    );
+    assert_eq!(list_jobs(&config).unwrap().len(), 1);
+}
