@@ -10,6 +10,9 @@
 //! Mirrors the `cron` domain's `with_connection` + migrate-on-open
 //! pattern.
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -442,28 +445,89 @@ fn sql_conv<E: std::fmt::Display>(err: E) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(anyhow::anyhow!("{err}").into())
 }
 
-fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    let db_path = config.workspace_dir.join("task_sources").join("sources.db");
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to create task_sources directory: {}",
-                parent.display()
-            )
-        })?;
-    }
-    let conn = Connection::open(&db_path)
-        .with_context(|| format!("Failed to open task_sources DB: {}", db_path.display()))?;
-    // Overlapping periodic-poll + UI writes can otherwise hit
-    // "database is locked"; WAL + a busy timeout match the other stores.
-    conn.busy_timeout(Duration::from_secs(5))
-        .context("Failed to configure task_sources DB busy timeout")?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .context("Failed to enable WAL for task_sources DB")?;
+/// Tracks which task_sources database files have already had their schema DDL
+/// (the `CREATE TABLE`/`CREATE INDEX` batch plus the `add_column_if_missing`
+/// migration probes) run against them in this process. `with_connection`
+/// deliberately keeps opening a fresh `rusqlite::Connection` per call —
+/// `Connection` is `!Sync`, so caching a single shared one would need a
+/// process-wide mutex that serializes every caller. What repeats needlessly on
+/// every open is the DDL batch itself (2 `CREATE TABLE` + 1 `CREATE INDEX`) plus
+/// the 2 `PRAGMA table_info(...)` migration scans — paid before every store op,
+/// and the periodic-poll fetch loop hits three of them per task (`is_ingested`,
+/// `get_card_id`, `mark_ingested`). Gating just that batch behind a per-path
+/// "already initialized" set keeps it to one execution per process per database
+/// file while every call still gets its own connection.
+///
+/// This mirrors `flows::store`'s `INITIALIZED_SCHEMAS` (R-m8) and the companion
+/// `cron::store` gating — the `task_sources` store was itself derived from the
+/// `cron` `with_connection` idiom.
+///
+/// Keyed by path rather than a single flag: tests each open an independent
+/// per-`TempDir` workspace within the same test binary, and a bare
+/// `OnceLock<()>` would silently skip schema creation for every database path
+/// after the first test to run in the process.
+static INITIALIZED_SCHEMAS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
+/// Runs the one-time schema DDL + migrations against `conn` unless `db_path`
+/// has already been initialized in this process (see [`INITIALIZED_SCHEMAS`]).
+/// Only marks `db_path` as initialized *after* [`init_schema`] succeeds, so a
+/// transient failure is retried on the next call rather than permanently
+/// wedging the store into believing a schema exists that was never created.
+///
+/// **Trust, but verify.** A cache hit is confirmed against the file actually on
+/// disk before it is honoured. Before this gating existed, the DDL ran on every
+/// `with_connection` call, so a database deleted or replaced at runtime (a
+/// workspace reset, a manual deletion, a disk-recovery restore) self-healed on
+/// the very next call: `Connection::open` silently creates a fresh empty file,
+/// and `CREATE TABLE IF NOT EXISTS` immediately repopulated it. Caching removes
+/// that safety net, so one indexed `sqlite_master` lookup — far cheaper than the
+/// DDL batch + the metadata scans — is paid on each hit to restore the
+/// self-healing rather than trusting a cache entry the filesystem may have
+/// invalidated.
+fn ensure_schema_initialized(conn: &Connection, db_path: &Path) -> Result<()> {
+    use rusqlite::OptionalExtension;
+
+    let initialized = INITIALIZED_SCHEMAS.get_or_init(|| Mutex::new(HashSet::new()));
+    {
+        let guard = initialized
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.contains(db_path) {
+            let schema_present: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_sources'",
+                    [],
+                    |_| Ok(true),
+                )
+                .optional()
+                .context("Failed to probe task_sources schema presence")?
+                .unwrap_or(false);
+            if schema_present {
+                return Ok(());
+            }
+            tracing::warn!(
+                target: "task_sources",
+                db = %db_path.display(),
+                "[task_sources:store] schema cached as initialized but the database has no tables (deleted or replaced at runtime?) — re-running schema init"
+            );
+        }
+    }
+    init_schema(conn)?;
+    let mut guard = initialized
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.insert(db_path.to_path_buf());
+    Ok(())
+}
+
+/// The actual schema DDL + post-hoc column migrations, split out of
+/// `with_connection` so [`ensure_schema_initialized`] can gate it. Does **not**
+/// carry the open-time pragmas (`busy_timeout`, `journal_mode = WAL`,
+/// `foreign_keys = ON`): those are (re)applied on every open in
+/// `with_connection`, outside this gate.
+fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "PRAGMA foreign_keys = ON;
-         CREATE TABLE IF NOT EXISTS task_sources (
+        "CREATE TABLE IF NOT EXISTS task_sources (
             id                  TEXT PRIMARY KEY,
             provider            TEXT NOT NULL,
             connection_id       TEXT,
@@ -495,9 +559,43 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
 
     // Additive migration: add card_id to existing databases that pre-date
     // this column. Tolerate "duplicate column" in case of a concurrent open.
-    add_column_if_missing(&conn, "ingested_tasks", "card_id", "TEXT")?;
+    add_column_if_missing(conn, "ingested_tasks", "card_id", "TEXT")?;
     // G7: static executor routing on a source.
-    add_column_if_missing(&conn, "task_sources", "assigned_executor", "TEXT")?;
+    add_column_if_missing(conn, "task_sources", "assigned_executor", "TEXT")?;
+
+    Ok(())
+}
+
+fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    let db_path = config.workspace_dir.join("task_sources").join("sources.db");
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create task_sources directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+    let conn = Connection::open(&db_path)
+        .with_context(|| format!("Failed to open task_sources DB: {}", db_path.display()))?;
+    // Open-time pragmas, reapplied on every open regardless of the schema-init
+    // cache below (they configure the connection, not the schema). Overlapping
+    // periodic-poll + UI writes can otherwise hit "database is locked"; WAL + a
+    // busy timeout match the other stores, and `foreign_keys` is required on
+    // every connection for the `ingested_tasks` ON DELETE CASCADE FK to be
+    // enforced. `foreign_keys` was moved out of the gated DDL batch to here so
+    // it still runs on every open once the batch stops doing so. (`journal_mode
+    // = WAL` is persisted in the db file and need only run once, but is kept
+    // here with the other open-time pragmas to keep the connection setup
+    // byte-identical; it is idempotent per open.)
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("Failed to configure task_sources DB busy timeout")?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .context("Failed to enable WAL for task_sources DB")?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .context("Failed to set task_sources DB connection pragmas")?;
+
+    ensure_schema_initialized(&conn, &db_path)?;
 
     f(&conn)
 }
