@@ -468,6 +468,13 @@ fn sql_conv<E: std::fmt::Display>(err: E) -> rusqlite::Error {
 /// after the first test to run in the process.
 static INITIALIZED_SCHEMAS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
+/// On-disk schema version stamped into `PRAGMA user_version` by [`init_schema`]
+/// and checked by [`ensure_schema_initialized`] on a cache hit. **Bump this
+/// whenever a table or `add_column_if_missing` migration is added to
+/// [`init_schema`]** so a database replaced at runtime with an older/partial
+/// schema is re-migrated rather than trusted.
+const TASK_SOURCES_SCHEMA_VERSION: i64 = 1;
+
 /// Runs the one-time schema DDL + migrations against `conn` unless `db_path`
 /// has already been initialized in this process (see [`INITIALIZED_SCHEMAS`]).
 /// Only marks `db_path` as initialized *after* [`init_schema`] succeeds, so a
@@ -485,37 +492,38 @@ static INITIALIZED_SCHEMAS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 /// self-healing rather than trusting a cache entry the filesystem may have
 /// invalidated.
 fn ensure_schema_initialized(conn: &Connection, db_path: &Path) -> Result<()> {
-    use rusqlite::OptionalExtension;
-
     let initialized = INITIALIZED_SCHEMAS.get_or_init(|| Mutex::new(HashSet::new()));
-    {
-        let guard = initialized
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.contains(db_path) {
-            let schema_present: bool = conn
-                .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_sources'",
-                    [],
-                    |_| Ok(true),
-                )
-                .optional()
-                .context("Failed to probe task_sources schema presence")?
-                .unwrap_or(false);
-            if schema_present {
-                return Ok(());
-            }
-            tracing::warn!(
-                target: "task_sources",
-                db = %db_path.display(),
-                "[task_sources:store] schema cached as initialized but the database has no tables (deleted or replaced at runtime?) — re-running schema init"
-            );
-        }
-    }
-    init_schema(conn)?;
+    // Hold the guard across the verify *and* `init_schema`, so two first callers
+    // for the same path cannot both observe a miss and both run the DDL
+    // (CodeRabbit: initialization must be atomic per path). On a cache hit the
+    // critical section is a single `PRAGMA user_version` read; on a miss it also
+    // covers the one-time init + insert.
     let mut guard = initialized
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.contains(db_path) {
+        // Trust, but verify — against the *whole* schema, not just one table.
+        // `user_version` is stamped only after a full `init_schema` succeeds, so
+        // a database deleted (fresh file ⇒ version 0) or replaced at runtime
+        // with an older/partial schema — missing `ingested_tasks` or a migrated
+        // column ⇒ a stale version — fails this check and is re-migrated, rather
+        // than being trusted and later failing on the incomplete schema
+        // (CodeRabbit / Codex review on #5709).
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+        if version == TASK_SOURCES_SCHEMA_VERSION {
+            return Ok(());
+        }
+        tracing::warn!(
+            target: "task_sources",
+            db = %db_path.display(),
+            cached_version = version,
+            expected_version = TASK_SOURCES_SCHEMA_VERSION,
+            "[task_sources:store] schema cached as initialized but the database's user_version does not match (deleted or replaced at runtime?) — re-running schema init"
+        );
+    }
+    init_schema(conn)?;
     guard.insert(db_path.to_path_buf());
     Ok(())
 }
@@ -562,6 +570,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "ingested_tasks", "card_id", "TEXT")?;
     // G7: static executor routing on a source.
     add_column_if_missing(conn, "task_sources", "assigned_executor", "TEXT")?;
+
+    // Stamp the schema version last, so [`ensure_schema_initialized`] only
+    // trusts a cache hit whose on-disk schema is fully migrated. Bump
+    // TASK_SOURCES_SCHEMA_VERSION whenever a table or migration is added above.
+    conn.pragma_update(None, "user_version", TASK_SOURCES_SCHEMA_VERSION)
+        .context("Failed to stamp task_sources schema version")?;
 
     Ok(())
 }
