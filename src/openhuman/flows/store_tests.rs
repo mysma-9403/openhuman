@@ -1453,3 +1453,58 @@ fn schema_reinitializes_when_the_database_file_is_deleted_at_runtime() {
     let (flows_final, _) = list_flows(&config).unwrap();
     assert_eq!(flows_final.len(), 1);
 }
+
+/// Regression: a cache hit must be validated against the *whole* schema, not
+/// just the presence of one table. A database replaced at runtime with an
+/// older/partial schema — `flow_definitions` present but a migrated column
+/// dropped — must be re-migrated, not trusted and then failed on the incomplete
+/// schema. The `PRAGMA user_version` check (which supersedes the prior
+/// single-table `sqlite_master` probe) is what catches it.
+#[test]
+fn older_on_disk_schema_under_a_cached_path_is_remigrated() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+
+    // First use creates the full (versioned) schema and caches the path.
+    let flow = create_flow(&config, "v1".to_string(), trigger_graph(), false, true).unwrap();
+
+    // Simulate a workspace restore of an OLDER database swapped in under the
+    // same (already-cached) path: drop a migrated column and clear the version
+    // stamp, exactly as a pre-migration database would look on disk.
+    let db_path = config.workspace_dir.join("flows").join("flows.db");
+    {
+        let raw = rusqlite::Connection::open(&db_path).unwrap();
+        raw.execute_batch(
+            "ALTER TABLE flow_definitions DROP COLUMN require_approval;
+             PRAGMA user_version = 0;",
+        )
+        .unwrap();
+    }
+
+    // The path is still cached. With a single-table `sqlite_master` probe this
+    // would be trusted and `list_flows` / `get_flow` (which select
+    // `require_approval`) would fail with `no such column`. The version check
+    // detects the drift and re-migrates instead.
+    let (listed, _skipped) = list_flows(&config)
+        .expect("an older on-disk schema under a cached path must be re-migrated, not trusted");
+    assert_eq!(
+        listed.len(),
+        1,
+        "the pre-existing row survives DROP COLUMN and the schema is repaired"
+    );
+    assert_eq!(listed[0].id, flow.id);
+    // The migrated column is back (re-added with its `DEFAULT 0` ⇒ false).
+    assert!(
+        !get_flow(&config, &flow.id)
+            .unwrap()
+            .expect("flow present")
+            .require_approval
+    );
+
+    // And the store is fully usable again.
+    let recreated = create_flow(&config, "v2".to_string(), trigger_graph(), false, true).unwrap();
+    assert_eq!(
+        get_flow(&config, &recreated.id).unwrap().unwrap().id,
+        recreated.id
+    );
+}

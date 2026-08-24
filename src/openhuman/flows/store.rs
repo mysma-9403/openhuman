@@ -47,6 +47,13 @@ use uuid::Uuid;
 /// after the first test to run in the process.
 static INITIALIZED_SCHEMAS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
+/// On-disk schema version stamped into `PRAGMA user_version` by [`init_schema`]
+/// and checked by [`ensure_schema_initialized`] on a cache hit. **Bump this
+/// whenever a table or `add_column_if_missing` migration is added to
+/// [`init_schema`]** so a database replaced at runtime with an older/partial
+/// schema is re-migrated rather than trusted.
+const FLOWS_SCHEMA_VERSION: i64 = 1;
+
 /// Runs the one-time schema DDL + migrations against `conn` unless `db_path`
 /// has already been initialized in this process (see [`INITIALIZED_SCHEMAS`]).
 /// Only marks `db_path` as initialized *after* [`init_schema`] succeeds, so a
@@ -61,42 +68,47 @@ static INITIALIZED_SCHEMAS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 /// the very next call: `Connection::open` silently creates a fresh empty file,
 /// and `CREATE TABLE IF NOT EXISTS` immediately repopulated it. Caching removes
 /// that safety net: the set still says "initialized" while the file behind it is
-/// empty, so every subsequent query fails with `no such table` until the process
-/// restarts. One indexed `sqlite_master` lookup is far cheaper than the ~11
-/// statement DDL batch and restores the self-healing, so it is paid on each hit
-/// rather than trusting a cache entry that the filesystem may have invalidated.
+/// empty (or an older/partial schema), so subsequent queries fail with `no such
+/// table`/`no such column` until the process restarts. A single `PRAGMA
+/// user_version` read — stamped only after a full [`init_schema`] succeeds —
+/// confirms the on-disk schema is fully migrated far more cheaply than the DDL
+/// batch and restores the self-healing for *both* a missing table and a drifted
+/// column, rather than trusting a cache entry the filesystem may have
+/// invalidated. (This validates the whole schema, not just one table's
+/// presence, which the prior `sqlite_master` probe could not.)
 fn ensure_schema_initialized(conn: &Connection, db_path: &Path) -> Result<()> {
-    use rusqlite::OptionalExtension;
-
     let initialized = INITIALIZED_SCHEMAS.get_or_init(|| Mutex::new(HashSet::new()));
-    {
-        let guard = initialized
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.contains(db_path) {
-            let schema_present: bool = conn
-                .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'flow_definitions'",
-                    [],
-                    |_| Ok(true),
-                )
-                .optional()
-                .context("Failed to probe flows schema presence")?
-                .unwrap_or(false);
-            if schema_present {
-                return Ok(());
-            }
-            tracing::warn!(
-                target: "flows",
-                db = %db_path.display(),
-                "[flows] schema cached as initialized but the database has no tables (deleted or replaced at runtime?) — re-running schema init"
-            );
-        }
-    }
-    init_schema(conn)?;
+    // Hold the guard across the verify *and* `init_schema`, so two first callers
+    // for the same path cannot both observe a miss and both run the DDL
+    // (initialization must be atomic per path). On a cache hit the critical
+    // section is a single `PRAGMA user_version` read; on a miss it also covers
+    // the one-time init + insert.
     let mut guard = initialized
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.contains(db_path) {
+        // Trust, but verify — against the *whole* schema, not just one table.
+        // `user_version` is stamped only after a full `init_schema` succeeds, so
+        // a database deleted (fresh file ⇒ version 0) or replaced at runtime
+        // with an older/partial schema — `flow_definitions` present but missing
+        // a migrated column (`require_approval` / `graph_hash`) or one of the
+        // other tables ⇒ a stale version — fails this check and is re-migrated,
+        // rather than being trusted and later failing on the incomplete schema.
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+        if version == FLOWS_SCHEMA_VERSION {
+            return Ok(());
+        }
+        tracing::warn!(
+            target: "flows",
+            db = %db_path.display(),
+            cached_version = version,
+            expected_version = FLOWS_SCHEMA_VERSION,
+            "[flows] schema cached as initialized but the database's user_version does not match (deleted or replaced at runtime?) — re-running schema init"
+        );
+    }
+    init_schema(conn)?;
     guard.insert(db_path.to_path_buf());
     Ok(())
 }
@@ -192,6 +204,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // a hard refusal, so upgrading mid-park cannot strand an in-flight
     // approval.
     add_column_if_missing(conn, "flow_runs", "graph_hash", "TEXT")?;
+
+    // Stamp the schema version last, so [`ensure_schema_initialized`] only
+    // trusts a cache hit whose on-disk schema is fully migrated. Bump
+    // FLOWS_SCHEMA_VERSION whenever a table or `add_column_if_missing` migration
+    // is added above.
+    conn.pragma_update(None, "user_version", FLOWS_SCHEMA_VERSION)
+        .context("Failed to stamp flows schema version")?;
 
     Ok(())
 }
