@@ -23,16 +23,29 @@
 //! 1. **Consent.** [`keyring_consent::policy::check_secret_access`] must return
 //!    [`PolicyDecision::Proceed`]. A prompt that has not been answered is not a
 //!    missing credential, and conflating the two would train an operator to
-//!    "fix" a pending consent dialog by editing config.
+//!    "fix" a pending consent dialog by editing config. An *unanswered* prompt
+//!    and a *declined* one are also reported apart
+//!    ([`CredentialRefError::ConsentPending`] vs
+//!    [`CredentialRefError::ConsentDenied`]): telling an operator who already
+//!    said no to wait for a dialog describes a state that will never arrive.
 //! 2. **Availability.** A host with no usable keychain backend reports that as
 //!    itself rather than as a missing entry — the same order
 //!    `web3::wallet`'s `keychain_load_mnemonic` uses.
 //! 3. **Absence.** Only then is a `None` from the keychain a genuine
 //!    "not configured".
 //!
+//! The order is enforced structurally, not by convention: [`preflight`] takes
+//! availability as a **closure**, so a refused consent decision returns before
+//! the probe can run. That matters because the probe is a real backend
+//! round-trip on its first call (`keyring::ops`' availability cache starts
+//! empty) — evaluating it eagerly would touch the keychain on exactly the paths
+//! this gate exists to stop.
+//!
 //! ## Nothing here may reach an operator-facing string
 //!
-//! [`CredentialRefError`] carries **no name and no secret**, and
+//! [`CredentialRefError`] carries **no name and no secret** — not the entry
+//! name, and not the scheme half either, which is operator-typed text rather
+//! than fixed vocabulary (`sk-abc:123` parses as the scheme `sk-abc`). And
 //! [`CredentialRef`]'s `Debug` redacts the name. That is load-bearing rather
 //! than decorative: `MemoryDriverConfig`'s own doc requires the credential
 //! reference to stay out of `Debug`/error output (plan-memory.md §7, Tier 3),
@@ -40,11 +53,19 @@
 //! `subsystems_status` — pinned by
 //! `fallback_reason_never_contains_credential_ref_or_endpoint`.
 //!
-//! The sharp edge is [`KeyringError`], whose own `Display` interpolates the
-//! key: `"OS keychain error for key '{key}': {source}"`. Propagating one
-//! verbatim into a bind failure would leak the very name this module exists to
-//! keep out of that string, so backend failures are deliberately mapped to a
-//! name-free variant and the detail is logged instead.
+//! The sharp edge is [`KeyringError`](keyring::KeyringError), whose own
+//! `Display` interpolates the key (`"OS keychain error for key '{key}':
+//! {source}"`) — and so does its `diagnostic()`, which is `{self:?}`.
+//! Propagating or logging one verbatim would leak the very name this module
+//! exists to keep out of that string, so backend failures are mapped to a
+//! name-free variant and logged through [`keyring_error_kind`], which yields a
+//! fixed label and nothing else.
+//!
+//! **Scope of that promise.** It covers this module's errors and this module's
+//! logs. `keyring::get` itself logs its `key=` argument at `debug`, as the
+//! whole keyring surface has always done for its fixed-name callers; narrowing
+//! that is a shared-kernel decision affecting every subsystem in kernel.md §5,
+//! not something to settle here.
 
 use zeroize::Zeroizing;
 
@@ -78,22 +99,30 @@ pub enum CredentialRefError {
 
     /// The scheme is not one this build understands.
     ///
-    /// The scheme itself is a fixed vocabulary word, not user data, so it is
-    /// safe to name; the entry name after it is not and is never included.
-    #[error("credential_ref scheme '{scheme}' is not supported (expected \"{KEYCHAIN_SCHEME}\")")]
-    UnsupportedScheme {
-        /// The offending scheme, lowercased.
-        scheme: String,
-    },
+    /// The offending scheme is deliberately **not** carried. It is whatever
+    /// text precedes the first colon in a hand-edited `config.toml`, so a
+    /// mistake such as pasting a raw secret (`sk-abc:123`) would otherwise put
+    /// its first fragment into an operator-facing string. With exactly one
+    /// scheme defined, naming the expected value is the actionable half.
+    #[error("credential_ref scheme is not supported (expected \"{KEYCHAIN_SCHEME}:<name>\")")]
+    UnsupportedScheme,
 
     /// The scheme was valid but the name after it was empty.
     #[error("credential_ref has an empty name after \"{KEYCHAIN_SCHEME}:\"")]
     EmptyName,
 
     /// Keychain access is gated behind a consent prompt that has not been
-    /// answered. Distinct from [`Self::Unavailable`] on purpose.
+    /// answered. Distinct from [`Self::Unavailable`] on purpose, and from
+    /// [`Self::ConsentDenied`]: this one resolves itself once the operator
+    /// answers.
     #[error("keychain access is pending user consent")]
     ConsentPending,
+
+    /// The operator declined keychain access. Distinct from
+    /// [`Self::ConsentPending`] because there is no dialog left to answer —
+    /// reporting it as "pending" describes a state that will never arrive.
+    #[error("keychain access was declined by the user")]
+    ConsentDenied,
 
     /// No usable keychain backend on this host.
     #[error("no keychain backend is available on this host")]
@@ -112,23 +141,63 @@ pub enum CredentialRefError {
 /// The two gates that run *before* the keychain is touched, as a pure
 /// function of what they observed.
 ///
-/// Split out for the same reason `memory::binding::admit` is pure: the rule
-/// worth pinning is the **order** — a pending consent prompt must be reported
-/// as consent, not as an unavailable backend, and neither may be reported as a
-/// missing entry. That ordering is what stops an operator "fixing" an
-/// unanswered dialog by editing `config.toml`, and it is testable here without
-/// a keychain, a consent store, or a booted core.
+/// Split out for the same reason `memory::binding::admit` is: the rule worth
+/// pinning is the **order** — a consent refusal must be reported as consent,
+/// not as an unavailable backend, and neither may be reported as a missing
+/// entry. That ordering is what stops an operator "fixing" an unanswered dialog
+/// by editing `config.toml`, and it is testable here without a keychain, a
+/// consent store, or a booted core.
+///
+/// `keychain_available` is a **closure, not a `bool`**, so the order is a
+/// property of the code rather than of the call site. Passing the probe's
+/// result would evaluate it before this function is entered, and
+/// `keyring::is_available`'s first call is a real backend round-trip — the
+/// keychain would be touched on precisely the paths consent just refused.
+///
+/// The decision is matched exhaustively rather than compared against
+/// `Proceed`, so a variant added to [`PolicyDecision`] upstream becomes a
+/// compile error here instead of being silently folded into "pending".
 ///
 /// Returns `None` when the caller may proceed to the lookup.
 #[must_use]
-pub fn preflight(decision: PolicyDecision, keychain_available: bool) -> Option<CredentialRefError> {
-    if decision != PolicyDecision::Proceed {
-        return Some(CredentialRefError::ConsentPending);
+pub fn preflight(
+    decision: PolicyDecision,
+    keychain_available: impl FnOnce() -> bool,
+) -> Option<CredentialRefError> {
+    match decision {
+        PolicyDecision::ConsentRequired => return Some(CredentialRefError::ConsentPending),
+        PolicyDecision::Declined => return Some(CredentialRefError::ConsentDenied),
+        PolicyDecision::Proceed => {}
     }
-    if !keychain_available {
+    if !keychain_available() {
         return Some(CredentialRefError::Unavailable);
     }
     None
+}
+
+/// A fixed, name-free label for a [`KeyringError`](keyring::KeyringError).
+///
+/// Both that type's `Display` and its `diagnostic()` interpolate the key, so
+/// neither may be logged from a path whose key is a credential reference. This
+/// keeps the failure classified — which is the part worth having in a log —
+/// while carrying nothing operator-typed.
+///
+/// The match is exhaustive so an upstream variant is a compile error here
+/// rather than a silent fall-through to a wrong label. The five folded into
+/// `"backend"` cannot arise from a `get`: they belong to `set`, migration and
+/// random generation.
+fn keyring_error_kind(e: &keyring::KeyringError) -> &'static str {
+    use keyring::KeyringError as E;
+    match e {
+        E::Os { .. } => "os-backend",
+        E::InvalidUtf8 { .. } => "invalid-utf8",
+        E::Crypto(_) => "crypto",
+        E::VerifyFailed { .. }
+        | E::RandomGeneration(_)
+        | E::Backend(_)
+        | E::MigrationReadFailed { .. }
+        | E::MigrationDeleteFailed { .. } => "backend",
+    }
 }
 
 /// The scheme half of a parsed reference.
@@ -185,7 +254,8 @@ impl CredentialRef {
     ///
     /// [`CredentialRefError::Empty`], [`CredentialRefError::MissingScheme`],
     /// [`CredentialRefError::UnsupportedScheme`] or
-    /// [`CredentialRefError::EmptyName`]. None of them carry the name.
+    /// [`CredentialRefError::EmptyName`]. None of them carry any part of the
+    /// input — neither the name nor the scheme.
     pub fn parse(raw: &str) -> Result<Self, CredentialRefError> {
         let raw = raw.trim();
         if raw.is_empty() {
@@ -198,13 +268,13 @@ impl CredentialRef {
             return Err(CredentialRefError::MissingScheme);
         };
 
-        let scheme_norm = scheme_raw.trim().to_ascii_lowercase();
-        let scheme = if scheme_norm == KEYCHAIN_SCHEME {
+        // `eq_ignore_ascii_case` rather than lowercasing into a `String`: the
+        // normalised scheme is never carried anywhere now, so materialising it
+        // would only produce a value that must not be allowed to escape.
+        let scheme = if scheme_raw.trim().eq_ignore_ascii_case(KEYCHAIN_SCHEME) {
             CredentialRefScheme::Keychain
         } else {
-            return Err(CredentialRefError::UnsupportedScheme {
-                scheme: scheme_norm,
-            });
+            return Err(CredentialRefError::UnsupportedScheme);
         };
 
         let name = name_raw.trim();
@@ -245,9 +315,11 @@ impl CredentialRef {
     ///
     /// # Errors
     ///
-    /// [`CredentialRefError::ConsentPending`], [`CredentialRefError::Unavailable`],
-    /// [`CredentialRefError::NotFound`] or [`CredentialRefError::Backend`], in
-    /// that order of checking. No variant carries the name or the secret.
+    /// [`CredentialRefError::ConsentPending`],
+    /// [`CredentialRefError::ConsentDenied`],
+    /// [`CredentialRefError::Unavailable`], [`CredentialRefError::NotFound`] or
+    /// [`CredentialRefError::Backend`], in that order of checking. No variant
+    /// carries the name or the secret.
     pub fn resolve(&self, user_id: &str) -> Result<Zeroizing<String>, CredentialRefError> {
         match self.scheme {
             CredentialRefScheme::Keychain => self.resolve_keychain(user_id),
@@ -255,11 +327,13 @@ impl CredentialRef {
     }
 
     fn resolve_keychain(&self, user_id: &str) -> Result<Zeroizing<String>, CredentialRefError> {
-        if let Some(refusal) = preflight(policy::check_secret_access(), keyring::is_available()) {
+        // `keyring::is_available` is passed unevaluated: a consent refusal must
+        // return before the availability probe, whose first call is a real
+        // backend round-trip. See `preflight`.
+        if let Some(refusal) = preflight(policy::check_secret_access(), keyring::is_available) {
             log::debug!(
                 "{LOG_PREFIX} keychain access refused before lookup user_id={user_id} \
-                 refusal={refusal} backend={}",
-                keyring::backend_name()
+                 refusal={refusal}"
             );
             return Err(refusal);
         }
@@ -273,11 +347,16 @@ impl CredentialRef {
                 log::debug!("{LOG_PREFIX} no keychain entry for credential_ref user_id={user_id}");
                 Err(CredentialRefError::NotFound)
             }
-            // Logged, not propagated: `KeyringError`'s Display interpolates the
-            // key, and this error's Display is allowed into operator-facing
-            // strings. See the module docs.
+            // Classified, never rendered: `KeyringError`'s `Display` — and its
+            // `diagnostic()`, which is `{self:?}` — both interpolate the key.
+            // Formatting either here would write the credential name to a
+            // retained warn-level log, which is the leak this module's
+            // redaction exists to prevent. See the module docs.
             Err(e) => {
-                log::warn!("{LOG_PREFIX} keychain lookup failed user_id={user_id}: {e}");
+                log::warn!(
+                    "{LOG_PREFIX} keychain lookup failed user_id={user_id} kind={}",
+                    keyring_error_kind(&e)
+                );
                 Err(CredentialRefError::Backend)
             }
         }
