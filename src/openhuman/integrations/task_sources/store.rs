@@ -475,54 +475,77 @@ static INITIALIZED_SCHEMAS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 /// schema is re-migrated rather than trusted.
 const TASK_SOURCES_SCHEMA_VERSION: i64 = 1;
 
-/// Runs the one-time schema DDL + migrations against `conn` unless `db_path`
-/// has already been initialized in this process (see [`INITIALIZED_SCHEMAS`]).
-/// Only marks `db_path` as initialized *after* [`init_schema`] succeeds, so a
-/// transient failure is retried on the next call rather than permanently
-/// wedging the store into believing a schema exists that was never created.
+/// Ensures the schema on `conn` (a connection to `db_path`) is present and fully
+/// migrated, running the DDL + migrations at most once per process per path.
 ///
-/// **Trust, but verify.** A cache hit is confirmed against the file actually on
-/// disk before it is honoured. Before this gating existed, the DDL ran on every
+/// **The on-disk `PRAGMA user_version` is the authority, and the fast path is
+/// lock-free.** [`init_schema`] stamps [`TASK_SOURCES_SCHEMA_VERSION`] only after
+/// a full, successful migration, so a connection whose `user_version` already
+/// matches is known-good and returns without touching any process-global state —
+/// the common case (an already-initialized store) never acquires the
+/// initialization mutex. Reading `user_version` is a single database-header read,
+/// far cheaper than the DDL batch + metadata scans it replaces.
+///
+/// **Initialization is serialized and atomic per process.** Only a version
+/// *mismatch* takes the [`INITIALIZED_SCHEMAS`] lock, and `user_version` is
+/// re-read under it, so two first callers racing on the same fresh path run the
+/// DDL exactly once — the loser observes the winner's stamp on the recheck and
+/// returns (CodeRabbit: initialization must be atomic per path). Independent db
+/// paths contend only during that rare init window, never on the hot path.
+///
+/// **Trust, but verify.** Before this gating existed the DDL ran on every
 /// `with_connection` call, so a database deleted or replaced at runtime (a
 /// workspace reset, a manual deletion, a disk-recovery restore) self-healed on
-/// the very next call: `Connection::open` silently creates a fresh empty file,
-/// and `CREATE TABLE IF NOT EXISTS` immediately repopulated it. Caching removes
-/// that safety net, so one indexed `sqlite_master` lookup — far cheaper than the
-/// DDL batch + the metadata scans — is paid on each hit to restore the
-/// self-healing rather than trusting a cache entry the filesystem may have
-/// invalidated.
+/// the next call. The version gate restores that: a stale/zero `user_version` —
+/// a fresh file, or an older/partial schema swapped in under a live process
+/// (missing `ingested_tasks` or a migrated column such as
+/// `card_id`/`assigned_executor`) — falls through to the idempotent
+/// [`init_schema`] and is re-migrated rather than trusted and later failing on
+/// the incomplete schema (CodeRabbit / Codex review on #5709).
+///
+/// [`INITIALIZED_SCHEMAS`] no longer gates the DDL — the on-disk version does —
+/// and is kept purely as a **diagnostic marker**: a path present in the set
+/// whose on-disk version no longer matches was initialized by *this* process and
+/// has since been deleted or replaced, which is worth a warning; a path absent
+/// from the set is an ordinary first-ever init and stays silent.
 fn ensure_schema_initialized(conn: &Connection, db_path: &Path) -> Result<()> {
+    let is_current = || -> bool {
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap_or(0)
+            == TASK_SOURCES_SCHEMA_VERSION
+    };
+
+    // Lock-free fast path: an already-migrated database carries
+    // TASK_SOURCES_SCHEMA_VERSION in its header, so the common case never
+    // acquires the process-global initialization mutex.
+    if is_current() {
+        return Ok(());
+    }
+
+    // Mismatch ⇒ (re-)initialization is required. Serialize it so two first
+    // callers for the same path cannot both run the DDL, and re-read the version
+    // under the lock — another thread may have migrated between the lock-free
+    // read above and acquiring the guard.
     let initialized = INITIALIZED_SCHEMAS.get_or_init(|| Mutex::new(HashSet::new()));
-    // Hold the guard across the verify *and* `init_schema`, so two first callers
-    // for the same path cannot both observe a miss and both run the DDL
-    // (CodeRabbit: initialization must be atomic per path). On a cache hit the
-    // critical section is a single `PRAGMA user_version` read; on a miss it also
-    // covers the one-time init + insert.
     let mut guard = initialized
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if is_current() {
+        return Ok(());
+    }
+
+    // Diagnostic only (see the doc comment): a cached path whose on-disk schema
+    // no longer matches was deleted or replaced under a live process — a
+    // first-ever init leaves the path absent and stays silent.
     if guard.contains(db_path) {
-        // Trust, but verify — against the *whole* schema, not just one table.
-        // `user_version` is stamped only after a full `init_schema` succeeds, so
-        // a database deleted (fresh file ⇒ version 0) or replaced at runtime
-        // with an older/partial schema — missing `ingested_tasks` or a migrated
-        // column ⇒ a stale version — fails this check and is re-migrated, rather
-        // than being trusted and later failing on the incomplete schema
-        // (CodeRabbit / Codex review on #5709).
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap_or(0);
-        if version == TASK_SOURCES_SCHEMA_VERSION {
-            return Ok(());
-        }
         tracing::warn!(
             target: "task_sources",
             db = %db_path.display(),
-            cached_version = version,
             expected_version = TASK_SOURCES_SCHEMA_VERSION,
-            "[task_sources:store] schema cached as initialized but the database's user_version does not match (deleted or replaced at runtime?) — re-running schema init"
+            "[task_sources:store] a database this process already initialized no longer matches the expected schema version (deleted or replaced at runtime?) — re-running schema init"
         );
     }
+
     init_schema(conn)?;
     guard.insert(db_path.to_path_buf());
     Ok(())
