@@ -22,8 +22,8 @@
 //!   subagent spans carry lifecycle/timing and child tool/model structure but
 //!   empty delegated prompt/final output until a richer journal event exists.
 
-use tinyagents::harness::events::AgentEvent;
-use tinyagents::harness::observability::AgentObservation;
+use tinyagents_harness::events::AgentEvent;
+use tinyagents_harness::observability::AgentObservation;
 
 use super::{SpanCollector, TraceContext, TraceSpan};
 use crate::openhuman::agent::progress::AgentProgress;

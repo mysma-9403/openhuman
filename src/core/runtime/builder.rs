@@ -61,8 +61,6 @@ pub struct ServiceSet {
     pub integrations: bool,
     /// Workspace memory-source periodic sync — repos, folders, RSS, web pages.
     pub memory_sync: bool,
-    /// Orchestration relay-mailbox drain supervisor.
-    pub orchestration: bool,
 }
 
 impl ServiceSet {
@@ -81,7 +79,6 @@ impl ServiceSet {
             mcp_boot: true,
             integrations: true,
             memory_sync: true,
-            orchestration: true,
         }
     }
 
@@ -101,7 +98,6 @@ impl ServiceSet {
             mcp_boot: false,
             integrations: false,
             memory_sync: false,
-            orchestration: false,
         }
     }
 
@@ -121,7 +117,6 @@ impl ServiceSet {
             mcp_boot: false,
             integrations: false,
             memory_sync: false,
-            orchestration: false,
         }
     }
 
@@ -151,7 +146,6 @@ impl ServiceSet {
             mcp_boot: false,
             integrations: false,
             memory_sync: true,
-            orchestration: false,
         }
     }
 }
@@ -190,8 +184,6 @@ pub struct DomainSet {
     pub skills: bool,
     /// MCP client subsystem (Smithery registry, local servers, audit).
     pub mcp: bool,
-    /// Google Meet join, agent meetings, live meet-agent loop.
-    pub meet: bool,
     /// Messaging channels + webview bridges (web channel, whatsapp data, …).
     pub channels: bool,
     /// Wallet, high-level web3 surface, x402 machine payments.
@@ -220,8 +212,6 @@ pub struct DomainSet {
     pub desktop: bool,
     /// Clients of the hosted TinyHumans backend.
     pub hosted: bool,
-    /// The multi-agent relay surface (tinyplace).
-    pub relay: bool,
     /// Loadable native modules: the module host, registry and `modules` RPC.
     pub modules: bool,
     /// Everything not in a named family — always on in `full()`.
@@ -241,7 +231,6 @@ impl DomainSet {
             flows: true,
             skills: true,
             mcp: true,
-            meet: true,
             channels: true,
             web3: true,
             voice: true,
@@ -253,7 +242,6 @@ impl DomainSet {
             runtimes: true,
             desktop: true,
             hosted: true,
-            relay: true,
             modules: true,
             platform: true,
         }
@@ -272,7 +260,6 @@ impl DomainSet {
             flows: false,
             skills: false,
             mcp: false,
-            meet: false,
             channels: false,
             web3: false,
             voice: false,
@@ -284,7 +271,6 @@ impl DomainSet {
             runtimes: false,
             desktop: false,
             hosted: false,
-            relay: false,
             modules: false,
             platform: false,
         }
@@ -309,7 +295,7 @@ impl DomainSet {
     /// `ctx.domains().flows` rather than a `ServiceSet` flag.
     ///
     /// An embedded host supplies its own harness wrappers, networking and
-    /// routing, so `meet` / `web3` / `voice` / `media` / `mcp` stay off.
+    /// routing, so `web3` / `voice` / `media` / `mcp` stay off.
     pub fn embedded() -> Self {
         Self {
             agent: true,
@@ -320,7 +306,6 @@ impl DomainSet {
             flows: true,
             skills: true,
             mcp: false,
-            meet: false,
             channels: true,
             web3: false,
             voice: false,
@@ -332,7 +317,6 @@ impl DomainSet {
             runtimes: true,
             desktop: false,
             hosted: false,
-            relay: false,
             modules: false,
             platform: true,
         }
@@ -357,7 +341,6 @@ impl DomainSet {
             flows: false,
             skills: false,
             mcp: false,
-            meet: false,
             channels: false,
             web3: false,
             voice: false,
@@ -369,7 +352,6 @@ impl DomainSet {
             runtimes: false,
             desktop: false,
             hosted: false,
-            relay: false,
             modules: false,
             platform: false,
         }
@@ -386,7 +368,6 @@ impl DomainSet {
             flows: false,
             skills: false,
             mcp: false,
-            meet: false,
             channels: false,
             web3: false,
             voice: false,
@@ -398,7 +379,6 @@ impl DomainSet {
             runtimes: false,
             desktop: false,
             hosted: false,
-            relay: false,
             modules: false,
             platform: false,
         }
@@ -415,7 +395,6 @@ impl DomainSet {
             DomainGroup::Flows => self.flows,
             DomainGroup::Skills => self.skills,
             DomainGroup::Mcp => self.mcp,
-            DomainGroup::Meet => self.meet,
             DomainGroup::Channels => self.channels,
             DomainGroup::Web3 => self.web3,
             DomainGroup::Voice => self.voice,
@@ -427,7 +406,6 @@ impl DomainSet {
             DomainGroup::Runtimes => self.runtimes,
             DomainGroup::Desktop => self.desktop,
             DomainGroup::Hosted => self.hosted,
-            DomainGroup::Relay => self.relay,
             DomainGroup::Modules => self.modules,
             DomainGroup::Platform => self.platform,
         }
@@ -454,8 +432,10 @@ pub struct CoreBuilder {
     token: TokenSource,
     services: ServiceSet,
     domains: DomainSet,
+    tool_groups: crate::openhuman::tools::toolpacks::ToolGroups,
     host: Option<String>,
     port: Option<u16>,
+    config: Option<crate::openhuman::config::Config>,
 }
 
 impl CoreBuilder {
@@ -467,8 +447,10 @@ impl CoreBuilder {
             token: TokenSource::EnvOrFile,
             services: ServiceSet::desktop(),
             domains: DomainSet::full(),
+            tool_groups: Default::default(),
             host: None,
             port: None,
+            config: None,
         }
     }
 
@@ -483,6 +465,37 @@ impl CoreBuilder {
     /// domain family while retaining transport built-ins and core infrastructure.
     pub fn domains(mut self, domains: DomainSet) -> Self {
         self.domains = domains;
+        self
+    }
+
+    /// Choose how each tool group reaches the model (default: every group
+    /// withheld behind `load_skill` / `use_skill`, the desktop app's shape).
+    ///
+    /// The third narrowing axis, independent of both `services` and `domains`:
+    /// `ServiceSet` picks the background services, `DomainSet` picks which
+    /// families exist, and this picks how the tools of the families that do
+    /// exist are disclosed — advertised on the wire, withheld behind the pack
+    /// proxy, or not registered at all.
+    ///
+    /// ```no_run
+    /// # use openhuman_core::core::runtime::CoreBuilder;
+    /// # use openhuman_core::openhuman::tools::toolpacks::{GroupMode, ToolGroups};
+    /// # fn f(b: CoreBuilder) -> CoreBuilder {
+    /// b.tool_groups(
+    ///     ToolGroups::none()
+    ///         .with("documents", GroupMode::Advertised)
+    ///         .with("workflows", GroupMode::Withheld),
+    /// )
+    /// # }
+    /// ```
+    ///
+    /// Narrowing only: a group set to `Advertised` whose tools are compiled
+    /// out, or whose `DomainGroup` is off under `domains`, stays absent.
+    pub fn tool_groups(
+        mut self,
+        tool_groups: crate::openhuman::tools::toolpacks::ToolGroups,
+    ) -> Self {
+        self.tool_groups = tool_groups;
         self
     }
 
@@ -504,6 +517,75 @@ impl CoreBuilder {
         self
     }
 
+    /// Supply the [`Config`](crate::openhuman::config::Config) outright instead
+    /// of letting `build()` discover one from `config.toml` and the environment.
+    ///
+    /// Without this an embedder can only configure the core by setting
+    /// environment variables before `build()` — process-global, order-dependent
+    /// relative to a call it does not appear in, and silently wrong if a later
+    /// caller in the same process wants different values. With it, every knob
+    /// the core reads from config (workspace, action dir, autonomy tier, MCP
+    /// servers, provider routes) is an ordinary struct field.
+    ///
+    /// The config is used **verbatim**: no `config.toml` read and no env
+    /// overlay. Call
+    /// [`apply_env_overrides`](crate::openhuman::config::Config::apply_env_overrides)
+    /// yourself first if you want the environment to participate.
+    pub fn config(mut self, config: crate::openhuman::config::Config) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Root the core's state at `dir` — sessions, memory, attachments, skills.
+    ///
+    /// Sugar over [`config`](Self::config) for the common case of "same
+    /// configuration, different workspace"; starts from the config already
+    /// supplied, or [`Config::default`](Default::default) when none is.
+    pub fn workspace(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        let dir = dir.into();
+        let mut config = self.config.take().unwrap_or_default();
+        config.workspace_dir = dir.clone();
+        // Credential profiles and the file-backed keyring resolve from
+        // `config_path`'s parent, not from `workspace_dir`. Rooting only the
+        // workspace while leaving the default config path would keep sessions
+        // and credentials in the previous config root even though this method
+        // documents `dir` as rooting "core state" — so set a deterministic
+        // config path beside the workspace, mirroring the harness's `Dir`
+        // layout (`<root>/config.toml` next to `<root>/workspace`).
+        config.config_path = dir.join("config.toml");
+        self.config = Some(config);
+        self
+    }
+
+    /// Set the agent's read/write root for acting tools (`action_dir`).
+    ///
+    /// Sugar over [`config`](Self::config), like [`workspace`](Self::workspace).
+    /// Distinct from the workspace on purpose: the workspace holds internal
+    /// state the agent must never write to, and `is_workspace_internal_path`
+    /// enforces that separation fail-closed.
+    pub fn action_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        let mut config = self.config.take().unwrap_or_default();
+        config.action_dir = dir.into();
+        self.config = Some(config);
+        self
+    }
+
+    /// Point the core's backend calls at `url` (`Config::api_url`).
+    ///
+    /// Sugar over [`config`](Self::config), like [`workspace`](Self::workspace).
+    /// Worth having as its own method because the value reaches more than the
+    /// obvious client: `/auth/me` session validation, the hosted-backend
+    /// surfaces, and — with no `OPENHUMAN_MEDULLA_BASE_URL` override — the
+    /// Medulla client all resolve through it. A host that sets only one of
+    /// those has the other two pointing at a different deployment, which fails
+    /// as "backend rejected session token" rather than as a mismatch.
+    pub fn backend_url(mut self, url: impl Into<String>) -> Self {
+        let mut config = self.config.take().unwrap_or_default();
+        config.api_url = Some(url.into());
+        self.config = Some(config);
+        self
+    }
+
     /// Initialize the core: register controllers, load the master key, seed the
     /// RPC bearer, initialize workspace-bound stores, and run
     /// [`bootstrap_core_runtime`]. Binds no port and starts no transport.
@@ -511,8 +593,14 @@ impl CoreBuilder {
     /// The init sequence itself is owned by [`CoreContext::init`] (Phase 2,
     /// Stage A).
     pub async fn build(self) -> anyhow::Result<CoreRuntime> {
-        let (ctx, has_operator_token, config) =
-            CoreContext::init(self.host_kind, &self.token, self.domains).await?;
+        let (ctx, has_operator_token, config) = CoreContext::init_with_config(
+            self.host_kind,
+            &self.token,
+            self.domains,
+            self.tool_groups.clone(),
+            self.config,
+        )
+        .await?;
 
         Ok(CoreRuntime {
             ctx,
@@ -841,7 +929,6 @@ mod tests {
             DomainGroup::Flows,
             DomainGroup::Skills,
             DomainGroup::Mcp,
-            DomainGroup::Meet,
             DomainGroup::Channels,
             DomainGroup::Web3,
             DomainGroup::Voice,
@@ -869,7 +956,6 @@ mod tests {
             DomainGroup::Flows,
             DomainGroup::Skills,
             DomainGroup::Mcp,
-            DomainGroup::Meet,
             DomainGroup::Channels,
             DomainGroup::Web3,
             DomainGroup::Voice,
@@ -891,7 +977,6 @@ mod tests {
             DomainGroup::Flows,
             DomainGroup::Skills,
             DomainGroup::Mcp,
-            DomainGroup::Meet,
             DomainGroup::Channels,
             DomainGroup::Web3,
             DomainGroup::Voice,
@@ -925,7 +1010,6 @@ mod tests {
 
         for off in [
             DomainGroup::Mcp,
-            DomainGroup::Meet,
             DomainGroup::Web3,
             DomainGroup::Voice,
             DomainGroup::Media,
@@ -995,7 +1079,6 @@ mod tests {
         assert!(!custom.mcp_boot);
         assert!(!custom.integrations);
         assert!(!custom.memory_sync);
-        assert!(!custom.orchestration);
 
         let desktop = ServiceSet::desktop();
         assert!(desktop.memory_queue);
@@ -1004,12 +1087,10 @@ mod tests {
         assert!(desktop.mcp_boot);
         assert!(desktop.integrations);
         assert!(desktop.memory_sync);
-        assert!(desktop.orchestration);
 
         // headless_api() runs no bootstrap jobs either.
         let headless = ServiceSet::headless_api();
         assert!(!headless.integrations);
         assert!(!headless.memory_sync);
-        assert!(!headless.orchestration);
     }
 }

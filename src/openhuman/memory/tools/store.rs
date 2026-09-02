@@ -1,5 +1,7 @@
-use crate::openhuman::memory::store::safety;
-use crate::openhuman::memory::{Memory, MemoryCategory};
+use crate::openhuman::memory::api::provider::MemoryCore;
+use crate::openhuman::memory::api::types::{MemoryCategory, MemoryTaint};
+use crate::openhuman::memory::ops::guard::active_memory_guard;
+use crate::openhuman::memory::safety;
 use crate::openhuman::security::policy::ToolOperation;
 use crate::openhuman::security::SecurityPolicy;
 use crate::openhuman::tools::traits::{Tool, ToolResult};
@@ -9,13 +11,14 @@ use std::sync::Arc;
 
 /// Let the agent store memories — its own brain writes
 pub struct MemoryStoreTool {
-    memory: Arc<dyn Memory>,
     security: Arc<SecurityPolicy>,
 }
 
 impl MemoryStoreTool {
-    pub fn new(memory: Arc<dyn Memory>, security: Arc<SecurityPolicy>) -> Self {
-        Self { memory, security }
+    /// Holds no memory handle — the guarded driver is resolved per call.
+    #[must_use]
+    pub fn new(security: Arc<SecurityPolicy>) -> Self {
+        Self { security }
     }
 }
 
@@ -26,14 +29,7 @@ impl Tool for MemoryStoreTool {
     }
 
     fn description(&self) -> &str {
-        "Store a general fact or note in a namespace (e.g. global, background, autocomplete, skill-{id}). \
-         Do NOT use this for user preferences — for any preference (how the user wants you to behave, \
-         their tastes, settings, standing instructions) call `save_preference` instead, which routes it \
-         to the preference store the assistant actually reads. Requires an explicit namespace. \
-         Memory protocol (only with tools you actually have available): if you have a memory-recall \
-         tool (e.g. `memory_recall`), check for a near-duplicate before storing so you don't create \
-         one; and if `update_memory_md` is available, call it after storing to keep the MEMORY.md \
-         index in sync with the store."
+        "Store a general fact or note in an explicit namespace (e.g. global, background, autocomplete, skill-{id}). NOT for preferences — those go to `save_preference`, which writes the store the assistant actually reads. Check `memory_recall` for a near-duplicate first, and call `update_memory_md` afterwards, when you have those tools."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -121,9 +117,19 @@ impl Tool for MemoryStoreTool {
         }
 
         let display_key = format!("{namespace}/{key}");
-        match self
-            .memory
-            .store(namespace, key, content, category, None)
+        let guard = active_memory_guard()
+            .await
+            .map_err(|e| anyhow::anyhow!("memory_store: {e}"))?;
+        match guard
+            .store(
+                namespace,
+                key,
+                content,
+                category,
+                None,
+                // Requested provenance; the guard stamps the effective value.
+                MemoryTaint::default(),
+            )
             .await
         {
             Ok(()) => Ok(ToolResult::success(format!("Stored memory: {display_key}"))),
@@ -133,177 +139,5 @@ impl Tool for MemoryStoreTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::openhuman::inference::embeddings::NoopEmbedding;
-    use crate::openhuman::memory::store::UnifiedMemory;
-    use crate::openhuman::security::{AutonomyLevel, SecurityPolicy};
-    use tempfile::TempDir;
-
-    fn test_security() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::default())
-    }
-
-    fn test_mem() -> (TempDir, Arc<dyn Memory>) {
-        let tmp = TempDir::new().unwrap();
-        let mem = UnifiedMemory::new(tmp.path(), Arc::new(NoopEmbedding), None).unwrap();
-        (tmp, Arc::new(mem))
-    }
-
-    #[test]
-    fn name_and_schema() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem, test_security());
-        assert_eq!(tool.name(), "memory_store");
-        let schema = tool.parameters_schema();
-        assert!(schema["properties"]["key"].is_object());
-        assert!(schema["properties"]["content"].is_object());
-        // The memory protocol (#4116) must be stated up front so the model recalls
-        // for dedupe before writing and reconciles the index after.
-        let desc = tool.description();
-        assert!(
-            desc.contains("memory_recall") && desc.contains("update_memory_md"),
-            "memory_store description must state the read→dedupe→write→update contract: {desc}"
-        );
-    }
-
-    #[tokio::test]
-    async fn store_core() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
-        let result = tool
-            .execute(json!({"namespace": "global", "key": "lang", "content": "Prefers Rust"}))
-            .await
-            .unwrap();
-        assert!(!result.is_error);
-        assert!(result.output().contains("lang"));
-
-        let entry = mem.get("global", "lang").await.unwrap();
-        assert!(entry.is_some());
-        assert_eq!(entry.unwrap().content, "Prefers Rust");
-    }
-
-    #[tokio::test]
-    async fn store_with_category() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
-        let result = tool
-            .execute(
-                json!({"namespace": "global", "key": "note", "content": "Fixed bug", "category": "daily"}),
-            )
-            .await
-            .unwrap();
-        assert!(!result.is_error);
-    }
-
-    #[tokio::test]
-    async fn store_with_custom_category() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
-        let result = tool
-            .execute(
-                json!({"namespace": "global", "key": "proj_note", "content": "Uses async runtime", "category": "project"}),
-            )
-            .await
-            .unwrap();
-        assert!(!result.is_error);
-
-        let entry = mem.get("global", "proj_note").await.unwrap().unwrap();
-        assert_eq!(entry.content, "Uses async runtime");
-        assert_eq!(entry.category, MemoryCategory::Custom("project".into()));
-    }
-
-    /// Regression: a `custom:<name>` wire value (the form `memory_recall` and
-    /// `Display` now emit) must store as `Custom("<name>")`, not the
-    /// double-prefixed `Custom("custom:<name>")` — otherwise it would `Display`
-    /// as `custom:custom:<name>` and stop matching the original category.
-    #[tokio::test]
-    async fn store_strips_custom_prefix_from_wire_category() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
-        let result = tool
-            .execute(json!({
-                "namespace": "global",
-                "key": "proj_note",
-                "content": "Uses async runtime",
-                "category": "custom:project"
-            }))
-            .await
-            .unwrap();
-        assert!(!result.is_error);
-
-        let entry = mem.get("global", "proj_note").await.unwrap().unwrap();
-        assert_eq!(
-            entry.category,
-            MemoryCategory::Custom("project".into()),
-            "the `custom:` wire prefix must be stripped, not double-stored"
-        );
-    }
-
-    #[tokio::test]
-    async fn store_rejects_secret_like_content() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
-        let result = tool
-            .execute(json!({
-                "namespace": "global",
-                "key": "api",
-                "content": "api_key=sk-123456789012345678901234567890"
-            }))
-            .await
-            .unwrap();
-        assert!(result.is_error);
-        assert!(result.output().contains("looks like a secret"));
-        assert!(mem.get("global", "api").await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn store_missing_key() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem, test_security());
-        let result = tool.execute(json!({"content": "no key"})).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn store_missing_content() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem, test_security());
-        let result = tool.execute(json!({"key": "no_content"})).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn store_blocked_in_readonly_mode() {
-        let (_tmp, mem) = test_mem();
-        let readonly = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
-        let tool = MemoryStoreTool::new(mem.clone(), readonly);
-        let result = tool
-            .execute(json!({"namespace": "global", "key": "lang", "content": "Prefers Rust"}))
-            .await
-            .unwrap();
-        assert!(result.is_error);
-        assert!(result.output().contains("read-only mode"));
-        assert!(mem.get("global", "lang").await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn store_blocked_when_rate_limited() {
-        let (_tmp, mem) = test_mem();
-        let limited = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
-        let tool = MemoryStoreTool::new(mem.clone(), limited);
-        let result = tool
-            .execute(json!({"namespace": "global", "key": "lang", "content": "Prefers Rust"}))
-            .await
-            .unwrap();
-        assert!(result.is_error);
-        assert!(result.output().contains("Rate limit exceeded"));
-        assert!(mem.get("global", "lang").await.unwrap().is_none());
-    }
-}
+#[path = "store_tests.rs"]
+mod tests;

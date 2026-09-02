@@ -24,6 +24,7 @@ use crate::openhuman::config::Config;
 /// unavailable, and the feature says so at the point of use. Taking the core
 /// down because an optional codec is missing would be a worse trade.
 pub async fn load_declared_modules(config: &Config) {
+    super::memory::set_modules_policy(std::sync::Arc::new(config.clone()));
     if !config.modules.enabled {
         log::debug!("[modules] boot load skipped: modules are disabled in configuration");
         return;
@@ -57,6 +58,13 @@ pub async fn load_declared_modules(config: &Config) {
         if record.load != LoadPolicy::Eager {
             continue;
         }
+        if !should_eager_load(record, config) {
+            log::debug!(
+                "[modules] eager module '{}' skipped: the memory driver is not module-backed",
+                record.id
+            );
+            continue;
+        }
         if let Err(reason) = ops::ensure_loaded(config, record.id).await {
             log::warn!(
                 "[modules] eager module '{}' did not load: {reason}",
@@ -66,26 +74,29 @@ pub async fn load_declared_modules(config: &Config) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::load_declared_modules;
-    use crate::openhuman::config::Config;
-
-    #[tokio::test]
-    async fn boot_is_a_no_op_when_modules_are_disabled() {
-        // Must not start a broker as a side effect of being switched off.
-        let mut config = Config::default();
-        config.modules.enabled = false;
-        load_declared_modules(&config).await;
+/// Whether `record` should be loaded eagerly at boot, given `config`.
+///
+/// Every `LoadPolicy::Eager` record is eager unconditionally, except
+/// TinyMemory: it is eager only when this host's memory subsystem actually
+/// selected the module-backed driver. Eager-loading it for every
+/// `modules.enabled` host — regardless of which memory driver is bound —
+/// would mean a host on the (default) `Embedded` driver pays a startup
+/// download and native `dlopen` for a module it never binds, breaking the
+/// module driver's opt-in contract.
+///
+/// [`crate::openhuman::memory::binding::admit`] is the same pure,
+/// side-effect-free check `memory::binding::build` itself uses to decide what
+/// actually gets bound, so this can never disagree with the real binding.
+fn should_eager_load(record: &super::types::ModuleRecord, config: &Config) -> bool {
+    if record.id != super::memory::MODULE_ID {
+        return true;
     }
-
-    #[tokio::test]
-    async fn boot_tolerates_an_empty_search_path() {
-        // The ordinary case on a fresh machine: nothing installed, nothing eager,
-        // and boot must complete rather than warn or fail.
-        let mut config = Config::default();
-        config.modules.enabled = true;
-        config.modules.allow_download = false;
-        load_declared_modules(&config).await;
-    }
+    matches!(
+        crate::openhuman::memory::binding::admit(&config.subsystems.memory),
+        Ok((_, crate::core::subsystem::DriverClass::Module))
+    )
 }
+
+#[cfg(test)]
+#[path = "boot_tests.rs"]
+mod tests;

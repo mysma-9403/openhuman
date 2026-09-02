@@ -72,7 +72,7 @@ All handlers go through the memory client's `profile_store()` and a `FacetCache`
 
 ## Agent tools
 
-The module defines no `tools.rs`. However the `tool_effectiveness` stats it writes are surfaced by the cross-cutting `tool_stats` tool in `src/openhuman/tools/impl/system/tool_stats.rs`, and `memory_tools` references learning namespaces.
+`tools.rs` (~617 production lines) defines 11 LLM-callable tools mirroring the RPC surface above: `LearningListFacetsTool`, `LearningGetFacetTool`, `LearningCacheStatsTool`, `LearningUpdateFacetTool`, `LearningPinFacetTool`, `LearningUnpinFacetTool`, `LearningForgetFacetTool`, `LearningRebuildCacheTool`, `LearningResetCacheTool`, `LearningSaveProfileTool`, `LearningEnrichProfileTool`. Re-exported via `src/openhuman/tools/mod.rs` (`pub use crate::openhuman::agent::learning::tools::*;`). Separately, the `tool_effectiveness` stats this module writes are surfaced by the cross-cutting `tool_stats` tool in `src/openhuman/tools/impl/system/tool_stats.rs`, and `memory_tools` references learning namespaces.
 
 ## Events
 
@@ -94,7 +94,7 @@ These are subscriber registrations rather than a single `bus.rs`; subscriptions 
 
 ## Dependencies
 
-- `crate::openhuman::memory::store::profile` — the `ProfileFacet` / `FacetState` / `UserState` types and the SQL helpers backing `FacetCache` (heaviest dependency).
+- `tinymemory_core::store::profile` — the `ProfileFacet` / `FacetState` / `UserState` types and the SQL helpers backing `FacetCache` (heaviest dependency).
 - `crate::openhuman::memory` / `memory_store` — the `Memory` trait, `MemoryClient`, categories; all KV persistence and the global memory client used by RPC handlers.
 - `crate::openhuman::agent::hooks` — `PostTurnHook` / `TurnContext` / `ToolCallRecord` implemented by the three hooks.
 - `crate::openhuman::agent::harness::session::transcript` — `SessionTranscript` parsing for transcript ingestion.

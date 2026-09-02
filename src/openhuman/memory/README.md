@@ -46,7 +46,6 @@ tinymemory_core::<domain>::*;` plus the handler/schema modules that name
 | Module                          | Role                                                     |
 | -------------------------------- | --------------------------------------------------------- |
 | [`conversations/`](conversations/) | Conversation-scoped memory RPC.                          |
-| [`diff/`](diff/)                 | Git-backed diff RPC (gated by the `memory-git` feature). |
 | [`goals/`](goals/)               | Goal tracking RPC.                                       |
 | [`people/`](people/)             | People/contacts RPC.                                     |
 | [`sources/`](sources/)           | Source-registration RPC.                                 |
@@ -56,7 +55,7 @@ tinymemory_core::<domain>::*;` plus the handler/schema modules that name
 
 ## What lives in the extracted crate (for reference)
 
-See [`vendor/tinymemory/core/src/`](https://github.com/tinyhumansai/tinymemory/tree/main/core/src) for
+See [`vendor/tinymemory/crates/tinymemory-core/src/`](https://github.com/tinyhumansai/tinymemory/tree/1d6b997874a06600ba0c4922708b5613497c9ffe/crates/tinymemory-core/src) for
 the storage primitives (`store/`), ingestion queue (`ingestion/`), sync
 lifecycle types (`sync_events.rs`), remember classification (`remember.rs`),
 ingest orchestration (`ingest_pipeline.rs`), the `Memory`/`MemoryEntry`/etc.

@@ -18,7 +18,7 @@ use crate::openhuman::agent::progress::AgentProgress;
 use crate::openhuman::tools::traits::{PermissionLevel, Tool, ToolCallOptions, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
-use tinyagents::harness::tool::ToolExecutionContext;
+use tinytools::ToolRunContext;
 
 pub struct ContinueSubagentTool;
 
@@ -49,7 +49,7 @@ impl ContinueSubagentTool {
         task_id: &str,
         agent_id: &str,
         message: &str,
-        tool_context: Option<&ToolExecutionContext>,
+        tool_context: Option<&dyn ToolRunContext>,
     ) -> anyhow::Result<ToolResult> {
         use crate::openhuman::agent::orchestration::subagent_sessions::{
             self, SubagentSessionStore,
@@ -130,15 +130,7 @@ impl Tool for ContinueSubagentTool {
     }
 
     fn description(&self) -> &str {
-        "Resume an existing sub-agent with a follow-up message, keeping its \
-         full prior context. Two cases: (1) a sub-agent paused on \
-         ask_user_clarification — pass the task_id from the \
-         [SUBAGENT_AWAITING_USER] envelope and the user's answer; (2) a \
-         durable worker from the [active_subagents] roster (e.g. an `idle` \
-         workflow_builder whose proposal the user is now reacting to) — pass \
-         its subagent_session_id (or task id) and the follow-up. Always \
-         prefer this over re-delegating the same task from scratch: a fresh \
-         delegation loses everything the worker already did."
+        "Resume an existing sub-agent with a follow-up, keeping its full prior context: pass the `task_id` from a `[SUBAGENT_AWAITING_USER]` envelope with the user's answer, or a `subagent_session_id` from the `[active_subagents]` roster. Always prefer this to re-delegating — a fresh delegation loses everything the worker already did."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -175,7 +167,7 @@ impl Tool for ContinueSubagentTool {
         &self,
         args: serde_json::Value,
         _options: ToolCallOptions,
-        tool_context: Option<&ToolExecutionContext>,
+        tool_context: Option<&dyn ToolRunContext>,
     ) -> anyhow::Result<ToolResult> {
         let task_id = args
             .get("task_id")
@@ -329,7 +321,7 @@ impl Tool for ContinueSubagentTool {
         }
 
         // Build options with initial_history for replay
-        let workspace_descriptor = tool_context.and_then(|ctx| ctx.workspace.clone());
+        let workspace_descriptor = tool_context.and_then(|ctx| ctx.workspace().cloned());
         let worktree_action_dir = workspace_descriptor
             .as_ref()
             .map(|descriptor| descriptor.root.clone());

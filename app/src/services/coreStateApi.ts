@@ -49,7 +49,6 @@ interface AppStateSnapshotResult {
    * normalises the missing case to `false` before returning so callers
    * never observe `undefined` here.
    */
-  meetAutoOrchestratorHandoff?: boolean;
   localState: {
     encryptionKey?: string | null;
     onboardingTasks?: OnboardingTasks | null;
@@ -111,12 +110,8 @@ export const fetchCoreAppSnapshot = async (): Promise<AppStateSnapshotResult> =>
     timeoutMs: SNAPSHOT_TIMEOUT_MS,
   });
   // Normalise the optional #1299 field at the API boundary so older core
-  // builds without `meetAutoOrchestratorHandoff` still surface the
   // privacy-conservative `false` to callers (e.g. CoreStateProvider).
-  return {
-    ...response.result,
-    meetAutoOrchestratorHandoff: response.result.meetAutoOrchestratorHandoff ?? false,
-  };
+  return { ...response.result };
 };
 
 export const updateCoreLocalState = async (params: UpdateCoreLocalStateParams): Promise<void> => {

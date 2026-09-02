@@ -113,7 +113,7 @@ fn unresolved_status(reason: String) -> SubsystemStatus {
         health: DriverHealth::down(reason.clone()).as_str().to_string(),
         health_reason: Some(reason.clone()),
         contract_version: crate::core::subsystem::format_contract_version(
-            tinycortex_api::CONTRACT_VERSION,
+            crate::openhuman::memory::api::CONTRACT_VERSION,
         ),
         capabilities: Vec::new(),
         fell_back_from: None,
@@ -127,105 +127,5 @@ pub async fn memory_provider_status() -> RpcOutcome<SubsystemStatus> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn status_without_a_context_reports_an_unresolved_slot() {
-        let status = unresolved_status("no workspace".to_string());
-        assert_eq!(status.slot, "memory");
-        assert_eq!(status.class, "null");
-        assert_eq!(status.health, "down");
-        assert!(status.capabilities.is_empty());
-        assert_eq!(status.last_error.as_deref(), Some("no workspace"));
-        // Still reports the contract version this build speaks — that is a
-        // build fact, independent of whether anything bound.
-        assert_eq!(
-            status.contract_version,
-            crate::core::subsystem::format_contract_version(tinycortex_api::CONTRACT_VERSION)
-        );
-    }
-
-    #[tokio::test]
-    async fn bound_driver_status_reports_id_class_contract_and_capabilities() {
-        let workspace = tempfile::tempdir().expect("tempdir");
-        let cfg = crate::openhuman::config::schema::MemorySubsystemConfig::default();
-        let binding = crate::openhuman::memory::binding::for_workspace(workspace.path(), &cfg)
-            .expect("binding resolves");
-
-        let status = status_from_binding(&binding).await;
-        assert_eq!(status.slot, "memory");
-        // The default `[subsystems.memory] driver` is the embedded tinycortex
-        // driver.
-        assert_eq!(status.driver, cfg.driver);
-        assert_eq!(status.class, "embedded");
-        assert_eq!(status.health, "ready");
-        assert_eq!(
-            status.contract_version,
-            crate::core::subsystem::format_contract_version(tinycortex_api::CONTRACT_VERSION)
-        );
-        // All thirteen families, as of M3d. Spelled out rather than derived
-        // from `Capabilities::all()` on purpose: this is the wire surface the
-        // frontend reads, so the strings themselves are the assertion.
-        assert_eq!(
-            status.capabilities,
-            vec![
-                "core",
-                "diff",
-                "documents",
-                "entities",
-                "goals",
-                "graph",
-                "ingest",
-                "maintenance",
-                "portability",
-                "recall",
-                "sources",
-                "tool_memory",
-                "tree"
-            ]
-        );
-        assert_eq!(status.fell_back_from, None);
-        assert_eq!(status.last_error, None);
-    }
-
-    #[tokio::test]
-    async fn a_refused_driver_reports_the_fallback_and_its_reason() {
-        let workspace = tempfile::tempdir().expect("tempdir");
-        let mut cfg = crate::openhuman::config::schema::MemorySubsystemConfig {
-            driver: "supermemory".into(),
-            ..Default::default()
-        };
-        cfg.drivers.insert(
-            "supermemory".into(),
-            crate::openhuman::config::schema::MemoryDriverConfig {
-                class: Some("external".into()),
-                transport: Some("http".into()),
-                endpoint: Some("https://api.supermemory.ai".into()),
-                credential_ref: Some("keychain:supermemory".into()),
-                trust_state: "untrusted".into(),
-            },
-        );
-        let binding = crate::openhuman::memory::binding::for_workspace(workspace.path(), &cfg)
-            .expect("binding falls back rather than failing");
-
-        let status = status_from_binding(&binding).await;
-        assert_eq!(status.driver, "null");
-        assert_eq!(status.class, "null");
-        assert_eq!(status.fell_back_from.as_deref(), Some("supermemory"));
-        let last_error = status.last_error.expect("a refused bind records why");
-        assert!(last_error.contains("supermemory"), "{last_error}");
-        assert!(last_error.contains("untrusted"), "{last_error}");
-        // The refusal reason must never leak the credential reference or the
-        // endpoint — same rule the binding's own tests pin.
-        assert!(!last_error.contains("keychain:supermemory"), "{last_error}");
-        assert!(!last_error.contains("api.supermemory.ai"), "{last_error}");
-    }
-
-    #[tokio::test]
-    async fn provider_status_wraps_the_snapshot_with_no_logs() {
-        let outcome = memory_provider_status().await;
-        assert!(outcome.logs.is_empty());
-        assert_eq!(outcome.value.slot, "memory");
-    }
-}
+#[path = "provider_tests.rs"]
+mod tests;

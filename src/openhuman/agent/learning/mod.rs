@@ -32,6 +32,11 @@ pub mod scheduler;
 pub mod schemas;
 pub mod stability_detector;
 pub mod startup;
+/// In-memory profile fake for tests.
+///
+/// Not `#[cfg(test)]`: integration tests link the lib without it.
+#[doc(hidden)]
+pub mod test_profile;
 pub mod tool_tracker;
 pub mod tools;
 pub mod transcript_ingest;

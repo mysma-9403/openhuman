@@ -1,9 +1,9 @@
 use super::journal_projection::spans_from_observations;
 use super::{SpanKind, SpanStatus, TraceContext};
-use tinyagents::harness::events::AgentEvent;
-use tinyagents::harness::ids::{CallId, EventId, RunId};
-use tinyagents::harness::observability::AgentObservation;
-use tinyagents::harness::usage::Usage;
+use tinyagents_harness::events::AgentEvent;
+use tinyagents_harness::ids::{CallId, EventId, RunId};
+use tinyagents_harness::observability::AgentObservation;
+use tinyinference::usage::Usage;
 
 /// Wraps an event as a journalled observation stamped at `ts`.
 fn obs(offset: u64, ts: u64, event: AgentEvent) -> AgentObservation {

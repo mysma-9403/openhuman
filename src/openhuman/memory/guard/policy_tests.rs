@@ -250,6 +250,40 @@ fn guard_does_not_redact_for_a_null_driver() {
     assert_eq!(policy.redact_outbound(SECRETY), SECRETY);
 }
 
+/// Pins the `Module` pass-through explicitly. The exhaustiveness check on
+/// [`GuardPolicy::redact_outbound`]'s `match` guarantees `Module` is handled
+/// *somewhere*, but it does not guarantee it stays in the no-op group with
+/// `Embedded` — moving it into the `External` arm would silently start
+/// sanitizing (corrupting) module-backed memory writes with no compile error
+/// to catch it. This test is what would catch that move.
+#[test]
+fn guard_does_not_redact_for_a_module_driver() {
+    let policy = GuardPolicy::new(
+        "tinymemory",
+        DriverClass::Module,
+        MemoryHooksConfig::default(),
+        TRUSTED,
+    );
+    let out = policy.redact_outbound(SECRETY);
+    assert_eq!(out, SECRETY, "module traffic must be byte-identical");
+    assert!(
+        matches!(out, std::borrow::Cow::Borrowed(_)),
+        "and must not even be re-allocated"
+    );
+}
+
+#[test]
+fn guard_does_not_redact_json_for_a_module_driver() {
+    let policy = GuardPolicy::new(
+        "tinymemory",
+        DriverClass::Module,
+        MemoryHooksConfig::default(),
+        TRUSTED,
+    );
+    let value = serde_json::json!({ "token": SECRETY });
+    assert_eq!(policy.redact_outbound_json(value.clone()), value);
+}
+
 #[test]
 fn guard_redacts_content_for_an_external_driver() {
     let out = external_policy(TRUSTED).redact_outbound(SECRETY);

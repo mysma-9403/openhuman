@@ -117,8 +117,6 @@ pub(crate) fn build_text_mode_tool_instructions() -> String {
 /// * every synthesised per-archetype `delegate_*` tool
 ///   ([`crate::openhuman::tools::orchestrator_tools::collect_orchestrator_tools`]
 ///   emits `delegate_researcher`, `delegate_planner`, …).
-/// * custom delegate names that intentionally do not use the `delegate_*`
-///   prefix, currently `use_tinyplace`.
 /// * `agent_prepare_context` — the context-scout entry point. It reads the
 ///   *parent's* visible catalog/session via `current_parent()`, which inside a
 ///   nested run is still the top-level orchestrator (the runner does not
@@ -132,10 +130,7 @@ pub(crate) fn build_text_mode_tool_instructions() -> String {
 /// this function and the corresponding generator in
 /// `orchestrator_tools.rs` together.
 pub(super) fn is_subagent_spawn_tool(name: &str) -> bool {
-    if name == "spawn_subagent"
-        || name.starts_with("delegate_")
-        || name == "use_tinyplace"
-        || name == "agent_prepare_context"
+    if name == "spawn_subagent" || name.starts_with("delegate_") || name == "agent_prepare_context"
     {
         return true;
     }
@@ -230,145 +225,12 @@ pub(super) fn disallowed_tool_matches(disallowed: &[String], name: &str) -> bool
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn custom_tinyplace_delegate_is_treated_as_spawn_tool() {
-        assert!(is_subagent_spawn_tool("spawn_subagent"));
-        assert!(is_subagent_spawn_tool("delegate_researcher"));
-        assert!(is_subagent_spawn_tool("use_tinyplace"));
-        // Context scouting is top-level only — never visible to sub-agents
-        // (incl. wildcard agents), which would otherwise scout the wrong
-        // parent context. See #3949 review.
-        assert!(is_subagent_spawn_tool("agent_prepare_context"));
-        assert!(!is_subagent_spawn_tool("tinyplace_directory_resolve"));
-    }
-
-    #[test]
-    fn unprefixed_delegate_name_overrides_are_treated_as_spawn_tools() {
-        // Most synthesised delegation tools use an unprefixed
-        // `delegate_name` override (`plan`, `run_code`, `research`, …).
-        // They must be stripped from every sub-agent surface, exactly like
-        // the `delegate_*`-prefixed defaults.
-        let tmp = tempfile::TempDir::new().unwrap();
-        crate::openhuman::agent::harness::definition::AgentDefinitionRegistry::init_global(
-            tmp.path(),
-        )
-        .unwrap();
-        for delegate in [
-            "plan",
-            "run_code",
-            "research",
-            "review_code",
-            "do_crypto",
-            "schedule_task",
-            // `make_presentation` is `presentation_agent`'s `delegate_name`; the agent —
-            // and therefore this delegate tool — is compiled out with the
-            // `documents` feature.
-            #[cfg(feature = "documents")]
-            "make_presentation",
-            "archive_session",
-            // `use_mcp_server` is `mcp_agent`'s `delegate_name`; the agent —
-            // and therefore this delegate tool — is compiled out with the
-            // `mcp` feature (#4799). `setup_mcp_server` belongs to
-            // `mcp_setup`, which stays registered in both builds.
-            #[cfg(feature = "mcp")]
-            "use_mcp_server",
-            "setup_mcp_server",
-        ] {
-            assert!(
-                is_subagent_spawn_tool(delegate),
-                "`{delegate}` is a synthesised delegation tool and must be \
-                 stripped from sub-agent tool surfaces"
-            );
-        }
-        // Ordinary worker tools stay visible.
-        for plain in ["shell", "file_read", "web_fetch", "todo"] {
-            assert!(
-                !is_subagent_spawn_tool(plain),
-                "`{plain}` must not be classified as a spawn tool"
-            );
-        }
-    }
-}
+#[path = "tool_prep_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod recovery_visibility_tests {
-    use super::*;
-    use crate::openhuman::inference::tokenjuice::LEGACY_RETRIEVE_TOOL_NAME as RECOVERY_TOOL_NAME;
-    use crate::openhuman::tools::{CurrentTimeTool, RetrieveToolOutputTool};
-
-    fn tools() -> Vec<Box<dyn crate::openhuman::tools::Tool>> {
-        vec![
-            Box::new(CurrentTimeTool::new()),
-            Box::new(RetrieveToolOutputTool::new()),
-        ]
-    }
-
-    fn names(idx: &[usize], tools: &[Box<dyn crate::openhuman::tools::Tool>]) -> Vec<String> {
-        idx.iter().map(|&i| tools[i].name().to_string()).collect()
-    }
-
-    #[test]
-    fn named_scope_still_includes_recovery_tool() {
-        let t = tools();
-        // Named scope allow-lists only current_time — recovery tool not listed.
-        let idx = filter_tool_indices(
-            &t,
-            &ToolScope::Named(vec!["current_time".into()]),
-            &[],
-            None,
-        );
-        let got = names(&idx, &t);
-        assert!(got.contains(&"current_time".to_string()));
-        assert!(
-            got.contains(&RECOVERY_TOOL_NAME.to_string()),
-            "recovery tool must survive Named scope: {got:?}"
-        );
-    }
-
-    #[test]
-    fn tool_less_agent_stays_tool_less() {
-        // A deliberately tool-less agent (e.g. the payload summarizer,
-        // ToolScope::Named([])) runs no tools and produces no compacted output,
-        // so it must NOT be handed the recovery tool — it stays empty.
-        let t = tools();
-        let idx = filter_tool_indices(&t, &ToolScope::Named(vec![]), &[], None);
-        assert!(idx.is_empty(), "empty scope must yield zero tools: {idx:?}");
-    }
-
-    #[test]
-    fn skill_filter_still_includes_recovery_tool() {
-        let t = tools();
-        // A skill-restricted subagent (only `foo__*` tools) must still get it.
-        let idx = filter_tool_indices(&t, &ToolScope::Wildcard, &[], Some("foo"));
-        assert!(names(&idx, &t).contains(&RECOVERY_TOOL_NAME.to_string()));
-    }
-
-    #[test]
-    fn explicit_disallow_still_wins() {
-        let t = tools();
-        let idx = filter_tool_indices(
-            &t,
-            &ToolScope::Wildcard,
-            &[RECOVERY_TOOL_NAME.to_string()],
-            None,
-        );
-        assert!(!names(&idx, &t).contains(&RECOVERY_TOOL_NAME.to_string()));
-    }
-
-    #[test]
-    fn parent_visibility_caps_wildcard_child_scope() {
-        let t = tools();
-        let mut idx = filter_tool_indices(&t, &ToolScope::Wildcard, &[], None);
-        let parent_visible = ["current_time".to_string()].into_iter().collect();
-
-        retain_parent_visible_tool_indices(&mut idx, &t, &parent_visible);
-
-        assert_eq!(names(&idx, &t), vec!["current_time".to_string()]);
-    }
-}
+#[path = "tool_prep_recovery_visibility_tests_tests.rs"]
+mod recovery_visibility_tests;
 
 // ── Prompt loading ──────────────────────────────────────────────────────
 

@@ -16,12 +16,54 @@ use crate::openhuman::agent::messages::{ChatMessage, ConversationMessage};
 use crate::openhuman::agent::progress::AgentProgress;
 use crate::openhuman::agent::tinyagents::TurnModelSource;
 use crate::openhuman::agent::tool_policy::ToolPolicy;
-use crate::openhuman::memory::agent::memory_loader::MemoryLoader;
 use crate::openhuman::memory::Memory;
 use crate::openhuman::tools::agent_policy::ToolPolicySession;
 use crate::openhuman::tools::{Tool, ToolSpec};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Per-turn behaviour overrides applied to a **single** [`Agent::turn`] call.
+///
+/// Defaults to all-`false`, so an agent built and driven exactly as before
+/// behaves identically — the overrides only take effect when a caller opts in
+/// via [`Agent::set_next_turn_overrides`] before dispatching a turn. The turn
+/// consumes (takes) them at its start, so they apply to exactly one turn and
+/// then reset to the default; a caller that wants a run of chat turns re-sets
+/// them each time.
+///
+/// The motivating case (opencompany issue #1725) is a bare greeting / small-talk
+/// turn that should run as a cheap conversational reply instead of the full
+/// agentic task loop: no tools to loop on, no pre-turn memory-agent retrieval,
+/// and no stale per-thread goal re-injected from a prior task. Each field is an
+/// independent, additive suppression so a caller can compose exactly the
+/// reduction it wants.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnOverrides {
+    /// Skip loading, auto-resuming, and injecting this thread's durable
+    /// `[active_goal]` block for this turn (and skip arming the goal budget
+    /// stop hook). Prevents an uncompleted goal left by a prior task from
+    /// steering an unrelated chat turn.
+    pub suppress_active_goal: bool,
+    /// Run this turn with **no** tools regardless of the agent's built tool
+    /// set — the provider request carries an empty tool schema, so the model
+    /// cannot enter the tool loop and answers in one shot. The agent's durable
+    /// `tools` / `tool_specs` are left untouched, so the next (un-overridden)
+    /// turn has its full toolbelt back.
+    pub suppress_tools: bool,
+    /// Force [`TriggerMemoryAgent::Never`] behaviour for this turn — skip the
+    /// pre-turn `agent_memory` retrieval even when the agent's policy is
+    /// `Always`. The agent's built policy is left untouched for later turns.
+    pub suppress_memory_agent: bool,
+    /// Skip auto-resuming this turn from the agent's most-recent on-disk
+    /// transcript (`try_load_session_transcript`, which resolves the *latest*
+    /// transcript for the agent name -- NOT thread-scoped). A host that has just
+    /// re-bound the in-memory history to a different chat sets this so a cleared
+    /// history is not silently repopulated from an unrelated thread's transcript
+    /// (opencompany #1725). Thread-correct resume via
+    /// `Agent::seed_resume_from_thread_transcript` still works -- it seeds
+    /// `cached_transcript_messages`, which this path never touches.
+    pub suppress_transcript_autoload: bool,
+}
 
 /// An autonomous or semi-autonomous AI agent.
 ///
@@ -63,7 +105,6 @@ pub struct Agent {
     // `Arc` (not `Box`) so the tinyagents turn path can hold a cheap clone of
     // the dispatcher without borrowing the `Agent` while session state mutates.
     pub(super) tool_dispatcher: Arc<dyn ToolDispatcher>,
-    pub(super) memory_loader: Box<dyn MemoryLoader>,
     pub(super) config: crate::openhuman::config::AgentConfig,
     pub(super) model_name: String,
     /// User-configured vision capability for [`Self::model_name`], evaluated at
@@ -79,7 +120,7 @@ pub struct Agent {
     /// turn so acting tools (shell/file/git) resolve their default cwd to
     /// `<action_dir>/profiles/<id>` instead of the shared `action_dir`. `None`
     /// (the common case) preserves the shared-cwd behaviour unchanged.
-    pub(super) workspace_descriptor: Option<tinyagents::harness::workspace::WorkspaceDescriptor>,
+    pub(super) workspace_descriptor: Option<tinyagents_harness::workspace::WorkspaceDescriptor>,
     pub(super) workflows: Vec<crate::openhuman::skills::Workflow>,
     /// Agent workflows discovered at session start.
     pub(super) auto_save: bool,
@@ -90,6 +131,23 @@ pub struct Agent {
     /// Consumed by web-channel delivery to render source chips in the UI.
     pub(super) last_turn_citations:
         Vec<crate::openhuman::memory::agent::memory_loader::MemoryCitation>,
+    /// In-flight citation recall for the current turn.
+    ///
+    /// Citations are UI-only — they render source chips and never enter the
+    /// prompt — but collecting them is a full recall, which on a large memory
+    /// store is one of the most expensive things a turn does. Running it inline
+    /// before the model call meant every reply waited on a scan whose result the
+    /// model never sees.
+    ///
+    /// It is spawned instead, so the scan overlaps the inference round-trip, and
+    /// joined only when a consumer actually asks for the citations — which
+    /// happens after the turn returns. The contract is unchanged: callers still
+    /// get the citations for the turn they just ran.
+    pub(super) pending_citations: Option<
+        tokio::task::JoinHandle<
+            Vec<crate::openhuman::memory::agent::memory_loader::MemoryCitation>,
+        >,
+    >,
     /// Holistic token/cost/context accounting for the most recent turn (parent +
     /// any sub-agents spawned during it). Consumed by web-channel delivery to
     /// surface session token/cost/context meters in the UI footer. `None` until
@@ -404,6 +462,14 @@ pub struct Agent {
     ///
     /// Empty at construction time and whenever `tools` is fully reconciled.
     pub(super) pending_synthesized_tools_mask: std::collections::HashSet<String>,
+    /// Overrides applied to the **next** [`Agent::turn`] call, then reset.
+    ///
+    /// Defaults to [`TurnOverrides::default`] (no suppression), so an agent
+    /// driven exactly as before is byte-for-byte unchanged. A caller sets this
+    /// via [`Agent::set_next_turn_overrides`] immediately before dispatching a
+    /// chat / small-talk turn; `turn()` takes it at the top so it applies to
+    /// one turn only. See [`TurnOverrides`] for the motivating case (#1725).
+    pub(super) pending_turn_overrides: TurnOverrides,
 }
 
 /// A builder for creating `Agent` instances with custom configuration.
@@ -419,7 +485,6 @@ pub struct AgentBuilder {
     pub(super) shared_experience_memory: Option<Arc<dyn Memory>>,
     pub(super) prompt_builder: Option<SystemPromptBuilder>,
     pub(super) tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
-    pub(super) memory_loader: Option<Box<dyn MemoryLoader>>,
     pub(super) config: Option<crate::openhuman::config::AgentConfig>,
     /// Optional [`ContextConfig`] override threaded through from
     /// `Agent::from_config`. When unset the builder falls back to
@@ -433,7 +498,7 @@ pub struct AgentBuilder {
     pub(super) action_dir: Option<std::path::PathBuf>,
     /// Optional per-profile workspace descriptor forwarded to [`Agent`] at build
     /// time. Defaults to `None` (shared `action_dir` cwd).
-    pub(super) workspace_descriptor: Option<tinyagents::harness::workspace::WorkspaceDescriptor>,
+    pub(super) workspace_descriptor: Option<tinyagents_harness::workspace::WorkspaceDescriptor>,
     pub(super) workflows: Option<Vec<crate::openhuman::skills::Workflow>>,
     /// Agent workflows to surface in the prompt. Populated from `load_workflows`
     /// at session start; defaults to empty when not explicitly set.
@@ -498,22 +563,5 @@ impl Default for AgentBuilder {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn agent_builder_default_matches_new() {
-        let builder = AgentBuilder::new();
-        let default_builder = AgentBuilder::default();
-
-        assert_eq!(builder.learning_enabled, default_builder.learning_enabled);
-        assert_eq!(builder.auto_save, default_builder.auto_save);
-        assert!(builder.turn_model_source.is_none());
-        assert!(builder.tools.is_none());
-        assert!(builder.memory.is_none());
-        assert!(builder.event_session_id.is_none());
-        assert!(builder.event_channel.is_none());
-        assert!(builder.agent_definition_name.is_none());
-        assert!(builder.post_turn_hooks.is_empty());
-    }
-}
+#[path = "types_tests.rs"]
+mod tests;

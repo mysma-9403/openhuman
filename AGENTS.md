@@ -12,7 +12,7 @@ Architecture docs: [`gitbooks/developing/architecture.md`](gitbooks/developing/a
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | **`app/`**              | pnpm workspace `openhuman-app`: Vite + React (`app/src/`), Tauri desktop host (`app/src-tauri/`), Vitest tests                |
 | **`src/`** (root)       | Rust lib crate `openhuman` + `openhuman-core` CLI binary (`src/main.rs`) — `src/core/` (transport), `src/openhuman/*` domains |
-| **`Cargo.toml`** (root) | Core crate; `cargo build --bin openhuman-core`. Also `slack-backfill` and `gmail-backfill-3d` in `src/bin/`.                  |
+| **`Cargo.toml`** (root) | Core crate; `cargo build --bin openhuman-core`. Also `openhuman-fleet`, `rss-bench` and `library-profile` in `src/bin/`.                  |
 | **`docs/`**             | Deep internals. Public contributor docs in `gitbooks/developing/`.                                                            |
 
 Commands assume **repo root**. Root `package.json` is `openhuman-repo` (private, pnpm-enforced).
@@ -59,7 +59,9 @@ GGML_NATIVE=OFF cargo check --manifest-path Cargo.toml
 
 `pnpm core:stage` is a no-op (sidecar removed).
 
-**Build speed**: both `Cargo.toml` files set `[profile.dev.package."*"] debug = false` — dependencies compile without DWARF in `dev`/`test` (faster builds + smaller `target/`); our own crates keep full debuginfo so panics/backtraces still resolve to file:line. `release`/`ci` profiles are unchanged. Keep this stanza in sync across the root and `app/src-tauri/Cargo.toml` if you touch profiles.
+**Build speed**: both `Cargo.toml` files set `[profile.dev.package."*"] debug = false` — dependencies compile without DWARF in `dev`/`test` (faster builds + smaller `target/`); our own crates keep full debuginfo so panics/backtraces still resolve to file:line. Keep this stanza in sync across the root and `app/src-tauri/Cargo.toml` if you touch profiles.
+
+**Binary size**: both `[profile.release]` blocks set `lto = "thin"`, `codegen-units = 1` and `strip = "symbols"` (#5541) — measured at **116.9 MB → 67.1 MB** for `openhuman-core` on the product feature set, with no feature removed and no dependency dropped. The win is not about dependencies: `cargo bloat` puts **59.5% of `.text` in `openhuman_core` itself** and only ~15 MB across all 379 third-party packages, and there is no hotspot — it is ~110k monomorphized methods, of which the default 16 codegen units emitted many twice (`Config::load_or_init_with_env_lookup::{{closure}}` appeared 6× at ~40 KB, and it is not even generic). `strip` is safe because Sentry symbolicates **server-side** from the separate dSYM/PDB/DWP that `scripts/upload_sentry_symbols.sh` uploads, matched by a debug ID `strip` preserves; if that ever broke, the script hard-exits on zero DIFs (#1403) instead of shipping un-symbolicated. Do not drop `debug = "line-tables-only"` — that is what makes the dSYM useful. `[profile.ci]` deliberately overrides all three, so the fast CI lanes are unaffected; release builds are slower by design.
 
 **Two-lane CI model**: **CI Lite** (`ci-lite.yml`, quick — pushes to `main` + PRs targeting `main` or `release`): quality checks per changed area plus unit tests **only for the changed files** — `vitest related` for `app/src` changes and domain-scoped `cargo llvm-cov` (libtest filter derived from `src/<a>/<b>/…`) for Rust — still gated at ≥ 80% diff coverage. Config-level changes (lockfile, Cargo.toml/lock, vitest config, `src/lib.rs`, …) fall back to the full suite (`scripts/ci/vitest-changed-coverage.sh`, `scripts/ci/rust-coverage-changed.sh`). **CI Full** (`ci-full.yml`, slow — PRs targeting the long-lived `release` branch + every push to it): complete unit suites, Rust mock-backend E2E, Playwright, and the full desktop E2E matrix on 3 OSes, aggregated by the `CI Full Gate` check (except the Playwright spec run — non-blocking signal while flaky, #3615). `release` advances when a maintainer dispatches `promote-main-to-release.yml` (pushes a merge commit from `main` into `release` — no standing PR) and when fix PRs opened directly against `release` merge (those run both lanes, with `CI Full Gate` blocking the merge; the post-merge push re-runs CI Full). Production releases are always cut from `release`; staging builds may be cut from `main` or `release` by selecting that workflow-dispatch ref. Release-source cuts back-merge `release` into `main` via `scripts/release/merge-release-into-main.sh`, and version-bump commits carry `[skip ci]`. Long build/test commands must run through `scripts/ci-cancel-aware.sh`, whose Actions-API watchdog stops cancelled builds inside container jobs (docker exec swallows runner signals).
 
@@ -111,6 +113,21 @@ The `[autonomy]` block (`src/openhuman/config/schema/autonomy.rs`) drives `Secur
 
 **Sandbox backends** (opt-in per agent via `sandbox_mode = "sandboxed"`): Docker (remote/cron), Local OS jail (Landlock/Seatbelt/AppContainer, desktop), Noop fallback. In-Rust path hardening applies regardless.
 
+### Hooks — two unrelated things with one name
+
+**In-process hooks** (`src/openhuman/agent/hooks.rs`, `agent/stop_hooks.rs`) are Rust traits an *embedding host* installs by compiling against the core: `PostTurnHook`, `ToolHook`, `StopHook`. `ToolHook` now answers with a `ToolHookDecision` (`Proceed` / `ProceedWith(args)` / `Deny(reason)` / `Ask(reason)`) and `after_tool_context` may append text to a tool result. Both come with defaults that bridge to the old `Result<()>` pair, so existing implementations compile unchanged — but a hook that only vetoes is now the degenerate case, not the contract.
+
+**Configurable hooks** (`src/openhuman/hooks/`) are user-authored scripts declared in `hooks.json`, taking [Cursor's contract](https://cursor.com/docs/hooks) verbatim — event names, stdin envelope, stdout decision, exit code 2 = deny — so a script ports between hosts. Full guide: [`gitbooks/developing/hooks.md`](gitbooks/developing/hooks.md).
+
+Four things to know before touching that domain:
+
+- **It mounts on the existing seams, not new call sites.** `hooks::bridge` registers itself as an embedder `ToolHook` + `PostTurnHook`. Only the moments with no seam at all (`beforeSubmitPrompt`, `subagentStart`/`Stop`) get their own call site, in `hooks::ops`.
+- **Shell/file/MCP events are derived from tool calls.** OpenHuman has no separate shell-execution call site — `beforeShellExecution` is the `shell` tool going through the tool seam, reshaped into a Cursor-shaped payload. Both the generic and the specialised event fire, generic first. `SHELL_TOOLS`/`READ_TOOLS`/`WRITE_TOOLS` in `bridge.rs` are the mapping; extend those rather than adding a call site.
+- **`HookEvent::is_wired()` is load-bearing honesty.** Four events (`sessionStart`, `sessionEnd`, `preCompact`, `afterAgentThought`) are fully defined but have no call site yet. The loader warns when one is configured and `hooks.list` reports `wired: false`. Flip the flag when the call site lands — never optimistically.
+- **Strictest verdict wins, and layers concatenate.** Four `hooks.json` layers merge by appending, and `HookOutput::merge` folds deny over ask over allow, so a project file can never loosen an operator's rule. Do not "fix" the layering into an override model.
+
+Gating events run sequentially in the turn's path; observational ones are spawned and never block it (`HookEvent::is_gating` is the single place that split lives). With nothing configured the bridge is not installed, so an unconfigured host pays nothing per tool call.
+
 ---
 
 ## Testing
@@ -149,13 +166,13 @@ bash scripts/test-rust-with-mock.sh --test json_rpc_e2e
 
 No `UserProvider`/`AIProvider`/`SkillProvider` — auth lives in `CoreStateProvider` via `fetchCoreAppSnapshot()` RPC.
 
-**State** (`store/`): Redux Toolkit slices — `accounts`, `agentProfile`, `announcement`, `backendMeet`, `channelConnections`, `chatRuntime`, `companion`, `connectivity`, `coreMode`, `deepLinkAuth`, `layout`, `locale`, `mascot`, `notification`, `persona`, `providerSurface`, `ptt`, `socket`, `theme`, `thread`, `userErrors` (authoritative list: `store/index.ts`; persistence via `userScopedStorage`). Prefer Redux over ad-hoc `localStorage`.
+**State** (`store/`): Redux Toolkit slices — `accounts`, `agentProfile`, `announcement`, `channelConnections`, `chatRuntime`, `connectivity`, `coreMode`, `deepLinkAuth`, `layout`, `locale`, `mascot`, `notification`, `persona`, `providerSurface`, `ptt`, `socket`, `theme`, `thread`, `userErrors` (authoritative list: `store/index.ts`; persistence via `userScopedStorage`). Prefer Redux over ad-hoc `localStorage`.
 
-**Services** (`services/`): `apiClient`, `socketService`, `coreRpcClient`, `coreCommandClient`, `chatService`, `analytics`, `notificationService`, `webviewAccountService`, `daemonHealthService`, plus domain `api/*` clients. Always use `coreRpcClient` (which invokes the `relay_http_rpc` Tauri command) for core RPC.
+**Services** (`services/`): `apiClient`, `socketService`, `coreRpcClient`, `coreCommandClient`, `chatService`, `analytics`, `notificationService`, `daemonHealthService`, plus domain `api/*` clients. Always use `coreRpcClient` (which invokes the `relay_http_rpc` Tauri command) for core RPC.
 
 **Analytics**: use `Button analyticsId="stable-content-free-id"` for shared button interactions, `AnalyticsPageTracker` once inside the router, and `trackAnalyticsEvent` from `components/analytics` for successful domain outcomes (messages, automation runs, connections, etc.). Native controls and links may use `data-analytics-id` directly. Use privacy-safe dimensions only; never send user-authored text, entity IDs, filenames, credentials, or error messages. `services/analytics.ts` is the consent/provider implementation, not the feature-code API.
 
-**Routing** (`AppRoutes.tsx`, HashRouter): `/` (Welcome), `/auth`, `/onboarding/*`, `/chat/:threadId?`, `/human`, `/brain` (+ `/brain/tinyplace-orchestration`), `/orchestration`, `/connections`, `/flows` (+ `/flows/:id`, `/flows/draft`), `/agent-world/*`, `/invites`, `/notifications`, `/rewards`, `/settings/*`, `/feedback`. Back-compat redirects: `/home`→`/chat`, `/skills`→`/connections`, `/channels`→`/connections?tab=messaging`, `/intelligence` & `/activity`→`/settings/notifications`, `/routines` & `/workflows`→`/settings/automations`, `/webhooks`→`/settings/integrations#webhooks`. No `/login`, `/mnemonic`, `/agents`, `/conversations`.
+**Routing** (`AppRoutes.tsx`, HashRouter): `/` (Welcome), `/auth`, `/onboarding/*`, `/chat/:threadId?`, `/human`, `/brain`, `/connections`, `/flows` (+ `/flows/:id`, `/flows/draft`), `/invites`, `/notifications`, `/rewards`, `/settings/*`, `/feedback`. Back-compat redirects: `/home`→`/chat`, `/skills`→`/connections`, `/channels`→`/connections?tab=messaging`, `/intelligence` & `/activity`→`/settings/notifications`, `/routines` & `/workflows`→`/settings/automations`, `/webhooks`→`/settings/integrations#webhooks`. No `/login`, `/mnemonic`, `/agents`, `/conversations`.
 
 **AI config**: bundled prompts in `src/openhuman/agent/prompts/` ship via `tauri.conf.json` resources and are read core-side (`app/src/lib/ai/` holds agent-context helpers, not prompt loaders).
 
@@ -163,9 +180,9 @@ No `UserProvider`/`AIProvider`/`SkillProvider` — auth lives in `CoreStateProvi
 
 ## Tauri shell (`app/src-tauri/`)
 
-Thin desktop host. Key modules: `core_process`, `core_rpc`, `cdp`, `dictation_hotkeys`, `file_logging`, `mascot_native_window`, `window_state`, `imessage_scanner`, `webview_apis`.
+Thin desktop host. Key modules: `core_process`, `core_rpc`, `dictation_hotkeys`, `file_logging`, `mascot_native_window`, `window_state`, `imessage_scanner`.
 
-The CDP-driven provider scanners (`discord_scanner`, `slack_scanner`, `telegram_scanner`, `whatsapp_scanner`, `wechat_scanner`, `gmessages_scanner`), the `webview_accounts` surface they ran inside, and the in-app Meet call window (`meet_call`, `meet_audio`, `meet_video`, `meet_scanner`, `fake_camera`) were removed in #5478 — CDP only exists under a Chromium engine, and the app moved to Wry in #5456. `imessage_scanner` is unaffected: it reads `chat.db` natively and never used CDP. Meet itself is unaffected too — it runs through `src/openhuman/meet/` and the `backend_bot` (Recall.ai) path, which never touched CDP.
+The CDP-driven provider scanners (`discord_scanner`, `slack_scanner`, `telegram_scanner`, `whatsapp_scanner`, `wechat_scanner`, `gmessages_scanner`), the `webview_accounts` surface they ran inside, and the in-app Meet call window (`meet_call`, `meet_audio`, `meet_video`, `meet_scanner`, `fake_camera`) were removed in #5478 — CDP only exists under a Chromium engine, and the app moved to Wry in #5456. `imessage_scanner` is unaffected: it reads `chat.db` natively and never used CDP. Meet has since been removed from the product entirely (see below), so the `src/openhuman/meet/` and `backend_bot` paths those notes referred to are gone.
 
 IPC commands (authoritative list: `generate_handler!` in `app/src-tauri/src/lib.rs`): `core_rpc::relay_http_rpc`, `core_rpc_url`, `core_rpc_token`, `start_core_process`/`restart_core_process`, update commands (`check_app_update`, `apply_core_update`, …), window commands (`activate_main_window`, `mascot_window_*`, `notch_window_*`), `workspace_paths::*`, `artifact_commands::*`, hotkeys (dictation/PTT/companion), `native_notifications::*`, `mcp_commands::*`, `loopback_oauth::*`.
 
@@ -183,39 +200,83 @@ Audit new Tauri plugins for `js_init_script` calls.
 
 ## Rust core (`src/`)
 
-### Extracted host-agnostic crates — `vendor/tinydocs`, `vendor/tinywallet`
+### Module wire contracts — one `*-bus` crate per loadable module
 
-Two vendored crates own logic that used to live in this repo. Both are git
-submodules consumed by `path` (not published to crates.io, so no
-`[patch.crates-io]` entry — same shape as `tinyhumans-sdk`). After cloning:
-`git submodule update --init vendor/tinydocs vendor/tinywallet`.
+A capability that runs in a loaded module is reached over the bus, and a host
+cannot import Rust items from a `cdylib`. So every module ships an ordinary
+crate carrying its **call vocabulary** — interface names, member names, request
+and response types, and the contract version — and this crate links that and
+nothing else from the module's repository. Each is a git submodule consumed by
+`path` (not published to crates.io, so no `[patch.crates-io]` entry — same shape
+as `tinyhumans-sdk`).
+
+| Contract crate | Gate | Reached from |
+| --- | --- | --- |
+| `tinydocs-bus` | `documents` | `modules/documents.rs`, `tools/impl/document/` (as `format`) |
+| `tinyvoice-bus` | `voice` | `modules/voice.rs` |
+| `tinyjuice-bus` | **none** — `inference::tokenjuice` is kernel | `inference/tokenjuice/types.rs`, `modules/tokenjuice_host.rs` |
+| `tinyruntime-bus` | none — `ShellTool` holds an `Option<Arc<NodeBootstrap>>` field | `modules/runtime.rs`, `runtime/**` |
+| `tinywallet-bus` | `web3` | `modules/wallet.rs`, `web3/**` |
+| `tinymcp-bus` | `mcp` | `mcp/**` |
+| `tinychannels-bus` | **none** — the channel vocabulary is kernel surface | `core/events.rs`, `config/schema/channels.rs`, `security/pairing.rs`, `cron/bus.rs`, `memory/conversations/bus.rs`, `channels/traits.rs` |
+
+After cloning: `git submodule update --init --recursive vendor/`.
+
+**What this binary takes from each repository is its `-bus` contract crate, not
+its root crate.** The root crate holds the implementation the TinyBus module
+carries, and this binary does not link it. `tinymcp` is the one exception, and a
+temporary one: its path dependency stays until `tinymcp-bus` grows the members
+the host reaches for (see the `Cargo.toml` comment and tinyhumansai/tinymcp#4).
+
+**Never re-declare a contract type here.** Each of these crates replaced a copy
+that had already drifted or was one edit away from it — `tools/impl/document/
+format/` was 1,873 lines differing from `crates/tinydocs-bus/src/` only in
+doc-link paths, `modules/voice.rs` redeclared four types with a comment
+explaining that it had to, and `inference/tokenjuice/types.rs` was 259 lines
+headed "shared with the separately compiled module" and shared by convention
+alone. A field added on one side of a copy is a decode failure on the other with
+nothing to catch it, and for the document specs it is worse than that: those
+specs are also what an LLM is shown as a JSON tool schema, so a limit that moves
+upstream becomes a tool description promising what the module does not enforce.
+
+**Call members by their constant, never by a string.** `methods::GENERATE_DOCX`,
+not `"GenerateDocx"`. A rename upstream is then a compile error here instead of
+a `MemberNotFound` at runtime.
+
+**`registry.rs` is the one place a name is still written out by hand.** It is a
+`const` table and cannot name a gated crate, so the `_tests.rs` beside each
+module client assert its `bus_name` / `object_path` against the contract's
+`BUS_NAME` / `OBJECT_PATH`. A mismatch is not a compile error — it is a
+`NameHasNoOwner` at first use, in the field, on whichever platform nobody tested.
+
+**Host policy stays host-side.** The contract says what a module may send; it
+does not decide what this host will act on. When a type becomes foreign, the
+policy attached to it becomes a free function rather than moving upstream —
+`modules/voice.rs`'s `clamped` (a volume that reaches an `osascript` command),
+`vad_config_from_server_config` (this host persists seconds, the module speaks
+milliseconds), and `hallucination_mode_wire`.
 
 The split follows one rule, and it is worth stating because it decides where
 the *next* extraction goes: **a crate owns what is the same for every host; the
-host owns what depends on its own runtime, config, or threat model.** Both
-crates are therefore synchronous, I/O-free, and runtime-free.
+host owns what depends on its own runtime, config, or threat model.** The
+contract crates are therefore synchronous, I/O-free, and runtime-free.
 
 | Crate | Owns | OpenHuman keeps |
 | --- | --- | --- |
-| `tinydocs` | the `.docx` spec types, their size limits, validation, and OOXML synthesis (`docx-rs` sits behind it) | the artifact pipeline, the `spawn_blocking` hop, and the generation deadline — `src/openhuman/tools/impl/document/` |
-| `tinywallet` | the BTC / EVM / Solana / Tron address formats: parsing, validation, encoding conversions | RPC endpoint resolution, transaction assembly and broadcast, key custody — `src/openhuman/web3/` |
+| `tinydocs-bus` | the `.docx` / `.pptx` spec types, their size limits and validation | the artifact pipeline, the `spawn_blocking` hop, and the generation deadline — `src/openhuman/tools/impl/document/` |
+| `tinywallet-bus` | the TinyWallet wire contract and bus member names, the BTC / EVM / Solana / Tron address formats, the EIP-712 and ERC-20 encoders, and the Tron verification codec | RPC endpoint resolution, transaction assembly and broadcast, key custody — `src/openhuman/web3/` |
 
 Consequences worth knowing before touching either seam:
 
-- **`tinydocs::docx::generate` is synchronous on purpose.** A crate that
-  guessed at an executor or a deadline would be wrong for every host that
-  guessed differently, so `document/engine.rs` supplies exactly that policy and
-  nothing else. `DocumentError::GenerationTimeout` therefore has no `tinydocs`
-  equivalent and can only be produced host-side.
-- **`tinydocs::Error` is `#[non_exhaustive]`.** The `From` impl in
-  `document/types.rs` needs its catch-all arm; it degrades an unmapped variant
-  to `GenerationFailed` and logs, so a crate bump that adds a case worth
-  handling structurally shows up rather than being swallowed.
-- **The JSON tool schema did not change.** `GenerateDocumentInput` is
-  `tinydocs`' `DocumentSpec` re-exported under its historical name, with field
-  names unchanged; `the_json_wire_shape_is_unchanged_by_the_extraction` pins
-  that.
-- **`tinywallet` rejects an uppercase `0X` EVM prefix, matching the code it
+- **A `-bus` crate may hold logic, not only types, and that is deliberate.**
+  Four wallet rules are the host's to run synchronously: validating an address
+  before a spec is sent (a rejected input rather than a failed call), hashing
+  EIP-712 typed data for the x402 payment path, encoding ERC-20 calldata, and
+  verifying the txid and contents of what a Tron node handed back. That last one
+  is not optional — Tron has the *node* build the transaction, so the check has
+  to happen wherever the decision to sign is made. `tinydocs-bus`' spec
+  validators set the same precedent.
+- **`tinywallet-bus` rejects an uppercase `0X` EVM prefix, matching the code it
   replaced, which rejected that prefix too.** The old path went through `ethers_core::types::Address`'s
   `FromStr`, which is `fixed-hash`'s and strips only a lowercase `0x`
   (`fixed-hash-0.8.0/src/hash.rs`, `input.strip_prefix("0x")`), so `0X…` failed
@@ -224,11 +285,27 @@ Consequences worth knowing before touching either seam:
 - **Bitcoin has two rules, not one.** `btc::validate` is the recipient rule;
   `btc::validate_sender` additionally requires P2WPKH. Using the first where
   the second belongs accepts an address that only fails later, at signing time.
-- **Each crate's gates ride OpenHuman's existing ones**: `tinydocs` is
-  exclusive to `documents`, `tinywallet` to `web3`. Both are default-ON and
-  already forwarded to the desktop shell. Note `tinydocs` is now taken with
-  `default-features = false` — the wire contract, not the writers, which run in
-  the TinyBus module instead (see the module host section).
+- **The root `tinywallet` crate survives as a dev-dependency only.** Test
+  fixtures derive a known account through its `key` gate. Cargo does not link
+  dev-dependency features into the shipped binary, so this does not put
+  `bitcoin`, `coins-bip39` or a native `secp256k1` build back into the product.
+- **Document generation is synchronous on purpose.** A crate that guessed at an
+  executor or a deadline would be wrong for every host that guessed
+  differently, so `document/engine.rs` supplies exactly that policy and nothing
+  else. `DocumentError::GenerationTimeout` therefore has no contract equivalent
+  and can only be produced host-side.
+- **`tinydocs_bus::Error` is `#[non_exhaustive]`.** The `From` impl in
+  `document/types.rs` needs its catch-all arm; it degrades an unmapped variant
+  to `GenerationFailed` and logs, so a crate bump that adds a case worth
+  handling structurally shows up rather than being swallowed.
+- **The JSON tool schema did not change.** `GenerateDocumentInput` is the
+  contract's `DocumentSpec` re-exported under its historical name, with field
+  names unchanged; `the_json_wire_shape_is_unchanged_by_the_extraction` pins
+  that.
+- **Each crate's gates ride OpenHuman's existing ones**: `tinydocs-bus` is
+  exclusive to `documents`, `tinywallet-bus` to `web3`. Both are default-OFF for
+  contributors and product-ON, and both are already forwarded to the desktop
+  shell.
 
 ### Backend API access — `src/api/` over `tinyhumans-sdk`
 
@@ -341,13 +418,152 @@ two paths' equivalence — keep that as call sites migrate.
 
 ### Domain layout (`src/openhuman/`)
 
-~31 domain directories — authoritative list: `ls -d src/openhuman/*/`. Major families: agent (`agent` — with `agent/{agentbox,artifacts,context,experience,file_state,harness_init,learning,orchestration,plan_review,profiles,registry,session_db,session_import,tinyagents}`), memory (`memory` — with `memory/{agent,conversations,diff,goals,people,queue,search,sources,store,sync,tinycortex,tool_memory,tree}`), skills/flows (`skills` — with `skills/{catalog,runtime,webhooks}` —, `flows` — with `flows/{tinyflows,rhai}`), inference/AI (`inference` — with `inference/{embeddings,tokenjuice}` —, `routing`), MCP (`mcp` — with `mcp/{server,registry,audit,config_servers,http_client}`), runtimes (`runtime` — with `runtime/{node,python,python_server,pool,javascript}` —, `sandbox` — with `sandbox/cwd_jail`), channels (`channels` — with `channels/whatsapp_data`), meet (`meet` — with `meet/agent`, `meet/backend_bot`), web3 (`web3` — with `web3/{wallet,x402}`), plus kernel domains (`platform` — with `platform/{about_app,connectivity,cost,doctor,health,proc_metrics,service,socket,startup,update}` —, `config` — with `config/{migrations,migration_helpers,workspace}` —, `cron` — with `cron/scheduler_gate` —, `integrations`, `security` — with `security/{approval,credentials,keyring,keyring_consent,encryption,prompt_injection,devices}` —, `threads` — with `threads/{goals,todos}` —, `tools` — with `tools/{registry,status,timeout,agent_policy}` —, `util` — with `util/{text,retry,tls,types}` —, `voice`, …).
+~31 domain directories — authoritative list: `ls -d src/openhuman/*/`. Major families: agent (`agent` — with `agent/{artifacts,context,experience,file_state,harness_init,learning,orchestration,plan_review,profiles,registry,session_db,session_import,tinyagents}`), memory (`memory` — with `memory/{agent,conversations,diff,goals,people,queue,search,sources,store,sync,tinycortex,tool_memory,tree}`), skills/flows (`skills` — with `skills/{catalog,runtime,webhooks}` —, `flows` — with `flows/{tinyflows,rhai}`), inference/AI (`inference` — with `inference/{embeddings,tokenjuice}` —, `routing`), MCP (`mcp` — with `mcp/{server,registry,audit,config_servers,http_client}`), runtimes (`runtime` — with `runtime/{node,python,python_server,pool,javascript}` —, `sandbox` — with `sandbox/cwd_jail`), channels (`channels`), web3 (`web3` — with `web3/{wallet,x402}`), plus kernel domains (`platform` — with `platform/{about_app,connectivity,cost,doctor,health,proc_metrics,service,socket,startup,update}` —, `config` — with `config/{migrations,migration_helpers,workspace}` —, `cron` — with `cron/scheduler_gate` —, `integrations`, `security` — with `security/{approval,credentials,keyring,keyring_consent,encryption,prompt_injection,devices}` —, `threads` — with `threads/{goals,todos}` —, `tools` — with `tools/{registry,status,timeout,agent_policy}` —, `util` — with `util/{text,retry,tls,types}` —, `voice`, …).
 
-**Family directories (in progress).** The flat tree is being collapsed so that **one directory equals one feature gate**: a capability spread across sibling top-level dirs costs a `#[cfg]` per dir plus five parallel registries to keep in sync. Landed so far (124 → 31 top-level dirs, 0 root-level `*.rs`): `meet/`, `util/` (incl. `util/sanitize`), `mcp/{server,registry,audit,config_servers,http_client}`, `sandbox/cwd_jail`, `cron/scheduler_gate`, `runtime/`, `media/`, `voice/audio_toolkit`, `web3/{wallet,x402}`, `medulla/chat`, `flows/{tinyflows,rhai}`, `channels/whatsapp_data`, `desktop/` (accessibility, app_state, dashboard, notifications, overlay, provider_surfaces), `hosted/` (announcements, billing, orchestration, referral, team — all thin proxies to the TinyHumans backend), `subconscious/{triggers,monitors}`, `threads/{goals,todos}`, `tools/{registry,status,timeout,agent_policy}`, `platform/` (about_app, connectivity, cost, doctor, health, proc_metrics, service, socket, startup, update), `config/{migrations,migration_helpers,workspace}`, `integrations/{composio,recall_calendar,file_storage,task_sources}`, `skills/{catalog,runtime,webhooks}`, `inference/{embeddings,tokenjuice}`, `security/{approval,credentials,keyring,keyring_consent,encryption,prompt_injection,devices}` (the kernel security family — never gated), and `agent/{experience,orchestration,registry,agentbox,harness_init,session_db,session_import,context,profiles,learning,plan_review,file_state,artifacts,tinyagents}` (the agent harness is kernel and is never gated; `agent/` stayed put as the parent rather than becoming `agent/core`, which would have cost ~999 extra import rewrites for no gate benefit), and `memory/{store,sync,tree,search,sources,queue,diff,goals,conversations,tool_memory,tinycortex,agent,people}` (the largest family, moved last; `memory/` stayed put as the parent — a `memory → memory/core` rename would have cost ~545 extra rewrites — with the pre-existing `memory/sync.rs` renamed to `memory/sync_events.rs` to free the name for `memory_sync`, and `memory_tools` landing as `memory/tool_memory` to avoid the pre-existing `memory/tools/` agent-tool directory). The `heartbeat/` re-export shim is deleted; use `subconscious::heartbeat` directly. Plan, target tree, and move-PR rules: [`docs/specs/2026-08-02-core-kernel-domain-reorg.md`](docs/specs/2026-08-02-core-kernel-domain-reorg.md).
+**Family directories (in progress).** The flat tree is being collapsed so that **one directory equals one feature gate**: a capability spread across sibling top-level dirs costs a `#[cfg]` per dir plus five parallel registries to keep in sync. Landed so far (124 → 28 top-level dirs, 0 root-level `*.rs`): `util/` (incl. `util/sanitize`), `mcp/{server,registry,audit,config_servers,http_client}`, `sandbox/cwd_jail`, `cron/scheduler_gate`, `runtime/`, `media/`, `voice/audio_toolkit`, `web3/{wallet,x402}`, `medulla/chat`, `flows/{tinyflows,rhai}`, `desktop/` (accessibility, app_state, dashboard, notifications, overlay, provider_surfaces), `hosted/` (announcements, billing, referral, team — all thin proxies to the TinyHumans backend), `threads/{goals,todos}`, `tools/{registry,status,timeout,agent_policy}`, `platform/` (about_app, connectivity, cost, doctor, health, proc_metrics, service, socket, startup, update), `config/{migrations,migration_helpers,workspace}`, `integrations/{composio,file_storage,task_sources}`, `skills/{catalog,runtime,webhooks}`, `inference/{embeddings,tokenjuice}`, `security/{approval,credentials,keyring,keyring_consent,encryption,prompt_injection,devices}` (the kernel security family — never gated), and `agent/{experience,orchestration,registry,harness_init,session_db,session_import,context,profiles,learning,plan_review,file_state,artifacts,tinyagents}` (the agent harness is kernel and is never gated; `agent/` stayed put as the parent rather than becoming `agent/core`, which would have cost ~999 extra import rewrites for no gate benefit), and `memory/{store,sync,tree,search,sources,queue,diff,goals,conversations,tool_memory,tinycortex,agent,people}` (the largest family, moved last; `memory/` stayed put as the parent — a `memory → memory/core` rename would have cost ~545 extra rewrites — with the pre-existing `memory/sync.rs` renamed to `memory/sync_events.rs` to free the name for `memory_sync`, and `memory_tools` landing as `memory/tool_memory` to avoid the pre-existing `memory/tools/` agent-tool directory). Plan, target tree, and move-PR rules: [`docs/specs/2026-08-02-core-kernel-domain-reorg.md`](docs/specs/2026-08-02-core-kernel-domain-reorg.md).
 
 A move never changes the wire surface — RPC namespaces are string literals in `ControllerSchema`, not derived from module paths — so **do not rename namespace strings to match new paths**.
 
-**Skills runtime**: the QuickJS per-skill VM engine is gone. `src/openhuman/skills/` holds skill metadata/tool descriptors; execution of installed `SKILL.md` workflows lives in `src/openhuman/skills/runtime/` (starts/cancels runs, hosts the `skill_executor` agent, reuses `runtime_node`/`runtime_python`).
+
+**Removed product surfaces.** Four capabilities were deleted from the core and the
+UI rather than gated off, so there is no flag that brings them back:
+
+| Removed | What went | Notes |
+| --- | --- | --- |
+| Desktop companion | `app/src-tauri/src/companion{,_commands}.rs`, the `companion` Redux slice, `CompanionPanel`, `companionEvents`, the overlay/notch companion modes | Shell + UI only; the core never owned it. `mascot_native_window`, `notch_window` and `ptt_overlay` are unaffected. |
+| AgentBox | `agent/agentbox/`, the `agentbox` RPC namespace, the GMI MaaS provider bridge, the `AgentBoxPanel` settings page | Moved to [tinybox](https://github.com/tinyhumansai/tinybox). The unauthenticated `/run` and `/jobs/` routes left `core::auth`'s public-path list with it — `agentbox_run_and_jobs_paths_are_no_longer_public` pins that they stay authenticated. |
+| Meetings | the `meet` Cargo gate and `openhuman::meet/` (join validation, live agent loop, backend bot), `MeetConfig`, the `meet`/`meet_agent`/`agent_meetings` namespaces, every `BackendMeet*`/`Meeting*` `DomainEvent`, the meetings UI, and `integrations/recall_calendar` (its only purpose was Meet auto-join) | `DomainGroup::Meet` is gone, so `DomainGroup::COUNT` dropped 23 → 22. The approval gate's in-call branch went with it — nothing set `APPROVAL_IN_CALL_CONTEXT` any more. |
+| Subconscious | `openhuman::subconscious/` (engine, heartbeat, planner, monitors, triggers, user_thread), the `openhuman subconscious` CLI, the monitor + `notify_user` agent tools, the Brain/Activity subconscious tabs | `DomainGroup::Automation` now means cron alone. **`HeartbeatConfig` stays** — `threads::goals::continuation` reads `heartbeat.goal_continuation_enabled` / `goal_idle_minutes`, and **the `subconscious` provider role stays** because `agent::triage::routing` resolves its provider through it. |
+| TinyPlace | `openhuman::tinyplace/`, hosted orchestration, relay controllers/events/services, pairing support, the TinyPlace dependency and submodule, Agent World and Brain orchestration UI, routes, settings, tests, and documentation | The Medulla harness envelope is now core-owned. The security path denylist retains the legacy `tinyplace` directory name so upgraded workspaces cannot expose old private state to agent file tools. |
+
+One compatibility behavior deliberately survived and should not be "cleaned up":
+`threadFilter`'s `MEETINGS_LABELS` still routes historical meeting-labelled
+threads so existing user data does not leak into the General bucket.
+
+**Removed agent-tool families.** A second, narrower removal: six families left
+the *agent tool surface* while their RPC controllers stayed registered, because
+the dashboard still calls them. The distinction matters — "the tool is gone" is
+not "the domain is gone", and only one of these took its domain with it:
+
+| Removed family | Tools gone | Domain / RPC |
+| --- | --- | --- |
+| `apify_*` | `apify_run_actor`, `apify_get_run_status`, `apify_get_run_results` + the `[integrations].apify` toggle | Deleted. **`openhuman.tools_apify_linkedin_scrape` stays** — onboarding's ContextGatheringStep calls it, and `agent::learning::linkedin_enrichment` reaches the backend route directly, not through the deleted tools. |
+| `people_*` | all 7 | `memory/tools/people.rs` deleted; the `people` RPC surface and `memory/people/` (address book, the `contacts` gate) stay. |
+| `thread_*` | all 17, plus `transcript_search` | `threads/tools.rs` deleted; the `threads` domain stays — it is `DomainGroup::Threads` kernel surface and backs the whole chat UI. `todo_*` and `goal_*` are untouched. |
+| `billing_*`, `team_*`, `referral_*` | all 34 | `hosted/{billing,team,referral}/tools.rs` deleted; every controller stays (32 `team` and 5 `billing` frontend call sites). |
+
+One agent went with them: **`account_admin_agent`** (its belt was billing +
+team + referral). `account_admin_agent`'s read-only
+half — `session_state`, `session_get_user`, `credential_list`,
+`oauth_connect_url`, `oauth_list` — moved to `settings_agent`: that is account
+*state*, which is settings territory, and has nothing to do with the money
+movement that went away.
+
+**Known regression, accepted:** removing `thread_list` from the orchestrator
+reopens #4744 — "list my recent conversation threads" has no direct route and
+the model will fall back to `retrieve_memory`, which walks the memory *tree*,
+the wrong index. `tests/orchestrator_thread_list_wiring.rs`, which existed to
+pin that fix, was deleted with the tool. If threads need a chat route again, the
+cheap fix is a single read-only `thread_list` rather than restoring the family.
+
+**Skills runtime**: the QuickJS per-skill VM engine is gone. `src/openhuman/skills/` holds skill metadata/tool descriptors; execution of installed `SKILL.md` workflows lives in `src/openhuman/skills/runtime/` (starts/cancels runs, hosts the `skill_executor` agent, reuses `runtime::node`/`runtime::python`, which are clients for the `tinyruntime` module).
+
+### Tool calling lives in tinyagents — `src/openhuman/agent/dispatcher.rs` is a seam
+
+How a model is told to ask for a tool, how the ask is parsed, how results are
+rendered back, and how a transcript is replayed onto the provider wire are one
+thing — a **dialect** — and all four live in
+`tinyagents::harness::tool_calling::dialect` (`XmlDialect` / `PFormatDialect` /
+`NativeDialect`). They belong together because a catalogue advertising one
+grammar next to a parser expecting another is a silent whole-turn failure: the
+model emits a call, nothing recognises it, the iteration is spent, and no error
+is logged anywhere.
+
+`dispatcher.rs` keeps two things and delegates the rest:
+
+- **The vocabulary.** `ParsedToolCall` / `ToolExecutionResult` are named for
+  ~190 call sites, and `ConversationMessage` is the durable JSONL record on
+  existing installations' disks. The crate speaks its own thin `TranscriptEntry`
+  instead, so the conversions in `dispatcher.rs` are the seam — field-wise maps
+  that keep the wire bytes identical while the logic sits upstream. **A
+  conversion that decides something is a second implementation in disguise; put
+  the judgement in the crate.**
+- **The `Tool` trait object.** The crate takes `ToolSchema`s, never a host's
+  tool type — same reason the parse seam already documents: depending on
+  OpenHuman's `Tool` would make the crate unusable by a second host.
+
+Two consequences worth knowing before editing this area:
+
+- **Executing a tool did not move and will not.** The security policy, approval
+  gate, sandbox, per-call timeout and progress events are OpenHuman's. A dialect
+  decides what the model reads and writes; it never decides what is allowed to
+  happen. That line is what keeps the policy auditable in one place.
+- **The catalogue has one renderer.** `ToolsSection` calls the crate's
+  `render_pformat_catalogue`, which builds each `Call as:` signature from the
+  same schema its parser reconstructs arguments from — so prompt order and parse
+  order agree by construction. The local copy this replaced carried a comment
+  promising the two "stay in lockstep", which is the shape of a bug waiting to
+  happen, not a guarantee. `humanize_tool_name` and `context_detail_from_args`
+  now live in `tinytools` and are re-exported by both this crate and tinyagents
+  — see the section below.
+
+
+### The tool vocabulary lives in `tinytools` — `tools/traits.rs` is a re-export
+
+The `Tool` trait, `ToolResult` / `ToolContent`, `ToolSpec`, `PermissionLevel`,
+`ToolScope`, `ToolCategory`, `ToolCallOptions`, `ToolTimeout`,
+`WorkspaceDescriptor` and `SandboxMode` are defined in
+[`tinytools`](https://github.com/tinyhumansai/tinytools), which **tinyagents
+also depends on**. That is the whole point: `tinytools::Tool` and the trait the
+harness runs a loop over are the *same* trait, so a tool is implemented once and
+both sides accept it, with no conversion at the seam to get subtly wrong.
+
+`src/openhuman/tools/traits.rs` and `src/openhuman/skills/types.rs` stay as the
+import paths ~190 and ~14 call sites already name; both are now short
+re-exports. New code may name either.
+
+**It is vendored through tinyagents, not beside it.** The dependency is
+`vendor/tinyagents/vendor/tinytools/crates/tinytools` — the exact path tinyagents
+itself declares. A second `vendor/tinytools` submodule of our own would be a
+*different package* to cargo, and `tinytools::ToolResult` from one would not be
+the same type as from the other; every tool here would stop satisfying the
+harness's trait, with a type error naming the same path twice. After cloning:
+`git submodule update --init --recursive vendor/`.
+
+Four things to know before editing this area:
+
+- **The edge points one way, and `ToolRunContext` is why.** tinyagents depends
+  on tinytools, so tinytools cannot name `ToolExecutionContext` — that would be
+  a cycle. A tool that needs its isolated worktree root takes
+  `Option<&dyn ToolRunContext>` instead, which tinyagents implements for its own
+  context type. The trait exposes the workspace, the thread id and the turn
+  output budget and nothing else; the run id, event sink and cancellation token
+  stay harness-internal, because a tool reaching for those is reaching into the
+  run rather than doing its job. tinytools' CI fails if `tinyagents` appears
+  anywhere in its forward dependency tree.
+- **Host-specific tool metadata rides on an erased extension.**
+  `Tool::host_extension` / `host_call_extension` return `dyn Any`, and
+  `traits::pack_registry_handle` / `traits::generated_runtime_context` downcast
+  them back. `PackRegistryHandle` and `GeneratedToolRuntimeContext` are *our*
+  concepts and a shared vocabulary has no business naming them. Two tools and
+  one test use this; everything else returns `None` and pays nothing.
+- **Nothing that decides anything moved.** tinytools lets a tool *declare* the
+  privilege it needs and whether it reaches outside the machine. What to do
+  about those declarations is still ours and stays in one auditable place: the
+  `SecurityPolicy`, the approval gate, the sandbox, `tools/policy.rs`,
+  `tools/timeout/`, `tools/agent_policy/` and the whole `tools/registry/` +
+  `tools/toolpacks/` surface. `tools/schemas.rs` likewise stays — those are RPC
+  controllers bound to `crate::core`.
+- **The MCP conversion is a free function, not a `From` impl.**
+  `skills::types::tool_result_from_mcp` — once `ToolResult` became foreign, the
+  orphan rule forbade the trait impl. It is still written exactly once, because
+  spelled out at each call site it would be three chances to get the error flag
+  the wrong way round.
+
+`tinytools` costs the kernel floor **+1 package / +1 name / 0 native builds**
+(it adds no third-party crate this profile did not already have) and cannot be
+gated: `tools/` is kernel surface, so the trait compiles in every build. See the
+2026-08-29 entry in `scripts/kernel-floor.limits`.
 
 **Rules:**
 
@@ -379,18 +595,69 @@ A move never changes the wire surface — RPC namespaces are string literals in 
 
 Modules: `all`, `auth`, `cli`, `dispatch`, `event_bus/`, `jsonrpc`, `logging`, `observability`, `types`, etc. No business logic here.
 
-### Runtime composition — `ServiceSet` + `DomainSet` on `CoreBuilder`
+### Running a turn as a library call — `Harness`
 
-Two independent runtime axes on `CoreBuilder` (`src/core/runtime/builder.rs`):
+`CoreBuilder` composes a core and `embed::Core` gives it typed methods; **`openhuman_core::Harness` is the front door that turns a prompt into a reply**, with model/provider, workspace, access tier, MCP servers and skills as typed builder inputs.
+
+```rust
+let harness = Harness::builder()
+    .provider(Provider::openai_compatible(base_url, key).model("gpt-5"))
+    .workspace(Workspace::Ephemeral)          // or ::Dir(path) / ::Inherit
+    .access(Access::full())
+    .session(Session::local("my-host"))
+    .backend_url(backend)
+    .mcp(McpServer::stdio("gh", "gh-mcp", ["stdio"]))   // #[cfg(feature = "mcp")]
+    .skills_dir("./skills")                              // #[cfg(feature = "skills")]
+    .build().await?;
+
+let out = harness.run("Summarize this repo.").await?;
+let next = harness.turn("Now the risks.").session(&out.session_id).send().await?;
+```
+
+Layering: `embed::Core::agent()` is the typed turn surface for a host that already owns a `CoreRuntime` (the shell, an existing embedder); `Harness` builds that runtime for you and owns the workspace's lifetime. `embed::Core::auth()` types the session store. Everything routes through `CoreRuntime::invoke`, never `ops::*`, so `DomainSet` gating is honoured — see `src/embed/call.rs`.
+
+**Five things that bite, each of which cost a debugging session to find:**
+
+- **`CoreBuilder::config(..)` alone configures boot and nothing else.** RPC handlers do not receive it — they call `config::ops::load_config_with_timeout()` per dispatch, which re-runs `Config::load_or_init()` and re-resolves the process-global workspace. The config is published on `CoreContext::embedder_config` and that loader prefers it; without that branch an embedder watches its turns run against `~/.openhuman` while believing otherwise.
+- **`config_path` is not cosmetic — set it with `workspace_dir`.** Credential state, auth profiles and the keyring file backend resolve against its *parent*, not against the workspace. Setting only `workspace_dir` yields a harness that looks hermetic and reads the operator's real credentials. `Harness` puts it beside the workspace (`<root>/config.toml` next to `<root>/workspace`), the same shape `load_or_init` produces.
+- **A custom provider is gated on an active app session** (`verify_session_active`), even for a host that supplied the endpoint and key itself — the gate exists to stop an unregistered *desktop* user routing around registration and cannot tell the two apart. `Session::local(..)` satisfies it without asserting anything at the backend.
+- **Point `backend_url` somewhere real or stubbed.** The core makes non-inference backend calls regardless of where inference goes. Signed out of the hosted backend, those are rejected, a rejection publishes `SessionExpired`, and the *next* turn then fails the provider gate for reasons unrelated to the turn.
+- **The access tier is only half of "allowed to act".** The other half is the turn origin, a task-local the approval gate fail-closes on. Setting `autonomy.level = full` and no origin gives an agent whose `shell` / `edit` / `apply_patch` all refuse while the transcript still reads plausibly. `Access::full()` sets both; that is the whole reason the type exists.
+
+**One `Harness` per process.** The keyring master key, the RPC bearer, the global event bus and the `Once`-guarded domain subscribers are process-scoped, so a second one would silently share them. `build()` returns `HarnessError::AlreadyRunning` instead. Lifting this is phase 3 of `docs/plans/pluggable-core/`. The caller also owns the tokio runtime and **must** size it with `AGENT_WORKER_STACK_BYTES` / `MAX_BLOCKING_THREADS` — the default 2 MiB worker stack overflows on a turn that delegates to a sub-agent and aborts the process, which is why `examples/run_turn.rs` does not use `#[tokio::main]`.
+
+**Skills are copied, not linked**, into `<workspace>/skills`. Discovery rejects symlinked bundle dirs and symlinked manifests deliberately (that root is scanned with no trust marker), so a link is silently skipped — skills that look configured and are absent from the turn. `Workspace::Inherit` refuses the copy rather than leaving bundles in the operator's install.
+
+Example: `examples/run_turn.rs`. End-to-end test: `tests/harness_embed.rs`.
+
+### Runtime composition — `ServiceSet` + `DomainSet` + `ToolGroups` on `CoreBuilder`
+
+Three independent runtime axes on `CoreBuilder` (`src/core/runtime/builder.rs`):
 
 - **`ServiceSet`** selects which *background services / transports* run (`rpc_http`, `socketio`, `cron`, `channels`, `heartbeat`, …). Presets: `desktop()` / `headless_api()` / `none()`.
 - **`DomainSet`** selects which *domain families* exist at runtime, one flag per `DomainGroup` (`src/core/all.rs`). Presets: `full()` (default — byte-identical to before #4796), `harness()` (agent + memory + threads + config + security only), `none()`. Every controller is tagged with its `DomainGroup` at the single registration site in `src/core/all.rs`; the live surface (controllers/`/schema`/dispatch, agent tools, stores, subscribers) is filtered by the ambient `CoreContext::domains()`. A gated domain's controllers become unknown-method, its agent tools absent, its stores/subscribers uninitialized. `examples/embed_headless.rs` uses `DomainSet::harness()`; `examples/embed_kernel.rs` uses `DomainSet::kernel()` — the floor (threads + config + security, with `agent`/`memory` OFF) that a host opts subsystems back into by field assignment. Per-gate Cargo `[features]` (children #4797–#4804) narrow the compile-time surface further; `DomainSet` is the runtime axis they compose with.
 
-**`DomainGroup` tracks family directories 1:1.** After the domain reorg (#5328) each variant names a `src/openhuman/` family, so the runtime axis stopped sweeping half the surface into the `Platform` catch-all. Groups: the harness families (`Agent`, `Memory`, `Threads`, `Config`, `Security`), the compile-gate families (`Flows`, `Skills`, `Mcp`, `Meet`, `Channels`, `Web3`, `Voice`, `Media`, `Medulla`), the families carved out of `Platform` (`Inference`, `Integrations`, `Automation` = cron + subconscious, `Runtimes` = runtime + sandbox, `Desktop`, `Hosted`, `Relay` = tinyplace, `Modules` = the native module host), and `Platform` itself — now only the kernel surfaces with no family of their own (`platform/`, `tools/`, `http_host/`, `test_support/`).
+- **`ToolGroups`** selects how each *tool group* reaches the model, one mode per compiled-in pack in `tools/toolpacks/registry.rs` (`src/openhuman/tools/toolpacks/groups.rs`). Presets: `packed()` (default — every group withheld, byte-identical to before the type existed), `advertised()`, `none()`, plus `.with(id, mode)`. Also on `Harness::builder()`.
+
+**The third axis exists because the pack table answers a compression question, and a library embedder is asking a capability question.** Packs were built for one host's problem — an orchestrator whose fixed per-turn cost is dominated by tool schemas — and membership is compiled in for a good reason: a pack that config or RPC could edit would let a caller move a dangerous tool out of the reviewed surface. But `openhuman_core` is also consumed as a library, and there the group id is the natural unit of *what this product has at all*. A host embedding the harness to summarise documents has no use for the crypto belt at any disclosure level; a host doing its own routing may want every schema on the wire because it does not pay the orchestrator's budget. Neither is expressible by membership, which only ever says "advertised or withheld".
+
+So `GroupMode` has three states, not two:
+
+| `GroupMode` | Schemas on the wire | Registered and callable |
+| --- | --- | --- |
+| `Advertised` | yes | yes |
+| `Withheld` | no (reached via `load_skill` / `use_skill`) | yes |
+| `Off` | no | **no** |
+
+`Off` is the state that could not be said before, and it is the one an embedder reaches for most — absence beats a registered tool that fails, the same reasoning the `flows` compile gate already documents. Enforcement is two-sited and mirrors the existing filters: `Off` drops the tool in `all_tools_with_runtime`'s post-filter block (a third `retain`, right after the `DomainSet` and memory-capability ones), and `Withheld` is what `strip_packed_from_visible` acts on. **The three narrow, they never widen** — `Advertised` cannot conjure a tool that a Cargo gate compiled out or that the ambient `DomainSet` dropped.
+
+**Packs now carry an `owners` list, and a pack is skipped entirely for its owner.** This is new with the raw-tool packs and was not needed before: the original packs held only synthesised `delegate_*` tools, which exist on the orchestrator alone. A pack over raw tools is different — `settings_agent` exists precisely to run `config_*` / `health_*` / `service_*`, so withholding the `system` pack from it would put a `load_skill` round trip in front of the first call of every one of its turns and hide nothing that was idle. Its whole belt *is* the pack. `strip_packed_from_visible` therefore takes the agent id.
+
+**`DomainGroup` tracks family directories 1:1.** After the domain reorg (#5328) each variant names a `src/openhuman/` family, so the runtime axis stopped sweeping half the surface into the `Platform` catch-all. Groups: the harness families (`Agent`, `Memory`, `Threads`, `Config`, `Security`), the compile-gate families (`Flows`, `Skills`, `Mcp`, `Channels`, `Web3`, `Voice`, `Media`, `Medulla`), the families carved out of `Platform` (`Inference`, `Integrations`, `Automation` = cron, `Runtimes` = runtime + sandbox, `Desktop`, `Hosted`, `Modules` = the native module host), and `Platform` itself — now only the kernel surfaces with no family of their own (`platform/`, `tools/`, `http_host/`, `test_support/`).
 
 That realignment fixed two real defects, both pinned by tests in `src/core/all_tests.rs`:
 
-- `harness()` claimed "agent + memory + threads + config + security" but silently dropped `agent::{agentbox, harness_init, artifacts, learning}`, `security::{credentials, devices}`, `config::{workspace, migration_helpers}`, `memory::people` and `skills::webhooks` into `Platform`. An agent harness that never registers `harness_init` is a latent bug.
+- `harness()` claimed "agent + memory + threads + config + security" but silently dropped `agent::{harness_init, artifacts, learning}`, `security::{credentials, devices}`, `config::{workspace, migration_helpers}`, `memory::people` and `skills::webhooks` into `Platform`. An agent harness that never registers `harness_init` is a latent bug.
 - `embedded()` had to set `platform: true` purely to reach credentials and config, which dragged the desktop and hosted-backend surfaces along with it. Those are `Desktop` / `Hosted` now and stay off.
 
 **Adding a family directory means four edits, all compiler-enforced:** the `DomainGroup` variant (`src/core/all.rs`), the `DomainSet` field + `allows()` arm + every preset (`src/core/runtime/builder.rs`).
@@ -410,7 +677,23 @@ Per-domain Cargo features drop whole domains **at compile time** (smaller binary
 
 | Set | Where it lives | What it is |
 | --- | --- | --- |
-| **Contributor** | `[features] default` in `Cargo.toml` | What a bare `cargo check`, `cargo test` and rust-analyzer compile. 9 cheap gates. **353 packages / 3 native builds** (`libsqlite3-sys`, `lzma-sys`, `ring`). |
+| **Contributor** | `[features] default` in `Cargo.toml` | What a bare `cargo check`, `cargo test` and rust-analyzer compile. 10 cheap gates. **~353 packages / 2 native builds** (`libsqlite3-sys`, `ring`). |
+
+> **`modules` is in `default`, and it is the one gate here that is not optional.**
+> The table below has documented it as Contrib=ON since it landed and
+> `scripts/ci/product-features.txt` has always listed it, but it was missing from
+> `[features] default` — so a bare `cargo test --lib -- memory::` failed **26**
+> tests (582 passed / 26 failed), every one a "null vs module" assertion, because
+> `memory::binding::module_provider` took its `#[cfg(not(feature = "modules"))]`
+> arm and bound `NullMemoryProvider`. A further 15 module-gated tests did not
+> exist at all. With the gate on: **623 passed, 0 failed.** A default set that
+> cannot run its own test suite is not an inner loop, so this one stays.
+> It is also the cheapest gate in the list — **+9 packages / +5 unique names**
+> (`ureq`, `ureq-proto`, `utf8-zero`, `toml_edit`, `toml_write`) and **zero** new
+> native builds; the native list is identical with it on and off. Nothing like
+> the cohorts that motivated splitting `default` from the product set. It does
+> **not** move the kernel floor — that profile is `--no-default-features
+> --features flows` and never reads this list.
 | **Product** | `scripts/ci/product-features.txt` | What the shipped desktop app has. 16 gates. **540 packages / 7 native builds** (adds `bzip2-sys`, `libgit2-sys`, `libz-sys`, `zstd-sys`). |
 
 `default` used to be the product set, which made the inner loop pay for the whole product on every edit — web3's ethers/secp256k1 cohort, `documents`' zstd/bzip2 native builds (since removed from the graph entirely — the codecs run in a module now), the cpal/hound/arboard/enigo/rdev stack behind `voice`+`inference`, `contacts`' macOS objc2 cohort, `crash-reporting`'s sentry tree, `tui`'s ratatui. Those are default-OFF now. **This did not change what ships**: the shell has set `default-features = false` since #1061 and never inherited `default` anyway.
@@ -434,10 +717,11 @@ GGML_NATIVE=OFF cargo check --manifest-path Cargo.toml \
 
 `--no-default-features --features flows` is the **kernel profile**: the surface a
 second host would embed to get workflow execution and nothing else. It is measured
-and ratcheted, because unmeasured it grows — three heavy dependencies remain
-unconditional today (`git2`/vendored-libgit2, `rusqlite`/bundled, and
-`tokio-tungstenite`), and none would likely have
-landed that way had a number moved in CI when they did.
+and ratcheted, because unmeasured it grows — `rusqlite`/bundled and
+`tokio-tungstenite` remain unconditional today (`git2`/vendored-libgit2 left the
+kernel profile with the `libgit2-sys` + `libz-sys` shed below, once it moved
+behind the `memory-git` gate, since deleted outright), and none would likely have landed that way had a
+number moved in CI when they did.
 
 ```bash
 scripts/kernel-floor.sh flows        # CI Linux: 304 packages / 281 names / 3 native
@@ -452,7 +736,8 @@ builds** (`libsqlite3-sys`, `ring`). **This is the target** — MIGRATION-PLAN G
 set 2 native builds as the goal, and the profile is there, down from 418 names
 / 6 native when the program started. The four that left: `aws-lc-sys` (the
 tinychannels rustls pin), `lzma-sys` (the `runtime-node` gate), and
-`libgit2-sys` + `libz-sys` together (the `memory-git` gate). The macOS graph
+`libgit2-sys` + `libz-sys` together (the `memory-git` gate, now deleted along
+with the `memory::diff` surface it guarded — libgit2 is out of every profile). The macOS graph
 resolves a few packages higher because of target-specific edges; the CI ratchet
 is intentionally calibrated on Linux.
 
@@ -486,17 +771,15 @@ Two columns because there are two sets (see above): **Contrib** is `[features] d
 | `inference` | OFF | ON | the `cpal` audio-device stack: microphone capture for voice, plus `desktop::accessibility::permissions`' mic-permission probe. Implied by `voice`. Off ⇒ the probe reports `Unknown`. **The name is historical** — it used to gate the bundled whisper.cpp STT engine, which no longer exists (see the scope note below); do not rename it, it is forwarded by name from the shell manifest and asserted by `INFERENCE_COMPILED_IN` | `cpal` |
 | `web3` | OFF | ON | the `openhuman::web3` family (`web3`, `web3::wallet`, `web3::x402`) — crypto wallet (multi-chain sign/broadcast), swaps/bridges/dapp calls, x402 machine payments | `bitcoin`, `curve25519-dalek` |
 | `media` | ON | ON | `openhuman::media::generation` (the `media_generate_*` agent tools) + `openhuman::media::image` scaffold | none (surface-only) |
-| `documents` | OFF | ON | the `generate_document` / `generate_presentation` agent tools and PDF text extraction during multimodal ingest. **The synthesis is not in this build** — all three run in the `tinydocs` TinyBus module (see below), so this gate turns on the tools and the host policy around them: the artifact pipeline, the deadlines, image resolution under the security policy. `tinydocs` is consumed with `default-features = false`, for the wire contract only. Implies `modules`. Off ⇒ both tools absent from the tool list rather than degraded, and PDF ingest degrades a file to a reference instead of extracted text | **39 crates**, and they leave `Cargo.lock` entirely: `docx-rs`, `ppt-rs`, `pdf-extract` plus `lopdf`, `syntect`, `pulldown-cmark`, `xml-rs`, `quick-xml`, `zip 0.6`, `zstd`, `bzip2`, `encoding_rs`, `euclid`, `ttf-parser`, the CFF/Type1/CMap parsers, … Product profile 505 → 448 names |
+| `documents` | OFF | ON | the `generate_document` / `generate_presentation` agent tools and PDF text extraction during multimodal ingest. **The synthesis is not in this build** — all three run in the `tinydocs` TinyBus module (see below), so this gate turns on the tools and the host policy around them: the artifact pipeline, the deadlines, image resolution under the security policy. The dependency is `tinydocs-bus`, the wire contract crate, and nothing else from that repository. Implies `modules`. Off ⇒ both tools absent from the tool list rather than degraded, and PDF ingest degrades a file to a reference instead of extracted text | **39 crates**, and they leave `Cargo.lock` entirely: `docx-rs`, `ppt-rs`, `pdf-extract` plus `lopdf`, `syntect`, `pulldown-cmark`, `xml-rs`, `quick-xml`, `zip 0.6`, `zstd`, `bzip2`, `encoding_rs`, `euclid`, `ttf-parser`, the CFF/Type1/CMap parsers, … Product profile 505 → 448 names |
 | `modules` | ON | ON | `openhuman::modules` — the dynamic module host: the loader that admits a compiled `cdylib` through tinybus's ABI descriptor, manifest, dependency and SHA-256 gates, the compiled-in registry of modules this build trusts, and the `modules` RPC namespace. Implied by `documents`. Off ⇒ `modules.*` is unknown-method and nothing can load a native module | none in the product profile (`ureq`, `flate2`, `tar`, `zip 2`, `tempfile`, `toml` are already there) — **but see the kernel-floor note**: this feature exists so `tinybus/modules` is not enabled on the dependency itself, which would put a `dlopen` loader into the kernel profile where `tinybus` is always-on |
-| `meet` | OFF | ON | `openhuman::meet` (join-URL validation) + `openhuman::meet::agent` (live STT/LLM/TTS loop) + `openhuman::meet::backend_bot` (backend-delegated Meet bot over Socket.IO) | none — see note |
 | `skills` | ON | ON | `openhuman::skills` + `openhuman::skills::runtime` + `openhuman::skills::catalog` domains — SKILL.md discovery/parse/install, workflow execution + run logs, remote catalogs, the `skill_setup` / `skill_executor` builtin agents, and the 16 skill agent tools | none (see below) |
-| `flows` | ON | ON | `openhuman::flows` (saved automation graphs — create/run/schedule, the `workflow_builder` + `flow_discovery` agents), `openhuman::flows::tinyflows` (engine seam), `openhuman::flows::rhai` (`.ragsh` language-workflow tool) | `tinyflows`, `jaq-core`, `jaq-std`, `jaq-json`, `rhai` |
-| `mcp` | ON | ON | `openhuman::mcp::server` (the `openhuman mcp` stdio/HTTP server), `openhuman::mcp::registry` (dynamic Smithery installs — `mcp_clients` RPC namespace, SQLite, boot spawn, supervisor, OAuth), `openhuman::mcp::audit` (write-audit log), and the static config-declared server set in `openhuman::mcp::config_servers`. ~19 agent tools, ~20k LOC | **none** (see scope note) |
+| `flows` | ON | ON | `openhuman::flows` (saved automation graphs — create/run/schedule, the `workflow_builder` + `flow_discovery` agents), `openhuman::flows::tinyflows` (engine seam), `openhuman::flows::rhai` (`.ragsh` language-workflow tool). Pulls the four tinyflows workspace crates — see the seam note below | `tinyflows`, `tinyflows-catalog`, `tinyflows-copilot`, `tinyflows-sqlite`, `jaq-core`, `jaq-std`, `jaq-json`, `rhai` |
+| `mcp` | ON | ON | `openhuman::mcp::server` (the `openhuman mcp` stdio/HTTP server), `openhuman::mcp::registry` (dynamic Smithery installs — `mcp_clients` RPC namespace, SQLite, boot spawn, supervisor, OAuth), `openhuman::mcp::audit` (write-audit log), and the static config-declared server set in `openhuman::mcp::config_servers`. ~19 agent tools, ~20k LOC | **none** — and the `tinymcp` module extraction does not change that either; see the scope note |
 | `tui` | OFF | — | `openhuman::tui` — the tabbed ratatui/crossterm CLI UI (Logs, Chat, Config, Settings), auto-opened by bare `openhuman` on interactive non-container hosts and forced with `openhuman tui` (alias `chat`). Runs the core in-process. No controllers, no agent tools. **Intentionally NOT forwarded to the desktop shell** (allowlisted in `check-feature-forwarding.mjs`). | `ratatui`, `crossterm` |
-| `channels` | ON | ON | `openhuman::channels` (external-messaging providers — Telegram/Discord/Slack/Signal/WhatsApp/iMessage/IRC/… — plus the channel runtime, controllers, host, proactive messaging + inbound dispatch) and the `channels::webview_accounts` / `webview_apis` / `webview_notifications` / `channels::whatsapp_data` webview-bridge domains (incl. the 3 `whatsapp_data_*` agent tools). **Carve-outs `channels::{traits, cli}` stay ungated.** | **28** via `tinychannels/{email,lark}` — the crate itself stays (load-bearing), its two heavy providers do not |
-| `memory-git` | OFF | ON | `openhuman::memory::diff` (git-backed snapshots/checkpoints/read markers, the `memory_diff` RPC namespace + agent tool) and the git wiki mirror in `memory::store::content::wiki_git`. **Type carve-out**: `memory::diff::types` compiles in BOTH builds — the always-on subconscious memory profile renders `CrossSourceDiff`/`ChangeKind` into prompts, and tinycortex makes the matching split (its `memory::diff::{types,source}` are ungated, only the `Ledger`/`DiffEngine` half sits behind `git-diff`). Off ⇒ `memory_diff` is unknown-method, the tool is absent, the embedded driver drops `Capability::Diff` **and** `as_diff()` returns `None` in lockstep (`audit_provider` fails on either half alone), and summary nodes are still written to disk but not mirrored into git. | **3**: `git2`, `libgit2-sys`, `libz-sys` — two of the five native C builds in the kernel profile, the largest native shed in the program |
+| `channels` | ON | ON | `openhuman::channels` (external-messaging providers — Telegram/Discord/Slack/Signal/WhatsApp/iMessage/IRC/… — plus the channel runtime, controllers, host, proactive messaging + inbound dispatch) and the `webview_notifications` bridge domain. **Carve-outs `channels::{traits, cli}` stay ungated.** The family now owns **no agent tool** — the three `whatsapp_data_*` tools were its only ones and went with the store (see below) — which is why `DomainGroup::Channels` is in `TOOL_LESS` in `tools/ops_tests.rs`. | **none in the kernel profile** — the gate swaps `tinychannels` for `tinychannels-bus` one-for-one, because every heavy dep it carried is shared. It buys ~31.7k lines of compile surface, not crates. The email + lark cohorts are shed only relative to a `channels`-ON build |
 | `contacts` | OFF | ON | `memory::people::address_book`'s macOS CNContactStore reader — the address-book seeding path for the people domain. Leaf gate over a **pre-existing** off-state: the module already shipped a non-macOS `imp` stub returning an empty contact list, so the gate only widens that stub's cfg. `read`/`read_with`/`AddressBookError`/`SystemContactsSource` and the whole `people` RPC surface stay compiled in every build; off ⇒ a refresh seeds nothing instead of failing. | **6** on macOS (`objc2`, `objc2-foundation`, `objc2-contacts`, `block2` + 2 transitive). **No-op on Linux/Windows** — never in those graphs, so the kernel-floor ratchet does not move. Verify cross-target: `cargo tree --target aarch64-apple-darwin -e normal -i objc2-contacts --no-default-features` (294 → 288 packages). |
-| `runtime-node` | OFF | ON | `runtime::node` (download / verify / extract / install a pinned Node.js toolchain), the `runtime::javascript` language slot, `runtime::pool::node`, the `node_exec` / `npm_exec` agent tools, and the `node_runtime` harness-init step. **Facade + stub** — `ShellTool` holds `Option<Arc<NodeBootstrap>>` and `shell.rs` is kernel, so the module cannot simply vanish; `runtime/node/stub.rs` carries the `NodeBootstrap` type surface while registration sites are leaf-gated. **The generic native-tool dispatcher (`runtime::node::ops` / `runtime::node::types`) is NOT gated** — it backs both the gated `javascript.*` controllers and the ungated `flows` `oh:` `NativeToolBackend`, so native flow tools (`memory_search`, file, shell, …) keep working when the managed Node runtime is off. Off ⇒ `try_cached`/`probe_installed` return `None` and the shell never prepends a managed bin dir, identical to today's `node.enabled = false` path. | **`xz2` + its static liblzma C build.** First gate to remove a NATIVE toolchain build: `lzma-sys` leaves the list, 6 → 5. `tar`/`zip` are NOT shed — shared with `inference` (install_piper), `runtime::python`, and the document tools. |
+| `runtime-node` | OFF | ON | `runtime::node` (the client that asks the `tinyruntime` module for a Node.js toolchain), the `runtime::javascript` language slot, `runtime::pool::node`, the `node_exec` / `npm_exec` agent tools, and the `node_runtime` harness-init step. **Facade + stub** — `ShellTool` holds `Option<Arc<NodeBootstrap>>` and `shell.rs` is kernel, so the module cannot simply vanish; `runtime/node/stub.rs` carries the `NodeBootstrap` type surface while registration sites are leaf-gated. **The generic native-tool dispatcher (`runtime::node::ops` / `runtime::node::types`) is NOT gated** — it backs both the gated `javascript.*` controllers and the ungated `flows` `oh:` `NativeToolBackend`, so native flow tools (`memory_search`, file, shell, …) keep working when the managed Node runtime is off. Off ⇒ `try_cached`/`probe_installed` return `None` and the shell never prepends a managed bin dir, identical to today's `node.enabled = false` path. | **Nothing any more.** This gate used to shed `xz2` and its static liblzma C build; download and extraction moved into the `tinyruntime` module, so that native build left the manifest for **every** configuration rather than only for slim ones. The gate still buys the absence of the tools and controllers. |
 
 **Facade pattern (pathfinder for the other gates).** `pub mod voice;` is **always compiled** as a facade: the real submodules are `#[cfg(feature = "voice")]`, and a `#[cfg(not(feature = "voice"))] mod stub;` (`src/openhuman/voice/stub.rs`) re-exposes the same public surface that always-on / other-gated callers use (`server`, `dictation_listener`, `streaming`, `reply_speech`, `cloud_transcribe`, `cli`, `create_stt_provider`, `effective_stt_provider`, `publish_ptt_transcript_committed`) with no-op / `None` / disabled-error bodies. Callers therefore do **not** need per-call `#[cfg]`. When voice is off: the voice/audio controllers are unregistered (unknown-method over `/rpc`, absent from `/schema`), the `audio_generate_podcast` agent tools are absent, and `openhuman voice` returns a "voice disabled" error. Stub signatures must match the real ones exactly — the disabled build (`--no-default-features`) is the **only** thing that catches drift, so run it before pushing any change to the voice surface.
 
@@ -504,32 +787,13 @@ Two columns because there are two sets (see above): **Contrib** is `[features] d
 
 The `voice` gate still does not drop `llama` or `cpal`: `cpal` belongs to the `inference` gate above, and `llama`/`whisper` inference for the *local model runtime* is a separate concern. Earlier revisions of this note promised a future `inference` gate that would shed whisper — that gate exists and sheds `cpal`; whisper left the graph entirely instead.
 
-**`web3` gate — first gate that sheds real crypto deps.** Same facade pattern: `pub mod wallet;` / `pub mod web3;` / `pub mod x402;` stay always-compiled, real submodules are `#[cfg(feature = "web3")]`, and each domain's `stub.rs` re-exposes the always-on caller surface with disabled-error / empty bodies. When off, the wallet/web3/x402 controllers are unregistered, the web3 swap/bridge/dapp agent tools are absent (via `all_web3_agent_tools()` → empty), and the exclusive `bitcoin` (BTC P2WPKH PSBT) + `ethers-core` / `ethers-signers` / `coins-bip39` (EVM/mnemonic signing, used by the multi-chain wallet's EVM path) deps are dropped. `curve25519-dalek` (used for Solana off-curve ATA here) is **not** among them — it stays enabled transitively through the always-on `ed25519-dalek`. **tinyplace on-chain payments degrade to graceful "wallet disabled" errors** (the tinyplace comms path and the core itself are unaffected — `tinyplace::signer` still works via ed25519). The stubs cover `WALLET_NOT_CONFIGURED_MESSAGE`, `status`, `secret_material`, `WalletChain`, `prepare_transfer`/`execute_prepared` (+ param/result types), `solana_cluster`/`SolanaCluster`/`tinyplace_solana_rpc_endpoints`, `tinyplace_signer_seed`, `wallet::rpc::{redact_rpc_url, with_tinyplace_solana_endpoints}`, and the `all_*_registered_controllers`/`all_*_controller_schemas`/`all_web3_agent_tools` entry points. Two caller families still need per-call `#[cfg(feature = "web3")]` because they name concrete gated types rather than a stubbable aggregator: the six `Wallet*Tool` + `X402RequestTool` registrations in `tools/ops.rs`, the `wallet::tools::*` glob in `tools/mod.rs`, and the x402 402-retry path in `tools/impl/network/http_request.rs` (with the feature off a 402 returns to the caller unpaid).
-
-**`bs58` and `ed25519-dalek` still do NOT drop, deliberately.** `orchestration/ingest` and `tinyplace/payment` use them for agent-network identity, which is unrelated to the wallet. `curve25519-dalek` also survives now, beneath `ed25519-dalek`. Measured: excluding all three from the cohort costs **0**, because tinyplace pulls them in regardless — so there is nothing to gain by chasing them.
+**`web3` gate — first gate that sheds real crypto deps.** Same facade pattern: `pub mod wallet;` / `pub mod web3;` / `pub mod x402;` stay always-compiled, real submodules are `#[cfg(feature = "web3")]`, and each domain's `stub.rs` re-exposes the always-on caller surface with disabled-error / empty bodies. When off, the wallet/web3/x402 controllers are unregistered, the web3 swap/bridge/dapp agent tools are absent (via `all_web3_agent_tools()` → empty), and the exclusive `bitcoin` (BTC P2WPKH PSBT) + `ethers-core` / `ethers-signers` / `coins-bip39` (EVM/mnemonic signing, used by the multi-chain wallet's EVM path) deps are dropped. `curve25519-dalek` (used for Solana off-curve ATA here) is **not** among them — it stays enabled transitively through the always-on `ed25519-dalek`. The stubs cover `WALLET_NOT_CONFIGURED_MESSAGE`, `status`, `secret_material`, `WalletChain`, `prepare_transfer`/`execute_prepared` (+ param/result types), `solana_cluster`/`SolanaCluster`, `wallet::rpc::redact_rpc_url`, and the `all_*_registered_controllers`/`all_*_controller_schemas`/`all_web3_agent_tools` entry points. Two caller families still need per-call `#[cfg(feature = "web3")]` because they name concrete gated types rather than a stubbable aggregator: the six `Wallet*Tool` + `X402RequestTool` registrations in `tools/ops.rs`, the `wallet::tools::*` glob in `tools/mod.rs`, and the x402 402-retry path in `tools/impl/network/http_request.rs` (with the feature off a 402 returns to the caller unpaid).
 
 `core/all.rs`'s `flows` registration builds a `Vec` and conditionally `push`es rather than using a `vec![]` literal, because an element of a `vec![]` cannot carry `#[cfg]`.
 
 Run the disabled build (`--no-default-features`) before pushing any change to the wallet/web3/x402 surface — it is the only drift catcher. Prove a claimed shed with `scripts/assert-shed.sh`, **not** `cargo tree -i`: the latter exits non-zero when a crate is absent and reports dev-dependency-only survivors as present.
 
 **Leaf-gate variant (`media`, #4804).** Unlike `voice`, the `media` gate needs **no** stub facade: `media::generation` has a single caller (the `build_media_tools` call in `src/openhuman/tools/ops.rs`, itself `#[cfg(feature = "media")]`) and `openhuman::media::image` is unwired scaffold (#2997), so both modules are simply `#[cfg(feature = "media")] pub mod …`. It is a **surface-only** gate: media generation is backend-proxied (`reqwest`, shared) and the `image` crate is shared with channel upload, so no exclusive deps are shed — the issue's "sheds media processing dependencies" / "controllers unregistered" DoD lines are superseded (Media is agent-tools-only; no controller/store/subscriber is tagged `Media`). When a gated domain is a true leaf, prefer this over the facade+stub.
-**`meet` gate (#4800)** — the three Meet domains are one **family directory**, `src/openhuman/meet/`:
-
-| Path | Was | Pattern |
-| --- | --- | --- |
-| `meet/{ops,rpc,schemas,types}` | `meet` | per-submodule `#[cfg(feature = "meet")]` |
-| `meet/agent/` | `meet_agent` | leaf-gate — every submodule (incl. `wav`) is `#[cfg(feature = "meet")]` |
-| `meet/backend_bot/` | `agent_meetings` | facade + `stub.rs` |
-
-`pub mod meet;` in `src/openhuman/mod.rs` is therefore **ungated**: `backend_bot` is a facade+stub domain, and three always-compiled call sites reach into it — the heartbeat planner (`calendar::handle_calendar_meeting_candidate`) and two subscriber registrations (`core::jsonrpc`, `channels::runtime::startup`) — so `meet/backend_bot/stub.rs` must resolve in a `meet`-less build and those callers need no `#[cfg]`. The gate moved down onto each submodule declaration inside `meet/mod.rs`; the set of items that compiles in each configuration is unchanged.
-
-**RPC namespaces did not move.** They are string literals in `ControllerSchema`, not derived from module paths, so `meet`, `meet_agent`, and `agent_meetings` are still three separate namespaces on `/rpc` and `/schema`, `openhuman.meet_agent_*` method names are untouched, and `DomainEvent::domain()` still reports `"agent_meetings"`. Directory layout and wire surface are independent — do not "fix" the namespace strings to match the new paths.
-
-**No deps to shed (do not re-litigate).** Unlike `voice`, this gate drops **zero** dependencies — the Meet domains have no exclusive crates. `meet::agent::wav` is a hand-rolled 79-line RIFF writer with no `use` statements, written precisely so Meet never needed `hound` (which `voice` already owns and sheds). The dependency shed was pre-paid; this gate's value is compile-time surface and binary size, not the dep tree.
-
-
-**Both-ways tests.** `src/core/all_tests.rs` pins the gate in both directions (`meet_controllers_registered_when_feature_on` / `meet_controllers_absent_when_feature_off`). The negative half is the one that proves the gate removes anything. Note CI's smoke lane runs `cargo check` only and never compiles test code, so a disabled-build **test** break is invisible to it — run `cargo test --lib --no-default-features core::all::tests` locally after touching any gated surface.
-
 **`skills` gate — the type carve-out (read before adding the next gate).** The three skill domains follow the same facade+stub shape as `voice`, with one important refinement: **`skills` is not a leaf — it is partly load-bearing infrastructure.** `src/openhuman/tools/traits.rs` re-exports the crate's unified `ToolResult` / `ToolContent` out of `skills::types`, and ~236 files consume them (`mcp`, `runtime::node`, every `Tool` impl). `Workflow` / `WorkflowFrontmatter` / `WorkflowScope` from `skills::ops_types` likewise appear in always-on agent-harness and prompt signatures. Gating `skills` wholesale would take down the entire tool trait system, MCP, and the Node runtime.
 
 So `skills::types` and `skills::ops_types` stay **compiled in both directions** — they are inert serde/std-only definitions with zero coupling to their gated siblings — and only *behaviour* is gated. `src/openhuman/skills/stub.rs` therefore mirrors **functions only** and re-exports the real types (`pub use super::ops_types::{Workflow, …}`), so there is **zero type duplication** — strictly less drift surface than the `voice` stub, which had to re-declare `SttResult` + the `SttProvider` trait because those live inside its gated tree.
@@ -541,11 +805,52 @@ Two places the carve-out doesn't reach, and why they are `#[cfg]` at the call si
 - `agent/registry/agents/loader.rs` — the `skill_setup` / `skill_executor` `BuiltinAgent` entries. `include_str!` embeds the agent TOML from disk regardless of module gating, so the entry itself must disappear.
 - `agent/task_dispatcher/executor.rs` — the workflow-resolution branch. `registry::get_workflow` returns `Option<WorkflowDefinition>`, which flattens in `AgentDefinition` and is destructured at the call site; stubbing it would mean re-declaring that struct (exactly what the carve-out avoids). With the domain compiled out no handle can resolve to a skill, so falling through to the builtin-agent branch is correct, not degraded.
 
-**Dep note:** `skills = []` — the empty list is **intentional, do not "fix" it**. Unlike `voice` (`hound`/`lettre`), these domains have no exclusive dependencies: every crate they touch is shared with always-on domains, and `runtime_node` / `runtime_python` are used by Agent / Flows / Memory too. This gate's value is tool-surface + prompt-bloat + startup cost, **not** binary size.
+**Dep note:** `skills = []` — the empty list is **intentional, do not "fix" it**. Unlike `voice` (`hound`/`lettre`), these domains have no exclusive dependencies: every crate they touch is shared with always-on domains, and `runtime::node` / `runtime::python` are used by Agent / Flows / Memory too. This gate's value is tool-surface + prompt-bloat + startup cost, **not** binary size.
 
 When skills are off: the `skills` / `skill_runtime` / `skill_registry` controllers are unregistered (unknown-method over `/rpc`, absent from `/schema`), the 16 skill agent tools (incl. `run_workflow` / `await_workflow`) are **absent** from the tool list rather than degraded to an error, the `skill_setup` / `skill_executor` builtin agents are gone, and the boot-time remote catalog refresh is skipped. Composes with the runtime `DomainSet::skills` flag (#4796) — that axis needed no change here; #4798 is compile-time only.
 
 **Leaf-gate pattern (`flows`).** Where `voice` needs a stub facade, `flows` needs **none** — and deliberately so. Every symbol reached from outside the gate is a *registration site* (controller push in `src/core/all.rs`, the `FlowTriggerSubscriber` in `src/core/jsonrpc.rs`, boot reconcile in `src/core/runtime/services.rs`, agent-tool `vec!` elements in `src/openhuman/tools/ops.rs`, `BuiltinAgent` entries in `agent/registry/agents/loader.rs`). Registration sites want **absence**: a stub that registered a controller returning `Err("flows disabled")` would make `flows.*` a *known* method that fails at runtime — the opposite of the intended "unknown method / omitted tool". So the family carries a **single** `#[cfg(feature = "flows")]` on `pub mod flows;` in `src/openhuman/mod.rs` — the nested `flows::tinyflows` and `flows::rhai` submodules inherit it — and each call site carries its own `#[cfg]`. The leaf gate holds only because no always-compiled domain has a real code edge into the tree: `memory/tools.rs` and `memory/tools/flavour.rs` name `flows::tinyflows` in comments only. There is no `openhuman flows` CLI subcommand, so no CLI stub is needed either. When flows is off: the `flows.*` controllers are unregistered (unknown-method over `/rpc`, absent from `/schema`), all 25 flow agent tools + the `rhai_workflows` tool are absent, and the `workflow_builder` / `flow_discovery` built-in agents are not advertised.
+
+**What is in `flows/` and what is upstream.** The domain used to own its whole
+stack; most of it was not OpenHuman's. Four crates in the vendored tinyflows
+workspace now carry the parts that are true for anyone storing and authoring
+workflows, and what stayed here is the **connector layer** — the part that could
+not be anything else:
+
+| Upstream crate | What moved | What `flows/` kept |
+| --- | --- | --- |
+| `tinyflows-catalog` | `Flow` / `FlowRevision` / `FlowRun` / `FlowDraft` / `FlowSuggestion` and friends, the run + build cancellation registries, the n8n importer, and the save/run safety predicates (`trigger_is_automatic`, `enforce_side_effect_approval`, `graph_has_actionable_nodes`) | `node_contracts.rs` — the *host overlay* on `tinyflows::catalog`: what a `tool_call` slug resolves to here, which trigger kinds this host actually dispatches |
+| `tinyflows-sqlite` | the `flows.db` catalog schema and every query, the JSON draft store, the durable run checkpointer | `store.rs` / `draft_store.rs` — one substitution each, `<workspace_dir>/flows`, and nothing else |
+| `tinyflows-copilot` | the `workflow_builder` + `flow_discovery` standing archetypes and the builder turn brief | `agents/*/prompt.rs` (appending this host's runtime sections) and `agent.toml` (this host's registry format) |
+| `tinyflows` | the authoring checks that are statements about the *graph* or the *engine*: `gates` (envelope violations, prose written as a `=`-expression, a tool arg reading an agent field no schema declares), `compat` (fan-in topologies the engine's barrier relief cannot execute safely), `preflight` (the mock run that proves an outbound arg can resolve), the schema-aware dry-run mocks, and the step-capturing `RunObserver` | `tinyflows/caps/` — every capability adapter: this host's LLM, agent harness, tools, HTTP, sandboxed code, memory |
+
+**`ops.rs` keeps the gates that need this host's vocabulary, and only those.**
+Which agent ids resolve, which Composio slugs and connections exist, what a
+toolkit's live output schema says, whether a provider is reachable, whether an
+upload path is workspace-relative — none of that is knowable upstream. What left
+was the opposite: analysis that only ever read the graph. Three of those had
+drifted into near-duplicates of code the engine already had (`collect_expressions`,
+`parse_node_binding`, an envelope-kind table, a jq-keyword list), which is the
+usual reason to look.
+
+**`tinyflows/caps/` is a connector directory and stays one.** The one exception
+was `mocks.rs`, whose every doc comment explained how the engine's own mocks
+fail a good graph — a fact about the engine, so it went with them. The other
+~685 lines name `integrations`, `memory`, `security`, `skills` and `config` on
+almost every screen; that is the seam working, not work left undone.
+
+Two rules follow, and both are load-bearing:
+
+- **A `store.rs` wrapper body that does more than `dir(config)` is host policy
+  that has leaked into persistence.** That is the only reason those 36
+  one-line functions are spelled out instead of being a `pub use`.
+- **`tinyflows-copilot` may not grow a harness dependency.** It names no tool
+  trait, no agent registry and no model client, which is exactly what lets the
+  desktop panel, the medulla plane and a CLI share one copilot. `tinytools` is
+  not published, so a path dependency on it from that crate would resolve to a
+  *second* `tinytools` package here and every tool would stop satisfying the
+  harness trait — the duplication hazard the `tinytools` note above describes.
+  The `Tool` impls in `builder_tools.rs` are the seam, and they stay here.
 
 **Scope note (`flows` deps):** the gate sheds `tinyflows` + its `jaq-core` / `jaq-std` / `jaq-json` JSON-query stack, and `rhai`. It does **not** shed `tinyagents` — 26+ domains consume that crate. The issue-level DoD line reading "sheds the rhai scripting engine" is therefore true only at the **feature** level: `rhai` arrives via `tinyagents/repl`, which the root `Cargo.toml` no longer enables directly — the `flows` feature turns it on. Dropping `flows` drops `repl`, which drops `rhai`; `tinyagents` itself stays. Verify a claimed shed with `cargo tree -i <crate> --no-default-features` (must return nothing) — compiling clean is **not** proof that a dep was dropped.
 
@@ -555,12 +860,20 @@ When skills are off: the `skills` / `skill_runtime` / `skill_registry` controlle
 
 Follows the voice facade+stub pattern for `mcp::server` / `mcp::registry` / `mcp::audit` (`stub.rs` in each), with two refinements worth copying:
 
-- **The family root `pub mod mcp;` is UNGATED.** It cannot carry `#[cfg(feature = "mcp")]` for two independent reasons: `mcp::http_client` is always compiled (below), and the three facades each ship a `stub.rs` that must resolve in an `mcp`-less build. The gate is pushed down onto each member in `src/openhuman/mcp/mod.rs` — the same rule the `meet/` pilot proved. `mcp::config_servers` is leaf-gated there; `mcp::http_client` is not gated at all.
+- **The family root `pub mod mcp;` is UNGATED.** It cannot carry `#[cfg(feature = "mcp")]` for two independent reasons: `mcp::http_client` is always compiled (below), and the three facades each ship a `stub.rs` that must resolve in an `mcp`-less build. The gate is pushed down onto each member in `src/openhuman/mcp/mod.rs` — the rule a family root with a stub or an ungated member must follow. `mcp::config_servers` is leaf-gated there; `mcp::http_client` is not gated at all.
 
 - **Type carve-out.** Inert, dependency-free type modules stay **ungated**: `mcp::registry::types`, `mcp::audit::types`, `mcp::server::tools::types` (`McpToolSpec`). They are `serde`/`serde_json`-only data consumed by always-compiled callers (the orchestrator prompt builder, `tool_registry`). Both builds therefore share the **one real type definition** — the stubs carry behaviour only, so struct fields can never drift between the enabled and disabled builds. `ConnectedServerOverview` was moved from `connections.rs` into `types.rs` for exactly this reason and is re-exported from `connections` so existing paths still resolve.
 - **Split facade — the old `mcp_client` directory did not match the dependency graph, so the reorg split it three ways.** Its transport primitives went to the **ungated** `mcp::http_client` (`McpHttpClient`, `redact_endpoint`, `McpUnauthorizedError`); its static server set + stdio transport + setup agent went to the **leaf-gated** `mcp::config_servers`; and `sanitize` left the family entirely for `util::sanitize`. The `gitbooks` docs tool dials `McpHttpClient` directly (GitBook is modelled as a legacy MCP server), and the orchestrator prompt sanitizes **skill** descriptions through `util::sanitize::sanitize_for_llm` — neither has anything to do with MCP, and stubbing them would silently break a docs tool and corrupt the orchestrator prompt in slim builds. **The gate follows the real dependency graph, not the directory name.** A bonus of keeping `http_client` compiled: the `McpServerNeedsAuth` classifier coupling test in `core::observability` stays always-compiled — no `#[cfg]`, no wording-drift leak.
 
-**Scope note — the `mcp` gate drops ZERO dependencies.** There is no MCP SDK in this crate: the dependency declarations contain no MCP-specific SDK or transport dependency; `test-mcp-stub` is the only MCP-named bin target. The entire protocol stack is hand-rolled over tokio process stdio + `reqwest` + `axum`, all of which are load-bearing for non-MCP domains. The gate is worth having for the ~20k LOC / ~19 agent tools / RPC surface it removes, but the issue-level DoD line claiming it "sheds the MCP SDK / transport stack" is superseded by this correction. The `mcp = []` feature list in `Cargo.toml` is intentionally empty — do not "fix" it by adding `dep:` entries.
+**Scope note — the `mcp` gate drops ZERO dependencies, and the module extraction does not change that.** The history is worth keeping because both halves of it are counter-intuitive.
+
+Before the extraction there was no MCP SDK in this crate at all: the entire protocol stack was hand-rolled over tokio process stdio + `reqwest` + `axum`, every one of which is load-bearing for non-MCP domains. So the gate shed nothing, and the issue-level DoD line claiming it "sheds the MCP SDK / transport stack" was superseded by that correction.
+
+After the extraction the stack lives in `tinymcp`, and the natural expectation — recorded in the `Cargo.toml` comment and in `scripts/kernel-floor.limits`' 2026-08-22 entry — was that loading it as a TinyBus module would take `reqwest` and `rusqlite` out of the always-on graph with it. **Measured, it does not.** In the kernel profile `rusqlite` has six parents (`openhuman` itself, `tinyagents`, `tinychannels`, `tinycortex`, `tinymcp`, `tinymemory-core`) and `reqwest` has ten. `scripts/dep-sim.py --cut tinymcp` projects the whole shed at **−1 package / −1 name / 0 native**: the `tinymcp` package itself, and nothing underneath it. This is the same shape as the TinyMemory port — a module boundary buys a *compilation* boundary, not a dependency shed, whenever the module's dependencies are already shared with kernel surface.
+
+The gate is still worth having for the ~20k LOC / ~19 agent tools / RPC surface it removes. The `mcp = []` feature list in `Cargo.toml` is intentionally empty — do not "fix" it by adding `dep:` entries.
+
+**Step two of the extraction is registry-entered but not wired.** `src/openhuman/modules/registry.rs` pins the `tinymcp` v0.3.1 release, so the module can be downloaded, verified and loaded; the host still calls the library directly, and `Cargo.toml` still declares both `tinymcp` and `tinymcp-bus`. Cutting the path dependency needs contract additions that `tinymcp-bus` v0.3.1 does not carry — `OAuthComplete`, a connected-overview member for the already-exported `ConnectedServerOverview`, the boot-connect and reconnect-supervisor passes, the `ServerDetail` / `AuthDetection` / `AuthKind` reply types, the registry curation helpers, an error anchor for the `McpServerNeedsAuth` classifier coupling test in `src/core/observability.rs`, and `render_tool_result` / `redact_endpoint` for the ungated `gitbooks` tool. It also needs a per-`data_dir` object seam of the shape `modules::memory` already uses, because `mcp::host` keys one store per workspace and a loaded module receives one `data_dir` at load — and a desktop session moves workspace on login and again on logout. Those are upstream in `tinyhumansai/tinymcp` and must land and be released first.
 
 **Static vs dynamic — the naming is INVERTED from intuition.** Both halves must be gated or the gate is only half-applied:
 
@@ -657,6 +970,147 @@ always-on kernel surface, so `features = ["modules"]` there puts a loader plus
 one — 305 → 308 packages, which the kernel-floor ratchet caught. It is forwarded
 from this crate's own `modules` feature instead.
 
+#### The memory seam — one contract, two live paths (#5560)
+
+Memory is the second module consumer, and it is **half migrated**. Read this
+before touching `src/openhuman/memory/`.
+
+**The contract is `tinymemory-api`, and `crate::openhuman::memory::api` is a
+re-export of it — not a copy.** `3ee5a3cad` inlined that crate as 10,894 lines
+under `src/openhuman/memory/api/`, every file byte-identical to
+`vendor/tinymemory/crates/tinymemory-api/src/` apart from doc-comment paths. Nothing behaved
+differently, which is what made it worth undoing: the contract is the vocabulary
+the host, `ModuleMemoryProvider`, and the separately compiled module all speak,
+and the module compiles against the **crate**. A verbatim copy made the host's
+`MemoryError`, `Chunk`, `Capabilities` and `MemoryProvider` distinct types from
+the ones on the wire. `api::wire` is where that bit hardest — its own docs, and
+`modules/memory.rs`, both justify sharing the error table because
+reimplementing it "is what would let a `PathEscape` arrive as an `Invalid`" —
+and while the host held a private copy of that table the sentence described an
+intention rather than the build. `memory/api.rs` is a short `pub use` now;
+`memory/api_identity_tests.rs` pins the identity with type equalities, so a
+re-inlining fails to compile rather than passing silently.
+
+**`memory::api` is the contract surface, not an alias for the crate.** It
+exports only what actually crosses the bus, derived from both directions —
+outbound from `modules/memory.rs`, inbound from `modules/memory_host.rs`. Whole
+namespaces where the namespace *is* wire vocabulary (`capabilities`, `chunks`,
+`error`, `goals`, `health`, `provider` with its `provider::types` payloads,
+`recall`, `tool_memory`, `tree`, `types`, `wire`), plus `CONTRACT_VERSION` for
+version negotiation. Three exclusions are deliberate and each has a reason:
+
+- **`host`** is re-exported as **two types, not the namespace** — only
+  `MemoryEvent` and `SpacyResponse` cross the bus. The rest of
+  `tinymemory_api::host` is the *in-process engine-embedding* seam (the
+  persisted `MemoryConfig` sections, `MemoryHostConfig`, `EmbeddingProvider`,
+  `MemoryEventSink`), which the host hands to `tinymemory-core` directly and
+  which never touches a module.
+- **`null`** is the fallback driver `memory::binding` installs when no module is
+  available — what runs when nothing crosses the bus, so the opposite of
+  contract. Name `tinymemory_api::null` at the call site.
+- **`traits`**, **`version`** and **`is_compatible`** had zero uses in `src/`;
+  they were alias surface only.
+
+That is the point of the split: `tinymemory-api` is *also* the crate this host
+embeds the engine through, and "the module contract" and "the host's own use of
+the crate" are different surfaces. Reaching the second one by naming
+`tinymemory_api::` directly keeps the difference visible in the source rather
+than in someone's memory. **Do not widen `memory::api` back out to the whole
+crate** — if a new path needs something not exported there, the question to
+answer first is whether it crosses the bus.
+
+**`tinymemory-api` stays; `tinymemory-core` has left the product build (#5560,
+2026-08-31).** The API crate is the host-owned contract and is meant to be a
+dependency. The *engine* crate used to be linked beside it — 1.44 MB of `.text`
+— and is not any more: it, `tinycortex`, `tinycortex-api`, the `tinymemory`
+facade and `tinymemory-tinycortex` are all out of the **normal** dependency
+graph. Verify rather than trust the manifest, because the two can disagree:
+`cargo tree -e normal -i <crate>` under the product feature set prints "nothing
+to print" for each.
+
+Two survivals are deliberate and neither puts the engine back in the product:
+
+- **`[dev-dependencies]`** carries `tinycortex`, `tinymemory-core` and
+  `tinymemory-tinycortex` for the ~11 test files that drive a real in-process
+  engine. Cargo does not link dev-dependency features into the shipped binary —
+  the same precedent the root `tinywallet` entry already sets.
+- **`optional = true`**, reached by two default-OFF-for-the-product features.
+  `rss-bench` keeps `tinycortex` and `tinymemory-core` available to the two
+  `library_profile` bins, which measure the in-process engine and cannot use a
+  dev-dependency because a `[[bin]]` never sees one. `memory-engine-seams`
+  compiles `memory::host_impls` for the ~24 `tests/*.rs` integration targets
+  that install the host seams — a `tests/` target links this crate as an
+  ordinary dependency, where `cfg(test)` is false, so `#[cfg(test)]` would not
+  have reached them however the engine was declared. It is in `default`
+  (so every test lane picks it up without composing a new feature string) and
+  allow-listed in `INTENTIONALLY_NOT_FORWARDED`; neither feature is in
+  `scripts/ci/product-features.txt`.
+
+The `[patch]` entries for `tinycortex` / `tinycortex-api` stay in both manifests
+and must not be removed with the dependencies. Dropping a direct dependency and
+dropping its patch are different things: the crates are unpublished and the
+engine crates still reached as dev-dependencies name them by version
+requirement, so removing a patch fails **resolution** ("no matching package
+named `tinycortex-api` found") before anything compiles.
+
+`memory/direct_engine_refs_tests.rs` is still the ratchet over direct
+`tinymemory_core::` references, but **its non-empty list no longer implies a
+linked engine** — it scans source text and cannot see `cfg`, and none of its
+ten remaining entries is in the product build: seven are `#[cfg(test)]`-only,
+one is `memory/host_impls.rs` behind the default-only `memory-engine-seams`
+feature, and two are the `rss-bench` bins, behind a feature the product set
+never enables. Draining them is a correctness goal (a second,
+unpoliced door into the subsystem), not a binary-size one.
+
+**Most of what remains is blocked upstream, not here.** `modules::registry` pins
+the TinyMemory module to a released, SHA-256-verified artifact, so a new bus
+method is a `tinymemory` release plus a registry re-pin before it is a host
+change. Adding a `MemoryProvider` method without that produces a driver that
+answers `Unsupported` — strictly worse than the direct call, because the failure
+moves from compile time to run time. The gap list in that lint's module docs is **stale as of 2026-08-23**: retrieval
+filters, chunk reads, the entity-kind filter, source listing and the people
+domain all landed as real capability families (`MemoryRetrieval`,
+`MemoryChunks`, `MemoryPeople`, `MemoryProfile`, `MemoryEpisodic`), and
+`ModuleMemoryProvider` implements all of them bar `as_episodic`. What blocks
+migrating onto them is **release lag, not seam width** — see the release note
+below. The `source_scope` task-local is no longer a gap either: it is host
+policy, it lives in `memory::source_scope`, and the scope crosses the bus as a
+`SourceScope` value.
+
+**Task-locals do not cross the bus, and both of the ones here are permission
+checks that fail OPEN.** The module is a separately compiled `cdylib` with its
+own statics, so a task-local set host-side reads as absent inside it — and
+absent means *unrestricted* for `source_scope` and *exclude nothing* for the
+self-echo exclusion. Never let a memory call infer either from ambient state:
+pass `memory::source_scope::as_bus_scope()` and `RecallOpts::exclude_session_id`
+explicitly. The engine's scoped/unscoped function pairs exist for this reason —
+`cover_window_scoped`, `query_source_scoped`, `drill_down_scoped`,
+`fetch_leaves_scoped`. **The unsuffixed twin reads the engine's task-local and
+must not be called from this host.**
+
+**The module release lags the vendored source.** `modules::registry` pins a
+released, SHA-256-verified artifact; the vendored submodule is routinely ahead
+of it. Check the *tag*, not the working tree, before migrating onto a family:
+`git -C vendor/tinymemory show <tag>:crates/tinymemory-module/src/lib.rs | grep '"ListChunks"'`.
+Migrating onto a method the pinned artifact does not serve yields a runtime
+`Unsupported` — strictly worse than the direct call, because the failure moves
+from compile time to run time.
+
+**The `SourceKind` trap is gone — do not re-derive it.** This note used to warn
+that `tinymemory_core::store::chunks::types::SourceKind` resolved to
+`tinycortex_api::chunks::SourceKind` and was **not** the contract's
+`SourceKind`, so swapping the import was a type error rather than a free carve-
+out. `tinycortex-api` is now a deprecated re-export of `tinymemory-bus`, and the
+two resolve to the **same item**; the engine's chunk types are re-exported from
+`crate::engine::backend::chunks`, which lands in the same place. Verified with a
+compile-time identity probe (a function taking the engine path and returning the
+contract path), then by repointing every OpenHuman call site — the compiler is
+the proof. Prefer `tinymemory_api::chunks::…` in new code.
+
+The general shape of the warning still holds for *other* pairs: two crates with
+near-identical types are a real hazard, and a "free carve-out" is only free once
+the compiler says so. Probe before assuming, in either direction.
+
 #### The `tui` gate
 
 The tabbed terminal UI (`openhuman`, or explicitly `openhuman tui` / alias `chat`) lives in `src/openhuman/tui/` and follows the **`mcp`/`voice` facade+stub** pattern: `pub mod tui;` is always compiled; the behavioural submodules (`app`, `render`, `state`, `terminal`, `runner`) are `#[cfg(feature = "tui")]`; and `#[cfg(not(feature = "tui"))] mod stub;` re-exposes the one symbol an always-compiled caller reaches — `run_from_cli` — with a build-fact error body (`"tui feature disabled at compile time … --features tui"`). Bare-command auto-launch requires terminal stdin/stdout and `HostKind::Cli`; Docker, CI, pipes, and `--no-tui` retain the non-TUI CLI path.
@@ -669,24 +1123,49 @@ The tabbed terminal UI (`openhuman`, or explicitly `openhuman tui` / alias `chat
 Drops the exclusive `ratatui` + `crossterm` deps when off. Verify with `cargo tree -i ratatui --no-default-features` (must return nothing).
 #### The `channels` gate (#4801 — last child of #4795)
 
-Leaf-gate pattern with **two ungated carve-outs and no stub file** — the reach-map put every gated symbol at a *registration/leaf* call site, so absence (unknown-method / omitted tool), not a disabled-error stub, is the correct off-state (same rationale as `flows` / `meet`).
+Leaf-gate pattern with **two ungated carve-outs and no stub file** — the reach-map put every gated symbol at a *registration/leaf* call site, so absence (unknown-method / omitted tool), not a disabled-error stub, is the correct off-state (same rationale as `flows`).
 
-- **Now sheds 28 crates** — `channels = ["tinychannels/email", "tinychannels/lark"]`. This bullet previously read "Sheds ZERO dependencies — do NOT re-litigate", and the premise behind it is still true and still worth knowing: **`tinychannels` itself can never be gated out.** `config/schema/channels.rs` re-exports its config types, `event_bus/events.rs`'s `DomainEvent` embeds `tinychannels::ChannelInboundEnvelope` in an always-on enum, and `security/pairing.rs` re-exports its pairing helpers.
+- **The gate now owns the crate.** This bullet has been rewritten twice, and the history is the useful part. It first read "Sheds ZERO dependencies — do NOT re-litigate", on the premise that **`tinychannels` can never be gated out**: `config/schema/channels.rs` re-exports its config types, `DomainEvent` embeds `ChannelInboundEnvelope` in an always-on enum, and `security/pairing.rs` re-exports its pairing helpers. It then became "sheds 28 crates" once the two heavy *providers* (`email_channel`'s lettre/async-imap/mail-parser, `lark`'s axum + prost) were gated **inside** the vendored crate, while the premise was left standing.
 
-  What was wrong was the conclusion, not the premise. The heavy crates do not belong to *tinychannels*, they belong to two of its **providers** — `providers::email_channel` (lettre + async-imap + mail-parser, 18 crates) and `providers::lark` (axum + prost, 9). Both are exclusively reachable through it, so gating them **inside the vendored crate** sheds them while the envelope, config, and pairing types stay compiled. Nothing needed stubbing.
+  The premise is now false, and deliberately so. Splitting **`tinychannels-bus`** out of the crate (the same shape as `tinydocs-bus` / `tinywallet-bus`) moved all three always-on pins into a transport-free contract crate — envelopes, intents, `ChannelsConfig`, controller metadata, relay frames, the session-key rules and the pairing helpers. `tinychannels-bus` is unconditional; **`tinychannels` is `optional = true`**, and the provider stack and relay transport loop go behind the gate with it.
+
+  **Measured, this sheds ZERO dependencies, and you should expect that.** The kernel profile is **288 packages / 270 names / 2 native before and after** — a diff of the two package lists is literally one line, `tinychannels` out, `tinychannels-bus` in. Every heavy crate tinychannels carried is shared with kernel surface (`rusqlite` has six parents, `reqwest` ten), so removing its *parent* frees nothing. This is the third time this exact result has been recorded here — the TinyMemory port and the `tinymcp` extraction both landed at −1/−1/0 for the same reason — so **do not open this seam expecting a dependency win.**
+
+  What it does buy is a **compilation** boundary and an architectural one: a `channels`-less build compiles **~31.7k lines instead of ~39.3k**, since only the ~7.6k-line contract crate remains. And the contract is now a real `-bus` crate, which is the prerequisite for moving the providers out of the binary entirely.
+
+  **The module now exists upstream; what is missing is a release.**
+`tinychannels` carries `crates/tinychannels-module`, a `cdylib` serving
+`ai.tinyhumans.tinychannels.Channels` (`StartChannel` / `StopChannel` /
+`SendMessage` / `ListChannels` / `ChannelStatus`) and calling the host's
+`ChannelsHost` object for inbound traffic. Provider construction was lifted out
+of `channels/runtime/startup.rs` into `tinychannels::factory::build_channels`, so
+the module and this host build the same providers from the same config instead of
+from two copies — credential hydration, the proxy-aware HTTP clients and the
+`ChannelHost` capability surface stay here, as host policy.
+
+  **There is deliberately no `TINYCHANNELS` entry in `modules::registry` yet.**
+That table pins SHA-256 digests taken verbatim from a published release, and
+`tinychannels` has not cut one. Do not invent digests or compute them from a
+local build — a registry entry that a server could satisfy with different bytes
+is the whole thing the digest exists to prevent. The order is: release the
+module, then pin it, then switch `channels/runtime` onto the bus.
+
+  **The module step, if it is taken, is worth roughly −20 packages.** Unlike the gate, that one is not zero: `scripts/dep-sim.py --features "$(bash scripts/ci/product-features.sh)" --cut tinychannels` projects **398/369/2 → 378/351/2, i.e. −20 packages / −18 names / 0 native**. Measure with the simulator rather than summing `cargo tree -i` results, which over-counts shared subtrees. Two things gate that work and neither is in this repo: the providers need a **host-callback object** for inbound traffic (a served object cannot open a stream back to its caller, so `tinychannels-bus` already declares `HOST_BUS_NAME` for it, the same shape as `modules/memory_host.rs`), and `modules::registry` pins SHA-256-verified release artifacts, so a `tinychannels` release must land first.
+
+  **Never re-declare a contract type host-side.** `channels/traits.rs` — the ungated carve-out — points at `tinychannels_bus`, not `tinychannels`, precisely because the implementation crate is optional and the vocabulary is not. Same rule as every other `-bus` crate: a field added on one side of a copy is a decode failure on the other, with nothing to catch it.
 
   That mattered: gating the crate out would have required stubbing ~28 items, among them `constant_time_eq`/`hash_token` (a wrong stub is a security bug) and `build_session_key_for_inbound_envelope`, which derives a **persisted** conversation key that `memory_conversations/bus.rs` writes — silent data regrouping if it ever drifted. Gate the providers, never the crate.
 
-  Two couplings to keep in mind when touching this: **`voice` also requires `tinychannels/email`**, because `voice::audio_toolkit::ops` delivers generated podcasts through `EmailChannel` — a voice-enabled, channels-less build still needs the provider. And `providers/discord/api_tests.rs` uses `axum` for a mock server unrelated to Lark, so axum is dual-declared as a dev-dependency in tinychannels and must stay that way.
+  Two couplings to keep in mind when touching this: **`voice` also requires `dep:tinychannels` + `tinychannels/email`**, because `voice::audio_toolkit::ops` delivers generated podcasts through `EmailChannel` — a voice-enabled, channels-less build still needs the provider, and this is now the *only* reason such a build links the implementation crate at all. And `providers/discord/api_tests.rs` uses `axum` for a mock server unrelated to Lark, so axum is dual-declared as a dev-dependency in tinychannels and must stay that way.
 
   (`whatsapp-web` is a **refinement inside** the gate — `whatsapp-web = ["channels", "tinychannels/whatsapp-web"]`.)
-- **Two ungated carve-outs.** `pub mod traits;` (a one-line `tinychannels` `Channel`/`SendMessage` re-export) and `pub mod cli;` (`CliChannel`, a dependency-free local stdin/stdout REPL) stay compiled in **all** builds — both are reached by the always-on agent-harness interactive loop (`agent::harness::session::runtime::run_interactive`). Same shape as the `meet::agent::wav` carve-out. `channels::mod.rs` `#[cfg(feature = "channels")]`s everything else; nothing inside the gated submodules changes.
+- **Two ungated carve-outs.** `pub mod traits;` (a one-line `tinychannels_bus` `Channel`/`SendMessage` re-export) and `pub mod cli;` (`CliChannel`, a dependency-free local stdin/stdout REPL) stay compiled in **all** builds — both are reached by the always-on agent-harness interactive loop (`agent::harness::session::runtime::run_interactive`). Same shape as the other ungated carve-outs. `channels::mod.rs` `#[cfg(feature = "channels")]`s everything else; nothing inside the gated submodules changes.
 - **The in-app web chat is NOT gated.** `openhuman::web_chat` (RPC namespace `channel`, decoupled from `channels/` in #5002 + #5003 which also moved `learning` out) is core product surface and stays always-compiled even though its runtime tag is `DomainGroup::Channels`. Its registration push in `src/core/all.rs` is deliberately left ungated; the both-ways test pins `channel` present with the feature OFF.
-- **Three mis-housed imports were retargeted to `tinychannels` (no stub needed).** `cron/bus.rs` (`Channel`/`SendMessage`/`ChannelMessage`), `memory_conversations/bus.rs` (`ChannelMessage` + `context::conversation_history_key`), and `voice/audio_toolkit/ops.rs` (`providers::email_channel::EmailChannel`) reached the gated domain only to pick up symbols that actually live in `tinychannels`; pointing them straight at the crate removes the always-on → gated edge (and the voice→channels cross-gate edge). The old `channels::` paths were 1-line delegations / `pub use` re-exports of exactly these.
-- **Leaf-gated call sites** (each carries its own `#[cfg]`): the 5 controller-registration pushes in `src/core/all.rs` (channels controllers, `webview_apis`, `webview_notifications`, public + internal `whatsapp_data`), the `ChannelInboundSubscriber` + web-only-proactive block in `src/core/jsonrpc.rs`, `spawn_channels_service` in `src/core/runtime/services.rs`, the `whatsapp_data::global::init` block in `src/core/runtime/context.rs`, and the `whatsapp_data::tools::*` glob + 3 `WhatsAppData*Tool` registrations in `src/openhuman/tools/{mod,ops}.rs`. The `whatsapp_data` `pub mod` declaration now lives in `channels/mod.rs` (still `#[cfg(feature = "channels")]`, because the parent stays ungated for the `traits`/`cli` carve-outs); `webview_apis` / `webview_notifications` moved under `desktop/` in the family reorg and stay leaf-gated there. String-match arms (`"channels" =>` descriptions, `whatsapp_data_` in `group_for_namespace`) stay **ungated** — they are data.
+- **Three mis-housed imports were retargeted (no stub needed).** `cron/bus.rs` (`Channel`/`SendMessage`/`ChannelMessage`) and `memory_conversations/bus.rs` (`ChannelMessage` + `context::conversation_history_key`) reached the gated domain only to pick up contract vocabulary that actually lives in `tinychannels_bus`; pointing them straight at the contract crate removes the always-on → gated edge. `voice/audio_toolkit/ops.rs` (`providers::email_channel::EmailChannel`) is different — `EmailChannel` is a provider, not contract vocabulary, so it stays on `tinychannels` itself (and is why voice keeps `dep:tinychannels` — see above). The old `channels::` paths were 1-line delegations / `pub use` re-exports of exactly these.
+- **Leaf-gated call sites** (each carries its own `#[cfg]`): the controller-registration pushes in `src/core/all.rs` (channels controllers, `webview_notifications`), the `ChannelInboundSubscriber` + web-only-proactive block in `src/core/jsonrpc.rs`, and `spawn_channels_service` in `src/core/runtime/services.rs`. `webview_notifications` moved under `desktop/` in the family reorg and stays leaf-gated there. String-match arms (`"channels" =>` descriptions) stay **ungated** — they are data.
 - **`start_bootstrap_jobs`' `services.channels` block keeps running slim** — it drives composio sync / workspace-memory sync / orchestration drain and names **no** `channels::` symbol, so it stays ungated by design.
 - **No CLI change.** There is no `openhuman channels` subcommand; generic namespace resolution yields "unknown namespace" when off (the `flows` precedent — acceptable).
-- **Both-ways tests.** `channels_controllers_{registered_when_feature_on,absent_when_feature_off}` in `src/core/all_tests.rs` pin the controller surface (the OFF half also asserts `channel`/web_chat survives), and `whatsapp_data_tools_{present_when_channels_on,absent_when_channels_off}` in `src/openhuman/tools/ops_tests.rs` pin the 3 agent tools (that module has the full-tool-list machinery). CI's smoke lane runs `cargo check` only, so run `cargo test --lib --no-default-features core::all::tests` locally after touching any gated surface.
+- **Both-ways tests.** `channels_controllers_{registered_when_feature_on,absent_when_feature_off}` in `src/core/all_tests.rs` pin the controller surface (the OFF half also asserts `channel`/web_chat survives), and `whatsapp_data_tools_are_gone_in_every_build` in `src/openhuman/tools/ops_tests.rs` pins that the removed tool family stays removed in both directions of the gate. CI's smoke lane runs `cargo check` only, so run `cargo test --lib --no-default-features core::all::tests` locally after touching any gated surface.
 
 ### Event bus (`src/core/event_bus/`)
 
@@ -709,7 +1188,7 @@ Each domain owns `bus.rs` with handlers. Convention: `<Purpose>Subscriber`, `nam
 
 ## Design & patterns
 
-**Visual**: ocean primary `#4A83DD`, sage/amber/coral semantics, Inter + Cabinet Grotesk + JetBrains Mono. Tokens in [`app/tailwind.config.js`](app/tailwind.config.js).
+**Visual**: primary `#2F6EF4`, sage/amber/coral semantics, Inter + Cabinet Grotesk + JetBrains Mono. Canonical tokens in [`app/src/styles/tokens.css`](app/src/styles/tokens.css) (RGB channel triples); [`app/tailwind.config.js`](app/tailwind.config.js) wraps each as `rgb(var(--token) / <alpha-value>)`.
 
 **Key rules:**
 

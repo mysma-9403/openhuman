@@ -26,17 +26,12 @@ import RootShellLayout from './components/layout/shell/RootShellLayout';
 import { SidebarSlotProvider } from './components/layout/shell/SidebarSlot';
 import LocalAIDownloadSnackbar from './components/LocalAIDownloadSnackbar';
 import SecretPromptDialog from './components/mcp-setup/SecretPromptDialog';
+import NoticeCenter from './components/notices/NoticeCenter';
 import OpenhumanLinkModal from './components/OpenhumanLinkModal';
 import PersistRehydrationScreen from './components/PersistRehydrationScreen';
 import PttHotkeyManager from './components/PttHotkeyManager';
 import SecurityBanner from './components/SecurityBanner';
-import SettingsModal from './components/settings/modal/SettingsModal';
-import { resolveSettingsOverlay } from './components/settings/modal/settingsOverlay';
-import GlobalUpsellBanner from './components/upsell/GlobalUpsellBanner';
-import MemoryEmbeddingBudgetBanner from './components/upsell/MemoryEmbeddingBudgetBanner';
-import UserErrorCenter from './components/userErrors/UserErrorCenter';
 import AppWalkthrough from './components/walkthrough/AppWalkthrough';
-import { MascotFrameProducer } from './features/meet/MascotFrameProducer';
 import { useNotchBootSync } from './hooks/useNotchBootSync';
 import { I18nProvider } from './lib/i18n/I18nContext';
 import {
@@ -229,26 +224,22 @@ export function AppShellDesktop() {
   const onHiddenChromePath = ['/', '/login'].some(
     path => location.pathname === path || location.pathname.startsWith(`${path}/`)
   );
-  // The workflow graph canvas (`/flows/:id`, `/flows/draft`) owns the full
-  // viewport for a focused builder — no app sidebar. The `/flows` list (and its
-  // in-page Runs / Discoveries sub-views on `?view=`) keep their chrome.
-  const onWorkflowCanvas = location.pathname.startsWith('/flows/');
-  const chromeless = !token || onOnboardingRoute || onHiddenChromePath || onWorkflowCanvas;
-
-  // Desktop Settings is a modal overlay (the backgroundLocation pattern): when
-  // the URL is a settings path we keep rendering the page behind it.
-  const { settingsOpen, baseLocation } = resolveSettingsOverlay(location);
+  // The workflow graph canvas (`/flows/:id`, `/flows/draft`) used to be listed
+  // here too, as "a focused builder — no app sidebar". It is back in the shell:
+  // going chromeless cost it the app nav AND the sidebar slot, so the builder
+  // had to hand-roll its own 240px run-history rail inside the page (`hidden
+  // lg:flex w-60 border-r`) — a second sidebar sitting where the real one would
+  // have been. It now projects that rail through `SidebarContent` like every
+  // other page, and a user who wants the focused view collapses the sidebar,
+  // which is what `collapsible="icon"` is for.
+  const chromeless = !token || onOnboardingRoute || onHiddenChromePath;
 
   const content = (
     <div ref={scrollRef} className="relative h-full overflow-y-auto">
-      <GlobalUpsellBanner />
-      {/* #5324: memory-specific budget warning. Distinct from the banner
-          above — that one sells a plan upgrade, this one steers to the
-          embedding fixes (local Ollama / BYO key) that keep memory growing.
-          Only renders for users whose embeddings actually bill against the
-          managed budget. */}
-      <MemoryEmbeddingBudgetBanner />
-      <AppRoutes location={baseLocation} />
+      {/* The plan-usage upsell and the #5324 memory-embedding warning used to
+          be full-width banners here, pushing every route down. Both are
+          notices in `NoticeCenter` now — see its docs for why. */}
+      <AppRoutes />
     </div>
   );
 
@@ -260,23 +251,22 @@ export function AppShellDesktop() {
           {chromeless ? (
             content
           ) : (
+            // Nothing sets `unframed` today. It existed for live CEF provider
+            // webviews — WebviewHost handed the Rust side a plain rectangle and
+            // CEF composited that child view above the whole HTML layer, so a
+            // rounded card under it showed four square corners punching through
+            // the radius. That surface was removed upstream along with
+            // WebviewHost, so no route needs the escape hatch right now; the
+            // prop stays on the primitive for the next full-bleed surface.
             <RootShellLayout sidebar={<AppSidebar />}>{content}</RootShellLayout>
           )}
         </div>
-        {/* Desktop Settings modal — mounted over whatever page is rendered
-            beneath when the URL is a settings path. */}
-        {settingsOpen && !chromeless && <SettingsModal />}
         <OpenhumanLinkModal />
-        {/* User-actionable runtime errors (#3931): a first-class panel for
-            expected user states (insufficient BYO credits, managed-budget
-            exhaustion). Mounted outside the routes so entries survive route
+        {/* Every notice the app raises, in one bottom-left FAB: classified
+            runtime errors (#3931), the memory-embedding budget (#5324), plan
+            usage limits. Mounted outside the routes so entries survive route
             changes and background-job completion. */}
-        <UserErrorCenter />
-        {/* Hidden Remotion-driven producer for the Meet camera. Mounts a
-            640×480 JPEG frame stream to the Rust frame bus while a meet
-            call is active; idle no-op otherwise. See
-            features/meet/MascotFrameProducer.tsx. */}
-        <MascotFrameProducer />
+        <NoticeCenter />
         {/* Post-onboarding Joyride walkthrough — mounted here (outside routes) so
             it persists across tab navigations. Joyride targets span Home + the
             sidebar nav so it must stay mounted while the user moves between routes. */}

@@ -7,7 +7,7 @@
 //! `RpcOutcome` shape are host concerns the runtime crate has no business
 //! knowing about.
 //!
-//! Call the store directly (`tinyagents::session::…`) rather
+//! Call the store directly (`tinyagents_session::…`) rather
 //! than through this module; it deliberately re-exports no storage API.
 //!
 //! Every store entry point takes the workspace root, so handlers pass

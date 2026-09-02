@@ -1,0 +1,28 @@
+{
+  "$comment": [
+    "Records in `modules::registry::ALL` whose submodule pin deliberately does",
+    "NOT sit on the tag their `version` names. See scripts/ci/check-module-pins.mjs.",
+    "",
+    "An entry here is a claim that the drift is known and accepted, NOT a way to",
+    "silence the gate: `expect` pins the exact `git describe --tags` output, so a",
+    "record already exempt cannot drift FURTHER without failing. Widening the drift",
+    "is a deliberate edit to this file, which is a reviewable diff.",
+    "",
+    "Delete an entry the moment the pins are reconciled. An exemption that has",
+    "stopped being true fails the gate too \u2014 `expect` must still match."
+  ],
+  "exemptions": [
+    {
+      "id": "tinyruntime-nodejs",
+      "submodule": "vendor/tinyruntime",
+      "expect": "v0.2.4",
+      "reason": "The provider is published independently at v0.2.2 while tinyruntime shared source contract is v0.2.4; registry retains its matching published provider artifact."
+    },
+    {
+      "id": "tinyruntime-python",
+      "submodule": "vendor/tinyruntime",
+      "expect": "v0.2.4",
+      "reason": "The provider is published independently at v0.2.2 while tinyruntime shared source contract is v0.2.4; registry retains its matching published provider artifact."
+    }
+  ]
+}

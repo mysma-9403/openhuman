@@ -6,11 +6,9 @@
 //!
 //! Scenarios (`library-profile <scenario>`):
 //! - `memory-ingest` — ingest 100 chat messages, drain the memory queue.
-//! - `subagents`     — one orchestrator turn spawning two real researchers.
 //! - `agent-turn`    — a single cold agent turn (minimal library unit).
 //! - `long-agent`    — N warmed sequential turns with a per-turn checkpoint series.
 //! - `workflow`      — a real flows trigger->transform->agent graph, end to end.
-//! - `subconscious`  — one promoted subconscious turn WITHOUT delegation.
 //! - `cold-phases`   — per-phase checkpoints of the cold bootstrap in one region.
 //! - `fleet`         — N live agents: marginal RSS, idle CPU, fd/thread growth, turn latency.
 //! - `skill-run`     — a skill step executing on a real `node` child: process-tree RSS.
@@ -55,11 +53,9 @@ fn start_dhat(scenario: &str) -> Result<dhat::Profiler> {
 async fn dispatch(scenario: &str) -> Result<ProfileResult> {
     match scenario {
         "memory-ingest" => scenarios::memory_ingest::run().await,
-        "subagents" => scenarios::subagents::run().await,
         "agent-turn" => scenarios::agent_turn::run().await,
         "long-agent" => scenarios::long_agent::run().await,
         "workflow" => scenarios::workflow::run().await,
-        "subconscious" => scenarios::subconscious::run().await,
         "cold-phases" => scenarios::cold_phases::run().await,
         "fleet" => scenarios::fleet::run().await,
         "skill-run" => scenarios::skill_run::run().await,
@@ -90,7 +86,7 @@ fn main() -> Result<()> {
     // can size the worker pool (the `fleet` scenario simulates the 2 vCPU box).
     let scenario = std::env::args().nth(1).context(
         "usage: library-profile \
-         <memory-ingest|subagents|agent-turn|long-agent|workflow|subconscious|cold-phases|fleet|\
+         <memory-ingest|agent-turn|long-agent|workflow|cold-phases|fleet|\
          skill-run|subagent-storm>",
     )?;
 

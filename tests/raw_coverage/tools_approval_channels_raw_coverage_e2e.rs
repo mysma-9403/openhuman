@@ -285,7 +285,6 @@ fn coverage_agent_definition(
         omit_identity: true,
         omit_memory_context: true,
         omit_safety_preamble: true,
-        omit_skills_catalog: true,
         omit_profile: true,
         omit_memory_md: true,
         model: ModelSpec::Inherit,
@@ -1399,12 +1398,10 @@ fn tools_and_tool_registry_public_surfaces_cover_schema_and_assembly_paths() {
         &config.workspace_dir,
         &config.workspace_dir,
     ));
-    let memory: Arc<dyn Memory> = Arc::new(StubMemory);
     let tools = all_tools(
         Arc::new(config.clone()),
         &security,
         AuditLogger::disabled(),
-        memory,
         &config.browser,
         &config.http_request,
         &config.workspace_dir,
@@ -1560,7 +1557,11 @@ fn tools_and_tool_registry_public_surfaces_cover_schema_and_assembly_paths() {
     assert!(!default_tool.is_concurrency_safe(&json!({})));
     assert!(!default_tool.external_effect());
     assert!(!default_tool.external_effect_with_args(&json!({})));
-    assert!(default_tool.generated_runtime_context(&json!({})).is_none());
+    assert!(openhuman_core::openhuman::tools::traits::generated_runtime_context(
+        &default_tool,
+        &json!({})
+    )
+    .is_none());
     assert!(default_tool.max_result_size_chars().is_none());
 
     let computer = ComputerUseConfig {
@@ -1622,12 +1623,14 @@ async fn orchestrator_tool_synthesis_covers_agent_and_integration_delegation_edg
     assert_eq!(names, vec!["research", "delegate_to_integrations_agent"]);
 
     let research = &tools[0];
-    assert!(research
-        .description()
-        .contains("direct tools are insufficient"));
-    assert!(research
-        .description()
-        .contains("careful public-source research"));
+    // The delegation tool's description is the target agent's `when_to_use`
+    // verbatim (the "Use only when direct response/direct tools are
+    // insufficient." prefix was deliberately dropped — it is stated once in
+    // the orchestrator prompt instead of once per delegate schema per turn).
+    assert_eq!(
+        research.description(),
+        "Use for careful public-source research."
+    );
     assert_eq!(research.permission_level(), PermissionLevel::Execute);
     assert_eq!(research.category(), ToolCategory::System);
     assert_eq!(
@@ -3537,11 +3540,7 @@ async fn node_and_npm_exec_tools_cover_validation_policy_and_disabled_runtime_pa
         &config.workspace_dir,
     ));
     let runtime = Arc::new(NativeRuntime::new());
-    let bootstrap = Arc::new(NodeBootstrap::new(
-        config.node.clone(),
-        workspace,
-        reqwest::Client::new(),
-    ));
+    let bootstrap = Arc::new(NodeBootstrap::new(Arc::new(config.clone())));
 
     let node = NodeExecTool::new(
         full_security.clone(),
@@ -3742,7 +3741,9 @@ async fn web_fetch_and_gitbooks_tools_use_local_http_backends() {
     assert!(bad_scheme.output().contains("URL rejected"));
 
     let endpoint = format!("{base}/mcp");
-    let search = GitbooksSearchTool::new(endpoint.clone(), 5);
+    // Fallible since the extraction: building the tool builds an HTTP client,
+    // and an unusable proxy configuration is reported rather than aborting.
+    let search = GitbooksSearchTool::new(endpoint.clone(), 5).expect("the search tool builds");
     assert_eq!(search.name(), "gitbooks_search");
     assert_eq!(search.permission_level(), PermissionLevel::ReadOnly);
     let blank_query = search
@@ -3760,7 +3761,7 @@ async fn web_fetch_and_gitbooks_tools_use_local_http_backends() {
         .output()
         .contains("gitbooks mocked searchDocumentation"));
 
-    let get_page = GitbooksGetPageTool::new(endpoint, 5);
+    let get_page = GitbooksGetPageTool::new(endpoint, 5).expect("the page tool builds");
     assert_eq!(get_page.name(), "gitbooks_get_page");
     let blank_url = get_page
         .execute(json!({ "url": "" }))

@@ -4,6 +4,8 @@ mod edit_file;
 mod file_read;
 mod file_write;
 mod git_operations;
+mod git_operations_config;
+mod git_operations_render;
 mod glob_search;
 mod grep;
 mod list_files;
@@ -14,7 +16,7 @@ mod update_memory_md;
 
 use crate::openhuman::security::policy::{TrustedAccess, TrustedRoot};
 use crate::openhuman::security::SecurityPolicy;
-use tinyagents::harness::tool::ToolExecutionContext;
+use tinytools::ToolRunContext;
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]
@@ -56,11 +58,11 @@ pub use update_memory_md::UpdateMemoryMdTool;
 /// model-supplied text.
 pub(super) fn security_for_tool_context(
     security: &SecurityPolicy,
-    context: Option<&ToolExecutionContext>,
+    context: Option<&dyn ToolRunContext>,
     tool: &str,
 ) -> SecurityPolicy {
     let mut scoped = security.clone();
-    if let Some(workspace) = context.and_then(|ctx| ctx.workspace.as_ref()) {
+    if let Some(workspace) = context.and_then(|ctx| ctx.workspace()) {
         tracing::debug!(
             tool,
             workspace_root = %workspace.root.display(),

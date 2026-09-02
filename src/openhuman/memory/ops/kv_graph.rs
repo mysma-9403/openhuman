@@ -2,12 +2,11 @@
 
 use serde::Deserialize;
 
-use tinycortex_api::provider::MemoryProvider;
+use crate::openhuman::memory::api::provider::MemoryProvider;
 
 use crate::rpc::RpcOutcome;
 
 use super::guard::active_memory_guard;
-use super::helpers::active_memory_client;
 
 /// Parameters for the `kv_set` RPC method.
 #[derive(Debug, Deserialize)]
@@ -69,13 +68,8 @@ pub struct GraphQueryParams {
 /// Sets a key-value pair in the memory store.
 ///
 /// Routed through [`MemoryGuard`](crate::openhuman::memory::guard::MemoryGuard)
-/// rather than the bare client. `MemoryGraph::kv_put` on the embedded driver is
-/// `client.kv_set(namespace, key, &value)` — the same call on the same store,
-/// so the only differences are the policy steps the guard adds (tier check,
-/// audit span) and an error string that gains a `"kv_put: "` prefix.
-///
-/// Its three siblings in this file deliberately stay on the bare client; see
-/// `docs/specs/memory-guard-allowlist.md`.
+/// and the shared [`MemoryGraph`](crate::openhuman::memory::api::provider::MemoryGraph)
+/// API, as are the other KV and graph handlers in this file.
 pub async fn kv_set(params: KvSetParams) -> Result<RpcOutcome<bool>, String> {
     let guard = active_memory_guard().await?;
     let graph = guard
@@ -92,19 +86,28 @@ pub async fn kv_set(params: KvSetParams) -> Result<RpcOutcome<bool>, String> {
 pub async fn kv_get(
     params: KvGetDeleteParams,
 ) -> Result<RpcOutcome<Option<serde_json::Value>>, String> {
-    let client = active_memory_client().await?;
-    let value = client
+    let guard = active_memory_guard().await?;
+    let graph = guard
+        .as_graph()
+        .ok_or_else(|| "memory driver does not support the graph family".to_string())?;
+    let value = graph
         .kv_get(params.namespace.as_deref(), &params.key)
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|record| record.value);
     Ok(RpcOutcome::single_log(value, "memory kv get"))
 }
 
 /// Deletes a key-value pair from the memory store.
 pub async fn kv_delete(params: KvGetDeleteParams) -> Result<RpcOutcome<bool>, String> {
-    let client = active_memory_client().await?;
-    let deleted = client
+    let guard = active_memory_guard().await?;
+    let graph = guard
+        .as_graph()
+        .ok_or_else(|| "memory driver does not support the graph family".to_string())?;
+    let deleted = graph
         .kv_delete(params.namespace.as_deref(), &params.key)
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(RpcOutcome::single_log(deleted, "memory kv delete"))
 }
 
@@ -112,8 +115,17 @@ pub async fn kv_delete(params: KvGetDeleteParams) -> Result<RpcOutcome<bool>, St
 pub async fn kv_list_namespace(
     params: super::documents::NamespaceOnlyParams,
 ) -> Result<RpcOutcome<Vec<serde_json::Value>>, String> {
-    let client = active_memory_client().await?;
-    let rows = client.kv_list_namespace(&params.namespace).await?;
+    let guard = active_memory_guard().await?;
+    let graph = guard
+        .as_graph()
+        .ok_or_else(|| "memory driver does not support the graph family".to_string())?;
+    let rows = graph
+        .kv_list(Some(&params.namespace), None, usize::MAX)
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|record| serde_json::to_value(record).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(RpcOutcome::single_log(rows, "memory namespace kv listed"))
 }
 
@@ -123,16 +135,25 @@ pub async fn kv_list_namespace(
 
 /// Upserts a relation triple in the knowledge graph.
 pub async fn graph_upsert(params: GraphUpsertParams) -> Result<RpcOutcome<bool>, String> {
-    let client = active_memory_client().await?;
-    client
-        .graph_upsert(
-            params.namespace.as_deref(),
-            &params.subject,
-            &params.predicate,
-            &params.object,
-            &params.attrs,
-        )
-        .await?;
+    let guard = active_memory_guard().await?;
+    let graph = guard
+        .as_graph()
+        .ok_or_else(|| "memory driver does not support the graph family".to_string())?;
+    graph
+        .put_relation(crate::openhuman::memory::api::types::GraphRelationRecord {
+            namespace: params.namespace,
+            subject: params.subject,
+            predicate: params.predicate,
+            object: params.object,
+            attrs: params.attrs,
+            updated_at: 0.0,
+            evidence_count: 1,
+            order_index: None,
+            document_ids: vec![],
+            chunk_ids: vec![],
+        })
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(RpcOutcome::single_log(true, "memory graph upserted"))
 }
 
@@ -140,155 +161,25 @@ pub async fn graph_upsert(params: GraphUpsertParams) -> Result<RpcOutcome<bool>,
 pub async fn graph_query(
     params: GraphQueryParams,
 ) -> Result<RpcOutcome<Vec<serde_json::Value>>, String> {
-    let client = active_memory_client().await?;
-    let rows = client
-        .graph_query(
+    let guard = active_memory_guard().await?;
+    let graph = guard
+        .as_graph()
+        .ok_or_else(|| "memory driver does not support the graph family".to_string())?;
+    let rows = graph
+        .relations(
             params.namespace.as_deref(),
             params.subject.as_deref(),
             params.predicate.as_deref(),
+            usize::MAX,
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|record| serde_json::to_value(record).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(RpcOutcome::single_log(rows, "memory graph queried"))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ensure_memory_client() {
-        crate::openhuman::memory::ops::ensure_shared_memory_client();
-    }
-
-    fn unique_namespace(prefix: &str) -> String {
-        let short = &uuid::Uuid::new_v4().as_simple().to_string()[..12];
-        format!("{prefix}{short}")
-    }
-
-    #[tokio::test]
-    async fn kv_handlers_roundtrip_scoped_values() {
-        let _serial = crate::openhuman::memory::ops::GLOBAL_MEMORY_TEST_LOCK
-            .lock()
-            .await;
-        ensure_memory_client();
-        let namespace = unique_namespace("kv-graph-kv");
-        let key = format!(
-            "state{}",
-            &uuid::Uuid::new_v4().as_simple().to_string()[..12]
-        );
-
-        let set = kv_set(KvSetParams {
-            namespace: Some(namespace.clone()),
-            key: key.clone(),
-            value: serde_json::json!({"open": true}),
-        })
-        .await
-        .expect("kv set");
-        assert!(set.value);
-
-        let get = kv_get(KvGetDeleteParams {
-            namespace: Some(namespace.clone()),
-            key: key.clone(),
-        })
-        .await
-        .expect("kv get");
-        assert_eq!(get.value, Some(serde_json::json!({"open": true})));
-
-        let listed = kv_list_namespace(super::super::documents::NamespaceOnlyParams {
-            namespace: namespace.clone(),
-        })
-        .await
-        .expect("kv list namespace");
-        assert!(listed
-            .value
-            .iter()
-            .any(|row| row["key"] == key && row["value"] == serde_json::json!({"open": true})));
-
-        let deleted = kv_delete(KvGetDeleteParams {
-            namespace: Some(namespace.clone()),
-            key: key.clone(),
-        })
-        .await
-        .expect("kv delete");
-        assert!(deleted.value);
-
-        let after = kv_get(KvGetDeleteParams {
-            namespace: Some(namespace),
-            key,
-        })
-        .await
-        .expect("kv get after delete");
-        assert!(after.value.is_none());
-    }
-
-    #[tokio::test]
-    async fn graph_handlers_roundtrip_relation_rows() {
-        let _serial = crate::openhuman::memory::ops::GLOBAL_MEMORY_TEST_LOCK
-            .lock()
-            .await;
-        ensure_memory_client();
-        let namespace = unique_namespace("kv-graph-rel");
-        let subject = format!(
-            "alice{}",
-            &uuid::Uuid::new_v4().as_simple().to_string()[..12]
-        );
-
-        let upsert = graph_upsert(GraphUpsertParams {
-            namespace: Some(namespace.clone()),
-            subject: subject.clone(),
-            predicate: "OWNS".into(),
-            object: "Atlas".into(),
-            attrs: serde_json::json!({"source": "test", "confidence": 0.9}),
-        })
-        .await
-        .expect("graph upsert");
-        assert!(upsert.value);
-
-        let queried = graph_query(GraphQueryParams {
-            namespace: Some(namespace),
-            subject: Some(subject.clone()),
-            predicate: Some("OWNS".into()),
-        })
-        .await
-        .expect("graph query");
-
-        assert_eq!(queried.logs, vec!["memory graph queried".to_string()]);
-        assert_eq!(queried.value.len(), 1);
-        assert_eq!(queried.value[0]["subject"], subject.to_uppercase());
-        assert_eq!(queried.value[0]["predicate"], "OWNS");
-        assert_eq!(queried.value[0]["object"], "ATLAS");
-    }
-
-    /// The guarded `kv_set` must land in the **same** store the unguarded
-    /// readers use. This is the failure a re-point can hide: routing through a
-    /// binding over a different workspace still returns `Ok`, it just writes
-    /// somewhere nobody reads. Asserted against the raw client rather than the
-    /// sibling handler so a shared bug in `active_memory_client` cannot make
-    /// both halves agree while both are wrong.
-    #[tokio::test]
-    async fn kv_set_through_the_guard_is_visible_to_the_unguarded_client() {
-        let _serial = crate::openhuman::memory::ops::GLOBAL_MEMORY_TEST_LOCK
-            .lock()
-            .await;
-        ensure_memory_client();
-        let namespace = unique_namespace("kv-guard");
-        let key = format!(
-            "guarded{}",
-            &uuid::Uuid::new_v4().as_simple().to_string()[..12]
-        );
-
-        kv_set(KvSetParams {
-            namespace: Some(namespace.clone()),
-            key: key.clone(),
-            value: serde_json::json!({"via": "guard"}),
-        })
-        .await
-        .expect("guarded kv set");
-
-        let client = active_memory_client().await.expect("client");
-        let raw = client
-            .kv_get(Some(namespace.as_str()), &key)
-            .await
-            .expect("unguarded kv get");
-        assert_eq!(raw, Some(serde_json::json!({"via": "guard"})));
-    }
-}
+#[path = "kv_graph_tests.rs"]
+mod tests;

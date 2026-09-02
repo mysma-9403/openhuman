@@ -33,8 +33,8 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tinyagents::harness::message::Message;
-use tinyagents::harness::model::{ModelRequest, ModelStreamItem};
+use tinyinference::message::Message;
+use tinyinference::model::{ModelRequest, ModelStreamItem};
 use tracing::{debug, warn};
 
 use super::types::{
@@ -390,5 +390,5 @@ pub(crate) fn strip_temperature_suffix(model: &str) -> &str {
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
+#[path = "http_tests.rs"]
 mod tests;

@@ -128,18 +128,29 @@ program can be halted at any phase boundary without leaving the tree broken.
 | `harness/subagent_runner/` | ~5,541 | merges into existing `harness::subagent` + `graph::orchestration` |
 | `harness/session/transcript.rs` + `turn_checkpoint.rs` | ~2,100 | the crate **`Store`/`AppendStore` session journal** (`{workspace}/tinyagents_store/`), via the in-flight #4249 migration — **not** a `JsonlChatHistory`; corrected 2026-08-03, see §5 Phase 2 |
 | `harness/{parse,definition,definition_loader,tool_filter,required_output,graph,agent_graph,fork_context}.rs` | ~3,300 | `harness::{tool_calling, definition, graph}` — merges with #55/#57 |
-| `harness/artifact_offload/`, `tool_result_artifacts/` | ~1,400 | `harness::artifacts` |
+| `harness/artifact_offload/`, `tool_result_artifacts/` | ~1,400 | `harness::artifacts` — **`artifact_offload` landed** (tinyagents#101); `tool_result_artifacts/` still to do |
 | `harness/run_queue/`, `harness/memory_context*.rs` | ~1,000 | `harness::runtime`, behind `MemoryProvider` |
 | `task_dispatcher/`, `dispatcher.rs` (parse half), `pformat.rs`, `stop_hooks.rs`, `hooks.rs` (trait defs) | ~3,000 | `harness::{tool_calling, hooks}` |
 | `progress_tracing/` | ~3,186 | deleted, not moved — crate observability already covers it (parent spec DS-5) |
+| `multimodal.rs` (resolution half) | ~1,300 | `harness::multimodal` behind the `multimodal` cargo feature — **landed**, see §5 Phase 5 |
 
 ### Stays in OpenHuman as the adapter layer
 
 `messages.rs` (`ChatMessage`), `message_convert.rs`, `progress.rs`
 (`AgentProgress`), `turn_origin.rs`, `prompts/`, `triage/`, `bus.rs`,
-`host_runtime.rs`, `error.rs`, `cost.rs`, `tool_policy.rs`, `multimodal.rs`,
+`host_runtime.rs`, `error.rs`, `cost.rs`, `tool_policy.rs`,
 `agent/tools/`, `archivist/`, `schemas.rs`, plus **every impl of the ~10 new
 traits**. Estimated ~20–25k LOC including tests.
+
+> **`multimodal.rs` moved off this list.** It read `multimodal.rs` until
+> 2026-08-21, when the maintainer reversed that row and the module was split.
+> The row was not wrong about the part that matters — the `ChatMessage`
+> adapters, the config mapping, the proxy client, the PDF extractor and the
+> on-disk attachment stash are all still here — it was wrong that *nothing*
+> generic was underneath them. Marker parsing, `data:` URI decoding, MIME
+> detection, the limit clamps and the rendered payload are the same for any
+> host, and they are now `harness::multimodal`. The host file is ~1,300 lines
+> lighter and reads as what §5 calls the irreducible remainder.
 
 ---
 
@@ -526,6 +537,24 @@ filed upstream — repointing should not proceed past them:
   has no route to the resolver. Per-agent pins would silently resolve to the
   workload default.
 
+> **Both are fixed upstream in
+> [`tinyagents#100`](https://github.com/tinyhumansai/tinyagents/pull/100)**,
+> awaiting merge. `ProgressEvent` gains `ToolCallFinished { run, call, success,
+> output }` and `ModelResolveRequest` gains `model_pin: Option<String>`.
+>
+> Two notes for whoever does the repointing:
+>
+> - **Neither type is emitted by the runtime yet.** The PR makes the seams
+>   *expressible*; the agent loop still has to produce `ToolCallFinished`, and
+>   the subagent runner still has to populate `model_pin` from
+>   `AgentDefinition.model`. Landing #100 unblocks the adapters, it does not
+>   wire them.
+> - **The `model_pin` is advisory by design.** The host decides whether it can
+>   honour a pin, because the runtime has no view of credentials or provider
+>   health. `OpenHumanModelResolver` should therefore validate the id against
+>   configured providers rather than pass it through blind — which is the
+>   behaviour §4's adapter notes already wanted and had no channel for.
+
 **21 `TODO(phase4)` markers** remain across the adapters, each naming a domain
 surface that was not reachable. They are honest gaps, not stubs pretending to
 work; the notable ones are `AgentMemory::thread_summary` (no host-authored
@@ -533,14 +562,47 @@ per-thread prose rollup exists) and `SecurityGate::screen_input` never returning
 `Redacted` (OpenHuman can detect PII but exposes no public text-rewriting
 helper).
 
-**Phase 5 — Relocate, module family at a time.**
+**Phase 5 — Relocate, module family at a time.** — *3 of 7 families landed*
 Order by inbound coupling, lowest first: `artifact_offload` → `run_queue` →
-`parse`/`tool_calling` (merges with DS-5b) → `subagent_runner` → `session/turn`
-→ `session/{builder,runtime,types}`. Each family: move to
+`multimodal` → `parse`/`tool_calling` (merges with DS-5b) → `subagent_runner` →
+`session/turn` → `session/{builder,runtime,types}`. Each family: move to
 `vendor/tinyagents/src/harness/`, re-export from the host adapter for one
 release, then repoint consumers.
 *Exit per family:* crate tests green; host `cargo check` both worlds; the
 family's tests live upstream.
+
+| Family | State |
+| --- | --- |
+| `artifact_offload` | **landed** — crate `harness::artifacts` (tinyagents#101), host keeps the prompt contract + two policy adapters |
+| `run_queue` | **landed** — crate `harness::run_queue` owns the FIFO mechanics; host wrapper keeps `QueueMode::{Interrupt,Parallel}` and the `QueuedMessage` payload |
+| `multimodal` | **landed** — crate `harness::multimodal` owns marker parsing, `data:` URIs, MIME detection, limits and payload rendering; host keeps the `ChatMessage` adapters, the config mapping, the proxy client, the `documents` PDF extractor and the attachment stash |
+| `parse`/`tool_calling` | not started |
+| `subagent_runner` | not started |
+| `session/turn` | blocked on Phase 2's soak |
+| `session/{builder,runtime,types}` | blocked on Phase 2's soak |
+
+> **The shape both landed families converge on**, and the template for the
+> rest: the crate owns the mechanics, the host keeps a thin wrapper holding
+> exactly the parts that are product-specific. `run_queue` keeps two enum
+> variants and a payload struct; `artifact_offload` keeps prompt text and two
+> policy adapters. Neither host module is a re-export shim — each is the
+> irreducible remainder, which is what "keep just the wiring" means in
+> practice.
+>
+> **Two rules the `artifact_offload` move established**, both of which will
+> recur:
+>
+> 1. **Prompt text never moves.** §6 lists OpenHuman prompt text as
+>    unpublishable, and prompts name host tool ids. So the crate's pointer
+>    renderer takes the read-tool name as a *parameter* rather than a constant
+>    — a hard-coded tool name in a redistributed crate would put a tool some
+>    other host does not have into its prompts.
+> 2. **A host policy becomes a trait pair, not an import.** `SecurityPolicy`
+>    and `sanitize_text` became `ArtifactPathPolicy` / `ArtifactRedactor`. The
+>    host constructor installs both every time, because the crate permits
+>    `None` for each and OpenHuman never wants either — routing construction
+>    through one helper is what stops a call site producing an unguarded writer
+>    by omission.
 
 **Phase 6 — Collapse the seam and the adapter.**
 `src/openhuman/tinyagents/` dissolves into the host adapter layer. Delete the

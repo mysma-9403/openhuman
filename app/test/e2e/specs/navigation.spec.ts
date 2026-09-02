@@ -43,8 +43,6 @@ const ROUTES: Route[] = [
   { hash: '/connections' },
   { hash: '/rewards' },
   { hash: '/settings' },
-  // The Agent World index redirects to its welcome surface.
-  { hash: '/agent-world/welcome' },
   { hash: '/flows' },
   // Orchestration folded under Brain; `/orchestration` now redirects to
   // `/brain?tab=orchestration`, so we assert the Brain destination instead

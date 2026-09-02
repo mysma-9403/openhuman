@@ -2,18 +2,28 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use tinycortex_api::capabilities::{Capabilities, Capability};
-use tinycortex_api::error::MemoryError;
-use tinycortex_api::health::MemoryHealth;
-use tinycortex_api::provider::{
-    MemoryDiff, MemoryDocuments, MemoryEntities, MemoryGoals, MemoryGraph, MemoryIngest,
-    MemoryMaintenance, MemoryProvider, MemorySourceSink, MemoryToolMemory, MemoryTree,
+use crate::openhuman::memory::api::capabilities::{Capabilities, Capability};
+use crate::openhuman::memory::api::error::MemoryError;
+use crate::openhuman::memory::api::health::MemoryHealth;
+use crate::openhuman::memory::api::provider::operations::{
+    MemoryAnswer, MemoryConversationIngest, MemoryDocumentIngest, MemoryEventIngest,
+    MemoryLearningIngest,
 };
+use crate::openhuman::memory::api::provider::scoring::MemoryScoring;
+use crate::openhuman::memory::api::provider::{
+    MemoryChunks, MemoryCodingSessions, MemoryDiff, MemoryDocuments, MemoryEntities,
+    MemoryEpisodic, MemoryGoals, MemoryGraph, MemoryIngest, MemoryMaintenance, MemoryPeople,
+    MemoryProfile, MemoryProvider, MemoryRetrieval, MemorySourceSink, MemorySourceSync,
+    MemoryToolMemory, MemoryTree,
+};
+use async_trait::async_trait;
 
 use super::families::{
-    GuardedDiff, GuardedDocuments, GuardedEntities, GuardedGoals, GuardedGraph, GuardedIngest,
-    GuardedMaintenance, GuardedSources, GuardedToolMemory, GuardedTree,
+    GuardedAnswer, GuardedChunks, GuardedCodingSessions, GuardedConversationIngest, GuardedDiff,
+    GuardedDocumentIngest, GuardedDocuments, GuardedEntities, GuardedEpisodic, GuardedEventIngest,
+    GuardedGoals, GuardedGraph, GuardedIngest, GuardedLearningIngest, GuardedMaintenance,
+    GuardedPeople, GuardedProfile, GuardedRetrieval, GuardedScoring, GuardedSourceSync,
+    GuardedSources, GuardedToolMemory, GuardedTree,
 };
 use super::policy::GuardPolicy;
 
@@ -22,7 +32,7 @@ use super::policy::GuardPolicy;
 ///
 /// It implements [`MemoryProvider`], so it is transparent to callers and cannot
 /// be "skipped" by a caller that simply keeps using the contract — there is no
-/// second, unguarded shape to hold. Its ten `as_*` overrides hand back
+/// second, unguarded shape to hold. Its fourteen `as_*` overrides hand back
 /// **guarded** family handles rather than the inner driver's, which is what
 /// closes the accessor bypass; see [`super::families`] for why that forces the
 /// decorators to be owned fields.
@@ -30,7 +40,7 @@ pub struct MemoryGuard {
     inner: Arc<dyn MemoryProvider>,
     policy: Arc<GuardPolicy>,
 
-    // The ten optional families. Each is `Some` **iff** the inner driver
+    // The fourteen optional families. Each is `Some` **iff** the inner driver
     // provides it, so `provides()` — which the contract's `audit_provider`
     // compares against `capabilities()` — answers identically for the guard and
     // for the driver underneath it.
@@ -44,12 +54,25 @@ pub struct MemoryGuard {
     tool_memory: Option<GuardedToolMemory>,
     sources: Option<GuardedSources>,
     maintenance: Option<GuardedMaintenance>,
+    people: Option<GuardedPeople>,
+    chunks: Option<GuardedChunks>,
+    retrieval: Option<GuardedRetrieval>,
+    profile: Option<GuardedProfile>,
+    episodic: Option<GuardedEpisodic>,
+    source_sync: Option<GuardedSourceSync>,
+    coding_sessions: Option<GuardedCodingSessions>,
+    scoring: Option<GuardedScoring>,
+    document_ingest: Option<GuardedDocumentIngest>,
+    conversation_ingest: Option<GuardedConversationIngest>,
+    learning_ingest: Option<GuardedLearningIngest>,
+    event_ingest: Option<GuardedEventIngest>,
+    answer: Option<GuardedAnswer>,
 }
 
 impl MemoryGuard {
     /// Wrap `inner` in `policy`.
     ///
-    /// Builds all ten decorators up front. That is not an optimisation: the
+    /// Builds all fourteen decorators up front. That is not an optimisation: the
     /// `as_*` accessors return borrows, so a decorator constructed inside an
     /// accessor could not outlive the call.
     pub fn new(inner: Arc<dyn MemoryProvider>, policy: Arc<GuardPolicy>) -> Self {
@@ -71,6 +94,19 @@ impl MemoryGuard {
             tool_memory: family!(ToolMemory, GuardedToolMemory),
             sources: family!(Sources, GuardedSources),
             maintenance: family!(Maintenance, GuardedMaintenance),
+            people: family!(People, GuardedPeople),
+            chunks: family!(Chunks, GuardedChunks),
+            retrieval: family!(Retrieval, GuardedRetrieval),
+            profile: family!(Profile, GuardedProfile),
+            episodic: family!(Episodic, GuardedEpisodic),
+            source_sync: family!(SourceSync, GuardedSourceSync),
+            coding_sessions: family!(CodingSessions, GuardedCodingSessions),
+            scoring: family!(Scoring, GuardedScoring),
+            document_ingest: family!(DocumentIngest, GuardedDocumentIngest),
+            conversation_ingest: family!(ConversationIngest, GuardedConversationIngest),
+            learning_ingest: family!(LearningIngest, GuardedLearningIngest),
+            event_ingest: family!(EventIngest, GuardedEventIngest),
+            answer: family!(Answer, GuardedAnswer),
             inner,
             policy,
         }
@@ -110,6 +146,34 @@ impl MemoryProvider for MemoryGuard {
 
     async fn shutdown(&self) -> Result<(), MemoryError> {
         self.inner.shutdown().await
+    }
+
+    fn as_document_ingest(&self) -> Option<&dyn MemoryDocumentIngest> {
+        self.document_ingest
+            .as_ref()
+            .map(|g| g as &dyn MemoryDocumentIngest)
+    }
+
+    fn as_conversation_ingest(&self) -> Option<&dyn MemoryConversationIngest> {
+        self.conversation_ingest
+            .as_ref()
+            .map(|g| g as &dyn MemoryConversationIngest)
+    }
+
+    fn as_learning_ingest(&self) -> Option<&dyn MemoryLearningIngest> {
+        self.learning_ingest
+            .as_ref()
+            .map(|g| g as &dyn MemoryLearningIngest)
+    }
+
+    fn as_event_ingest(&self) -> Option<&dyn MemoryEventIngest> {
+        self.event_ingest
+            .as_ref()
+            .map(|g| g as &dyn MemoryEventIngest)
+    }
+
+    fn as_answer(&self) -> Option<&dyn MemoryAnswer> {
+        self.answer.as_ref().map(|g| g as &dyn MemoryAnswer)
     }
 
     fn as_ingest(&self) -> Option<&dyn MemoryIngest> {
@@ -154,6 +218,41 @@ impl MemoryProvider for MemoryGuard {
         self.maintenance
             .as_ref()
             .map(|g| g as &dyn MemoryMaintenance)
+    }
+
+    fn as_people(&self) -> Option<&dyn MemoryPeople> {
+        self.people.as_ref().map(|g| g as &dyn MemoryPeople)
+    }
+
+    fn as_chunks(&self) -> Option<&dyn MemoryChunks> {
+        self.chunks.as_ref().map(|g| g as &dyn MemoryChunks)
+    }
+
+    fn as_retrieval(&self) -> Option<&dyn MemoryRetrieval> {
+        self.retrieval.as_ref().map(|g| g as &dyn MemoryRetrieval)
+    }
+
+    fn as_profile(&self) -> Option<&dyn MemoryProfile> {
+        self.profile.as_ref().map(|g| g as &dyn MemoryProfile)
+    }
+
+    fn as_episodic(&self) -> Option<&dyn MemoryEpisodic> {
+        self.episodic.as_ref().map(|g| g as &dyn MemoryEpisodic)
+    }
+
+    fn as_source_sync(&self) -> Option<&dyn MemorySourceSync> {
+        self.source_sync
+            .as_ref()
+            .map(|g| g as &dyn MemorySourceSync)
+    }
+
+    fn as_coding_sessions(&self) -> Option<&dyn MemoryCodingSessions> {
+        self.coding_sessions
+            .as_ref()
+            .map(|g| g as &dyn MemoryCodingSessions)
+    }
+    fn as_scoring(&self) -> Option<&dyn MemoryScoring> {
+        self.scoring.as_ref().map(|g| g as &dyn MemoryScoring)
     }
 }
 

@@ -119,12 +119,14 @@ async fn resolve(config: &Config, record: &'static ModuleRecord) -> Result<(), S
     // An override points at a developer's own build. Checked before the pinned
     // release so a module can be iterated on against a live core.
     if let Some(path) = local_override(config, record.id) {
-        return blocking(move || load_local(runtime, &path, record.id)).await;
+        let module_config = module_config(config, record.id);
+        return blocking(move || load_local(runtime, &path, record.id, module_config)).await;
     }
 
     // An artifact already extracted into the install directory by an earlier run.
     if let Some(path) = installed_artifact(config, record) {
-        return blocking(move || load_local(runtime, &path, record.id)).await;
+        let module_config = module_config(config, record.id);
+        return blocking(move || load_local(runtime, &path, record.id, module_config)).await;
     }
 
     // The search path tinybus itself honours, including OPENHUMAN_MODULE_PATH.
@@ -158,7 +160,8 @@ async fn resolve(config: &Config, record: &'static ModuleRecord) -> Result<(), S
     // hashes the archive, extracts it and `dlopen`s the result — all
     // synchronously. Left inline it would stall every other task sharing this
     // worker for the length of a download on whatever link the user has.
-    blocking(move || download(runtime, record)).await
+    let module_config = module_config(config, record.id);
+    blocking(move || download(runtime, record, module_config)).await
 }
 
 /// Run a blocking module operation on the blocking pool.
@@ -169,19 +172,23 @@ async fn blocking<F>(work: F) -> Result<(), String>
 where
     F: FnOnce() -> Result<(), String> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(work).await {
-        Ok(result) => result,
-        Err(err) => Err(format!(
-            "the module loader did not finish: {err}. This is terminal for the running \
-             process; restart the app to try again"
-        )),
-    }
+    host::runtime()
+        .await
+        .map_err(|error| format!("the module bus could not start: {error}"))?
+        .blocking(work)
+        .await
+        .map_err(|error| {
+            format!(
+                "{error}. This is terminal for the running process; restart the app to try again"
+            )
+        })
 }
 
 /// Download, verify, and load the pinned release artifact for this host.
 fn download(
     runtime: &'static host::ModuleRuntime,
     record: &'static ModuleRecord,
+    module_config: serde_json::Value,
 ) -> Result<(), String> {
     let candidates = platform::host_candidates();
     let assets: Vec<_> = candidates
@@ -205,7 +212,7 @@ fn download(
             record.release_url,
             asset.archive,
             Some(asset.sha256),
-            serde_json::json!({}),
+            module_config.clone(),
         ) {
             Ok(_) => {
                 log::info!(
@@ -240,8 +247,9 @@ pub(super) fn load_local(
     runtime: &host::ModuleRuntime,
     path: &Path,
     id: &str,
+    module_config: serde_json::Value,
 ) -> Result<(), String> {
-    match runtime.host().load_file(path) {
+    match runtime.host().load_file_with_config(path, module_config) {
         Ok(_) => {
             log::info!("[modules] loaded '{id}' from a local artifact");
             Ok(())
@@ -253,13 +261,108 @@ pub(super) fn load_local(
     }
 }
 
+/// Configuration crossing into a first-party compiled module.
+///
+/// Credentials are intentionally absent. TinyMemory calls back into the host
+/// for embedding and chat compute; the other modules need no host config.
+fn module_config(config: &Config, id: &str) -> serde_json::Value {
+    if id == super::connectors::MODULE_ID {
+        // The connector module takes its route and credential from here and
+        // reads one from nowhere else. A configuration that cannot be built —
+        // direct mode with no key, an unknown mode — loads the module with an
+        // empty blob rather than failing the load: the capability members need
+        // no route and must still answer, and every member that does need one
+        // reports the missing route when it is called.
+        return super::connectors::module_config(config).unwrap_or_else(|error| {
+            tracing::info!(
+                error = %error,
+                "[connectors] no route configured; loading with the capability surface only"
+            );
+            serde_json::json!({})
+        });
+    }
+    if id != super::memory::MODULE_ID {
+        return serde_json::json!({});
+    }
+    serde_json::json!({
+        "workspace_dir": config.workspace_dir,
+        // The registry file the host writes `[[memory_sources]]` into. The
+        // module used to derive `workspace_dir/config.toml`, a file that does
+        // not exist, and answered `NotFound` for every host-registered source
+        // on sync (openhuman#5820). Additive: an older module ignores it.
+        "config_path": config.config_path,
+        "memory": config.memory,
+        "memory_tree": config.memory_tree,
+        "scheduler_gate": config.scheduler_gate,
+        "local_ai": config.local_ai,
+        "embeddings_provider": config.embeddings_provider,
+        "memory_provider": config.memory_provider,
+        "default_model": config.default_model,
+        "default_temperature": config.default_temperature,
+        "output_language": config.output_language,
+        "memory_sources": config.memory_sources,
+        "embedding_routes": config.embedding_routes,
+        "storage_provider": config.storage.provider.config,
+        "ollama_base_url": crate::openhuman::inference::local::ollama_base_url_from_config(config),
+        // The module's `EmbeddingHost::default_cloud_embedding_model`: what the
+        // engine switches to when the opted-in local model is unreachable
+        // (`store::factories`). That is the host's managed-cloud default, the
+        // same constant the in-process `OpenHumanEmbeddingHost` answers with.
+        // It is NOT `config.memory.embedding_model`, which is the user's
+        // intended model and is usually the local one; sending that here made
+        // the cloud fallback ask the managed embedder for `nomic-embed-text`
+        // (openhuman#5820).
+        "cloud_embedding_model":
+            crate::openhuman::inference::embeddings::DEFAULT_CLOUD_EMBEDDING_MODEL,
+        "cloud_embedding_dimensions":
+            crate::openhuman::inference::embeddings::DEFAULT_CLOUD_EMBEDDING_DIMENSIONS,
+        "models_supporting_dimensions":
+            crate::openhuman::inference::embeddings::MODELS_SUPPORTING_DIMENSIONS,
+        // The periodic composio and workspace-source sync loops run INSIDE the
+        // module now (tinymemory#100), and these three are what let them run at
+        // all. Without the cadence the module answers manual-only and skips
+        // every source silently; without the mode `composio_config` never
+        // selects its direct branch and every connection fails. All three are
+        // `#[serde(default)]` upstream, so an older module ignores them rather
+        // than failing to load.
+        "memory_sync_interval_secs": config.memory_sync_interval_secs,
+        "composio_mode": config.composio.mode,
+        "composio_entity_id": config.composio.entity_id,
+        // Proxied Composio addresses the backend with this; without it the module
+        // builds its request against an empty base and fails in the HTTP client.
+        "backend_api_url": crate::api::config::effective_backend_api_url(&config.api_url),
+        "driver_id": "tinymemory",
+    })
+}
+
 /// A configured local artifact for `id`, if one is set.
+///
+/// The test fixture uses the same explicit-override path as a developer build,
+/// so TinyMemory is initialized with the host's real module configuration.
+/// Loading it through `OPENHUMAN_MODULE_PATH` would initialize it during boot
+/// before that configuration and its host callbacks are installed.
 fn local_override(config: &Config, id: &str) -> Option<PathBuf> {
-    config
+    let configured = config
         .modules
         .overrides
         .iter()
-        .find_map(|entry| (entry.id == id).then(|| PathBuf::from(entry.path.clone())))
+        .find_map(|entry| (entry.id == id).then(|| PathBuf::from(entry.path.clone())));
+
+    configured
+        .or_else(|| {
+            (id == super::memory::MODULE_ID)
+                .then(|| std::env::var_os("TINYMEMORY_TEST_MODULE"))
+                .flatten()
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            // TinyConnectors exposes its contract to the host, but has no
+            // host-side module namespace: it is resolved by its registry ID.
+            (id == "tinyconnectors")
+                .then(|| std::env::var_os("TINYCONNECTORS_TEST_MODULE"))
+                .flatten()
+                .map(PathBuf::from)
+        })
 }
 
 /// The artifact an earlier run extracted, if it is still there.

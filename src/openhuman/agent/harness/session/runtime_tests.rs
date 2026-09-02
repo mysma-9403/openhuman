@@ -9,9 +9,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tinyagents::harness::model::{
-    ChatModel, ModelRequest, ModelResponse, ModelStream, ModelStreamItem,
-};
+use tinyinference::model::{ChatModel, ModelRequest, ModelResponse, ModelStream, ModelStreamItem};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, Duration};
 
@@ -25,7 +23,7 @@ impl ChatModel<()> for StaticModel {
         &self,
         _state: &(),
         request: ModelRequest,
-    ) -> tinyagents::Result<ModelResponse> {
+    ) -> tinyinference::Result<ModelResponse> {
         let response = self.response.lock().take().unwrap_or_else(|| {
             Ok(ChatResponse {
                 text: Some("done".into()),
@@ -40,11 +38,15 @@ impl ChatModel<()> for StaticModel {
                     &response, &request,
                 ),
             ),
-            Err(error) => Err(tinyagents::TinyAgentsError::Model(error.to_string())),
+            Err(error) => Err(tinyinference::Error::Model(error.to_string())),
         }
     }
 
-    async fn stream(&self, state: &(), request: ModelRequest) -> tinyagents::Result<ModelStream> {
+    async fn stream(
+        &self,
+        state: &(),
+        request: ModelRequest,
+    ) -> tinyinference::Result<ModelStream> {
         let response = self.invoke(state, request).await?;
         Ok(Box::pin(futures::stream::iter(vec![
             ModelStreamItem::Started,
@@ -92,10 +94,8 @@ impl ChatModel<()> for PersistentErrModel {
         &self,
         _state: &(),
         _request: ModelRequest,
-    ) -> tinyagents::Result<ModelResponse> {
-        Err(tinyagents::TinyAgentsError::Model(
-            self.build_error().to_string(),
-        ))
+    ) -> tinyinference::Result<ModelResponse> {
+        Err(tinyinference::Error::Model(self.build_error().to_string()))
     }
 }
 
@@ -110,9 +110,8 @@ fn make_agent(model: Arc<dyn ChatModel<()>>) -> Agent {
         backend: "none".into(),
         ..crate::openhuman::config::MemoryConfig::default()
     };
-    let mem: Arc<dyn Memory> = Arc::from(
-        crate::openhuman::memory::store::create_memory(&memory_cfg, &workspace_path).unwrap(),
-    );
+    let mem: Arc<dyn Memory> =
+        Arc::from(tinymemory_core::store::create_memory(&memory_cfg, &workspace_path).unwrap());
 
     Agent::builder()
         .chat_model(model)
@@ -409,7 +408,7 @@ fn helper_paths_cover_no_overlap_native_calls_and_truncation() {
 /// too, not just behind the factory.
 #[tokio::test]
 async fn memory_backed_host_capabilities_build_from_session_state() {
-    use tinyagents::harness::host::{AgentMemory, ExperienceStore};
+    use tinyagents_harness::host::{AgentMemory, ExperienceStore};
 
     let model: Arc<dyn ChatModel<()>> = Arc::new(StaticModel {
         response: Mutex::new(None),
@@ -420,7 +419,7 @@ async fn memory_backed_host_capabilities_build_from_session_state() {
     // the accessor is that the runtime can hold `dyn AgentMemory`.
     let memory: &dyn AgentMemory = &agent.host_agent_memory();
     let recalled = memory
-        .recall(tinyagents::harness::host::RecallRequest::new("anything"))
+        .recall(tinyagents_harness::host::RecallRequest::new("anything"))
         .await
         .expect("recall must succeed against an empty backend");
     assert!(

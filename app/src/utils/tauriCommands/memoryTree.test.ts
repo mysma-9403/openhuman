@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, type Mock, test, vi } from 'vitest';
 
 import { callCoreRpc } from '../../services/coreRpcClient';
 import {
+  memoryNamespaceSummaries,
   memorySyncStatusList,
   memoryTreeBackfillStatus,
   memoryTreeChunkScore,
@@ -485,5 +486,42 @@ describe('memoryTreeRetryFailed', () => {
     const out = await memoryTreeRetryFailed();
 
     expect(out).toEqual({ requeued: 0 });
+  });
+});
+
+describe('memoryNamespaceSummaries', () => {
+  // The stored-document total is the sync-verification number the tree tiles
+  // cannot answer (#5932: a user watched 100 items land while the tree figure
+  // sat at 2), so both the dispatch and the envelope unwrap are pinned here.
+  test('dispatches openhuman.memory_namespace_summaries and returns the rows plus total', async () => {
+    mockCallCoreRpc.mockResolvedValueOnce({
+      result: {
+        namespaces: [
+          { namespace: 'slack', count: 80, last_updated: '2026-09-01T12:00:00Z' },
+          { namespace: 'gmail', count: 20, last_updated: null },
+        ],
+        total_documents: 100,
+      },
+      logs: ['memory::namespaces: summaries n=2 total=100'],
+    });
+
+    const out = await memoryNamespaceSummaries();
+
+    expect(mockCallCoreRpc).toHaveBeenCalledWith({
+      method: 'openhuman.memory_namespace_summaries',
+      params: {},
+    });
+    expect(out.total_documents).toBe(100);
+    expect(out.namespaces).toHaveLength(2);
+    expect(out.namespaces[0].namespace).toBe('slack');
+    expect(out.namespaces[0].count).toBe(80);
+  });
+
+  test('passes through bare-shape responses (no logs envelope) unchanged', async () => {
+    mockCallCoreRpc.mockResolvedValueOnce({ namespaces: [], total_documents: 0 });
+
+    const out = await memoryNamespaceSummaries();
+
+    expect(out).toEqual({ namespaces: [], total_documents: 0 });
   });
 });

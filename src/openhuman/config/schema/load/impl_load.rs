@@ -615,6 +615,7 @@ impl Config {
 
     pub async fn save(&self) -> Result<()> {
         let mut config_to_save = self.clone();
+        super::super::cli_overrides::restore_persisted_inference_fields(&mut config_to_save);
         encrypt_config_secrets(&mut config_to_save)?;
 
         let toml_str =

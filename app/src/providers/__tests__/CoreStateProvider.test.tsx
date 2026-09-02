@@ -99,7 +99,6 @@ function resetCoreStateStore() {
       onboardingCompleted: false,
       chatOnboardingCompleted: false,
       analyticsEnabled: true,
-      meetAutoOrchestratorHandoff: false,
       localState: { encryptionKey: null, onboardingTasks: null, keyringConsent: null },
       keyringStatus: {
         available: true,
@@ -537,38 +536,6 @@ describe('CoreStateProvider — identity-change cache clearing', () => {
     expect(vi.mocked(tauriCommands.logout)).not.toHaveBeenCalled();
   });
 
-  it('setMeetAutoOrchestratorHandoff(true) calls update RPC + flips snapshot optimistically (#1299)', async () => {
-    fetchSnapshot.mockResolvedValue(makeSnapshot({ userId: 'u1', sessionToken: 'tok1' }));
-    listTeams.mockResolvedValue([]);
-    vi.mocked(tauriCommands.openhumanUpdateMeetSettings).mockReset();
-    vi.mocked(tauriCommands.openhumanUpdateMeetSettings).mockResolvedValue({
-      result: { config: {}, workspace_dir: '/tmp', config_path: '/tmp/cfg.toml' },
-      logs: [],
-    } as never);
-
-    let ctx: CoreStateContextValue | undefined;
-    render(
-      <CoreStateProvider>
-        <Consumer
-          captureCtx={next => {
-            ctx = next;
-          }}
-        />
-      </CoreStateProvider>
-    );
-
-    await waitFor(() => expect(screen.getByTestId('ready').textContent).toBe('ready'));
-    expect(ctx?.snapshot.meetAutoOrchestratorHandoff).toBe(false);
-
-    await act(async () => {
-      await ctx!.setMeetAutoOrchestratorHandoff(true);
-    });
-
-    expect(vi.mocked(tauriCommands.openhumanUpdateMeetSettings)).toHaveBeenCalledWith({
-      auto_orchestrator_handoff: true,
-    });
-  });
-
   it('dispatching core-rpc-auth-expired triggers clearSession (and debounces repeated fires within 10s)', async () => {
     fetchSnapshot.mockResolvedValue(makeSnapshot({ userId: 'u1', sessionToken: 'tok1' }));
     listTeams.mockResolvedValue([]);
@@ -884,38 +851,6 @@ describe('CoreStateProvider — identity-change cache clearing', () => {
     });
 
     expect(vi.mocked(tauriCommands.storeSession)).toHaveBeenCalled();
-  });
-
-  it('setMeetAutoOrchestratorHandoff swallows refresh errors after the RPC succeeds (#1299)', async () => {
-    fetchSnapshot.mockResolvedValueOnce(makeSnapshot({ userId: 'u1', sessionToken: 'tok1' }));
-    listTeams.mockResolvedValue([]);
-    vi.mocked(tauriCommands.openhumanUpdateMeetSettings).mockReset();
-    vi.mocked(tauriCommands.openhumanUpdateMeetSettings).mockResolvedValue({
-      result: { config: {}, workspace_dir: '/tmp', config_path: '/tmp/cfg.toml' },
-      logs: [],
-    } as never);
-
-    let ctx: CoreStateContextValue | undefined;
-    render(
-      <CoreStateProvider>
-        <Consumer
-          captureCtx={next => {
-            ctx = next;
-          }}
-        />
-      </CoreStateProvider>
-    );
-
-    await waitFor(() => expect(screen.getByTestId('ready').textContent).toBe('ready'));
-    fetchSnapshot.mockRejectedValueOnce(new Error('refresh failed'));
-
-    await act(async () => {
-      await expect(ctx!.setMeetAutoOrchestratorHandoff(false)).resolves.toBeUndefined();
-    });
-
-    expect(vi.mocked(tauriCommands.openhumanUpdateMeetSettings)).toHaveBeenCalledWith({
-      auto_orchestrator_handoff: false,
-    });
   });
 });
 

@@ -9,14 +9,23 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use openhuman_core::openhuman::config::Config;
-use openhuman_core::openhuman::memory::{
-    ExtractionMode, IngestionState, MemoryIngestionConfig, MemoryIngestionRequest,
-    NamespaceDocumentInput,
-};
-use openhuman_core::openhuman::memory::sources::status::{source_status, FreshnessLabel};
+use openhuman_core::openhuman::memory::NamespaceDocumentInput;
+// The engine's own ingest request/config — what `UnifiedMemory::ingest_document`
+// takes. `memory::MemoryIngestion*` are the host's WIRE shapes now
+// (`rpc_models`), distinct types (#5560).
+use tinycortex::memory::ingest::{ExtractionMode, MemoryIngestionConfig, MemoryIngestionRequest};
+// The in-process ingest queue is the engine's and has no bus representation, so
+// `memory::mod` stopped re-exporting it for a consumer that was only ever this
+// test (#5560). Named on the crate directly, exactly as `upsert_chunks` below
+// already is — `tinymemory-core` is a dev-dependency, which this target links.
+use tinymemory_core::ingestion::IngestionState;
+// The engine's per-source SQL read, which is what this suite seeds a store for.
+// `memory::sources::status` is host-side now and asks the bound driver, which an
+// integration test has no module to load (#5560).
+use tinymemory_core::sources::status::{source_status, FreshnessLabel};
 use openhuman_core::openhuman::memory::sources::{MemorySourceEntry, SourceKind};
-use openhuman_core::openhuman::memory::store::chunks::store::upsert_chunks;
-use openhuman_core::openhuman::memory::store::chunks::types::{
+use tinymemory_core::store::chunks::store::upsert_chunks;
+use tinymemory_core::store::chunks::types::{
     approx_token_count, chunk_id, Chunk, Metadata, SourceKind as ChunkSourceKind, SourceRef,
 };
 use tinycortex::memory::ingest::canonicalize::chat::{
@@ -28,14 +37,18 @@ use tinycortex::memory::ingest::canonicalize::document::{
 use tinycortex::memory::ingest::canonicalize::email::{
     canonicalise as canonicalise_email, EmailMessage, EmailThread,
 };
-use openhuman_core::openhuman::memory::sync::composio::providers::{
+// These scope/catalog helpers moved off `memory::sync::composio::providers`
+// (the deleted engine registry's former home) onto
+// `integrations::composio::providers`, which re-exports them straight from
+// the `tinymemory-api` contract crate — see that module's doc comment.
+use openhuman_core::openhuman::integrations::composio::providers::{
     classify_unknown, find_curated, toolkit_from_slug, CuratedTool, ToolScope,
 };
 use tinycortex::memory::sync::{SyncOutcome, SyncPipelineKind};
-use openhuman_core::openhuman::memory::tree::summarise::{
+use tinymemory_core::tree::summarise::{
     fallback_summary, SummaryContext, SummaryInput,
 };
-use openhuman_core::openhuman::memory::tree::tree_runtime::store as tree_store;
+use tinymemory_core::tree::tree_runtime::store as tree_store;
 use openhuman_core::openhuman::memory::tree::tree_runtime::{
     derive_node_ids, estimate_tokens, level_from_node_id, node_id_to_path, NodeLevel, TreeNode,
 };
@@ -267,7 +280,7 @@ fn memory_tree_types_and_fallback_summary_cover_budget_and_legacy_parse_paths() 
 
     let ctx = SummaryContext {
         tree_id: "tree-coverage",
-        tree_kind: openhuman_core::openhuman::memory::store::trees::types::TreeKind::Global,
+        tree_kind: tinymemory_core::store::trees::types::TreeKind::Global,
         target_level: 2,
         token_budget: 128,
         input_token_budget: tinycortex::memory::config::INPUT_TOKEN_BUDGET,

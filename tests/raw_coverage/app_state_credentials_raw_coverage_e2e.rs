@@ -457,7 +457,6 @@ async fn round14_snapshot_preserves_rich_local_state_with_backend_or_stored_user
     );
     assert!(snap.onboarding_completed);
     assert!(snap.analytics_enabled);
-    assert!(snap.meet_auto_orchestrator_handoff);
     assert_eq!(
         snap.local_state.encryption_key.as_deref(),
         Some("round14-key")

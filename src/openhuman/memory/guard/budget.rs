@@ -12,7 +12,7 @@
 //! on a byte index panics when that index is not a char boundary. Slicing at a
 //! char boundary is the only form that is both correct and total.
 
-use tinycortex_api::types::MemoryEntry;
+use crate::openhuman::memory::api::types::MemoryEntry;
 
 /// Truncate `content` to at most `max_chars` characters.
 ///

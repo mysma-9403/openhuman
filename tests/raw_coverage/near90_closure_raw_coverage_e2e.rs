@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration as StdDuration;
 
 use chrono::Utc;
@@ -30,7 +30,10 @@ use openhuman_core::openhuman::memory::{
     RecallContextRequest, RecallMemoriesRequest, RecallNamespaceParams, WriteMemoryFileRequest,
 };
 use openhuman_core::openhuman::memory::sources::readers::SourceReader;
-use openhuman_core::openhuman::memory::sources::sync::sync_source;
+// The engine's own source pipeline. `memory::sources::sync` is host-side now and
+// carries only `derive_scopes`; `sync_source` stayed upstream because nothing in
+// `src/` calls it any more (#5560).
+use tinymemory_core::sources::sync::sync_source;
 use openhuman_core::openhuman::memory::sources::{ContentType, MemorySourceEntry, SourceKind};
 use openhuman_core::openhuman::threads::ops as thread_ops;
 use openhuman_core::openhuman::threads::welcome_migration::migrate_welcome_agent_artifacts;
@@ -103,6 +106,22 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn ensure_memory_seams(config: Arc<openhuman_core::openhuman::config::Config>) {
+    std::thread::Builder::new()
+        .name("round20-memory-seams".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            openhuman_core::openhuman::memory::host_impls::install_memory_host_seams(Arc::clone(
+                &config,
+            ));
+            #[cfg(feature = "modules")]
+            openhuman_core::openhuman::modules::memory::set_modules_policy(config);
+        })
+        .expect("spawn round20 memory seam installer")
+        .join()
+        .expect("round20 memory seam installer panicked");
 }
 
 fn tempdir() -> TempDir {
@@ -278,7 +297,6 @@ async fn round20_app_state_quarantines_directory_state_and_uses_stored_user_on_h
     );
     assert_eq!(snap.session_token.as_deref(), Some("round20.remote.token"));
     assert!(!snap.analytics_enabled);
-    assert!(!snap.meet_auto_orchestrator_handoff);
 
     std::fs::remove_file(harness.app_state_file()).expect("remove app-state file");
     std::fs::create_dir_all(harness.app_state_file()).expect("directory at app-state path");
@@ -479,13 +497,13 @@ async fn round20_memory_sources_readers_and_sync_cover_error_edges_without_netwo
 
     let mut disabled = source_entry("disabled-twitter", SourceKind::TwitterQuery);
     disabled.enabled = false;
-    let disabled_err = sync_source(disabled, config.clone())
+    let disabled_err = sync_source(disabled, Arc::new(config.clone()))
         .await
         .expect_err("disabled sync rejected");
     assert!(disabled_err.contains("is disabled"));
 
     let twitter = source_entry("twitter-round20", SourceKind::TwitterQuery);
-    sync_source(twitter, config)
+    sync_source(twitter, Arc::new(config))
         .await
         .expect("twitter placeholder is reported by background task");
     tokio::time::sleep(StdDuration::from_millis(25)).await;
@@ -495,6 +513,7 @@ async fn round20_memory_sources_readers_and_sync_cover_error_edges_without_netwo
 async fn round20_memory_documents_files_and_envelopes_cover_success_and_failure_paths() {
     let _lock = env_lock();
     let harness = setup("http://127.0.0.1:9");
+    ensure_memory_seams(Arc::new(harness.config().await));
 
     let init = memory_init(MemoryInitRequest {
         jwt_token: Some("ignored-round20".to_string()),

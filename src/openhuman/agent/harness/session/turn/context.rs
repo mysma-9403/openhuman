@@ -165,7 +165,7 @@ impl Agent {
         // via per-turn recall (Lane B). The legacy `user_profile` pinned namespace
         // is no longer read here; explicit prefs now live in `user_pref_general`.
         if !self.learning_enabled && self.explicit_preferences_enabled {
-            let general = crate::openhuman::memory::preferences::load_general_preferences(
+            let general = crate::openhuman::memory::preferences::load_general_preferences_on(
                 &self.memory,
                 crate::openhuman::memory::preferences::STANDING_PREFS_LIMIT,
             )
@@ -210,7 +210,7 @@ impl Agent {
         // injected as ground truth. A high-confidence inferred facet should be
         // *proposed* to the user (and pinned via `save_preference` on
         // confirmation), not silently treated as a standing preference.
-        let general = crate::openhuman::memory::preferences::load_general_preferences(
+        let general = crate::openhuman::memory::preferences::load_general_preferences_on(
             &self.memory,
             crate::openhuman::memory::preferences::STANDING_PREFS_LIMIT,
         )
@@ -234,9 +234,10 @@ impl Agent {
         // Pull every namespace's root-level summary from the tree
         // summarizer. This is the densest user memory we can hand the
         // orchestrator: each root holds up to 20 000 tokens of distilled
-        // long-term context. Done synchronously here because the calls
-        // are filesystem reads, not provider/network round-trips, and
-        // happen exactly once per session (only on the first turn).
+        // long-term context. Awaited inline, alongside the four memory reads
+        // above: the shared tree's roots come from the bound driver now
+        // (#5560) rather than from a host-side filesystem scan, and this
+        // happens exactly once per session (only on the first turn).
         //
         // Per-namespace + total caps come from the user-facing memory
         // window preset on `AgentConfig` so changing the slider in the
@@ -247,7 +248,8 @@ impl Agent {
             &self.memory_subdir,
             limits.per_namespace_max_chars,
             limits.total_tree_max_chars,
-        );
+        )
+        .await;
 
         LearnedContextData {
             observations: obs_entries
@@ -335,10 +337,35 @@ impl Agent {
         // Route through the global context manager so every
         // prompt-building call-site — main agent, sub-agent runner,
         // channel runtimes — shares one builder configuration.
-        let mut prompt = self.context.build_system_prompt(&ctx)?;
-        if let Some(boundary) = render_tool_policy_boundary(&self.tool_policy_session, 2048) {
-            prompt = format!("{boundary}\n\n{prompt}");
-        }
-        Ok(prompt)
+        let prompt = self.context.build_system_prompt(&ctx)?;
+        // Appended, not prepended (#5704). Every line of this block is
+        // session-scoped — agent id, channel, entry point, risk level, the
+        // allowed-tool list — so putting it first moves the prompt's first
+        // diverging byte to offset 0 and costs the inference backend's
+        // automatic prefix cache everything behind it. That is the same
+        // concern that keeps DateTimeSection out of `for_subagent` and keeps
+        // the connected-server overview sorted. The model reads the whole
+        // system message either way.
+        //
+        // It also keeps the archetype/persona as the prompt's opening line,
+        // which the prepend had replaced with a constant heading for every
+        // agent.
+        let boundary = render_tool_policy_boundary(&self.tool_policy_session, 2048);
+        Ok(append_tool_policy_boundary(prompt, boundary))
     }
 }
+
+/// Place the tool-policy boundary block relative to the assembled prompt.
+///
+/// Separated from [`Agent`] so the ordering can be tested without standing up a
+/// session: everything that decides the placement is in these two arguments.
+fn append_tool_policy_boundary(prompt: String, boundary: Option<String>) -> String {
+    match boundary {
+        Some(boundary) => format!("{prompt}\n\n{boundary}"),
+        None => prompt,
+    }
+}
+
+#[cfg(test)]
+#[path = "context_tests.rs"]
+mod tool_policy_boundary_placement_tests;

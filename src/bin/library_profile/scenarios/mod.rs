@@ -8,6 +8,4 @@ pub mod long_agent;
 pub mod memory_ingest;
 pub mod skill_run;
 pub mod subagent_storm;
-pub mod subagents;
-pub mod subconscious;
 pub mod workflow;

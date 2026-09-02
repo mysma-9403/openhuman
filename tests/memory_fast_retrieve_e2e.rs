@@ -18,19 +18,43 @@
 //! or via the project wrapper:
 //!   bash scripts/test-rust-with-mock.sh --test memory_fast_retrieve_e2e
 
+use std::sync::{Arc, OnceLock};
+
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
 
 use openhuman_core::openhuman::config::Config;
-use openhuman_core::openhuman::memory::ingest_pipeline::ingest_chat;
-use openhuman_core::openhuman::memory::tree::retrieval::{fast_retrieve, FastRetrieveOptions};
+// Named on the engine crate directly: the host `memory::tree::retrieval`
+// dropped its engine glob in #5560 (no production caller remained).
 use tinycortex::memory::ingest::canonicalize::chat::{ChatBatch, ChatMessage};
+use tinymemory_core::ingest_pipeline::ingest_chat;
+use tinymemory_core::tree::retrieval::{fast_retrieve, FastRetrieveOptions};
+
+static MEMORY_SEAMS_INIT: OnceLock<()> = OnceLock::new();
+
+fn ensure_memory_seams() {
+    MEMORY_SEAMS_INIT.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("memory-fast-retrieve-e2e-seams".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                openhuman_core::openhuman::memory::host_impls::install_memory_host_seams(Arc::new(
+                    Config::default(),
+                ));
+            })
+            .expect("spawn memory retrieval seam installer")
+            .join()
+            .expect("memory retrieval seam installer panicked");
+    });
+}
 
 fn test_config() -> (TempDir, Config) {
+    ensure_memory_seams();
     let tmp = TempDir::new().unwrap();
     let mut cfg = Config::default();
     cfg.workspace_dir = tmp.path().to_path_buf();
     // Inert embedder — no Ollama/cloud in CI.
+    cfg.embeddings_provider = Some("none".to_string());
     cfg.memory_tree.embedding_endpoint = None;
     cfg.memory_tree.embedding_model = None;
     cfg.memory_tree.embedding_strict = false;

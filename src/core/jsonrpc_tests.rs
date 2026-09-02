@@ -38,7 +38,6 @@ fn domain_subscriber_plan_full_registers_every_gated_subscriber() {
             channels: true,
             flows: true,
             memory: true,
-            meet: true,
             agent: true,
             hosted: true,
             mcp: true,
@@ -61,7 +60,6 @@ fn domain_subscriber_plan_none_registers_no_gated_subscriber() {
             channels: false,
             flows: false,
             memory: false,
-            meet: false,
             agent: false,
             hosted: false,
             mcp: false,
@@ -89,7 +87,6 @@ fn domain_subscriber_plan_harness_gates_by_owning_group() {
         "harness must skip channel-inbound + web-only proactive"
     );
     assert!(!plan.flows, "harness must skip flows trigger dispatch");
-    assert!(!plan.meet, "harness must skip agent_meetings subscribers");
     assert!(
         !plan.hosted,
         "harness must skip hosted orchestration ingest"
@@ -1715,7 +1712,7 @@ async fn desktop_auth_rejects_embedded_fetch_metadata() {
 #[cfg(feature = "http-server")]
 fn is_wallet_not_configured_error_matches_wallet_constant() {
     // The classifier keys off the wallet layer's exact "not configured"
-    // message so a wallet-less user's tinyplace RPC stays out of Sentry.
+    // message so wallet-backed RPCs stay out of Sentry.
     assert!(is_wallet_not_configured_error(
         crate::openhuman::web3::wallet::WALLET_NOT_CONFIGURED_MESSAGE
     ));
@@ -1739,7 +1736,7 @@ fn is_wallet_not_configured_error_does_not_match_other_errors() {
     // Other wallet/seed-derivation failures (decrypt, key derivation, locked
     // keychain) are real defects and must keep reaching Sentry.
     assert!(!is_wallet_not_configured_error(
-        "tinyplace signer init: bad seed"
+        "wallet signer init: bad seed"
     ));
     assert!(!is_wallet_not_configured_error(
         "decrypt secret: kms timeout"

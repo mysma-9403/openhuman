@@ -32,6 +32,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APPIMAGE_RUNTIME_VALIDATOR="${APPIMAGE_RUNTIME_VALIDATOR:-$SCRIPT_DIR/validate-appimage-runtime.sh}"
+# shellcheck source=scripts/release/tauri-signer.sh
+. "$SCRIPT_DIR/tauri-signer.sh"
 
 EXCLUDE_PATTERNS=(
   'libGL.so.*'
@@ -531,6 +533,12 @@ is_elf() {
 # so the pass is idempotent.
 #
 # Returns 0 if any ELF was rewritten, 1 otherwise.
+# NOTE (#5606): the fallback rpath this synthesises is sharun-shaped
+# ($ORIGIN:$ORIGIN/<up>shared/lib). It is currently unreachable on a linuxdeploy
+# AppDir - linuxdeploy has already rewritten every ELF to $ORIGIN-relative paths,
+# so the forbidden-RPATH trigger never fires - but if it ever did fire it would
+# write a directory that does not exist in that layout. Make the fallback
+# layout-aware before relying on it.
 sanitize_elf_rpaths() {
   local appdir="$1"
   if ! command -v patchelf >/dev/null 2>&1; then
@@ -635,7 +643,10 @@ validate_appimage_required_libs() {
   fi
 
   local root pattern found
-  for pattern in 'anylinux.so' 'libxdo.so*' 'libcef.so*'; do
+  # libcef.so* was here until #5606. CEF was removed in #5456 and there is no
+  # cef package in either Cargo.lock, so no build can satisfy it - it would fail
+  # every sharun bundle this function is still able to see.
+  for pattern in 'anylinux.so' 'libxdo.so*'; do
     found=0
     for root in "$appdir/shared/lib" "$appdir/usr/lib" "$appdir/lib"; do
       [ -d "$root" ] || continue
@@ -652,9 +663,6 @@ validate_appimage_required_libs() {
         ;;
       libxdo.so\*)
         echo "[strip-libs] ERROR: AppImage is missing libxdo.so.* — the enigo NEEDED dependency was not bundled (issue #3224). The app would segfault on launch on hosts without the legacy libxdo soname (e.g. Arch). Ensure libxdo-dev is installed on the build runner so lib4bin's ldd-walk bundles it." >&2
-        ;;
-      libcef.so\*)
-        echo "[strip-libs] ERROR: AppImage is missing libcef.so — the CEF runtime was not copied into the final bundle (issue #4020). Ensure the CEF cache/prewarm step exposes the directory containing libcef.so before the Tauri AppImage build." >&2
         ;;
     esac
     return 1
@@ -838,19 +846,22 @@ strip_one_appimage() {
 
 resign_artifact() {
   local file="$1"
+  # No key configured means this is an unsigned lane (a PR build): the bundler
+  # produced no .sig either, so there is nothing to invalidate. Skipping is
+  # correct here and is the ONLY case in which signing may be skipped.
   if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
     return
   fi
-  if ! command -v cargo-tauri >/dev/null 2>&1; then
-    echo "[strip-libs] WARNING: cargo-tauri not on PATH; cannot re-sign $file" >&2
-    return
-  fi
   echo "[strip-libs] Re-signing $file"
-  rm -f "$file.sig"
-  cargo tauri signer sign \
-    --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
-    --password "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" \
-    "$file" >/dev/null
+  # Previously guarded by `command -v cargo-tauri` with a warn-and-return. CI
+  # never installs cargo-tauri, so that branch was always taken and this leg
+  # shipped a .sig covering the pre-strip bytes. Stripping rewrites the
+  # AppImage, so a signature that is merely left behind cannot verify -- fail
+  # the job instead of publishing it (#5658).
+  if ! tauri_signer_sign "$file"; then
+    echo "[strip-libs] ERROR: could not re-sign $file after stripping; refusing to publish an artifact whose signature does not match its bytes" >&2
+    exit 1
+  fi
 }
 
 main() {

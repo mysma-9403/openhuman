@@ -1,7 +1,7 @@
 //! Step 6 — the pure char-budget arithmetic.
 
 use super::*;
-use tinycortex_api::types::{MemoryCategory, MemoryEntry, MemoryTaint};
+use crate::openhuman::memory::api::types::{MemoryCategory, MemoryEntry, MemoryTaint};
 
 fn entry(content: &str) -> MemoryEntry {
     MemoryEntry {

@@ -19,16 +19,16 @@
 //! Run with: `cargo test --test ollama_embeddings_fallback_e2e`
 
 use std::net::SocketAddr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{routing::get, Json, Router};
 
-use openhuman_core::openhuman::config::MemoryConfig;
+use openhuman_core::openhuman::config::{Config, MemoryConfig};
 use openhuman_core::openhuman::inference::embeddings::{
     DEFAULT_CLOUD_EMBEDDING_DIMENSIONS, DEFAULT_CLOUD_EMBEDDING_MODEL, DEFAULT_OLLAMA_DIMENSIONS,
     DEFAULT_OLLAMA_MODEL,
 };
-use openhuman_core::openhuman::memory::store::factories::{
+use tinymemory_core::store::factories::{
     effective_embedding_settings, effective_embedding_settings_probed,
 };
 
@@ -38,6 +38,23 @@ use openhuman_core::openhuman::memory::store::factories::{
 /// process-global env var that the production code reads at call time, so
 /// concurrent mutation across tests would produce non-deterministic results.
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static MEMORY_SEAMS_INIT: OnceLock<()> = OnceLock::new();
+
+fn ensure_memory_seams() {
+    MEMORY_SEAMS_INIT.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("ollama-embeddings-fallback-e2e-seams".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                openhuman_core::openhuman::memory::host_impls::install_memory_host_seams(Arc::new(
+                    Config::default(),
+                ));
+            })
+            .expect("spawn ollama embeddings seam installer")
+            .join()
+            .expect("ollama embeddings seam installer panicked");
+    });
+}
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK
@@ -104,6 +121,7 @@ const UNREACHABLE_URL: &str = "http://127.0.0.1:1";
 ///   per process, but the fallback outcome is observable every call).
 #[tokio::test]
 async fn local_embeddings_enabled_ollama_unreachable_falls_back_to_cloud() {
+    ensure_memory_seams();
     let _env = OllamaUrlGuard::set(UNREACHABLE_URL);
 
     let mem = MemoryConfig::default();
@@ -138,6 +156,7 @@ async fn local_embeddings_enabled_ollama_unreachable_falls_back_to_cloud() {
 /// - dimensions are the Ollama default (not the cloud default).
 #[tokio::test]
 async fn local_embeddings_enabled_ollama_healthy_stays_on_local_provider() {
+    ensure_memory_seams();
     let mock_url = start_mock_ollama_200().await;
     let _env = OllamaUrlGuard::set(&mock_url);
 

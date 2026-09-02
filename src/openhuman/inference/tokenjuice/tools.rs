@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::openhuman::inference::tokenjuice::cache::{self, store::RangeUnit};
+use crate::openhuman::inference::tokenjuice::types::{RangeUnit, RetrieveRange};
 use crate::openhuman::tools::traits::{PermissionLevel, Tool, ToolResult};
 
 pub struct TokenjuiceRetrieveTool;
@@ -31,7 +31,7 @@ impl Default for TokenjuiceRetrieveTool {
 #[async_trait]
 impl Tool for TokenjuiceRetrieveTool {
     fn name(&self) -> &str {
-        cache::RETRIEVE_TOOL_NAME
+        super::RETRIEVE_TOOL_NAME
     }
 
     fn description(&self) -> &str {
@@ -92,27 +92,34 @@ impl Tool for TokenjuiceRetrieveTool {
                 Some("bytes") => RangeUnit::Bytes,
                 _ => RangeUnit::Lines,
             };
-            return match cache::retrieve_range(token, start, end, unit) {
-                Some(slice) => {
+            return match super::retrieve(
+                token.to_string(),
+                Some(RetrieveRange { start, end, unit }),
+            )
+            .await
+            {
+                Ok(Some(slice)) => {
                     log::debug!(
                         "[tokenjuice][ccr] retrieved range token={token} {start}..{end} {} bytes",
                         slice.len()
                     );
                     Ok(ToolResult::success(slice))
                 }
-                None => Ok(ToolResult::error(miss_message(token))),
+                Ok(None) => Ok(ToolResult::error(miss_message(token))),
+                Err(error) => Ok(ToolResult::error(error)),
             };
         }
 
-        match cache::retrieve(token) {
-            Some(original) => {
+        match super::retrieve(token.to_string(), None).await {
+            Ok(Some(original)) => {
                 log::debug!(
                     "[tokenjuice][ccr] retrieved token={token} bytes={}",
                     original.len()
                 );
                 Ok(ToolResult::success(original))
             }
-            None => Ok(ToolResult::error(miss_message(token))),
+            Ok(None) => Ok(ToolResult::error(miss_message(token))),
+            Err(error) => Ok(ToolResult::error(error)),
         }
     }
 }
@@ -125,42 +132,5 @@ fn miss_message(token: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::openhuman::inference::tokenjuice::cache::store;
-
-    #[tokio::test]
-    async fn retrieves_offloaded_original() {
-        let original = "ORIGINAL TOKENJUICE PAYLOAD ".repeat(20);
-        let hash = store::offload(&original);
-        let tool = TokenjuiceRetrieveTool::new();
-        let res = tool.execute(json!({ "token": hash })).await.unwrap();
-        assert!(!res.is_error);
-        assert_eq!(res.output(), original);
-    }
-
-    #[tokio::test]
-    async fn retrieves_line_range() {
-        let original = "r0\nr1\nr2\nr3\nr4";
-        let hash = store::offload(original);
-        let tool = TokenjuiceRetrieveTool::new();
-        let res = tool
-            .execute(json!({ "token": hash, "range": { "start": 1, "end": 3, "unit": "lines" } }))
-            .await
-            .unwrap();
-        assert!(!res.is_error);
-        assert_eq!(res.output(), "r1\nr2");
-    }
-
-    #[tokio::test]
-    async fn missing_token_is_error() {
-        let tool = TokenjuiceRetrieveTool::new();
-        let res = tool
-            .execute(json!({ "token": "deadbeefcafe" }))
-            .await
-            .unwrap();
-        assert!(res.is_error);
-        let res2 = tool.execute(json!({})).await.unwrap();
-        assert!(res2.is_error);
-    }
-}
+#[path = "tools_tests.rs"]
+mod tests;

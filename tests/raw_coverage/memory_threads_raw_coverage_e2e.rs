@@ -13,7 +13,7 @@ use chrono::{TimeZone, Utc};
 use serde_json::json;
 use serde_json::{Map, Value};
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use tempfile::TempDir;
 
@@ -21,15 +21,126 @@ use openhuman_core::openhuman::agent::progress::AgentProgress;
 use openhuman_core::openhuman::agent::task_board::{TaskBoard, TaskBoardCard, TaskCardStatus};
 use openhuman_core::openhuman::config::Config;
 use openhuman_core::openhuman::inference::embeddings::NoopEmbedding;
+use openhuman_core::openhuman::memory::api::tool_memory::{
+    ToolMemoryPriority as ApiToolMemoryPriority, ToolMemoryRule as ApiToolMemoryRule,
+    ToolMemorySource as ApiToolMemorySource,
+};
 use openhuman_core::openhuman::memory::query::{
     MemoryQueryTool, MemoryTreeDrillDownTool, MemoryTreeFetchLeavesTool,
     MemoryTreeIngestDocumentTool, MemoryTreeQuerySourceTool, MemoryTreeSearchEntitiesTool,
 };
+use openhuman_core::openhuman::memory::sources::readers::reader_for;
+use openhuman_core::openhuman::memory::sources::registry;
+use openhuman_core::openhuman::memory::sources::rpc as memory_sources_rpc;
+// The engine's per-source SQL read, which is what this suite seeds a store for.
+// `memory::sources::status` is host-side now and asks the bound driver, which an
+// integration test has no module to load (#5560).
+use tinymemory_core::sources::status::{source_status, FreshnessLabel};
+// The engine's own source pipeline. `memory::sources::sync` is host-side now and
+// carries only `derive_scopes`; `sync_source` stayed upstream because nothing in
+// `src/` calls it any more (#5560).
+use tinymemory_core::sources::sync::sync_source;
+use openhuman_core::openhuman::memory::sources::types::{
+    ContentType, MemorySourceEntry, SourceContent, SourceItem, SourceKind,
+};
+use openhuman_core::openhuman::memory::sources::{
+    all_memory_sources_controller_schemas, all_memory_sources_registered_controllers,
+};
+use openhuman_core::openhuman::memory::sync::composio;
+use tinymemory_core::queue::types::ReembedBackfillPayload;
+use tinymemory_core::queue::{
+    self as memory_queue, AppendBufferPayload, AppendTarget, ExtractChunkPayload,
+    FlushStalePayload, JobKind, JobStatus, NewJob, NodeRef, SealPayload, DEFAULT_LOCK_DURATION_MS,
+};
+use tinymemory_core::store::chunks::store::{upsert_chunks, with_connection};
+use tinymemory_core::store::chunks::types::{
+    approx_token_count, chunk_id, Chunk, DataSource, Metadata, SourceKind as ChunkSourceKind,
+    SourceRef,
+};
+use tinymemory_core::store::trees::types::{
+    SummaryNode, Tree, TreeKind, TreeStatus as StoredTreeStatus,
+};
+use tinymemory_core::store::{MemoryClient, NamespaceDocumentInput, UnifiedMemory};
+// `memory::sync::composio::providers::slack::schemas` is this host's own real,
+// current RPC schema module (`openhuman.slack_memory_sync_trigger` /
+// `_status`) — unrelated to the deleted per-action `post_process` (see below).
+use openhuman_core::openhuman::memory::sync::composio::providers::slack::schemas as slack_memory_schemas;
+// Everything below moved off `memory::sync::composio::providers::*` onto
+// `integrations::composio::providers`/`integrations::composio::identity_store`/
+// `integrations::composio::profile_md` (host code) or `tinymemory_api::composio`
+// (contract-crate vocabulary) — see `crate::openhuman::integrations::composio::providers`'s
+// module docs for the full account of what replaced each deleted piece.
+use openhuman_core::openhuman::integrations::composio::identity_store::{
+    delete_connected_identity_facets, load_connected_identities,
+};
+use openhuman_core::openhuman::integrations::composio::ops::{
+    composio_get_user_profile, composio_sync,
+};
+use openhuman_core::openhuman::integrations::composio::profile_md::{
+    block_end, block_start, merge_provider_into_profile_md, remove_provider_from_profile_md,
+    replace_managed_block,
+};
+use openhuman_core::openhuman::integrations::composio::providers::{
+    agent_ready_toolkits, catalog_for_toolkit, classify_unknown, curated_scope_for, find_curated,
+    is_action_visible_with_pref, toolkit_from_slug, toolkit_has_scope, CuratedTool, NormalizedTask,
+    ProviderUserProfile, SyncOutcome as ComposioSyncOutcome, SyncReason, TaskFetchFilter,
+    ToolScope, UserScopePref,
+};
+use tinymemory_api::composio::{
+    canonicalize, extract_item_id, render_connected_identities_section, ConnectedIdentity,
+    DailyBudget, IdentityKind, SyncState, DEFAULT_DAILY_REQUEST_LIMIT,
+};
+// The deleted engine's per-toolkit `is_self_identity(prefix, kind, value)` has
+// no replacement anywhere (confirmed by exhaustive grep of vendor/tinymemory) —
+// only the cross-toolkit matcher survived, because the memory tree's entity
+// indexer was never scoped to one toolkit to begin with. Note this is a
+// DIFFERENT (structurally identical) `IdentityKind` than
+// `tinymemory_api::composio::IdentityKind` above.
+use openhuman_core::openhuman::memory::sync::sync_status::{
+    rpc as memory_sync_status_rpc, schemas as memory_sync_status_schemas,
+};
+use openhuman_core::openhuman::memory::tool_memory::prompt::{
+    render_tool_memory_rules, ToolMemoryRulesSection, TOOL_MEMORY_HEADING,
+};
+use openhuman_core::openhuman::memory::tool_memory::{
+    tool_memory_namespace, tool_memory_store, ToolMemoryPriority, ToolMemoryRule, ToolMemorySource,
+    TOOL_MEMORY_PROMPT_CAP,
+};
+use openhuman_core::openhuman::memory::tools::tool_memory::{
+    MemoryToolsListTool, MemoryToolsPutTool,
+};
 use openhuman_core::openhuman::memory::tools::{
     MemoryForgetTool, MemoryRecallTool, MemoryStoreTool,
 };
-use openhuman_core::openhuman::memory::tree_policy::TreePolicy;
-use openhuman_core::openhuman::memory::tree_source;
+use tinymemory_core::tree::score::embed;
+use tinymemory_core::tree::score::embed::Embedder;
+use tinymemory_core::tree::score::extract::{
+    CompositeExtractor, EntityExtractor, EntityKind, ExtractedEntities, ExtractedEntity,
+    ExtractedTopic,
+};
+use tinymemory_core::tree::score::resolver::CanonicalEntity;
+use tinymemory_core::tree::score::signals::{
+    combine, combine_cheap_only, compute as compute_score_signals, entity_density_score,
+    interaction, metadata_weight, source_weight, token_count, unique_words, ScoreSignals,
+    SignalWeights,
+};
+use tinymemory_core::tree::score::store as score_store;
+use tinymemory_core::tree::score::{resolver, ScoringConfig};
+use tinymemory_core::tree::summarise::{
+    fallback_summary, SummaryContext, SummaryInput,
+};
+use tinymemory_core::tree::tree::bucket_seal::LeafRef;
+use tinymemory_core::tree::tree_runtime::store as tree_runtime_store;
+use openhuman_core::openhuman::memory::tree::tree_runtime::{
+    all_tree_summarizer_controller_schemas, all_tree_summarizer_registered_controllers,
+    derive_node_ids, derive_parent_id, estimate_tokens, level_from_node_id, node_id_to_path,
+    NodeLevel, TreeNode,
+};
+use tinymemory_core::store::identity::is_self_identity_any_toolkit;
+// `retrieval` is the engine module, not the host wrapper: the host stopped
+// re-exporting it in #5560. The `tree::score` / `tree::summarise` /
+// `tree::tree` imports above went engine-direct the same way once their host
+// re-export shims stopped serving production (#5560).
 use openhuman_core::openhuman::memory::{
     all_memory_controller_schemas, all_memory_registered_controllers,
     preferences::{
@@ -37,117 +148,32 @@ use openhuman_core::openhuman::memory::{
         USER_PREF_GENERAL_NAMESPACE, USER_PREF_SITUATIONAL_NAMESPACE,
     },
     read_rpc as memory_read_rpc,
-    remember::RememberSourceKind,
-    rpc_models::{
-        ApiEnvelope, ApiError, ApiMeta, AppendConversationMessageRequest,
-        ConversationMessageRecord, ConversationMessagesRequest, CreateConversationThreadRequest,
-        DeleteConversationThreadRequest, DeleteDocumentRequest, EmptyRequest,
-        GenerateConversationThreadTitleRequest, ListDocumentsRequest, ListMemoryFilesRequest,
-        MemoryInitRequest, PaginationMeta, QueryNamespaceRequest, ReadMemoryFileRequest,
-        RecallContextRequest, RecallMemoriesRequest, UpdateConversationMessageRequest,
-        UpdateConversationThreadLabelsRequest, UpdateConversationThreadTitleRequest,
-        UpsertConversationThreadRequest, WriteMemoryFileRequest,
-    },
-    traits::{Memory, MemoryCategory, MemoryEntry, NamespaceSummary, RecallOpts},
-    util::redact::{redact, redact_endpoint},
-    MemoryIngestionConfig, MemoryIngestionRequest,
 };
-use openhuman_core::openhuman::memory::queue::types::ReembedBackfillPayload;
-use openhuman_core::openhuman::memory::queue::{
-    self as memory_queue, AppendBufferPayload, AppendTarget, ExtractChunkPayload, FlushStalePayload, JobKind,
-    JobStatus, NewJob, NodeRef, SealPayload, DEFAULT_LOCK_DURATION_MS,
+// The engine's own ingest request/config — what `UnifiedMemory::
+// ingest_document` and `extract_graph` take. `memory::MemoryIngestion*` are
+// the host's WIRE shapes now (`rpc_models`), distinct types (#5560).
+use tinycortex::memory::ingest::{MemoryIngestionConfig, MemoryIngestionRequest};
+use tinymemory_core::tree::retrieval;
+use tinymemory_core::tree_policy::TreePolicy;
+use tinymemory_core::tree_source;
+// `remember`, `rpc_models`, `traits` and `util` moved into the extracted engine
+// crate with the rest of the memory implementation; the host re-exports some of
+// their contents flat but not the modules themselves.
+// The guard exposes `store` through the contract's mandatory core trait, and
+// stamps provenance from an explicit taint argument.
+use openhuman_core::openhuman::memory::api::provider::MemoryCore;
+use openhuman_core::openhuman::memory::api::types::MemoryTaint;
+// These request/record types are consumed directly by `openhuman_core::openhuman::memory::ops`
+// and `openhuman::threads::ops` handlers below, which take the host's own `rpc_models` types,
+// not the engine crate's same-named ones — so they must come from the host, not `tinymemory_core`.
+use openhuman_core::openhuman::memory::rpc_models::{
+    AppendConversationMessageRequest, ConversationMessageRecord, ConversationMessagesRequest,
+    CreateConversationThreadRequest, DeleteConversationThreadRequest, DeleteDocumentRequest,
+    EmptyRequest, GenerateConversationThreadTitleRequest, ListDocumentsRequest,
+    ListMemoryFilesRequest, MemoryInitRequest, ReadMemoryFileRequest,
+    UpdateConversationMessageRequest, UpdateConversationThreadLabelsRequest,
+    UpdateConversationThreadTitleRequest, UpsertConversationThreadRequest, WriteMemoryFileRequest,
 };
-use openhuman_core::openhuman::memory::sources::readers::reader_for;
-use openhuman_core::openhuman::memory::sources::registry;
-use openhuman_core::openhuman::memory::sources::rpc as memory_sources_rpc;
-use openhuman_core::openhuman::memory::sources::status::{source_status, FreshnessLabel};
-use openhuman_core::openhuman::memory::sources::sync::sync_source;
-use openhuman_core::openhuman::memory::sources::types::{
-    ContentType, MemorySourceEntry, SourceContent, SourceItem, SourceKind,
-};
-use openhuman_core::openhuman::memory::sources::{
-    all_memory_sources_controller_schemas, all_memory_sources_registered_controllers,
-};
-use openhuman_core::openhuman::memory::store::chunks::store::{upsert_chunks, with_connection};
-use openhuman_core::openhuman::memory::store::chunks::types::{
-    approx_token_count, chunk_id, Chunk, DataSource, Metadata, SourceKind as ChunkSourceKind,
-    SourceRef,
-};
-use openhuman_core::openhuman::memory::store::trees::types::{
-    SummaryNode, Tree, TreeKind, TreeStatus as StoredTreeStatus,
-};
-use openhuman_core::openhuman::memory::store::{
-    MemoryClient, NamespaceDocumentInput, UnifiedMemory,
-};
-use tinycortex::memory::ingest::canonicalize::chat::{
-    canonicalise as canonicalise_chat, ChatBatch, ChatMessage,
-};
-use tinycortex::memory::ingest::canonicalize::document::{
-    canonicalise as canonicalise_document, DocumentInput,
-};
-use tinycortex::memory::ingest::canonicalize::email::{
-    canonicalise as canonicalise_email, EmailMessage, EmailThread,
-};
-use tinycortex::memory::ingest::canonicalize::email_clean;
-use openhuman_core::openhuman::memory::sync::composio;
-use openhuman_core::openhuman::memory::sync::composio::providers::profile::{
-    canonicalize, delete_connected_identity_facets, is_self_identity, is_self_identity_any_toolkit,
-    load_connected_identities, render_connected_identities_section, ConnectedIdentity,
-    IdentityKind,
-};
-use openhuman_core::openhuman::memory::sync::composio::providers::profile_md::{
-    block_end, block_start, merge_provider_into_profile_md, remove_provider_from_profile_md,
-    replace_managed_block,
-};
-use openhuman_core::openhuman::memory::sync::composio::providers::slack::{
-    post_process as slack_post_process, schemas as slack_memory_schemas,
-};
-use openhuman_core::openhuman::memory::sync::composio::providers::sync_state::{
-    extract_item_id, DailyBudget, SyncState, DEFAULT_DAILY_REQUEST_LIMIT,
-};
-use openhuman_core::openhuman::memory::sync::composio::providers::user_scopes;
-use openhuman_core::openhuman::memory::sync::composio::providers::{
-    agent_ready_toolkits, all_providers as all_composio_providers, capability_matrix,
-    catalog_for_toolkit, classify_unknown, curated_scope_for, find_curated, get_provider,
-    init_default_providers as init_default_composio_providers, is_action_visible_with_pref,
-    register_provider, toolkit_from_slug, toolkit_has_scope, ComposioProvider, CuratedTool,
-    NormalizedTask, ProviderContext, ProviderUserProfile, SyncOutcome as ComposioSyncOutcome,
-    SyncReason, TaskFetchFilter, ToolScope, UserScopePref,
-};
-use openhuman_core::openhuman::memory::sync::sync_status::{
-    rpc as memory_sync_status_rpc, schemas as memory_sync_status_schemas,
-};
-use tinycortex::memory::sync::{SyncOutcome as PipelineSyncOutcome, SyncPipelineKind};
-use openhuman_core::openhuman::memory::tool_memory::tools::{MemoryToolsListTool, MemoryToolsPutTool};
-use openhuman_core::openhuman::memory::tool_memory::{
-    render_tool_memory_rules, tool_memory_namespace, tool_memory_store, ToolMemoryPriority,
-    ToolMemoryRule, ToolMemoryRulesSection, ToolMemorySource, TOOL_MEMORY_HEADING,
-    TOOL_MEMORY_PROMPT_CAP,
-};
-use openhuman_core::openhuman::memory::tree::score::embed::Embedder;
-use openhuman_core::openhuman::memory::tree::score::extract::{
-    CompositeExtractor, EntityExtractor, EntityKind, ExtractedEntities, ExtractedEntity,
-    ExtractedTopic,
-};
-use openhuman_core::openhuman::memory::tree::score::resolver::CanonicalEntity;
-use openhuman_core::openhuman::memory::tree::score::signals::{
-    combine, combine_cheap_only, compute as compute_score_signals, entity_density_score,
-    interaction, metadata_weight, source_weight, token_count, unique_words, ScoreSignals,
-    SignalWeights,
-};
-use openhuman_core::openhuman::memory::tree::score::store as score_store;
-use openhuman_core::openhuman::memory::tree::score::{resolver, ScoringConfig};
-use openhuman_core::openhuman::memory::tree::summarise::{
-    fallback_summary, SummaryContext, SummaryInput,
-};
-use openhuman_core::openhuman::memory::tree::tree::bucket_seal::LeafRef;
-use openhuman_core::openhuman::memory::tree::tree_runtime::store as tree_runtime_store;
-use openhuman_core::openhuman::memory::tree::tree_runtime::{
-    all_tree_summarizer_controller_schemas, all_tree_summarizer_registered_controllers,
-    derive_node_ids, derive_parent_id, estimate_tokens, level_from_node_id, node_id_to_path,
-    NodeLevel, TreeNode,
-};
-use openhuman_core::openhuman::memory::tree::{retrieval, score::embed};
 use openhuman_core::openhuman::security::{AutonomyLevel, SecurityPolicy};
 use openhuman_core::openhuman::threads::ops as thread_ops;
 use openhuman_core::openhuman::threads::title::{
@@ -164,6 +190,26 @@ use openhuman_core::openhuman::threads::{
     all_threads_controller_schemas, all_threads_registered_controllers,
 };
 use openhuman_core::openhuman::tools::traits::{PermissionLevel, Tool, ToolCategory};
+use tinycortex::memory::ingest::canonicalize::chat::{
+    canonicalise as canonicalise_chat, ChatBatch, ChatMessage,
+};
+use tinycortex::memory::ingest::canonicalize::document::{
+    canonicalise as canonicalise_document, DocumentInput,
+};
+use tinycortex::memory::ingest::canonicalize::email::{
+    canonicalise as canonicalise_email, EmailMessage, EmailThread,
+};
+use tinycortex::memory::ingest::canonicalize::email_clean;
+use tinycortex::memory::sync::{SyncOutcome as PipelineSyncOutcome, SyncPipelineKind};
+use tinymemory_core::{
+    remember::RememberSourceKind,
+    rpc_models::{
+        ApiEnvelope, ApiError, ApiMeta, PaginationMeta, QueryNamespaceRequest,
+        RecallContextRequest, RecallMemoriesRequest,
+    },
+    traits::{Memory, MemoryCategory, MemoryEntry, NamespaceSummary, RecallOpts},
+    util::redact::{redact, redact_endpoint},
+};
 
 struct EnvVarGuard {
     key: &'static str,
@@ -192,6 +238,19 @@ impl Drop for EnvVarGuard {
 }
 
 static ENV_LOCK: &OnceLock<Mutex<()>> = &crate::SHARED_ENV_LOCK;
+fn ensure_memory_seams() {
+    std::thread::Builder::new()
+        .name("raw-coverage-memory-seams".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            openhuman_core::openhuman::memory::host_impls::install_memory_host_seams(Arc::new(
+                Config::default(),
+            ));
+        })
+        .expect("spawn raw coverage memory seam installer")
+        .join()
+        .expect("raw coverage memory seam installer panicked");
+}
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK
@@ -201,9 +260,99 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn config_in(tmp: &TempDir) -> Config {
+    ensure_memory_seams();
     let mut config = Config::default();
     config.workspace_dir = tmp.path().to_path_buf();
     config
+}
+
+/// The one memory workspace every driver-routed case in this module shares.
+///
+/// The module host captures a workspace **once per process**: the boot policy
+/// is first-call-wins and the loaded artifact takes its `workspace_dir` at load,
+/// while each case here used to get its own `TempDir`. Whichever case published
+/// first bound the module to a directory that was deleted when that case
+/// returned, and every later read through the driver answered from the dead
+/// store: 0 rows where the case had just seeded 1. Production never has that
+/// mismatch, because boot publishes the runtime config and module and handlers
+/// name one object. This reproduces that arrangement the way
+/// `tests/json_rpc_e2e.rs` does: one leaked directory, the policy published from
+/// it exactly once, and every driver-routed case pointing its config (and
+/// `OPENHUMAN_WORKSPACE`) here. Cases keep their own `TempDir` for the files they
+/// write; only the memory workspace is shared. The path ends in `workspace` so
+/// `resolve_config_dir_for_workspace` treats it as the workspace itself rather
+/// than appending another segment, and the env var and the config agree exactly.
+fn module_workspace() -> &'static Path {
+    static WORKSPACE: OnceLock<PathBuf> = OnceLock::new();
+    WORKSPACE.get_or_init(|| {
+        let dir = TempDir::new().expect("module workspace tempdir");
+        let path = dir.path().join("workspace");
+        std::fs::create_dir_all(&path).expect("create module workspace");
+        // Leaked on purpose: the module keeps this path for the process lifetime.
+        std::mem::forget(dir);
+        ensure_memory_seams();
+        #[cfg(feature = "modules")]
+        openhuman_core::openhuman::modules::memory::set_modules_policy(Arc::new(shared_config_at(
+            &path,
+        )));
+        path
+    })
+}
+
+/// A config whose memory workspace **and** source registry are the shared ones.
+///
+/// `config_path` matters as much as `workspace_dir`: the module reads its
+/// source registry from the file the host names there, and `Config::default()`
+/// names the developer's real `~/.openhuman/config.toml`. Pointing it beside
+/// the shared workspace is also where `Config::load_or_init` resolves it from
+/// `OPENHUMAN_WORKSPACE`, so env-driven cases and config-driven cases write and
+/// read one registry. Embeddings are off so no case asks the host to embed.
+fn shared_config_at(workspace: &Path) -> Config {
+    let mut config = Config::default();
+    config.workspace_dir = workspace.to_path_buf();
+    config.config_path = workspace
+        .parent()
+        .expect("shared workspace has a parent")
+        .join("config.toml");
+    config.embeddings_provider = Some("none".into());
+    config
+}
+
+/// Point `config` at the shared module workspace and registry.
+fn use_module_workspace(config: &mut Config) {
+    let shared = shared_config_at(module_workspace());
+    config.workspace_dir = shared.workspace_dir;
+    config.config_path = shared.config_path;
+    config.embeddings_provider = shared.embeddings_provider;
+}
+
+/// Empty the shared chunk store so a case that counts rows sees only its own.
+///
+/// Rows, not the file: the module holds its connection open, so replacing the
+/// file would leave it reading the old inode. Tables a fresh store lacks are
+/// skipped rather than failed.
+fn wipe_shared_store(config: &Config) {
+    with_connection(config, |conn| {
+        for table in [
+            "mem_tree_chunk_embeddings",
+            "mem_tree_chunk_reembed_skipped",
+            "mem_tree_entity_edges",
+            "mem_tree_entity_hotness",
+            "mem_tree_entity_index",
+            "mem_tree_score",
+            "mem_tree_ingested_sources",
+            "mem_tree_summary_embeddings",
+            "mem_tree_summaries",
+            "mem_tree_chunks",
+        ] {
+            if let Err(error) = conn.execute(&format!("DELETE FROM {table}"), []) {
+                let text = error.to_string();
+                assert!(text.contains("no such table"), "wipe {table}: {text}");
+            }
+        }
+        Ok(())
+    })
+    .expect("wipe shared store");
 }
 
 fn source(kind: SourceKind, id: &str) -> MemorySourceEntry {
@@ -536,7 +685,7 @@ Kitchen is north of Garden.
                 taint: openhuman_core::openhuman::memory::MemoryTaint::Internal,
             },
             &MemoryIngestionConfig {
-                extraction_mode: openhuman_core::openhuman::memory::ExtractionMode::Chunk,
+                extraction_mode: tinycortex::memory::ingest::ExtractionMode::Chunk,
                 ..Default::default()
             },
         )
@@ -688,8 +837,18 @@ async fn memory_source_status_counts_reader_and_composio_prefixes() {
     ];
     upsert_chunks(&config, &chunks).expect("upsert chunks");
     with_connection(&config, |conn| {
+        // Mark the chunk embedded the way the status query now READS it.
+        // Setting `mem_tree_chunks.embedding` no longer means anything: that
+        // legacy column is never written by the engine, which is why the
+        // status query used to report every chunk pending forever
+        // (tinymemory#59 item 2). It counts against the live
+        // `mem_tree_chunk_embeddings` sidecar now, so the fixture writes
+        // there.
         conn.execute(
-            "UPDATE mem_tree_chunks SET embedding = X'00010203' WHERE source_id = ?1",
+            "INSERT INTO mem_tree_chunk_embeddings \
+               (chunk_id, model_signature, vector, dim, created_at) \
+             SELECT id, 'test-model', X'00010203', 4, 0.0 \
+               FROM mem_tree_chunks WHERE source_id = ?1",
             ["mem_src:src_folder:note-1"],
         )?;
         Ok(())
@@ -721,8 +880,9 @@ async fn memory_source_status_counts_reader_and_composio_prefixes() {
 async fn memory_thread_tree_and_sync_controller_schemas_execute_public_handlers() {
     let _lock = env_lock();
     let tmp = TempDir::new().expect("tempdir");
-    let _workspace = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", tmp.path());
+    let _workspace = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", module_workspace());
     let config = Config::load_or_init().await.expect("init isolated config");
+    wipe_shared_store(&config);
 
     let thread_schemas = all_threads_controller_schemas();
     let thread_controllers = all_threads_registered_controllers();
@@ -914,7 +1074,9 @@ async fn memory_thread_tree_and_sync_controller_schemas_execute_public_handlers(
 fn memory_schema_registries_and_query_tool_metadata_cover_public_surfaces() {
     let memory_schemas = all_memory_controller_schemas();
     let memory_controllers = all_memory_registered_controllers();
-    assert_eq!(memory_schemas.len(), 35);
+    // 35 → 37 with #5932: memory.scheduler_override (the gate's manual
+    // window) and memory.namespace_summaries (the sync-verification counts).
+    assert_eq!(memory_schemas.len(), 37);
     assert_eq!(memory_schemas.len(), memory_controllers.len());
     for function in [
         "init",
@@ -1049,7 +1211,7 @@ fn memory_tree_policy_and_source_registry_write_metadata_mirror() {
         0.0
     );
 
-    let stats = openhuman_core::openhuman::memory::store::trees::types::EntityIndexStats {
+    let stats = tinymemory_core::store::trees::types::EntityIndexStats {
         mention_count_30d: 9,
         distinct_sources: 4,
         last_seen_ms: Some(now - 4 * 86_400_000),
@@ -1225,14 +1387,15 @@ fn memory_sync_composio_catalog_scope_and_state_helpers_cover_edge_cases() {
         .windows(2)
         .all(|pair| pair[0] <= pair[1]));
 
-    let matrix = capability_matrix();
-    let gmail = matrix.iter().find(|cap| cap.toolkit == "gmail").unwrap();
-    assert!(gmail.native_provider);
-    assert!(gmail.curated_tools);
-    assert!(gmail.curated_tool_count > 0);
-    let spotify = matrix.iter().find(|cap| cap.toolkit == "spotify").unwrap();
-    assert!(!spotify.native_provider);
-    assert!(spotify.curated_tools);
+    // `capability_matrix()` — the host-side static function this used to
+    // build from the curated catalogs — is itself gone, not just relocated:
+    // `composio_list_capabilities` (`integrations::composio::ops::toolkits`)
+    // now answers directly from the connector module's live
+    // `ListCapabilities` reply, with no host-side matrix or conversion left
+    // to call statically. Confirmed by that op's own doc comment. Genuine,
+    // unrecoverable coverage gap for this specific assertion; the
+    // `has_native_provider`/`catalog_for_toolkit` checks above already cover
+    // the same per-toolkit facts this matrix used to expose.
 
     let sync_target = composio::SyncTarget {
         toolkit: "gmail".into(),
@@ -1277,76 +1440,27 @@ fn memory_sync_composio_catalog_scope_and_state_helpers_cover_edge_cases() {
     assert_eq!(extract_item_id(&item, &["missing"]), None);
 }
 
+/// The `slack_memory` RPC schema assertions below are unchanged real
+/// coverage — `memory::sync::composio::providers::slack::schemas` is this
+/// host's own current RPC surface, not part of the deletion.
+///
+/// The rest of this test's original name is no longer accurate: it also
+/// drove the deleted engine's per-action Slack response reshaping
+/// (`providers::slack::post_process` — history/channel/search-result
+/// normalization, empty-text filtering, non-object passthrough). That moved
+/// into the separately-versioned `tinyconnectors` module with nothing left
+/// in this crate to assert against — see
+/// `memory_sync_providers_raw_coverage_e2e.rs`'s module doc comment for the
+/// fuller account of this same gap. Reported rather than silently dropped;
+/// not recoverable from here.
 #[test]
-fn slack_memory_schemas_and_post_processors_normalize_composio_shapes() {
+fn slack_memory_schemas_cover_public_surfaces() {
     let schemas = slack_memory_schemas::all_slack_memory_controller_schemas();
     assert_eq!(schemas.len(), 2);
     assert_eq!(schemas[0].namespace, "slack_memory");
     assert!(schemas
         .iter()
         .any(|schema| schema.function == "sync_status" && schema.inputs.is_empty()));
-
-    let mut history = json!({
-        "data": {
-            "messages": [
-                {
-                    "ts": "1717000000.000100",
-                    "user": "U001",
-                    "text": " hello ",
-                    "thread_ts": "1717000000.000100",
-                    "permalink": "https://slack.test/archives/C1/p1"
-                },
-                { "ts": "1717000000.000200", "text": "   " },
-                { "user": "U002", "text": "missing timestamp" }
-            ]
-        }
-    });
-    slack_post_process::post_process("SLACK_FETCH_CONVERSATION_HISTORY", None, &mut history);
-    assert_eq!(history["messages"].as_array().unwrap().len(), 1);
-    assert_eq!(history["messages"][0]["text"], "hello");
-    assert_eq!(history["messages"][0]["user"], "U001");
-
-    let mut channels = json!({
-        "data": {
-            "conversations": [
-                { "id": "C001", "name": "engineering", "is_private": true },
-                { "id": " ", "name": "skip" },
-                { "id": "C002" }
-            ]
-        }
-    });
-    slack_post_process::post_process("SLACK_LIST_CONVERSATIONS", None, &mut channels);
-    assert_eq!(channels["channels"].as_array().unwrap().len(), 2);
-    assert_eq!(channels["channels"][0]["is_private"], true);
-    assert_eq!(channels["channels"][1]["name"], "C002");
-
-    let mut search = json!({
-        "messages": {
-            "matches": [
-                {
-                    "ts": "1717000000.000300",
-                    "bot_id": "B001",
-                    "text": "bot update",
-                    "channel": { "id": "C001" },
-                    "permalink": "https://slack.test/search/result"
-                },
-                { "ts": "1717000000.000400", "text": "" }
-            ],
-            "paging": { "pages": 3 }
-        }
-    });
-    slack_post_process::post_process("SLACK_SEARCH_MESSAGES", None, &mut search);
-    assert_eq!(search["pages"], 3);
-    assert_eq!(search["messages"].as_array().unwrap().len(), 1);
-    assert_eq!(search["messages"][0]["channel_id"], "C001");
-    assert_eq!(search["messages"][0]["user"], "B001");
-
-    let mut non_object = json!("replace me");
-    slack_post_process::post_process("SLACK_LIST_CONVERSATIONS", None, &mut non_object);
-    assert!(non_object["channels"].as_array().unwrap().is_empty());
-    let mut passthrough = json!({ "ok": true });
-    slack_post_process::post_process("SLACK_UNKNOWN", None, &mut passthrough);
-    assert_eq!(passthrough, json!({ "ok": true }));
 }
 
 #[test]
@@ -1356,7 +1470,7 @@ fn memory_tree_scoring_signal_helpers_cover_boundaries_and_serialization() {
     assert!(!EntityKind::Person.is_mechanical());
     assert!(EntityKind::parse("unknown").is_err());
 
-    let regex_entities = openhuman_core::openhuman::memory::tree::score::extract::regex::extract(
+    let regex_entities = tinymemory_core::tree::score::extract::regex::extract(
         "Alice emailed bob@example.com from https://example.test and mentioned #coverage.",
     );
     assert!(regex_entities
@@ -1642,12 +1756,12 @@ fn memory_tree_runtime_store_buffers_and_retrieval_wire_helpers() {
         0
     );
 
-    let source_factory = openhuman_core::openhuman::memory::tree::tree::TreeFactory::source(
+    let source_factory = tinymemory_core::tree::tree::TreeFactory::source(
         "gmail:alice@example.com|bob@example.com",
     );
     assert_eq!(
         source_factory.profile(),
-        openhuman_core::openhuman::memory::tree::tree::TreeProfile::Source
+        tinymemory_core::tree::tree::TreeProfile::Source
     );
     assert_eq!(
         source_factory.scope_slug(),
@@ -1657,26 +1771,27 @@ fn memory_tree_runtime_store_buffers_and_retrieval_wire_helpers() {
         .get_or_create(&config)
         .expect("source tree from factory");
     assert_eq!(
-        openhuman_core::openhuman::memory::tree::tree::TreeFactory::from_tree(&source_tree).kind(),
+        tinymemory_core::tree::tree::TreeFactory::from_tree(&source_tree).kind(),
         TreeKind::Source
     );
-    let topic_factory =
-        openhuman_core::openhuman::memory::tree::tree::TreeFactory::topic("email:alice@example.com");
+    let topic_factory = tinymemory_core::tree::tree::TreeFactory::topic(
+        "email:alice@example.com",
+    );
     assert!(matches!(
         topic_factory.summary_tree_kind(),
-        openhuman_core::openhuman::memory::store::content::SummaryTreeKind::Topic
+        tinymemory_core::store::content::SummaryTreeKind::Topic
     ));
     let topic_tree = topic_factory
         .get_or_create(&config)
         .expect("topic tree from factory");
     assert_ne!(source_tree.id, topic_tree.id);
     assert!(
-        openhuman_core::openhuman::memory::tree::tree::new_tree_id(TreeKind::Global)
+        tinymemory_core::tree::tree::new_tree_id(TreeKind::Global)
             .starts_with("global:")
     );
-    assert!(openhuman_core::openhuman::memory::tree::tree::new_summary_id(2).contains(":L2-"));
+    assert!(tinymemory_core::tree::tree::new_summary_id(2).contains(":L2-"));
     assert!(
-        openhuman_core::openhuman::memory::tree::tree::registry::is_unique_violation(
+        tinymemory_core::tree::tree::registry::is_unique_violation(
             &anyhow::anyhow!("UNIQUE constraint failed: mem_trees.kind, mem_trees.scope")
         )
     );
@@ -1684,7 +1799,7 @@ fn memory_tree_runtime_store_buffers_and_retrieval_wire_helpers() {
         .archive(&config)
         .expect("archive source tree");
     assert_eq!(
-        openhuman_core::openhuman::memory::tree::tree::store::get_tree_by_scope(
+        tinymemory_core::tree::tree::store::get_tree_by_scope(
             &config,
             TreeKind::Source,
             "gmail:alice@example.com|bob@example.com"
@@ -1698,10 +1813,14 @@ fn memory_tree_runtime_store_buffers_and_retrieval_wire_helpers() {
 
 #[tokio::test]
 async fn memory_read_rpc_score_index_and_summary_helpers_cover_dashboard_paths() {
+    // Serialised with every other case on the shared module store: a parallel
+    // run of this target would otherwise let another case's `wipe_shared_store`
+    // empty the rows seeded below before the reads assert on them.
+    let _lock = env_lock();
     let tmp = TempDir::new().expect("tempdir");
     let mut config = config_in(&tmp);
-    config.config_path = tmp.path().join("config.toml");
-    config.embeddings_provider = Some("none".into());
+    use_module_workspace(&mut config);
+    wipe_shared_store(&config);
 
     let now = Utc.with_ymd_and_hms(2026, 5, 29, 14, 0, 0).unwrap();
     let mut gmail = chunk(
@@ -1722,10 +1841,17 @@ async fn memory_read_rpc_score_index_and_summary_helpers_cover_dashboard_paths()
     slack.metadata.source_kind = ChunkSourceKind::Chat;
     slack.metadata.tags = vec!["reply".into(), "provider:slack".into()];
     upsert_chunks(&config, &[gmail.clone(), slack.clone()]).expect("upsert read rpc chunks");
+    // `has_embedding` is a row in the embeddings table, not the legacy column.
     with_connection(&config, |conn| {
         conn.execute(
-            "UPDATE mem_tree_chunks SET embedding = X'00010203', tags_json = ?2 WHERE id = ?1",
+            "UPDATE mem_tree_chunks SET tags_json = ?2 WHERE id = ?1",
             (&gmail.id, json!(["sent", "provider:gmail"]).to_string()),
+        )?;
+        conn.execute(
+            "INSERT INTO mem_tree_chunk_embeddings \
+               (chunk_id, model_signature, vector, dim, created_at) \
+             VALUES (?1, 'test-sig', X'00010203', 1, 0.0)",
+            [&gmail.id],
         )?;
         Ok(())
     })
@@ -1889,13 +2015,13 @@ async fn memory_read_rpc_score_index_and_summary_helpers_cover_dashboard_paths()
         ask: None,
     };
     let empty =
-        openhuman_core::openhuman::memory::tree::summarise::summarise(&config, &[], &empty_ctx)
+        tinymemory_core::tree::summarise::summarise(&config, &[], &empty_ctx)
             .await
             .expect("empty summarise avoids provider");
     assert_eq!(empty.token_count, 0);
 
     let embedder =
-        openhuman_core::openhuman::memory::tree::score::embed::factory::build_embedder_from_config(
+        tinymemory_core::tree::score::embed::factory::build_embedder_from_config(
             &config,
         )
         .expect("inert embedder");
@@ -2044,6 +2170,11 @@ fn memory_retrieval_embedding_and_rpc_model_helpers_round_trip() {
         category: Some(MemoryCategory::Conversation),
         session_id: Some("session-2"),
         min_score: Some(0.5),
+        // Self-echo exclusion is a separate concern from this coverage test's
+        // namespace/category/session assertions below; `None` means "exclude
+        // nothing", matching this literal's pre-existing behavior before the
+        // field was added.
+        exclude_session_id: None,
         cross_session: true,
     };
     assert!(opts.cross_session);
@@ -2058,17 +2189,21 @@ fn memory_retrieval_embedding_and_rpc_model_helpers_round_trip() {
 
 #[tokio::test]
 async fn memory_preferences_remember_redaction_and_pipeline_traits_cover_public_edges() {
-    let tmp = TempDir::new().expect("tempdir");
-    let memory: Arc<dyn Memory> =
-        Arc::new(UnifiedMemory::new(tmp.path(), Arc::new(NoopEmbedding), None).expect("memory"));
+    // The preference readers take a `MemoryGuard` since the module port: they
+    // are host policy over a driver, not engine calls. `guarded_in_memory`
+    // gives a real guard over a real store, so this still exercises the
+    // decorator production uses rather than reaching past it.
+    let (_provider, memory) =
+        openhuman_core::openhuman::memory::guard::in_memory::guarded_in_memory();
 
     memory
         .store(
             USER_PREF_GENERAL_NAMESPACE,
             "tone",
             "Prefer concise responses.",
-            MemoryCategory::Core,
+            openhuman_core::openhuman::memory::api::types::MemoryCategory::Core,
             None,
+            MemoryTaint::Internal,
         )
         .await
         .expect("store general preference");
@@ -2077,8 +2212,9 @@ async fn memory_preferences_remember_redaction_and_pipeline_traits_cover_public_
             USER_PREF_GENERAL_NAMESPACE,
             "empty",
             "   ",
-            MemoryCategory::Core,
+            openhuman_core::openhuman::memory::api::types::MemoryCategory::Core,
             None,
+            MemoryTaint::Internal,
         )
         .await
         .expect("store empty general preference");
@@ -2087,8 +2223,9 @@ async fn memory_preferences_remember_redaction_and_pipeline_traits_cover_public_
             USER_PREF_SITUATIONAL_NAMESPACE,
             "rust-tests",
             "When changing Rust code, run targeted tests first.",
-            MemoryCategory::Core,
+            openhuman_core::openhuman::memory::api::types::MemoryCategory::Core,
             None,
+            MemoryTaint::Internal,
         )
         .await
         .expect("store situational preference");
@@ -2143,14 +2280,12 @@ async fn memory_preferences_remember_redaction_and_pipeline_traits_cover_public_
 #[tokio::test]
 async fn memory_tools_and_user_scope_prefs_cover_public_execution_paths() {
     let tmp = TempDir::new().expect("tempdir");
-    let memory: Arc<dyn Memory> =
-        Arc::new(UnifiedMemory::new(tmp.path(), Arc::new(NoopEmbedding), None).expect("memory"));
     let security = Arc::new(SecurityPolicy {
         autonomy: AutonomyLevel::Full,
         ..SecurityPolicy::default()
     });
 
-    let store_tool = MemoryStoreTool::new(memory.clone(), security.clone());
+    let store_tool = MemoryStoreTool::new(security.clone());
     assert_eq!(store_tool.name(), "memory_store");
     assert!(store_tool.parameters_schema()["required"]
         .as_array()
@@ -2202,7 +2337,7 @@ async fn memory_tools_and_user_scope_prefs_cover_public_execution_paths() {
             .is_error
     );
 
-    let recall_tool = MemoryRecallTool::new(memory.clone());
+    let recall_tool = MemoryRecallTool::new();
     assert_eq!(recall_tool.name(), "memory_recall");
     let recalled = recall_tool
         .execute(json!({
@@ -2221,7 +2356,7 @@ async fn memory_tools_and_user_scope_prefs_cover_public_execution_paths() {
         .to_string()
         .contains("query cannot be empty"));
 
-    let forget_tool = MemoryForgetTool::new(memory.clone(), security);
+    let forget_tool = MemoryForgetTool::new(security);
     assert_eq!(forget_tool.name(), "memory_forget");
     let missing = forget_tool
         .execute(json!({
@@ -2242,37 +2377,19 @@ async fn memory_tools_and_user_scope_prefs_cover_public_execution_paths() {
     assert!(!forgot.is_error);
     assert!(forgot.output().contains("Forgot memory"));
 
-    let scoped_client: openhuman_core::openhuman::memory::store::MemoryClientRef =
-        Arc::new(MemoryClient::from_workspace_dir(tmp.path().join("scope-prefs")).unwrap());
-    assert_eq!(
-        user_scopes::load(&scoped_client, " GMAIL ").await,
-        UserScopePref::default()
-    );
-    let pref = UserScopePref {
-        read: true,
-        write: false,
-        admin: true,
-    };
-    user_scopes::save(&scoped_client, " GMAIL ", pref)
-        .await
-        .expect("save user scope pref");
-    assert_eq!(user_scopes::load(&scoped_client, "gmail").await, pref);
-    scoped_client
-        .kv_set(Some("composio-user-scopes"), "gmail", &json!("bad pref"))
-        .await
-        .expect("write bad pref");
-    assert_eq!(
-        user_scopes::load(&scoped_client, "gmail").await,
-        UserScopePref::default()
-    );
-    assert!(user_scopes::save(&scoped_client, " ", pref)
-        .await
-        .unwrap_err()
-        .contains("toolkit must not be empty"));
-    assert_eq!(
-        user_scopes::load_or_default("not-ready-toolkit").await,
-        UserScopePref::default()
-    );
+    // The engine's `tinymemory_core::sync::composio::providers::user_scopes`
+    // module this used to drive (`load`/`save`/`load_or_default` against a
+    // `&MemoryClientRef`) is deleted with the rest of the in-process
+    // Composio pipeline — confirmed by an exhaustive grep of
+    // vendor/tinymemory, nothing under that name survives anywhere. Its
+    // host-side replacement, `integrations::composio::ops::user_scopes`, is
+    // real but `pub(crate)` (reached only via the `composio.get_user_scopes`
+    // / `composio.set_user_scopes` JSON-RPC handlers, which this file does
+    // not run a server for) and so is not reachable from an integration
+    // test in this crate. Genuine, unrecoverable coverage gap — reported
+    // rather than silently dropped. `UserScopePref` itself (the pure type)
+    // is still exercised elsewhere in this file via
+    // `memory_sync_composio_catalog_scope_and_state_helpers_cover_edge_cases`.
 }
 
 #[tokio::test]
@@ -2515,7 +2632,14 @@ async fn memory_queue_and_tool_memory_public_stores_cover_persistence_edges() {
         .iter()
         .all(|rule| rule.priority.is_eager()));
     assert_eq!(TOOL_MEMORY_PROMPT_CAP, 30);
-    let rendered = render_tool_memory_rules(&[normal.clone(), updated.clone(), high.clone()]);
+    let render_rules: Vec<ApiToolMemoryRule> = [normal.clone(), updated.clone(), high.clone()]
+        .into_iter()
+        .map(|rule| {
+            serde_json::from_value(serde_json::to_value(rule).expect("serialize tool rule"))
+                .expect("convert tool rule to host API")
+        })
+        .collect();
+    let rendered = render_tool_memory_rules(&render_rules);
     assert!(rendered.starts_with(TOOL_MEMORY_HEADING));
     assert!(rendered.find("**[critical]**") < rendered.find("**[high]**"));
     assert!(rendered.contains("### `shell`"));
@@ -2566,8 +2690,16 @@ async fn memory_queue_and_tool_memory_public_stores_cover_persistence_edges() {
 
 #[tokio::test]
 async fn memory_source_sync_entrypoint_rejects_disabled_and_ingests_folder_items() {
+    let _lock = env_lock();
     let tmp = TempDir::new().expect("tempdir");
-    let config = config_in(&tmp);
+    let _env_workspace = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", module_workspace());
+    let mut config = config_in(&tmp);
+    use_module_workspace(&mut config);
+    wipe_shared_store(&config);
+    // Folder kinds run in-process through `run_source_pipeline_core`, which
+    // takes its memory client from the process global; bind that to the shared
+    // workspace too, or the rows land wherever an earlier case left it.
+    tinymemory_core::global::init(config.workspace_dir.clone()).expect("bind global memory client");
     std::fs::write(
         tmp.path().join("sync-note.md"),
         "# Sync note\n\nAlice documents deterministic source sync coverage.",
@@ -2577,7 +2709,10 @@ async fn memory_source_sync_entrypoint_rejects_disabled_and_ingests_folder_items
     let mut disabled = source(SourceKind::Folder, "src_disabled");
     disabled.path = Some(tmp.path().to_string_lossy().to_string());
     disabled.enabled = false;
-    assert!(sync_source(disabled, config.clone())
+    let disabled_entry = disabled.clone();
+    tinymemory_core::sources::registry::replace_sources_in(&config, &[disabled_entry.clone()])
+        .expect("register the disabled source the driver will look up");
+    assert!(sync_source(disabled, Arc::new(config.clone()))
         .await
         .unwrap_err()
         .contains("disabled"));
@@ -2585,7 +2720,14 @@ async fn memory_source_sync_entrypoint_rejects_disabled_and_ingests_folder_items
     let mut folder = source(SourceKind::Folder, "src_sync");
     folder.path = Some(tmp.path().to_string_lossy().to_string());
     folder.glob = Some("sync-note.md".into());
-    sync_source(folder, config.clone())
+    // The sync runs inside the bound driver, which resolves the source by id
+    // from the shared registry rather than from the entry handed in here.
+    tinymemory_core::sources::registry::replace_sources_in(
+        &config,
+        &[disabled_entry, folder.clone()],
+    )
+    .expect("register the sources the driver will look up");
+    sync_source(folder, Arc::new(config.clone()))
         .await
         .expect("queue folder sync");
 
@@ -2605,14 +2747,20 @@ async fn memory_source_sync_entrypoint_rejects_disabled_and_ingests_folder_items
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    let seen: Vec<String> = with_connection(&config, |conn| {
+        let mut stmt = conn.prepare("SELECT DISTINCT source_id FROM mem_tree_chunks")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+    .expect("list source ids");
     assert!(
         synced_rows > 0,
-        "folder sync should ingest at least one chunk"
+        "folder sync should ingest at least one chunk; store holds source_ids={seen:?}"
     );
 
     let mut twitter = source(SourceKind::TwitterQuery, "src_twitter_sync");
     twitter.query = Some("openhuman".into());
-    sync_source(twitter, config)
+    sync_source(twitter, Arc::new(config))
         .await
         .expect("twitter placeholder queues and reports failure asynchronously");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2621,7 +2769,7 @@ async fn memory_source_sync_entrypoint_rejects_disabled_and_ingests_folder_items
 #[test]
 fn memory_tree_io_contract_types_round_trip_leaf_read_and_write_shapes() {
     let now = Utc.with_ymd_and_hms(2026, 5, 29, 16, 0, 0).unwrap();
-    let payload = openhuman_core::openhuman::memory::tree::TreeLeafPayload {
+    let payload = tinycortex::memory::tree::TreeLeafPayload {
         chunk_id: "chunk-contract-1".into(),
         token_count: 42,
         timestamp: now,
@@ -2634,24 +2782,23 @@ fn memory_tree_io_contract_types_round_trip_leaf_read_and_write_shapes() {
     assert_eq!(leaf_ref.chunk_id, payload.chunk_id);
     assert_eq!(leaf_ref.entities, payload.entities);
     let round_trip =
-        openhuman_core::openhuman::memory::tree::TreeLeafPayload::from(leaf_ref.clone());
+        tinycortex::memory::tree::TreeLeafPayload::from(leaf_ref.clone());
     assert_eq!(round_trip.content, payload.content);
     assert_eq!(round_trip.score, payload.score);
 
-    let write_default_json = serde_json::to_value(
-        openhuman_core::openhuman::memory::tree::TreeWriteRequest {
+    let write_default_json =
+        serde_json::to_value(tinycortex::memory::tree::TreeWriteRequest {
             tree_id: "tree-contract".into(),
             tree_kind: TreeKind::Source,
             leaf: round_trip.clone(),
             label_strategy: Default::default(),
             deferred: false,
-        },
-    )
-    .expect("write request json");
+        })
+        .expect("write request json");
     assert_eq!(write_default_json["label_strategy"], "inherit");
     assert_eq!(write_default_json["deferred"], false);
 
-    let decoded_write: openhuman_core::openhuman::memory::tree::TreeWriteRequest =
+    let decoded_write: tinycortex::memory::tree::TreeWriteRequest =
         serde_json::from_value(json!({
             "tree_id": "tree-contract",
             "tree_kind": "global",
@@ -2668,12 +2815,12 @@ fn memory_tree_io_contract_types_round_trip_leaf_read_and_write_shapes() {
     assert_eq!(decoded_write.tree_kind, TreeKind::Global);
     assert_eq!(
         decoded_write.label_strategy,
-        openhuman_core::openhuman::memory::tree::TreeLabelStrategy::Empty
+        tinycortex::memory::tree::TreeLabelStrategy::Empty
     );
     assert!(decoded_write.leaf.entities.is_empty());
     assert!(decoded_write.deferred);
 
-    let outcome = openhuman_core::openhuman::memory::tree::TreeWriteOutcome {
+    let outcome = tinycortex::memory::tree::TreeWriteOutcome {
         new_summary_ids: vec!["summary-1".into()],
         seal_pending: true,
     };
@@ -2681,7 +2828,7 @@ fn memory_tree_io_contract_types_round_trip_leaf_read_and_write_shapes() {
     assert_eq!(outcome_json["new_summary_ids"][0], "summary-1");
     assert_eq!(outcome_json["seal_pending"], true);
 
-    let read_request: openhuman_core::openhuman::memory::tree::TreeReadRequest =
+    let read_request: tinycortex::memory::tree::TreeReadRequest =
         serde_json::from_value(json!({
             "tree_id": "tree-contract",
             "max_depth": 2,
@@ -2693,14 +2840,14 @@ fn memory_tree_io_contract_types_round_trip_leaf_read_and_write_shapes() {
     assert_eq!(read_request.max_depth, 2);
     assert_eq!(read_request.limit, Some(3));
 
-    let hit = openhuman_core::openhuman::memory::tree::TreeReadHit {
+    let hit = tinycortex::memory::tree::TreeReadHit {
         node_id: "summary-1".into(),
         node_kind: "summary".into(),
         level: 1,
         content: "Summary text".into(),
         score: 0.42,
     };
-    let result = openhuman_core::openhuman::memory::tree::TreeReadResult {
+    let result = tinycortex::memory::tree::TreeReadResult {
         hits: vec![hit],
         total: 4,
         tree_id: "tree-contract".into(),
@@ -2720,13 +2867,33 @@ fn memory_tree_io_contract_types_round_trip_leaf_read_and_write_shapes() {
         created_at: now,
         last_sealed_at: None,
     };
-    let empty = openhuman_core::openhuman::memory::tree::TreeReadResult::empty(&tree);
+    let empty = tinycortex::memory::tree::TreeReadResult::empty(&tree);
     assert_eq!(empty.tree_id, "empty-tree");
     assert!(empty.hits.is_empty());
 }
 
-#[test]
-fn memory_sync_profile_identity_helpers_cover_public_no_client_paths_and_rendering() {
+// The deleted engine's per-toolkit `is_self_identity(prefix, kind, value)`
+// has no replacement anywhere in `tinymemory-core` (confirmed by exhaustive
+// grep) — only the cross-toolkit `is_self_identity_any_toolkit` survived, and
+// it takes tinymemory-core's own `IdentityKind`, a distinct (structurally
+// identical) type from the contract crate's `IdentityKind` this test uses
+// everywhere else. Bridged here by name rather than imported directly at the
+// top of the file, so the two enums are never confused at a call site.
+fn to_core_identity_kind(kind: IdentityKind) -> tinymemory_core::store::identity::IdentityKind {
+    tinymemory_core::store::identity::IdentityKind::parse(kind.as_str())
+        .expect("every contract IdentityKind variant name parses on the core side too")
+}
+
+#[tokio::test]
+async fn memory_sync_profile_identity_helpers_cover_public_no_client_paths_and_rendering() {
+    let _lock = env_lock();
+    let tmp = TempDir::new().expect("tempdir");
+    let _env_workspace = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", module_workspace());
+    let mut config = config_in(&tmp);
+    use_module_workspace(&mut config);
+    wipe_shared_store(&config);
+    tinymemory_core::global::init(config.workspace_dir.clone()).expect("bind global memory client");
+
     assert_eq!(IdentityKind::parse("email"), Some(IdentityKind::Email));
     assert_eq!(IdentityKind::parse("missing"), None);
     assert!(IdentityKind::Email.is_matchable());
@@ -2751,22 +2918,23 @@ fn memory_sync_profile_identity_helpers_cover_public_no_client_paths_and_renderi
     );
     assert_eq!(canonicalize(IdentityKind::Email, "   "), None);
 
-    assert!(load_connected_identities().is_empty());
-    assert!(!is_self_identity(
-        "gmail",
-        IdentityKind::Email,
-        "alice@example.com"
-    ));
-    assert!(!is_self_identity(
-        "gmail",
-        IdentityKind::AvatarUrl,
-        "https://example.test/avatar.png"
-    ));
+    assert!(load_connected_identities(&config)
+        .await
+        .expect("load connected identities")
+        .is_empty());
+    // `is_self_identity("gmail", ...)` (per-toolkit) is the genuine gap noted
+    // above — no assertion here replaces it. `is_self_identity_any_toolkit`
+    // survives and is exercised with nothing persisted yet, same as before.
     assert!(!is_self_identity_any_toolkit(
-        IdentityKind::Email,
+        to_core_identity_kind(IdentityKind::Email),
         "alice@example.com"
     ));
-    assert_eq!(delete_connected_identity_facets("gmail", "conn-1"), 0);
+    assert_eq!(
+        delete_connected_identity_facets(&config, "gmail", "conn-1")
+            .await
+            .expect("delete connected identity facets"),
+        0
+    );
 
     let rendered = render_connected_identities_section(&[
         ConnectedIdentity {
@@ -2806,228 +2974,50 @@ fn memory_sync_profile_identity_helpers_cover_public_no_client_paths_and_renderi
     );
 }
 
-#[test]
-fn gmail_post_processor_and_provider_registry_cover_public_edges() {
-    let gmail_provider =
-        openhuman_core::openhuman::memory::sync::composio::providers::gmail::GmailProvider::new();
-    let mut raw_html_passthrough = json!({
-        "messages": [{ "messageId": "m-raw", "messageText": "<b>keep raw</b>" }]
-    });
-    gmail_provider.post_process_action_result(
-        "GMAIL_FETCH_EMAILS",
-        Some(&json!({ "rawHtml": true })),
-        &mut raw_html_passthrough,
-    );
-    assert_eq!(
-        raw_html_passthrough["messages"][0]["messageText"],
-        "<b>keep raw</b>"
-    );
-
-    let mut response = json!({
-        "data": {
-            "messages": [
-                {
-                    "messageId": "m-1",
-                    "threadId": "t-1",
-                    "subject": "Launch Plan",
-                    "sender": "Alice <alice@example.com>",
-                    "to": "Bob <bob@example.com>",
-                    "messageText": "fallback one",
-                    "markdownFormatted": "Rendered body one",
-                    "labelIds": ["INBOX"],
-                    "payload": {
-                        "headers": [
-                            { "name": "Date", "value": "Fri, 29 May 2026 12:00:00 +0000" },
-                            { "name": "List-Unsubscribe", "value": "<mailto:leave@example.com>" }
-                        ]
-                    },
-                    "attachmentList": [
-                        { "filename": "plan.pdf", "mimeType": "application/pdf" },
-                        { "filename": "", "mimeType": "text/plain" }
-                    ]
-                },
-                {
-                    "messageId": "m-2",
-                    "threadId": "t-2",
-                    "subject": "Budget",
-                    "sender": "Cara <cara@example.com>",
-                    "to": "Alice <alice@example.com>",
-                    "messageText": "fallback two",
-                    "markdown_formatted": "Rendered body two"
-                }
-            ],
-            "nextPageToken": "page-2",
-            "resultSizeEstimate": 2
-        }
-    });
-    gmail_provider.post_process_action_result("GMAIL_FETCH_EMAILS", None, &mut response);
-    let messages = response["data"]["messages"].as_array().expect("messages");
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0]["id"], "m-1");
-    assert_eq!(messages[0]["date"], "Fri, 29 May 2026 12:00:00 +0000");
-    assert_eq!(
-        messages[0]["list_unsubscribe"],
-        "<mailto:leave@example.com>"
-    );
-    assert_eq!(messages[0]["markdown"], "Rendered body one");
-    assert_eq!(messages[0]["attachments"][0]["filename"], "plan.pdf");
-    assert_eq!(messages[1]["markdown"], "Rendered body two");
-    assert_eq!(response["data"]["nextPageToken"], "page-2");
-    assert_eq!(response["data"]["resultSizeEstimate"], 2);
-
-    let mut no_container = json!({ "ok": true });
-    gmail_provider.post_process_action_result("GMAIL_FETCH_EMAILS", None, &mut no_container);
-    assert_eq!(no_container, json!({ "ok": true }));
-
-    let mut one = json!({ "messages": [{ "messageId": "m-3", "messageText": "plain" }] });
-    gmail_provider.post_process_action_result("GMAIL_FETCH_EMAILS", None, &mut one);
-    assert_eq!(one["messages"][0]["markdown"], "plain");
-
-    init_default_composio_providers();
-    assert!(get_provider(" gmail ").is_some());
-    assert!(get_provider("unknown_provider_slug").is_none());
-    assert!(all_composio_providers()
-        .iter()
-        .any(|provider| provider.toolkit_slug() == "slack"));
-    register_provider(Arc::new(RawCoverageProvider {
-        fail_profile: false,
-    }));
-    register_provider(Arc::new(RawCoverageProvider { fail_profile: true }));
-    assert_eq!(
-        get_provider("raw_coverage").unwrap().toolkit_slug(),
-        "raw_coverage"
-    );
-    let raw_count = all_composio_providers()
-        .iter()
-        .filter(|provider| provider.toolkit_slug() == "raw_coverage")
-        .count();
-    assert_eq!(raw_count, 1);
-    register_provider(Arc::new(EmptySlugProvider));
-    assert!(get_provider("").is_none());
-}
-
-struct RawCoverageProvider {
-    fail_profile: bool,
-}
-
-#[async_trait::async_trait]
-impl ComposioProvider for RawCoverageProvider {
-    fn toolkit_slug(&self) -> &'static str {
-        "raw_coverage"
-    }
-
-    async fn fetch_user_profile(
-        &self,
-        _ctx: &ProviderContext,
-    ) -> Result<ProviderUserProfile, String> {
-        if self.fail_profile {
-            Err("profile unavailable".into())
-        } else {
-            Ok(ProviderUserProfile {
-                toolkit: "raw_coverage".into(),
-                connection_id: Some("conn-1".into()),
-                display_name: Some("Raw Coverage".into()),
-                email: Some("raw@example.com".into()),
-                username: None,
-                avatar_url: None,
-                profile_url: None,
-                extras: json!({}),
-            })
-        }
-    }
-
-}
-
-struct EmptySlugProvider;
-
-#[async_trait::async_trait]
-impl ComposioProvider for EmptySlugProvider {
-    fn toolkit_slug(&self) -> &'static str {
-        ""
-    }
-
-    async fn fetch_user_profile(
-        &self,
-        _ctx: &ProviderContext,
-    ) -> Result<ProviderUserProfile, String> {
-        Ok(ProviderUserProfile::default())
-    }
-
-}
-
+/// The deleted engine's `ComposioProvider` trait, its per-toolkit structs
+/// (`GmailProvider` among them), `ProviderContext`, and the whole in-process
+/// registry (`register_provider`/`get_provider`/`all_providers`/
+/// `init_default_providers`) are genuinely gone with nothing in this crate to
+/// exercise them against — see
+/// `crate::openhuman::integrations::composio::providers`'s module docs and
+/// `memory_sync_providers_raw_coverage_e2e.rs`, which documents this same gap
+/// in detail for the sibling suite that covered these types most directly.
+///
+/// This test used to cover two things through that registry:
+/// Gmail's `post_process_action_result` (nested-payload flattening, raw-HTML
+/// opt-out, non-container passthrough) and the registry's own CRUD
+/// (register/get/list, empty-slug and duplicate-slug handling) plus the
+/// `ComposioProvider` trait's default method bodies (`sync_interval_secs`,
+/// `curated_tools`, `fetch_tasks`'s "no task-fetch surface" default,
+/// `on_trigger`'s no-op default, `identity_set`, `on_connection_created`
+/// writing `PROFILE.md`). None of it moved anywhere reachable from this
+/// crate — it now lives entirely inside the separately-versioned
+/// `tinyconnectors` module, reachable only via a live loaded module (real
+/// network + `dlopen`), which this suite's local-only design rules out. What
+/// remains honestly testable of "fetch a provider's profile" / "sync a
+/// connection" is `composio_get_user_profile` / `composio_sync`
+/// (`integrations::composio::ops`), which refuse cleanly, deterministically
+/// and without touching the network when no connectors module is loaded.
 #[tokio::test]
-async fn memory_sync_provider_trait_defaults_and_connection_hook_are_deterministic() {
+async fn composio_get_user_profile_and_sync_refuse_cleanly_without_a_loaded_module() {
+    let _lock = env_lock();
     let tmp = TempDir::new().expect("tempdir");
-    // Determinism (as this test's name promises): `identity_set` →
-    // `persist_provider_profile` writes through the PROCESS-GLOBAL memory client
-    // and returns 0 when it isn't ready. Other tests in this binary rebind that
-    // global, so under parallel execution this test could otherwise observe an
-    // unready client and see 0 instead of 1. Bind the global to this test's
-    // workspace up front so the assertion is independent of execution order.
-    openhuman_core::openhuman::memory::global::init(tmp.path().to_path_buf())
-        .expect("init global memory client");
-    let ctx = ProviderContext {
-        config: Arc::new(config_in(&tmp)),
-        toolkit: "raw_coverage".into(),
-        connection_id: Some("conn-1".into()),
-        usage: Default::default(),
-        max_items: None,
-        sync_depth_days: None,
-    };
-    let provider = RawCoverageProvider { fail_profile: true };
-    assert_eq!(provider.sync_interval_secs(), Some(15 * 60));
-    assert!(provider.curated_tools().is_none());
-    assert!(provider
-        .fetch_tasks(&ctx, &TaskFetchFilter::default())
-        .await
-        .unwrap_err()
-        .contains("provider has no task-fetch surface"));
+    let mut config = config_in(&tmp);
+    config.modules.enabled = false;
 
-    let mut action_data = json!({ "ok": true });
-    provider.post_process_action_result("RAW_ACTION", None, &mut action_data);
-    assert_eq!(action_data, json!({ "ok": true }));
-    provider
-        .on_trigger(&ctx, "raw.trigger", &json!({ "payload": true }))
+    let error = composio_get_user_profile(&config, "conn-raw-coverage")
         .await
-        .expect("default trigger no-op");
-    assert_eq!(
-        provider.identity_set(&ProviderUserProfile {
-            toolkit: "raw_coverage".into(),
-            connection_id: Some("conn-1".into()),
-            display_name: Some("No client".into()),
-            ..Default::default()
-        }),
-        1
-    );
-    let memory_client = ctx.memory_client().expect("test memory client");
-    memory_client
-        .kv_set(Some("provider-context"), "covered", &json!(true))
-        .await
-        .expect("write through provider context memory client");
-    assert_eq!(
-        memory_client
-            .kv_get(Some("provider-context"), "covered")
-            .await
-            .expect("read provider context kv"),
-        Some(json!(true))
+        .expect_err("profile fetch must refuse without a loaded connectors module");
+    assert!(
+        error.contains("modules are disabled in configuration"),
+        "unexpected error: {error}"
     );
 
-    provider
-        .on_connection_created(&ctx)
-        .await
-        .expect("profile failure still syncs");
-    assert!(!tmp.path().join("PROFILE.md").exists());
-
-    let profile_provider = RawCoverageProvider {
-        fail_profile: false,
-    };
-    profile_provider
-        .on_connection_created(&ctx)
-        .await
-        .expect("profile success syncs");
-    let profile_md = std::fs::read_to_string(tmp.path().join("PROFILE.md")).expect("profile md");
-    assert!(profile_md.contains("Raw Coverage"));
-    assert!(profile_md.contains("raw@example.com"));
+    let outcome = composio_sync(&config, "conn-raw-coverage", None).await;
+    assert!(
+        outcome.is_err(),
+        "sync must refuse to resolve toolkit for an unregistered connection"
+    );
 }
 
 #[test]
@@ -3735,8 +3725,9 @@ async fn threads_title_generation_branches_cover_noop_and_not_found_paths() {
 async fn memory_sources_registry_rpc_and_schema_handlers_cover_crud_edges() {
     let _lock = env_lock();
     let tmp = TempDir::new().expect("tempdir");
-    let _workspace = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", tmp.path());
-    Config::load_or_init().await.expect("init isolated config");
+    let _workspace = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", module_workspace());
+    let config = Config::load_or_init().await.expect("init isolated config");
+    wipe_shared_store(&config);
     std::fs::write(tmp.path().join("reader-note.md"), "# Reader note").expect("write note");
 
     let schemas = all_memory_sources_controller_schemas();
@@ -3957,8 +3948,9 @@ async fn memory_ops_public_handlers_cover_document_file_kv_graph_and_envelopes()
 
 async fn memory_ops_public_handlers_cover_document_file_kv_graph_and_envelopes_body() {
     let _lock = env_lock();
+    ensure_memory_seams();
     let tmp = TempDir::new().expect("tempdir");
-    let _workspace = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", tmp.path());
+    let _workspace = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", module_workspace());
 
     let init = openhuman_core::openhuman::memory::ops::memory_init(MemoryInitRequest {
         jwt_token: Some("ignored-token".into()),
@@ -4216,8 +4208,8 @@ async fn memory_ops_public_handlers_cover_document_file_kv_graph_and_envelopes_b
         openhuman_core::openhuman::memory::ops::ToolRulePutParams {
             tool_name: "shell".into(),
             rule: "Use dry-run flags before changing files.".into(),
-            priority: Some(ToolMemoryPriority::High),
-            source: Some(ToolMemorySource::UserExplicit),
+            priority: Some(ApiToolMemoryPriority::High),
+            source: Some(ApiToolMemorySource::UserExplicit),
             tags: vec!["safety".into()],
             id: Some("ops-rule-1".into()),
         },
@@ -4226,7 +4218,7 @@ async fn memory_ops_public_handlers_cover_document_file_kv_graph_and_envelopes_b
     .expect("tool rule put")
     .value;
     assert_eq!(tool_rule.id, "ops-rule-1");
-    assert_eq!(tool_rule.priority, ToolMemoryPriority::High);
+    assert_eq!(tool_rule.priority, ApiToolMemoryPriority::High);
     let fetched_rule = openhuman_core::openhuman::memory::ops::tool_rule_get(
         openhuman_core::openhuman::memory::ops::ToolRuleRefParams {
             tool_name: "shell".into(),
@@ -4447,10 +4439,15 @@ async fn memory_tree_retrieval_rpc_and_schema_wrappers_cover_empty_and_invalid_p
 }
 
 #[tokio::test]
+#[ignore = "needs a released tinymemory module serving the Retrieval family: \
+             the query tools resolve the bound driver, and the currently \
+             pinned artifact predates RetrieveSource"]
 async fn memory_query_backend_and_tree_flush_wrappers_cover_public_edges() {
     let _lock = env_lock();
+    // The query tools resolve a bound memory driver; `module_workspace` is
+    // where that driver lives for this whole process.
     let tmp = TempDir::new().expect("tempdir");
-    let _workspace = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", tmp.path());
+    let _workspace = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", module_workspace());
     let mut config = Config::load_or_init().await.expect("init isolated config");
     config.memory_tree.embedding_endpoint = None;
     config.memory_tree.embedding_model = None;
@@ -4497,29 +4494,69 @@ async fn memory_query_backend_and_tree_flush_wrappers_cover_public_edges() {
     assert!(leaves.is_empty());
 
     let no_stale =
-        openhuman_core::openhuman::memory::tree::tree::flush::flush_stale_buffers_default(
+        tinymemory_core::tree::tree::flush::flush_stale_buffers_default(
             &config,
-            &openhuman_core::openhuman::memory::tree::tree::LabelStrategy::Empty,
+            &tinymemory_core::tree::tree::LabelStrategy::Empty,
         )
         .await
         .expect("flush empty buffers");
     assert_eq!(no_stale, 0);
-    let missing_flush = openhuman_core::openhuman::memory::tree::tree::flush::force_flush_tree(
+    let missing_flush = tinymemory_core::tree::tree::flush::force_flush_tree(
         &config,
         "tree:missing",
         None,
-        &openhuman_core::openhuman::memory::tree::tree::LabelStrategy::Empty,
+        &tinymemory_core::tree::tree::LabelStrategy::Empty,
     )
     .await
     .unwrap_err();
     assert!(missing_flush.to_string().contains("no tree with id"));
 }
 
+/// The `tree_summarizer_*` handlers' validation, query and provider-consent
+/// edges — every one of them driven through the handler.
+///
+/// # One door, and why it is the handler's (#5560)
+///
+/// The subject is `tree_runtime::ops`, so the production path is the door: the
+/// five handlers resolve `memory::binding` and ask the loaded module over the
+/// contract's six runtime-tree members. This case used to seed its query with
+/// `tree_runtime_store::write_node` — the engine copy the `[dev-dependencies]`
+/// entry links into *this* binary — and after `d2697f00a` that is a different
+/// store from the one the handler reads, so the query answered "node 'root' not
+/// found in namespace 'ops_ns'" over a node that had just been written.
+///
+/// # The one assertion that could not survive the door change
+///
+/// The seed existed to reach `tree_summarizer_query`'s **success** branch, and
+/// no handler on this surface can create a node: `runtime_summarize` /
+/// `runtime_rebuild` are the only writers and both fold on the driver's own chat
+/// provider, which a hermetic case has no model for — and which this case
+/// deliberately refuses anyway, two asserts below. Seeding the module's store
+/// from the host's engine to get the branch back is precisely the divergence
+/// #5560 exists to remove, so the branch is asserted where a driver can be bound
+/// instead: `memory::tree::tree_runtime::ops_tests::
+/// tree_summarizer_query_returns_node_and_children` pins the whole
+/// `{node, children}` envelope and the `queried node 'root'` log line.
+///
+/// What replaces it here is the assertion the seed was in the way of: that an
+/// **ingest is not a node**. Buffering content leaves `total_nodes` at zero and
+/// leaves `root` absent, and the refusal names the trimmed namespace — the
+/// handler's own trim, over a padded input, which is what tells a
+/// namespace-mangling bug from an empty tree.
 #[tokio::test]
 async fn tree_summarizer_ops_cover_validation_query_and_local_provider_guards() {
+    let _lock = env_lock();
     let tmp = TempDir::new().expect("tempdir");
+    // The handlers resolve a bound memory driver; `module_workspace` is where
+    // that driver lives for this whole process, and the env var has to agree
+    // with the config or the two halves address different stores.
+    let _workspace = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", module_workspace());
     let mut config = config_in(&tmp);
+    use_module_workspace(&mut config);
+    // Local AI off and cloud summarization un-opted-in: the state the two
+    // provider guards below assert on.
     config.local_ai.runtime_enabled = false;
+    config.memory_tree.cloud_summarization_opt_in = false;
 
     let empty_content =
         openhuman_core::openhuman::memory::tree::tree_runtime::ops::tree_summarizer_ingest(
@@ -4530,44 +4567,53 @@ async fn tree_summarizer_ops_cover_validation_query_and_local_provider_guards() 
     assert!(empty_content.contains("content must not be empty"));
 
     let ts = Utc.with_ymd_and_hms(2026, 5, 29, 17, 0, 0).unwrap();
-    let ingest = openhuman_core::openhuman::memory::tree::tree_runtime::ops::tree_summarizer_ingest(
-        &config,
-        " ops_ns ",
-        "buffered raw content for summarizer ops",
-        Some(ts),
-        Some(&json!({ "source": "coverage" })),
-    )
-    .await
-    .expect("ingest buffer");
+    let ingest =
+        openhuman_core::openhuman::memory::tree::tree_runtime::ops::tree_summarizer_ingest(
+            &config,
+            " ops_ns ",
+            "buffered raw content for summarizer ops",
+            Some(ts),
+            Some(&json!({ "source": "coverage" })),
+        )
+        .await
+        .expect("ingest buffer");
     assert_eq!(ingest.value["buffered"], true);
     assert_eq!(ingest.value["namespace"], "ops_ns");
     assert_eq!(ingest.value["has_metadata"], true);
 
-    let status = openhuman_core::openhuman::memory::tree::tree_runtime::ops::tree_summarizer_status(
-        &config, "ops_ns",
-    )
-    .await
-    .expect("status");
+    let status =
+        openhuman_core::openhuman::memory::tree::tree_runtime::ops::tree_summarizer_status(
+            &config, "ops_ns",
+        )
+        .await
+        .expect("status");
     assert_eq!(status.value["namespace"], "ops_ns");
     assert_eq!(status.value["total_nodes"], 0);
 
-    let node = tree_node("ops_ns", "root", "Root summary from ops");
-    tree_runtime_store::write_node(&config, &node).expect("write ops node");
-    let query = openhuman_core::openhuman::memory::tree::tree_runtime::ops::tree_summarizer_query(
-        &config, "ops_ns", None,
-    )
-    .await
-    .expect("query root");
-    assert_eq!(query.value["node"]["node_id"], "root");
-    assert!(query.logs[0].contains("queried node 'root'"));
+    // An ingest buffers; it does not build a node. The default `root` target is
+    // therefore still absent, and the refusal names the namespace **trimmed**,
+    // from a padded argument — the handler's own wording, over the driver's
+    // `Ok(None)`.
+    let unbuilt_root =
+        openhuman_core::openhuman::memory::tree::tree_runtime::ops::tree_summarizer_query(
+            &config, " ops_ns ", None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        unbuilt_root,
+        "node 'root' not found in namespace 'ops_ns'",
+        "buffering content must not create a tree node"
+    );
 
-    let missing = openhuman_core::openhuman::memory::tree::tree_runtime::ops::tree_summarizer_query(
-        &config,
-        "ops_ns",
-        Some("2026/05/29/17"),
-    )
-    .await
-    .unwrap_err();
+    let missing =
+        openhuman_core::openhuman::memory::tree::tree_runtime::ops::tree_summarizer_query(
+            &config,
+            "ops_ns",
+            Some("2026/05/29/17"),
+        )
+        .await
+        .unwrap_err();
     assert!(missing.contains("node '2026/05/29/17' not found"));
 
     let provider_guard =
@@ -4664,46 +4710,29 @@ async fn memory_sources_types_registry_and_sync_state_cover_public_persistence_e
     assert_eq!(updated.max_issues, Some(6));
     assert_eq!(updated.max_prs, Some(7));
 
-    let memory = Arc::new(
-        MemoryClient::from_workspace_dir(tmp.path().join("memory-sync-state"))
-            .expect("memory client"),
-    );
-    let adapter = openhuman_core::openhuman::memory::tinycortex::HostSyncAdapter::new(memory.clone());
-    let fresh = SyncState::load(&adapter, "gmail", "conn-raw")
-        .await
-        .expect("fresh state");
-    assert_eq!(fresh.toolkit, "gmail");
-    assert_eq!(fresh.connection_id, "conn-raw");
-
+    // `SyncState::load`/`::save` — the key/value persistence extension this
+    // block used to round-trip through `tinymemory_core::tinycortex::
+    // HostSyncAdapter` (a `SyncStateStore` impl) — no longer exist anywhere
+    // in `tinymemory-core`: `HostSyncAdapter` now offers only `new`, and
+    // `integrations::composio::ops::memory_cleanup`'s doc comments confirm
+    // this in passing, speaking of `SyncState::load` only in the past tense
+    // ("exactly as `SyncState::load` had them"). The connection-delete path
+    // that used to read a persisted `SyncState` was rewritten to work
+    // without it (`ForgetSelector`-based cleanup instead). This is a
+    // genuine, unrecoverable coverage gap for the persistence half — the
+    // pure in-memory `SyncState`/`DailyBudget` behaviour (construction,
+    // `advance_cursor`, `mark_synced`, `is_synced`, `budget_remaining`, …)
+    // is still exercised elsewhere in this file
+    // (`memory_sync_composio_catalog_scope_and_state_helpers_cover_edge_cases`),
+    // so only the load/save round trip and its malformed-JSON recovery
+    // behaviour are lost.
     let mut saved = SyncState::new("gmail", "conn-raw");
     saved.advance_cursor("cursor-raw");
     saved.mark_synced("msg-1");
     saved.daily_budget.date = "2000-01-01".into();
     saved.daily_budget.requests_used = DEFAULT_DAILY_REQUEST_LIMIT;
-    saved.save(&adapter).await.expect("save state");
-
-    let loaded = SyncState::load(&adapter, "gmail", "conn-raw")
-        .await
-        .expect("load saved state");
-    assert_eq!(loaded.cursor.as_deref(), Some("cursor-raw"));
-    assert!(loaded.is_synced("msg-1"));
-    assert_eq!(loaded.daily_budget.requests_used, 0);
-    assert_eq!(loaded.budget_remaining(), DEFAULT_DAILY_REQUEST_LIMIT);
-
-    memory
-        .kv_set(
-            Some(openhuman_core::openhuman::memory::tinycortex::HOST_SYNC_STATE_NAMESPACE),
-            "composio-sync-state:gmail:bad-json",
-            &json!("not a sync state"),
-        )
-        .await
-        .expect("write bad state");
-    let recovered = SyncState::load(&adapter, "gmail", "bad-json")
-        .await
-        .expect("malformed state recovers to defaults");
-    assert_eq!(recovered.toolkit, "gmail");
-    assert_eq!(recovered.connection_id, "bad-json");
-    assert!(recovered.cursor.is_none());
+    assert_eq!(saved.cursor.as_deref(), Some("cursor-raw"));
+    assert!(saved.is_synced("msg-1"));
 }
 
 #[test]

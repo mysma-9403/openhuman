@@ -91,24 +91,6 @@ pub struct ChatRequestMetadata {
     pub agent_id: Option<String>,
 }
 
-impl ChatRequestMetadata {
-    /// Constructor for messages submitted via the AgentBox `/run` HTTP surface
-    /// (`OPENHUMAN_AGENTBOX_MODE=1`). These are background invocations driven
-    /// programmatically by a remote marketplace caller — no live UI is
-    /// attached to surface TTS or PTT signals — so `speak_reply` and
-    /// `session_id` stay `None` and the `source` tag identifies the origin
-    /// for analytics / log filtering downstream (mirrors the `"ptt"` /
-    /// `"dictation"` / `"type"` convention used by the desktop UI).
-    pub fn agentbox() -> Self {
-        Self {
-            speak_reply: None,
-            source: Some("agentbox".to_string()),
-            session_id: None,
-            agent_id: None,
-        }
-    }
-}
-
 #[derive(Debug, Deserialize)]
 pub(crate) struct WebChatParams {
     pub(super) client_id: String,

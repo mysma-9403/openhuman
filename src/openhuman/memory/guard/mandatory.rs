@@ -1,13 +1,17 @@
 //! The three mandatory families on [`MemoryGuard`] — where steps 3, 4 and 6
 //! land for the always-present surface.
 
+use crate::openhuman::memory::api::capabilities::Capability;
+use crate::openhuman::memory::api::error::MemoryError;
+use crate::openhuman::memory::api::provider::types::{
+    ExportPage, ExportRecord, ImportOutcome, SourceScope,
+};
+use crate::openhuman::memory::api::provider::{MemoryCore, MemoryPortability, MemoryRecall};
+use crate::openhuman::memory::api::recall::OwnedRecallOpts;
+use crate::openhuman::memory::api::types::{
+    MemoryCategory, MemoryEntry, MemoryTaint, NamespaceSummary,
+};
 use async_trait::async_trait;
-use tinycortex_api::capabilities::Capability;
-use tinycortex_api::error::MemoryError;
-use tinycortex_api::provider::types::{ExportPage, ExportRecord, ImportOutcome, SourceScope};
-use tinycortex_api::provider::{MemoryCore, MemoryPortability, MemoryRecall};
-use tinycortex_api::recall::OwnedRecallOpts;
-use tinycortex_api::types::{MemoryCategory, MemoryEntry, MemoryTaint, NamespaceSummary};
 
 use super::audit::{trace_allowed, trace_budget, NO_NAMESPACE};
 use super::budget::{truncate_content, truncate_entries};

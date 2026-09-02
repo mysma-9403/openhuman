@@ -210,13 +210,11 @@ async fn round19_all_tools_registers_composio_only_when_adapters_are_available()
     let _lock = env_lock();
     let harness = setup_config().await;
     let security = Arc::new(SecurityPolicy::default());
-    let memory: Arc<dyn Memory> = Arc::new(StubMemory);
 
     let unsigned = all_tools(
         Arc::new(harness.config.clone()),
         &security,
         AuditLogger::disabled(),
-        memory.clone(),
         &harness.config.browser,
         &harness.config.http_request,
         &harness.config.workspace_dir,
@@ -233,7 +231,6 @@ async fn round19_all_tools_registers_composio_only_when_adapters_are_available()
         Arc::new(enabled.clone()),
         &security,
         AuditLogger::disabled(),
-        memory,
         &enabled.browser,
         &enabled.http_request,
         &enabled.workspace_dir,

@@ -265,7 +265,7 @@ the reorg:
 | Native crate | Owner | Gate | Status |
 | --- | --- | --- | --- |
 | `libgit2-sys` (via `git2`) | `memory_store/content/wiki_git` **and** `tinycortex/git-diff` | `memory-git` | **cross-repo** — see below |
-| `lzma-sys` (via `xz2`) | `runtime_node/extractor.rs` only | `runtime-node` | ready; do with the `runtime/` move |
+| `lzma-sys` (via `xz2`) | *(none — removed)* | — | ✅ **done**, and better than planned: extraction moved into the `tinyruntime` module, so `xz2` left the manifest for **every** configuration rather than only for builds that opted out of `runtime-node` |
 | `libz-sys` | shared (`flate2`/`zip`/`git2`) | — | partly falls out of the above |
 | `aws-lc-sys` | TLS stack | — | needs a rustls-provider decision, own slice |
 | `libsqlite3-sys`, `ring` | kernel | — | **target keeps these** |

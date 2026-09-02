@@ -142,7 +142,7 @@ pub fn register_event_trigger(detector: Arc<StabilityDetector>) -> Option<Subscr
 
 async fn run_rebuild_logged(detector: &StabilityDetector, source: &str) {
     let now = now_secs();
-    match detector.rebuild(now) {
+    match detector.rebuild(now).await {
         Ok(outcome) => {
             tracing::info!(
                 "[learning::scheduler] {source} rebuild complete: \

@@ -91,12 +91,46 @@ fn message_never_contains_a_credential_or_endpoint() {
     assert!(msg.starts_with(CAPABILITY_UNAVAILABLE_PREFIX), "{msg}");
 }
 
-#[test]
-fn bound_driver_probe_reports_the_default_embedded_driver() {
+#[cfg(feature = "modules")]
+#[tokio::test]
+async fn bound_driver_probe_reports_the_default_module_driver() {
+    // Was asserting `capabilities() == Capabilities::all()`. That encoded #5598
+    // as expected: the then-pinned v1.0.1 artifact served thirteen of the
+    // contract's eighteen families, so claiming the full contract made the
+    // other five answer `UnknownMethod` instead of reporting themselves absent.
+    //
+    // The boundary has since moved twice more: v1.2.0 added bus members for
+    // `chunks`, `people`, `profile` and `retrieval` (thirteen -> seventeen),
+    // and the Episodic accessor landing with the archivist migration closed the
+    // last host gap (seventeen -> eighteen). Full advertisement is the honest
+    // set now — every family has both a bus member in the pinned artifact and a
+    // host accessor. What still guards drift is the accessor rule itself
+    // (`capabilities_for` can only name families the provider implements) plus
+    // the pin-drift test on every registry bump.
     let cfg = MemorySubsystemConfig::default();
     let binding = binding_for("default", cfg.clone());
-    assert_eq!(binding.driver_id(), cfg.driver);
-    assert_eq!(binding.capabilities(), Capabilities::all());
+    assert_eq!(
+        binding.driver_id(),
+        crate::openhuman::memory::binding::MODULE_ID
+    );
+    let advertised = binding.capabilities();
+    assert!(advertised.contains_all(Capabilities::mandatory()));
+    assert!(advertised.contains(Capability::Tree));
+    for capability in [
+        Capability::Chunks,
+        Capability::People,
+        Capability::Profile,
+        Capability::Retrieval,
+        Capability::Episodic,
+    ] {
+        assert!(
+            advertised.contains(capability),
+            "the pinned artifact serves {capability:?} and the host has an accessor for it — \
+             hiding it is an under-claim"
+        );
+    }
+    assert!(Capabilities::all().contains_all(advertised));
+    assert_eq!(advertised, Capabilities::all());
 }
 
 /// The negative control that makes the assertions above mean something.

@@ -1,10 +1,10 @@
-use crate::openhuman::config::rpc as config_rpc;
+use crate::openhuman::memory::api::chunks::SourceKind;
+use crate::openhuman::memory::api::provider::{CoverWindowQuery, MemoryProvider};
+use crate::openhuman::memory::ops::guard::active_memory_guard;
 use crate::openhuman::memory::tree::retrieval::rpc::CoverWindowRequest;
 use crate::openhuman::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
-use tinymemory_core::store::chunks::types::SourceKind;
-use tinymemory_core::tree::retrieval::cover::cover_window;
 
 /// Agent-facing wrapper for the windowed minimum-cover retrieval. Returns the
 /// smallest set of nodes (summaries + raw chunks) covering all memory in
@@ -84,23 +84,30 @@ impl Tool for MemoryTreeCoverWindowTool {
             }
             None => None,
         };
-        let cfg = config_rpc::load_config_with_timeout()
-            .await
-            .map_err(|e| anyhow::anyhow!("memory_tree_cover_window: load config failed: {e}"))?;
         log::trace!(
             "[tool][memory_tree] cover_window dispatch limit={}",
             req.limit.unwrap_or(0)
         );
-        let resp = cover_window(
-            &cfg,
-            req.since_ms,
-            req.until_ms,
-            req.source_id.as_deref(),
+        let guard = active_memory_guard()
+            .await
+            .map_err(|e| anyhow::anyhow!("memory_tree_cover_window: {e}"))?;
+        let window = CoverWindowQuery {
+            since_ms: req.since_ms,
+            until_ms: req.until_ms,
+            source_id: req.source_id.clone(),
             source_kind,
-            req.limit.unwrap_or(0),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("memory_tree_cover_window: {e}"))?;
+            limit: req.limit,
+        };
+        let resp = guard
+            .as_retrieval()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "memory_tree_cover_window: memory driver does not support the retrieval family"
+                )
+            })?
+            .cover_window(&window, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("memory_tree_cover_window: {e}"))?;
         log::debug!(
             "[tool][memory_tree] cover_window returning hits={} total={}",
             resp.hits.len(),
@@ -112,40 +119,5 @@ impl Tool for MemoryTreeCoverWindowTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::openhuman::tools::traits::Tool;
-    use serde_json::json;
-
-    #[test]
-    fn parameters_schema_requires_window_bounds() {
-        let schema = MemoryTreeCoverWindowTool.parameters_schema();
-        let required = schema.get("required").and_then(|r| r.as_array()).unwrap();
-        assert!(required.iter().any(|v| v.as_str() == Some("since_ms")));
-        assert!(required.iter().any(|v| v.as_str() == Some("until_ms")));
-    }
-
-    #[tokio::test]
-    async fn execute_rejects_missing_window_bounds() {
-        let err = MemoryTreeCoverWindowTool
-            .execute(json!({ "source_kind": "chat" }))
-            .await
-            .expect_err("missing since_ms/until_ms should fail");
-        assert!(err
-            .to_string()
-            .contains("invalid arguments for memory_tree_cover_window"));
-    }
-
-    #[tokio::test]
-    async fn execute_rejects_invalid_source_kind() {
-        let err = MemoryTreeCoverWindowTool
-            .execute(json!({ "since_ms": 0, "until_ms": 1, "source_kind": "not-real" }))
-            .await
-            .expect_err("invalid source kind should fail");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("memory_tree_cover_window:") && !msg.contains("load config failed"),
-            "expected a source-kind parse error, got: {msg}"
-        );
-    }
-}
+#[path = "cover_window_tests.rs"]
+mod tests;

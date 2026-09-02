@@ -62,7 +62,6 @@ export interface CoreAppSnapshot {
    * privacy-conservative gate added in #1299. The webview meet flow
    * reads this before invoking `handoffToOrchestrator`.
    */
-  meetAutoOrchestratorHandoff: boolean;
   localState: CoreLocalState;
   keyringStatus: KeyringStatus;
   runtime: CoreRuntimeSnapshot;
@@ -84,7 +83,6 @@ const emptySnapshot: CoreAppSnapshot = {
   onboardingCompleted: false,
   chatOnboardingCompleted: false,
   analyticsEnabled: false,
-  meetAutoOrchestratorHandoff: false,
   localState: { encryptionKey: null, onboardingTasks: null, keyringConsent: null },
   keyringStatus: {
     available: true,

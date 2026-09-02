@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::openhuman::tools::traits::{
     PermissionLevel, Tool, ToolCallOptions, ToolCategory, ToolResult, ToolTimeout,
 };
-use tinyagents::harness::tool::ToolExecutionContext;
+use tinytools::ToolRunContext;
 
 pub struct ArchetypeDelegationTool {
     pub tool_name: String,
@@ -23,50 +23,66 @@ impl Tool for ArchetypeDelegationTool {
         &self.tool_description
     }
 
+    /// The delegation envelope — deliberately description-light.
+    ///
+    /// This one literal is emitted for **every** synthesised `delegate_*` tool
+    /// (19 of them on the Master Agent after tool-pack withholding), so each
+    /// word of `description` here is billed 19× on every single turn. Fully
+    /// described the envelope was 356 tokens × 19 = 6,764 tokens — 39% of the
+    /// orchestrator's whole tool-schema budget, for the same JSON 19 times.
+    ///
+    /// The field *semantics* now live once in the parent's system prompt
+    /// (`registry/agents/orchestrator/prompt.md`, "Structured handoffs"),
+    /// which is where policy like "only observed facts" belonged anyway. The
+    /// property names stay self-describing, and they are the only thing
+    /// `render_structured_handoff` below reads.
+    ///
+    /// Four descriptions survive, each well under the 50-token cap, because
+    /// their property name does not carry the meaning:
+    ///
+    /// * `blocking` — the default is behaviour-critical and not inferable from
+    ///   the name. Getting it wrong is silent and asymmetric: async when it
+    ///   should have blocked finalizes the turn before the result lands, the
+    ///   exact failure the prompt's result-gating rule exists to prevent.
+    /// * `evidence` — "actually observed" is the anti-fabrication contract,
+    ///   not a label.
+    /// * `citation_requirement` / `model` — a bare name reads as neither.
+    ///
+    /// Enforced by `envelope_descriptions_stay_within_budget` below. If you
+    /// are about to add a description here, put it in prompt.md instead.
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "required": ["prompt"],
             "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "Brief task instruction. Prefer structured fields below for context; the sub-agent has no memory of your conversation."
-                },
-                "objective": {
-                    "type": "string",
-                    "description": "One sentence outcome the child must produce."
-                },
+                "prompt": { "type": "string" },
+                "objective": { "type": "string" },
                 "evidence": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Only facts, file paths, URLs, ids, or tool outputs the parent has actually observed."
+                    "description": "Only facts, paths, URLs, ids or tool outputs you actually observed."
                 },
                 "constraints": {
                     "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Hard requirements or limits the child must follow."
+                    "items": { "type": "string" }
                 },
                 "must_not_assume": {
                     "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Claims or facts the child must not infer without evidence."
+                    "items": { "type": "string" }
                 },
-                "expected_output": {
-                    "type": "string",
-                    "description": "Requested output shape, e.g. findings list, patch summary, cited answer."
-                },
+                "expected_output": { "type": "string" },
                 "citation_requirement": {
                     "type": "string",
                     "enum": ["none", "file_paths", "urls", "retrieval_hits", "tool_outputs"],
-                    "description": "Citation/evidence style the child must preserve in its result."
+                    "description": "Evidence style the child must preserve in its result."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional exact model id for this delegation only. Keeps the parent provider/routing, but pins the child agent to this model instead of the agent definition's default."
+                    "description": "Pin the child to this exact model id. Omit unless you have a reason."
                 },
                 "blocking": {
                     "type": "boolean",
-                    "description": "Default false: the delegation runs as a durable async worker — you immediately get an [async_subagent_ref] with a subagent_session_id (steer_subagent / wait_subagent / continue_subagent / close_subagent operate on it), and the finished result is inserted into this chat as a new turn. Pass true ONLY when the sub-agent's result must gate THIS reply (e.g. verify/review X before answering)."
+                    "description": "Default false: async worker, result arrives as a later turn. true: waits, and the result gates this reply."
                 }
             }
         })
@@ -105,7 +121,7 @@ impl Tool for ArchetypeDelegationTool {
         &self,
         args: serde_json::Value,
         _options: ToolCallOptions,
-        tool_context: Option<&ToolExecutionContext>,
+        tool_context: Option<&dyn ToolRunContext>,
     ) -> anyhow::Result<ToolResult> {
         let raw_prompt = args
             .get("prompt")
@@ -215,130 +231,5 @@ fn push_optional_array(out: &mut String, label: &str, value: Option<&Value>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::openhuman::agent::harness::definition::AgentDefinitionRegistry;
-
-    fn sample_tool() -> ArchetypeDelegationTool {
-        ArchetypeDelegationTool {
-            tool_name: "delegate_researcher".to_string(),
-            agent_id: "researcher".to_string(),
-            tool_description: "Use for web and docs research.".to_string(),
-        }
-    }
-
-    #[test]
-    fn metadata_methods_expose_name_description_and_system_category() {
-        let tool = sample_tool();
-        assert_eq!(tool.name(), "delegate_researcher");
-        assert_eq!(tool.description(), "Use for web and docs research.");
-        assert_eq!(tool.permission_level(), PermissionLevel::Execute);
-        assert_eq!(tool.category(), ToolCategory::System);
-    }
-
-    #[test]
-    fn delegation_opts_out_of_the_global_tool_timeout() {
-        // A delegated sub-agent run (delegate_tools_agent / run_code / …) can
-        // legitimately outlast the single-tool wall-clock default (120s): under
-        // `Inherit` every such run is hard-killed and truncated (Sentry
-        // TAURI-RUST-K29 / TAURI-RUST-8HB). The child bounds its own lifetime
-        // via its max_iterations, the run cancellation token, and each inner
-        // tool's own timeout — so this primitive must be Unbounded, like
-        // spawn_parallel_agents and the long-running scripting tools.
-        assert_eq!(
-            sample_tool().timeout_policy(&json!({})),
-            ToolTimeout::Unbounded,
-        );
-    }
-
-    #[test]
-    fn parameters_schema_advertises_async_default_blocking_opt_in() {
-        // Delegations are async by default (durable worker + follow-up
-        // delivery turn); `blocking: true` is the explicit opt-in for
-        // results that must gate the current reply. The flag must be
-        // advertised but never required.
-        let schema = sample_tool().parameters_schema();
-        let blocking = &schema["properties"]["blocking"];
-        assert_eq!(blocking["type"], "boolean");
-        let desc = blocking["description"].as_str().unwrap_or_default();
-        assert!(desc.contains("async"), "explains the async default: {desc}");
-        assert!(
-            desc.contains("continue_subagent") && desc.contains("subagent_session_id"),
-            "points at the resume contract: {desc}"
-        );
-        assert_eq!(schema["required"], json!(["prompt"]));
-    }
-
-    #[test]
-    fn parameters_schema_requires_prompt_only() {
-        let tool = sample_tool();
-        let schema = tool.parameters_schema();
-        assert_eq!(schema["type"], "object");
-        assert_eq!(schema["required"], json!(["prompt"]));
-        assert_eq!(schema["properties"]["prompt"]["type"], "string");
-        assert_eq!(schema["properties"]["objective"]["type"], "string");
-        assert_eq!(schema["properties"]["evidence"]["type"], "array");
-        assert_eq!(
-            schema["properties"]["citation_requirement"]["enum"],
-            json!([
-                "none",
-                "file_paths",
-                "urls",
-                "retrieval_hits",
-                "tool_outputs"
-            ])
-        );
-    }
-
-    #[test]
-    fn structured_handoff_renders_compact_child_prompt() {
-        let rendered = render_structured_handoff(
-            "Check this",
-            &json!({
-                "prompt": "Check this",
-                "objective": "Answer with supported claims only.",
-                "evidence": ["file:src/lib.rs", "tool output: count=3", ""],
-                "constraints": ["Do not edit files"],
-                "must_not_assume": ["Current service state"],
-                "expected_output": "Findings list",
-                "citation_requirement": "file_paths",
-            }),
-        );
-
-        assert!(rendered.contains("Task:\nCheck this"));
-        assert!(rendered.contains("Objective:\nAnswer with supported claims only."));
-        assert!(rendered.contains("Evidence:\n- file:src/lib.rs\n- tool output: count=3"));
-        assert!(rendered.contains("Must not assume:\n- Current service state"));
-        assert!(rendered.contains("Citation requirement:\nfile_paths"));
-        assert!(!rendered.contains("\"model\""));
-    }
-
-    #[tokio::test]
-    async fn execute_rejects_missing_or_blank_prompt() {
-        let tool = sample_tool();
-
-        let missing = tool.execute(json!({})).await.unwrap();
-        assert!(missing.is_error);
-        assert!(missing.output().contains("`prompt` is required"));
-
-        let blank = tool.execute(json!({ "prompt": "   " })).await.unwrap();
-        assert!(blank.is_error);
-        assert!(blank.output().contains("`prompt` is required"));
-    }
-
-    #[tokio::test]
-    async fn execute_accepts_non_empty_prompt_and_reaches_dispatch_path() {
-        let _ = AgentDefinitionRegistry::init_global_builtins();
-        let tool = sample_tool();
-        let result = tool
-            .execute(json!({ "prompt": "find the answer" }))
-            .await
-            .unwrap();
-
-        let out = result.output();
-        assert!(
-            !out.contains("`prompt` is required"),
-            "non-empty prompt should bypass local validation, got: {out}"
-        );
-    }
-}
+#[path = "archetype_delegation_tests.rs"]
+mod tests;

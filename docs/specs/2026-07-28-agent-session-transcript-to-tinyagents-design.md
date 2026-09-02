@@ -225,8 +225,6 @@ calls the TinyAgents session path" — it contains no turn engine. Reading it
 confirms that: `impl Agent` starts at line 432, and everything above it is
 product gating. What `turn()` actually does before delegating:
 
-- super-context gating hard-wired to `orchestrator` + `context_scout`, with an
-  explicit carve-out so background/cron/specialist turns don't spawn it;
 - agent-experience retrieval and `prepend_experience_block`;
 - memory recall citation collection;
 - integration / MCP / skill announcement + retraction notes.
@@ -263,8 +261,8 @@ input, and the durable `to_provider_messages` serialization.
 The productive question is not *"which file moves down"* but *"which extension
 point is missing upstream"*. `factory.rs` and `turn/core.rs` are large because
 the crate offers registries and middleware but no typed **turn-preparation**
-seam — so every product enrichment (experience, citations, announcements,
-super-context) is hand-written into one `turn()` body instead of registered.
+seam — so every product enrichment (experience, citations, and announcements)
+is hand-written into one `turn()` body instead of registered.
 
 If the crate grew a `ContextEnricher` / `TurnPreparation` pipeline —
 ordered, fallible, each returning prompt fragments plus metadata — OpenHuman's
@@ -598,8 +596,8 @@ transcript decision.
    `TurnPreparation` pipeline — ordered, fallible, returning prompt fragments +
    metadata — so product enrichment registers instead of being hand-written into
    `turn()`. This is a **crate roadmap proposal, not a refactor**: write the
-   design, get it accepted upstream, then migrate OpenHuman's four enrichers
-   (super-context, agent-experience, recall citations, announcements) onto it.
+   design, get it accepted upstream, then migrate OpenHuman's enrichers
+   (agent experience, recall citations, and announcements) onto it.
    Do not start by moving code.
 4. **Continue adopting crate types field-by-field on `Agent`**, following the
    `workspace_descriptor: tinyagents::harness::workspace::WorkspaceDescriptor`
@@ -671,4 +669,3 @@ Recorded so a later audit does not re-litigate:
 | `builder/factory.rs` re-check (§3.5.1) | stays — builds `Agent` (40+ fields of product session state), not `AgentHarness` (6 fields of execution config); one real carve-out: dispatcher selection duplicates crate `with_native_tool_calling` |
 | `turn/core.rs` re-check (§3.5.2) | stays — the engine left in WP-3; residue is product enrichment. ~150 LOC of message-list helpers are upstreamable |
 | The generalizable ask | the missing artifact is a crate **turn-preparation seam** (S6.3), not a relocated file — move the shape down, keep the wiring up |
-

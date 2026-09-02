@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use tempfile::TempDir;
-use tinyagents::harness::store::{AppendStore, FileStore, JsonlAppendStore, Store};
+use tinyagents_harness::store::{AppendStore, FileStore, JsonlAppendStore, Store};
 
 use super::convert::{sanitize_store_name, stream_name};
 use super::live::{

@@ -50,14 +50,22 @@
 //! [`CoreError::Unavailable`] so a host can hide the surface instead of
 //! reporting a failure.
 
+mod agent;
+mod auth;
 mod call;
 mod config;
 mod error;
+mod harness;
 #[cfg(feature = "medulla")]
 mod medulla;
 
+pub use agent::{absolute, Agent, Route, Turn, TurnOutcome, TurnRequest};
+pub use auth::{Auth, AuthState, Session};
 pub use config::{Config, RuntimeFlags};
 pub use error::CoreError;
+pub use harness::{Access, Harness, HarnessBuilder, HarnessError, Provider, Workspace};
+#[cfg(feature = "mcp")]
+pub use harness::{HttpHeader, McpAuthConfig, McpServer};
 #[cfg(feature = "medulla")]
 pub use medulla::{
     AbortResult, EventEnvelope, Medulla, MedullaStatus, Message, RosterWorker, SendResult,
@@ -91,6 +99,28 @@ impl Core {
     /// Typed configuration access.
     pub fn config(&self) -> Config<'_> {
         Config(&self.rt)
+    }
+
+    /// Typed access to the session store.
+    ///
+    /// Needed more often than it looks: routing a turn at a custom provider is
+    /// gated on an active session, so a host bringing its own endpoint still
+    /// has to present one. See [`Session`].
+    pub fn auth(&self) -> Auth<'_> {
+        Auth(&self.rt)
+    }
+
+    /// Typed access to the agent harness — run a turn, get a reply.
+    ///
+    /// Requires the `inference` domain family at runtime; with it off the turn
+    /// returns [`CoreError::Unavailable`], because the routed chat entry point
+    /// is registered under that group. Note
+    /// [`DomainSet::harness`](crate::core::runtime::DomainSet::harness) leaves
+    /// `inference` **off** despite its name — use
+    /// [`DomainSet::embedded`](crate::core::runtime::DomainSet::embedded), or
+    /// set the field.
+    pub fn agent(&self) -> Agent<'_> {
+        Agent(&self.rt)
     }
 
     /// Typed access to the Medulla orchestration backend.

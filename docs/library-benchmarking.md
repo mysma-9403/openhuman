@@ -367,6 +367,13 @@ The pool is configured in `[runtime_pool]` (master switch + per-language
 `max_queue_depth`); `enabled = false` reverts every caller to the legacy
 per-call spawn.
 
+The pool itself now lives in the `tinyruntime` module. That does **not** change
+what this scenario measures: a TinyBus module is a `cdylib` loaded into this
+process, so a worker it spawns is still a child of the host and still shows up in
+the process-tree sample the gate asserts on. What changed is which code spawns
+it. The configuration keys, the backpressure behaviour, and the
+`enabled = false` escape hatch are unchanged.
+
 Watch-items from the sweep: thread count grows ~0.35/agent (needs
 attribution + cap before real 1000-agent runs), and p95 latency at N=500 on
 2 workers shows CPU saturation is the load constraint, not memory.

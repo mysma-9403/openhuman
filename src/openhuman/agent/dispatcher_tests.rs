@@ -549,3 +549,28 @@ fn to_provider_messages_drops_pair_with_extra_unsolicited_results() {
         "extra unsolicited tool_call_ids must invalidate the pair, kept: {roles:?}"
     );
 }
+
+// `ChatMessage.role` is a free-form `String` in the durable transcript record,
+// but `to_dialect_message`/`from_dialect_message` route it through the
+// crate's closed `DialectRole` (system/user/assistant/tool) — the same four
+// roles every dispatcher already spoke before this seam existed. A role
+// outside that vocabulary (nothing in this codebase produces one today; see
+// the doc comment on `to_dialect_message`) is treated as a `user` turn on the
+// way out, matching how every provider already treats an unrecognized role.
+// This pins that intentional behaviour so it does not silently drift.
+#[test]
+fn to_provider_messages_treats_unrecognized_role_as_user() {
+    let dispatcher = XmlToolDispatcher;
+    let mut developer_message = crate::openhuman::agent::messages::ChatMessage::user("hi");
+    developer_message.role = "developer".to_string();
+    let history = vec![ConversationMessage::Chat(developer_message)];
+
+    let out = dispatcher.to_provider_messages(&history);
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].role, "user",
+        "an unrecognized role must fall back to `user`, not be dropped or panic"
+    );
+    assert_eq!(out[0].content, "hi");
+}

@@ -143,6 +143,20 @@ jobs:
               # The changed-files runner itself must trigger the lane that
               # runs it (it is also in rust-core-full → full-suite mode).
               - 'scripts/ci/rust-coverage-changed.sh'
+              # The product feature set decides what the Rust lanes below
+              # actually compile (clippy's `--features`, the test suite's, and
+              # rust-coverage-changed.sh's). Changing it changes the code under
+              # test as surely as editing `Cargo.toml` does, so it has to arm
+              # this lane too — #5619 turned `hosting` on and, without this
+              # entry, resolved to `["rust-tauri"]` alone, skipping every lane
+              # that would have compiled the family it enabled.
+              - 'scripts/ci/product-features.*'
+              # The coverage-presence gate and its allowlist decide whether this
+              # lane FAILS, so they arm it for the same reason.
+              - 'scripts/ci/assert-coverage-presence.sh'
+              - 'scripts/ci/coverage-presence-allowlist.txt'
+              - 'scripts/ci/check-openhuman-rust-layout.mjs'
+              - 'scripts/ci/list-feature-gated-rust-tests.mjs'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'build.rs'
@@ -154,12 +168,26 @@ jobs:
               - 'scripts/check-linux-tls-dependencies.sh'
               - 'scripts/test-rust-e2e.sh'
               - 'scripts/test-rust-with-mock.sh'
-              - 'vendor/motosan-ai-oauth/**'
-              - 'vendor/tinychannels'
+              # Every vendored crate, not an enumeration. `[patch.crates-io]`
+              # force-resolves all ten submodules by path, so ANY pointer bump
+              # changes what this crate compiles against. The previous list
+              # named two of them, so a bump to the other eight ran no openhuman
+              # Rust lane at all while PR CI Gate still reported success.
+              # Enumerating here failed the same way the release Docker
+              # submodule list did three times before #5596 replaced it with
+              # `--init --recursive`. Do not go back to a list.
+              - '.gitmodules'
+              - 'vendor/**'
             # Changes here invalidate per-module test scoping → full suite.
             rust-core-full:
               - '.github/workflows/ci-lite.yml'
               - 'scripts/ci/rust-coverage-changed.sh'
+              # Same reason as in `rust-core` above: a feature-set change
+              # changes what compiles, which invalidates per-module scoping
+              # exactly as a `Cargo.toml` change does.
+              - 'scripts/ci/product-features.*'
+              - 'scripts/ci/assert-coverage-presence.sh'
+              - 'scripts/ci/coverage-presence-allowlist.txt'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'build.rs'
@@ -167,8 +195,11 @@ jobs:
               - 'rust-toolchain.toml'
               - 'scripts/ci-cancel-aware.sh'
               - 'scripts/check-linux-tls-dependencies.sh'
-              - 'vendor/motosan-ai-oauth/**'
-              - 'vendor/tinychannels'
+              # A vendored-crate bump invalidates per-module test scoping for the
+              # same reason a Cargo.lock change does: it moves the dependency
+              # graph under every module. Full suite, not scoped.
+              - '.gitmodules'
+              - 'vendor/**'
             rust-core-src:
               - 'src/**'
               - 'tests/**'
@@ -185,6 +216,11 @@ jobs:
               - 'rust-toolchain.toml'
               - 'app/src-tauri/**'
               - 'scripts/ci-cancel-aware.sh'
+              # The shell is a second Cargo world with its own duplicate
+              # `[patch.crates-io]` table pointing at the same submodules, so it
+              # is affected by a bump exactly as the core is. It named none.
+              - '.gitmodules'
+              - 'vendor/**'
             # Shared mock backend + script self-tests. The mock backend every
             # E2E suite depends on had zero PR-lane coverage before this (its
             # own socket-auth tests never ran in CI) — arm the scripts
@@ -194,6 +230,15 @@ jobs:
               - 'scripts/mock-api/**'
               - 'scripts/*.mjs'
               - 'scripts/__tests__/**'
+              # Bash helpers with node --test coverage in scripts/__tests__/.
+              - 'scripts/ci/assert-coverage-presence.sh'
+              # Shared logic behind the gate CLIs, and the module-pin gate's own
+              # files. Without these a change to the checking logic would skip
+              # the lane that tests it — the gate would stop watching itself.
+              - 'scripts/lib/**'
+              - 'scripts/ci/check-module-pins.mjs'
+              - 'scripts/ci/check-submodule-monotonic.mjs'
+              - 'scripts/ci/module-pin-exemptions.json'
             # Test-wiring surface: a change here can orphan a test or add an
             # untested controller domain → run the inventory guard.
             inventory:
@@ -236,7 +281,10 @@ jobs:
           persist-credentials: false
 
       # The RPC-catalog drift-guard test (rpcMethods.test.ts) reads
-      # vendor/tinychannels/src/controllers/schemas.rs at test time. This lane
+      # vendor/tinychannels/crates/tinychannels-bus/src/controllers/schemas.rs
+      # at test time (controller metadata is contract, so it lives in the bus
+      # crate). Still one submodule — the bus crate is a workspace member of
+      # vendor/tinychannels, not a submodule of its own. This lane
       # otherwise checks out without submodules, so init just that one — not
       # `submodules: recursive`, which would also pull the large tauri-cef fork
       # this job never builds. Mirrors the same fix in test-reusable.yml's
@@ -371,6 +419,10 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      - name: Enforce OpenHuman Rust file layout
+        if: needs.changes.outputs['rust-core'] == 'true'
+        run: node scripts/ci/check-openhuman-rust-layout.mjs
+
       - name: Enforce Linux TLS dependency policy
         if: needs.changes.outputs['rust-core'] == 'true' || needs.changes.outputs['rust-tauri'] == 'true'
         run: bash scripts/check-linux-tls-dependencies.sh
@@ -478,6 +530,13 @@ jobs:
         # (#5022). This step executes the gate-contract test modules so that class of
         # regression fails CI, not just a local pre-push.
         #
+        # `memory::people::address_book::tests` used to be here and was removed: the
+        # address-book tests moved into the tinycortex dependency crate with the code
+        # they cover, and a dependency's unit tests are not collected by this crate's
+        # `--lib` harness — so the filter matched zero tests while reading like
+        # coverage. `contacts_gate_tests` is the live replacement (its off-macOS arm
+        # compiles on Linux, which is where this lane runs).
+        #
         # Scope is deliberate: the full gates-off `--lib` run aborts on a pre-existing
         # task_local stack overflow (`agent::harness::session::tests::
         # turn_dispatches_spawn_subagent_through_full_path`) that reproduces in the
@@ -486,7 +545,7 @@ jobs:
         run: |
           bash scripts/ci-cancel-aware.sh cargo test --manifest-path Cargo.toml \
             --no-default-features --lib -- \
-            core::all:: core::cli:: core::jsonrpc:: core::legacy_aliases:: core::runtime:: agent::registry::agents::loader:: memory::people::address_book::tests:: openhuman::config:: openhuman::platform::socket::event_handlers:: tools::schemas:: tools::ops::tests::
+            core::all:: core::cli:: core::jsonrpc:: core::legacy_aliases:: core::runtime:: agent::registry::agents::loader:: memory::people::contacts_gate_tests:: openhuman::config:: openhuman::platform::socket::event_handlers:: tools::schemas:: tools::ops::tests::
           bash scripts/ci-cancel-aware.sh cargo test --manifest-path Cargo.toml \
             --no-default-features --features mcp --lib -- \
             mcp::server::resources::
@@ -515,7 +574,36 @@ jobs:
         #
         # This asserts the calibration still holds. If it fails, every
         # projection built on the simulator is suspect until it is fixed.
-        run: python3 scripts/dep-sim.py --cut-nothing --expect-names 282
+        #
+        # The number is the Linux name count of the `flows` profile, so it moves
+        # whenever scripts/kernel-floor.limits does and belongs in the same PR.
+        # 264 -> 265 on 2026-08-21: the tinymemory #76/#77 bump adds exactly one
+        # name, `tinymemory-bus`. 265 -> 267 on 2026-08-22: the MCP extraction
+        # adds `tinymcp` and `tinymcp-bus`. 267 -> 268 on 2026-08-22: language
+        # runtimes moved behind the `tinyruntime` TinyBus module, adding
+        # `tinyruntime-bus`. 268 -> 269 on 2026-08-23: the TinyJuice wire
+        # contract moved into `tinyjuice-bus`, which cannot be gated because
+        # `inference::tokenjuice` compiles in every build. 269 -> 270 on
+        # 2026-08-29: `tinytools` becomes the dependency behind the `Tool`
+        # trait/types, which cannot be gated because `tools/` is kernel
+        # surface — zero transitive additions, native build count unchanged
+        # at 2. 270 -> 273 on 2026-08-30: the `tinyflows` crate's catalog/
+        # storage/copilot surface split into three sibling path-crates in the
+        # SAME vendored workspace (`tinyflows-catalog`, `tinyflows-sqlite`,
+        # `tinyflows-copilot`) — one name each, no new external crate, native
+        # build count unchanged at 2. 273 -> 275 on 2026-08-31: the compatible
+        # dependency refresh recorded in `kernel-floor.limits` raised the
+        # resolved Linux name count while keeping the native build count at 2.
+        # See the kernel-floor history for why
+        # these raises are temporary/justified. macOS resolves one higher per
+        # the host skew recorded in the limits history — this expects the CI
+        # host.
+        #
+        # This number MUST move in lockstep with scripts/kernel-floor.limits —
+        # it is a second source of truth for the same Linux name count and is
+        # not derived from that file. Bump both in the same PR that raises
+        # (or lowers) the floor.
+        run: python3 scripts/dep-sim.py --cut-nothing --expect-names 269
 
       - name: Guard — new feature-gated test modules must be acknowledged
         # Self-maintaining coverage: the set of source files that #[cfg]-gate a test on
@@ -527,34 +615,51 @@ jobs:
         run: |
           set -euo pipefail
           EXPECTED=$(cat <<'EOF'
+          core/all.rs
           core/all_tests.rs
           core/cli_tests.rs
           core/dispatch.rs
+          core/jsonrpc.rs
           core/jsonrpc_tests.rs
           core/legacy_aliases.rs
           core/runtime/services.rs
-          openhuman/agent/harness/builtin_definitions.rs
+          embed/harness/builder.rs
+          embed/harness/builder_tests.rs
+          openhuman/agent/harness/builtin_definitions_tests.rs
           openhuman/agent/harness/definition_tests.rs
-          openhuman/agent/harness/session/tests.rs
-          openhuman/agent/harness/subagent_runner/tool_prep.rs
+          openhuman/agent/harness/mod.rs
+          openhuman/agent/harness/session/session_tests_part_01_tests.rs
+          openhuman/agent/harness/subagent_runner/tool_prep_tests.rs
           openhuman/agent/registry/agents/loader.rs
+          openhuman/agent/registry/agents/loader_tests_part_01_tests.rs
+          openhuman/agent/registry/agents/loader_tests_part_02_tests.rs
+          openhuman/agent/registry/agents/loader_tests_part_03_tests.rs
           openhuman/config/migrations/retire_local_whisper_stt_tests.rs
-          openhuman/memory/people/address_book.rs
+          openhuman/flows/mod.rs
           openhuman/mcp/server/resources.rs
+          openhuman/mcp/server/tools/mod.rs
+          openhuman/memory/people/mod.rs
+          openhuman/memory/people/mod_contacts_gate_tests_tests.rs
           openhuman/platform/socket/event_handlers.rs
           openhuman/platform/socket/ops.rs
-          openhuman/tinyplace/manifest.rs
-          openhuman/tools/registry/ops_tests.rs
-          openhuman/tools/registry/schemas.rs
+          openhuman/skills/mod.rs
+          openhuman/tools/impl/network/http_request.rs
+          openhuman/tools/ops.rs
           openhuman/tools/ops_tests.rs
-          openhuman/voice/compile_status.rs
+          openhuman/tools/ops_tests_part_01_tests.rs
+          openhuman/tools/ops_tests_part_03_tests.rs
+          openhuman/tools/ops_tests_part_04_tests.rs
+          openhuman/tools/registry/ops_tests.rs
+          openhuman/tools/registry/schemas_tests.rs
+          openhuman/voice/compile_status_tests.rs
+          openhuman/web3/mod.rs
           openhuman/web3/stub.rs
           openhuman/web3/wallet/stub.rs
           openhuman/web3/x402/stub.rs
+          tui/runner.rs
           EOF
           )
-          ACTUAL=$(grep -rlE '#\[cfg\((not\()?feature = "(voice|media|web3|meet|mcp|skills|flows|channels|contacts)"|#\[cfg\((not\()?all\([^]]*feature = "contacts"' src --include='*.rs' \
-            | xargs grep -lE '#\[test\]|#\[tokio::test\]|fn .*_test' 2>/dev/null | sed 's|^src/||' | sort -u)
+          ACTUAL=$(node scripts/ci/list-feature-gated-rust-tests.mjs | sort -u)
           if ! diff <(echo "$EXPECTED" | sed 's/^ *//' | sort -u) <(echo "$ACTUAL"); then
             echo "::error::Gated-test file set changed. Update the EXPECTED allowlist in the rust-feature-gate-smoke lane, and extend the scoped 'cargo test' filter if the new module can carry an ungated-assert regression (see #5022)."
             exit 1
@@ -679,6 +784,60 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Install checksum-pinned native test modules
+        run: |
+          # tinybus validates every directory ancestor. GitHub mounts the
+          # checkout as the host runner uid while this container runs as root,
+          # so a module below $GITHUB_WORKSPACE is correctly refused. Keep
+          # native fixtures in a root-owned, container-ephemeral tree instead.
+          # Version and digest are ONE decision and live on adjacent lines for that
+          # reason: the archive name, the release tag and the checksum each used to
+          # carry the version independently, so a bump could update two of the three
+          # and leave a stale digest that only fails after the download. Both values
+          # are the ubuntu-22.04-x86_64 row of `src/openhuman/modules/registry.rs`,
+          # which is the authoritative pin — copy them from there, never recompute.
+          memory_version="1.13.7"
+          memory_sha256="e87fa05256c4a5571defa6f566ae9c8fc87d3233af112acfa631f84e3041af65"
+          module_root="/opt/openhuman-test-modules/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          memory_dir="$module_root/tinymemory"
+          juice_dir="$module_root/tinyjuice"
+          connectors_dir="$module_root/tinyconnectors"
+          memory_archive="$memory_dir/tinymemory-module-${memory_version}-ubuntu-22.04-x86_64.tar.gz"
+          juice_archive="$juice_dir/tinyjuice-module-0.2.2-ubuntu-22.04-x86_64.tar.gz"
+          rm -rf "$memory_dir" "$juice_dir" "$connectors_dir"
+          mkdir -p "$memory_dir" "$juice_dir" "$connectors_dir"
+          curl --fail --location --silent --show-error \
+            "https://github.com/tinyhumansai/tinymemory/releases/download/v${memory_version}/$(basename "$memory_archive")" \
+            --output "$memory_archive"
+          curl --fail --location --silent --show-error \
+            "https://github.com/tinyhumansai/tinyjuice/releases/download/v0.2.2/$(basename "$juice_archive")" \
+            --output "$juice_archive"
+          echo "${memory_sha256}  $memory_archive" \
+            | sha256sum --check
+          echo "fd8caf7fccb53328870fd26922aa9768d253cd4b3bf758967847d6512df03863  $juice_archive" \
+            | sha256sum --check
+          # Do not restore the release builder's uid into the trusted tree.
+          tar --no-same-owner -xzf "$memory_archive" -C "$memory_dir"
+          tar --no-same-owner -xzf "$juice_archive" -C "$juice_dir"
+          bash scripts/ci-cancel-aware.sh cargo build --release \
+            --manifest-path vendor/tinyconnectors/crates/tinyconnectors/Cargo.toml
+          cp vendor/tinyconnectors/target/release/libtinyconnectors.so \
+            "$connectors_dir/libtinyconnectors.so"
+          echo "TINYMEMORY_TEST_MODULE=$memory_dir/libtinymemory_module.so" \
+            >> "$GITHUB_ENV"
+          echo "TINYJUICE_TEST_MODULE=$juice_dir/libtinyjuice_module.so" \
+            >> "$GITHUB_ENV"
+          echo "TINYCONNECTORS_TEST_MODULE=$connectors_dir/libtinyconnectors.so" \
+            >> "$GITHUB_ENV"
+
+      - name: Run TinyJuice host-module regression
+        run: |
+          cargo test --lib --features modules \
+            openhuman::agent::tinyagents::middleware::tests::tool_output_tabulates_a_large_graph_for_a_non_exempt_tool \
+            -- --ignored --exact
+        env:
+          CARGO_BUILD_JOBS: "1"
+
       - name: Run cargo llvm-cov for openhuman core (changed modules only)
         run: bash scripts/ci/rust-coverage-changed.sh
         env:
@@ -788,29 +947,14 @@ jobs:
 
       - name: Run cargo llvm-cov for Tauri shell
         run: |
-          # Write raw profiles to the container's in-memory filesystem first.
-          # Both the workspace bind mount and the container overlay have
-          # dropped LLVM profile writes on hosted container jobs. /dev/shm is
-          # container-local and these raw counter files are only a few MiB.
-          profile_dir="/dev/shm/openhuman-tauri-profraw-${GITHUB_RUN_ID}"
-          rm -rf "$profile_dir"
-          mkdir -p "$profile_dir"
-          # Source cargo-llvm-cov's instrumentation environment, then override
-          # the raw-profile path before invoking Cargo directly. Calling
-          # `cargo llvm-cov` here would overwrite LLVM_PROFILE_FILE again.
-          export CARGO_TARGET_DIR="$PWD/app/src-tauri/target/llvm-cov-target"
-          # Do not chain the runner's sccache wrapper underneath llvm-cov.
-          # Its shared cache can return objects compiled without coverage,
-          # yielding a passing test binary that never writes a raw profile.
-          unset RUSTC_WRAPPER
-          eval "$(cargo llvm-cov show-env --manifest-path app/src-tauri/Cargo.toml --sh)"
-          export LLVM_PROFILE_FILE="$profile_dir/tauri-%p-%m.profraw"
-          bash scripts/ci-cancel-aware.sh cargo test --manifest-path app/src-tauri/Cargo.toml
-          shopt -s nullglob
-          profiles=("$profile_dir"/*.profraw)
-          test "${#profiles[@]}" -gt 0
-          mv "${profiles[@]}" "$CARGO_TARGET_DIR/"
-          bash scripts/ci-cancel-aware.sh cargo llvm-cov report --manifest-path app/src-tauri/Cargo.toml --lcov --output-path lcov-tauri.info
+          # The container's Cargo configuration installs sccache as its rustc
+          # wrapper. Use llvm-cov's RustFLAGS mode so that wrapper cannot
+          # replace its instrumentation wrapper and silently drop .profraw
+          # output after otherwise-passing tests.
+          # The job-level linker flag must also be cleared: llvm-cov sets the
+          # same variable with `-C instrument-coverage` for this invocation.
+          unset RUSTFLAGS
+          bash scripts/ci-cancel-aware.sh cargo llvm-cov --no-rustc-wrapper --manifest-path app/src-tauri/Cargo.toml --lcov --output-path lcov-tauri.info
         env:
           # Serialize codegen/link to cap peak memory + disk during the
           # instrumented Tauri-shell link (SIGBUS otherwise). Mirrors
@@ -950,6 +1094,51 @@ jobs:
       - name: Verify the desktop shell forwards every default-ON core gate
         run: node scripts/ci/check-feature-forwarding.mjs
 
+  module-pin-gate:
+    name: Module Pin Gate (registry pin matches submodule pin)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          # Full history and every submodule: the monotonicity half compares this
+          # branch's gitlinks against the base branch's and then asks the
+          # submodule whether the new pin is an ancestor of the old one. Both
+          # answers need real history — `fetch-depth: 1` would leave the script
+          # unable to resolve the base, which it reports as a FAILURE rather than
+          # passing on an empty comparison.
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      # Nine subsystems load as downloaded cdylib modules and each is pinned
+      # twice: once as a submodule (the contract compiled here) and once as a
+      # version + digest in modules/registry.rs (the artifact loaded at runtime).
+      # Nothing compared them, so a stale pin compiled clean, passed every lane,
+      # and lost a capability on a user's machine — #5598 (capability bitmask
+      # 8191 vs 262143), #5623 (missing ListAllFacets), #5641 (missing profile
+      # family). All three were fixed by bumping a pin; none added a check.
+      #
+      # Deliberately NOT filtered on `changes`: a path filter would have to watch
+      # registry.rs, modules/memory.rs, three workflows and sixteen gitlinks, and
+      # a skipped job counts as a pass in the gate below.
+      - name: Verify each module's registry pin matches its submodule pin
+        run: node scripts/ci/check-module-pins.mjs
+
+      # The other half, and the one that has actually bitten. A pin set can be
+      # internally consistent and still be consistent with an OLDER release:
+      # 14a23b994 moved vendor/tinyagents back from #122 to #121, silently
+      # dropping a shipped fix until #5796 restored it, and #5725 did the same
+      # (undone by #5787). Both were internally consistent, so the check above
+      # would have passed them. `tinyagents` has no registry record at all — one
+      # pin, nothing to compare — so only movement direction catches it.
+      - name: Verify no vendor/ submodule pin moved backwards
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: node scripts/ci/check-submodule-monotonic.mjs
+
   pester-install:
     name: PowerShell Install Test (Pester)
     needs: [changes]
@@ -1019,6 +1208,7 @@ jobs:
       - tinycortex-tests
       - orch-ip-gate
       - feature-forwarding-gate
+      - module-pin-gate
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1039,6 +1229,7 @@ jobs:
             ["TinyCortex Memory Tests"]="${{ needs['tinycortex-tests'].result }}"
             ["Orchestration IP Gate"]="${{ needs['orch-ip-gate'].result }}"
             ["Feature Forwarding Gate"]="${{ needs['feature-forwarding-gate'].result }}"
+            ["Module Pin Gate"]="${{ needs['module-pin-gate'].result }}"
           )
 
           failed=0
@@ -1147,7 +1338,29 @@ jobs:
             --compare-branch="${{ steps.coverage-compare.outputs.ref }}" \
             --fail-under=80 \
             --html-report diff-coverage.html \
-            --markdown-report diff-coverage.md
+            --markdown-report diff-coverage.md \
+            --format json:diff-coverage.json
+
+          # diff-cover exits 0 when it measured nothing at all ("No lines with
+          # coverage information in this diff"), which is how PR #5593 passed
+          # this gate with 1,643 uncompiled lines. Absence of data is not
+          # evidence of coverage — but it IS legitimate for a diff whose only
+          # Rust/TS changes are comments, imports or type declarations, so this
+          # only WARNS. The hard failure for "the file was never compiled" is
+          # scripts/ci/assert-coverage-presence.sh, which runs inside the core
+          # coverage lane and can tell those two cases apart.
+          #
+          # `total_num_lines` is diff-cover's own count of changed lines it
+          # found coverage rows for: 0 on the "no lines with coverage
+          # information" path, non-zero otherwise. Verified against
+          # diff-cover 10.5.1 (the version `>=9.2.0` resolves to today) on both
+          # an empty and a non-empty diff. `--format json:` rather than the
+          # `--json-report` alias, which that release deprecates.
+          measured="$(python3 -c 'import json; print(json.load(open("diff-coverage.json"))["total_num_lines"])')"
+          echo "diff-cover measured ${measured} changed line(s)"
+          if [ "${measured}" -eq 0 ]; then
+            echo "::warning::diff-cover measured 0 changed lines. If this PR changed executable code, that code was not compiled by any coverage lane — check the 'Rust Core Coverage' log for the coverage-presence gate."
+          fi
 
       - name: Upload diff-cover report
         if: always() && needs.changes.outputs.coverage == 'true'

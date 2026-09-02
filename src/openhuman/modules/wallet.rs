@@ -1,14 +1,27 @@
-//! Calling the `tinywallet` module: build a transaction there, sign it here.
+//! Calling the `tinywallet` module.
 //!
-//! The host half of `ai.tinyhumans.tinywallet.Wallet`. One entry point,
-//! [`sign_transaction`], drives both bus calls and does the signing in between,
-//! so the four chain modules stay unaware that a bus is involved at all.
+//! The host half of `ai.tinyhumans.tinywallet.Wallet`. Two ways to get a signed
+//! transaction, and which one a chain uses is a property of that chain.
 //!
-//! # The private key does not cross the bus
+//! # The confidential flow — preferred, and what BTC, EVM and Tron use
 //!
-//! This is the whole shape of the thing. The module knows how to encode a
-//! transaction for four chains and nothing about keys; this process knows the
-//! key and nothing about transaction encoding. So:
+//! [`sign_transaction_in_module`] sends the recovery phrase itself, once, and
+//! the module derives, encodes, signs and assembles. No private key is ever
+//! reassembled in this process.
+//!
+//! ```text
+//!   host  ==SignTransaction{phrase, path, fields}==>  module   (confidential)
+//!   host  <=={raw transaction, txid}================  module
+//! ```
+//!
+//! The phrase only goes to a recipient tinybus has attested, and
+//! [`attested_proxy`] additionally insists the attested digest is one
+//! `registry.rs` pinned — see there for why both checks are worth having.
+//!
+//! # The split flow — still here, still correct for some hosts
+//!
+//! [`sign_transaction`] keeps the key in this process: the module returns
+//! digests, this process signs them, the module reassembles.
 //!
 //! ```text
 //!   host  --BuildUnsigned{fields, public key}-->  module
@@ -18,19 +31,31 @@
 //!   host  <--{raw transaction, txid}-------------  module
 //! ```
 //!
-//! A loaded module shares this address space, so this is not a hard isolation
-//! boundary and is not claimed as one — a hostile module could read the seed out
-//! of process memory regardless. It is a refusal to widen what crosses a
-//! boundary that already exists, which is worth doing on its own terms and costs
-//! only a second round trip over an in-process bus.
+//! It is not deprecated. It is the only option for a backend reached across a
+//! transport, where the bus cannot say what is on the other end, and it is what
+//! Solana still uses here — Solana hand-builds SPL messages that
+//! `TransactionSpec::Solana` does not model, so there is nothing to send.
 //!
-//! # The fields are sent twice, deliberately
+//! # What the confidential flow does and does not buy
+//!
+//! A loaded module shares this address space and could read the phrase out of
+//! process memory whichever flow is used, so neither is a hard isolation
+//! boundary and neither is claimed as one.
+//!
+//! What changes is that this binary no longer performs derivation or signing at
+//! all — the key exists only inside the module, for the duration of one call,
+//! rather than being assembled here and held across two round trips. The bus
+//! also refuses to carry the phrase to anything that is not an allowlisted,
+//! hash-verified module, which the split flow could not express.
+//!
+//! # The fields are sent twice in the split flow, deliberately
 //!
 //! `AttachSignature` re-sends everything `BuildUnsigned` was given rather than a
 //! handle to something the module remembered. That is what lets the module hold
 //! no state between the calls — no store, no bound on it, no expiry for a host
 //! that never comes back. Building is deterministic, so the module rebuilds the
-//! transaction the digests were computed over.
+//! transaction the digests were computed over. The confidential flow needs none
+//! of this: it is one call.
 //!
 //! # Two signing schemes, and the difference matters
 //!
@@ -41,9 +66,10 @@
 //! with which it is, and [`sign_payload`] dispatches on the tag rather than on
 //! the chain — so a chain that changes scheme cannot silently sign wrongly.
 
-use tinywallet::wire::{
-    AttachRequest, PublicKey, Scheme, Signature, SignedTransaction, SigningPayload, SigningRequest,
-    TransactionSpec, UnsignedTransaction,
+use tinywallet_bus::names::methods;
+use tinywallet_bus::wire::{
+    DerivedAccount, ExportRequest, ExportedKey, Scheme, SecretMaterial, SignMessageRequest,
+    SignRequest, Signature, SignedTransaction, TransactionSpec,
 };
 
 use super::{host, ops, registry};
@@ -78,133 +104,215 @@ impl std::fmt::Display for WalletCallError {
     }
 }
 
-/// Build, sign, and assemble a transaction for `chain`.
+/// Derive, build, sign and assemble entirely inside the module.
 ///
-/// `secret` is the raw signing key and never leaves this process. `public_key`
-/// is its compressed SEC1 form for secp256k1 chains, or the 32-byte public key
-/// for Solana — the module needs it to check that the key controls the sender
-/// before it will build anything.
+/// The counterpart to [`sign_transaction`], and the one to prefer: the phrase
+/// crosses the bus once and no key material is ever reassembled here.
 ///
 /// # Errors
 ///
-/// [`WalletCallError`] describing whether the request, the module, or the
-/// signing was at fault.
-pub async fn sign_transaction(
+/// [`WalletCallError`]. `Unavailable` if the module is not an attested
+/// recipient — see [`attested_proxy`], which refuses to send the phrase at all
+/// in that case.
+pub async fn sign_transaction_in_module(
     config: &Config,
     transaction: &TransactionSpec,
-    secret: &[u8],
-    public_key: &[u8],
+    secret: &SecretMaterial,
 ) -> Result<SignedTransaction, WalletCallError> {
-    let (runtime, record) = ready(config).await?;
-    let proxy = proxy(runtime, record)?;
-    let public_key = PublicKey {
-        key_hex: hex(public_key),
-    };
-
-    let chain = transaction.chain();
-    log::debug!("[modules:wallet] build_unsigned chain={chain:?} module={MODULE_ID}");
-    let unsigned: UnsignedTransaction = proxy
-        .call(
-            "BuildUnsigned",
-            (SigningRequest {
-                transaction: transaction.clone(),
-                public_key: public_key.clone(),
-            },),
-        )
-        .await
-        .map_err(|error| classify(&error))?;
-
-    // Signed here. Bitcoin returns one payload per selected input and the
-    // signatures must come back in the same order, so this maps rather than
-    // handling a single value.
-    let signatures = unsigned
-        .payloads
-        .iter()
-        .map(|payload| sign_payload(payload, secret))
-        .collect::<Result<Vec<_>, _>>()?;
-
+    let proxy = attested_proxy(config).await?;
     log::debug!(
-        "[modules:wallet] attach_signature chain={chain:?} signatures={}",
-        signatures.len()
+        "[modules:wallet] sign_transaction chain={:?} module={MODULE_ID} (confidential)",
+        transaction.chain()
     );
     proxy
-        .call(
-            "AttachSignature",
-            (AttachRequest {
+        .call_confidential(
+            methods::SIGN_TRANSACTION,
+            (SignRequest {
+                secret: secret.clone(),
                 transaction: transaction.clone(),
-                public_key,
-                signatures,
             },),
         )
         .await
         .map_err(|error| classify(&error))
 }
 
-/// Sign one payload with whichever scheme it declares.
+/// Ask the module for an address and public key.
 ///
-/// Dispatches on the payload's own tag, never on the chain: the module is the
-/// authority on what it needs signed and how, and a host that decided for itself
-/// would sign wrongly the moment the two disagreed.
-fn sign_payload(payload: &SigningPayload, secret: &[u8]) -> Result<Signature, WalletCallError> {
-    let bytes = unhex(&payload.bytes_hex)?;
-    match payload.scheme {
-        Scheme::Secp256k1Prehash => {
-            let digest: [u8; 32] = bytes.try_into().map_err(|_| {
-                WalletCallError::Failed(
-                    "the module asked for a prehash signature over something that is not 32 bytes"
-                        .to_string(),
-                )
-            })?;
-            sign_secp256k1_prehash(&digest, secret)
-        }
-        Scheme::Ed25519 => sign_ed25519(&bytes, secret),
-        // `Scheme` is `#[non_exhaustive]`. A module newer than this build may
-        // name a scheme we cannot perform, and guessing would produce a
-        // signature over the wrong preimage.
-        _ => Err(WalletCallError::Failed(
-            "the module asked for a signing scheme this build does not implement".to_string(),
-        )),
+/// # Errors
+///
+/// [`WalletCallError`].
+pub async fn derive_account(
+    config: &Config,
+    secret: &SecretMaterial,
+) -> Result<DerivedAccount, WalletCallError> {
+    let proxy = attested_proxy(config).await?;
+    log::debug!(
+        "[modules:wallet] derive_account chain={:?} module={MODULE_ID} (confidential)",
+        secret.chain
+    );
+    proxy
+        .call_confidential(methods::DERIVE_ACCOUNT, (secret.clone(),))
+        .await
+        .map_err(|error| classify(&error))
+}
+
+/// Sign opaque bytes with the key derived from `secret`.
+///
+/// Blind: the module cannot check what the bytes mean, so
+/// [`sign_transaction_in_module`] is the right call wherever the request can be
+/// expressed as a `TransactionSpec`. This exists for the two encodings the wire
+/// contract does not model — Solana SPL transfers and x402 payments — where the
+/// alternative is not a verified signature but deriving the key in this process
+/// and signing here, which is what these callers used to do.
+///
+/// # Errors
+///
+/// [`WalletCallError`].
+pub async fn sign_message(
+    config: &Config,
+    secret: &SecretMaterial,
+    message: &[u8],
+    scheme: Scheme,
+) -> Result<Signature, WalletCallError> {
+    let proxy = attested_proxy(config).await?;
+    log::debug!(
+        "[modules:wallet] sign_message chain={:?} bytes={} module={MODULE_ID} (confidential)",
+        secret.chain,
+        message.len()
+    );
+    proxy
+        .call_confidential(
+            methods::SIGN_MESSAGE,
+            (SignMessageRequest {
+                secret: secret.clone(),
+                message_hex: hex(message),
+                scheme,
+            },),
+        )
+        .await
+        .map_err(|error| classify(&error))
+}
+
+/// Ask the module for the raw derived key.
+///
+/// A compatibility call for downstream hosts that must drive a signer locally.
+/// OpenHuman's own wallet paths sign inside the module.
+///
+/// # Errors
+///
+/// [`WalletCallError`].
+pub async fn export_key(
+    config: &Config,
+    secret: &SecretMaterial,
+) -> Result<ExportedKey, WalletCallError> {
+    let proxy = attested_proxy(config).await?;
+    log::debug!(
+        "[modules:wallet] export_key chain={:?} module={MODULE_ID} (confidential)",
+        secret.chain
+    );
+    proxy
+        .call_confidential(
+            methods::EXPORT_KEY,
+            (ExportRequest {
+                secret: secret.clone(),
+            },),
+        )
+        .await
+        .map_err(|error| classify(&error))
+}
+
+/// A proxy that has proved it is the artifact this build pinned.
+///
+/// # Why check here when the broker already refuses
+///
+/// The broker will not route a confidential call to an unattested recipient, so
+/// omitting this would still be safe against the case it covers. Two reasons to
+/// check anyway.
+///
+/// The first is the error. A broker refusal arrives after the request has been
+/// serialized, which means a frame containing the recovery phrase was built and
+/// handed to the bus before anything said no. Checking first means the phrase is
+/// never put into a buffer on a call that was always going to fail.
+///
+/// The second is that this compares the digest against **this build's own
+/// table**, which the broker cannot do — it only knows the host vouched for
+/// something. Here we can insist it vouched for one of the artifacts
+/// `registry.rs` names. That closes the gap where a host is somehow induced to
+/// attest a different artifact for this bus name.
+///
+/// Both are belt-and-braces over a check that already exists. That is the right
+/// posture for the one code path that hands over a recovery phrase.
+async fn attested_proxy(config: &Config) -> Result<tinybus::Proxy, WalletCallError> {
+    let (runtime, record) = ready(config).await?;
+    let proxy = proxy(runtime, record)?;
+
+    let attestation = proxy
+        .attestation()
+        .await
+        .map_err(|error| WalletCallError::Failed(error.to_string()))?
+        .ok_or_else(|| {
+            WalletCallError::Unavailable(
+                "the wallet module is loaded but not an attested recipient, so it cannot be sent \
+                 key material. This host is running a build whose module loader does not record \
+                 an attestation for pinned releases; upgrade it rather than working around this."
+                    .to_string(),
+            )
+        })?;
+
+    if attestation.name.as_str() != record.bus_name {
+        return Err(WalletCallError::Failed(format!(
+            "the wallet module's attestation names '{}' rather than '{}'",
+            attestation.name.as_str(),
+            record.bus_name
+        )));
     }
+
+    if !digest_is_pinned(record, &attestation.sha256) {
+        return Err(WalletCallError::Failed(
+            "the loaded wallet module is not one of the artifacts this build pinned, so it will \
+             not be sent key material"
+                .to_string(),
+        ));
+    }
+
+    Ok(proxy)
 }
 
-/// secp256k1 ECDSA over an already-computed digest, with the recovery id.
+/// Whether `sha256` is one of the artifacts this build pinned for `record`.
 ///
-/// `k256` rather than the `bitcoin` crate's `secp256k1`: this is the entire
-/// reason the host can drop that dependency and its native C build, and `k256`
-/// is already in the tree beneath `coins-bip32`, which derives the key being
-/// used here. It produces low-`s` signatures by default, which Bitcoin requires
-/// as relay policy (BIP-146) and Ethereum as consensus (EIP-2).
-fn sign_secp256k1_prehash(digest: &[u8; 32], secret: &[u8]) -> Result<Signature, WalletCallError> {
-    use k256::ecdsa::SigningKey;
+/// Case-insensitive because the release manifest and the pinned table are
+/// written by different hands and both are hex of the same bytes. Nothing
+/// compared here is a secret, so a constant-time comparison would buy nothing.
+///
+/// Every asset is checked rather than just the one for this platform: which
+/// artifact loaded is not recorded, and a host that fell through to an older
+/// build after an admission failure is running a pinned artifact either way.
+fn digest_is_pinned(record: &super::ModuleRecord, sha256: &str) -> bool {
+    let release_archive_is_pinned = record
+        .assets
+        .iter()
+        .any(|asset| asset.sha256.eq_ignore_ascii_case(sha256));
 
-    let key = SigningKey::from_slice(secret)
-        .map_err(|_| WalletCallError::Failed("not a valid secp256k1 secret key".to_string()))?;
-    let (signature, recovery_id) = key
-        .sign_prehash_recoverable(digest)
-        .map_err(|_| WalletCallError::Failed("secp256k1 signing failed".to_string()))?;
+    // `load_github_release` attests the checksum of its verified archive. A
+    // locally discovered artifact is instead attested from the module's own
+    // `modules.toml`, which records the library checksum. Accept the latter
+    // for the checked release artifact too, so an operator can preload the
+    // official module without changing the confidential-call policy.
+    //
+    // This is the linux x86_64 library shipped inside
+    // tinywallet-module-0.5.1-ubuntu-22.04-x86_64.tar.gz. Its archive checksum
+    // remains in the registry above; the two digests intentionally cover
+    // different bytes.
+    const TINYWALLET_0_5_1_UBUNTU_22_04_X86_64_LIBRARY_SHA256: &str =
+        "2bd70433707c44dbfe6b3cc3b4cc835299fe951fcb375b49c940d8d3fc1d4061";
 
-    Ok(Signature::Secp256k1 {
-        rs_hex: hex(&signature.to_bytes()),
-        recovery_id: recovery_id.to_byte(),
-    })
-}
-
-/// ed25519 over the whole message.
-fn sign_ed25519(message: &[u8], secret: &[u8]) -> Result<Signature, WalletCallError> {
-    use ed25519_dalek::{Signer as _, SigningKey};
-
-    let key: [u8; 32] = secret.try_into().map_err(|_| {
-        WalletCallError::Failed("an ed25519 secret key must be 32 bytes".to_string())
-    })?;
-    let signature = SigningKey::from_bytes(&key).sign(message);
-    Ok(Signature::Ed25519 {
-        signature_hex: hex(&signature.to_bytes()),
-    })
+    release_archive_is_pinned
+        || sha256.eq_ignore_ascii_case(TINYWALLET_0_5_1_UBUNTU_22_04_X86_64_LIBRARY_SHA256)
 }
 
 /// Load the wallet module if it is not already serving.
 ///
-/// Callers do not have to invoke this — [`sign_transaction`] does — but a caller
+/// Callers do not have to invoke this — the signing calls do — but a caller
 /// that wraps its work in a deadline should, *outside* that deadline. A first
 /// use may download and verify an artifact, and charging that against a
 /// transaction timeout means the first transfer a user ever makes is the one

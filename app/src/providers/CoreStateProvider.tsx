@@ -36,7 +36,6 @@ import { isLocalSessionToken } from '../utils/localSession';
 import {
   getSessionToken,
   openhumanUpdateAnalyticsSettings,
-  openhumanUpdateMeetSettings,
   restartApp,
   setOnboardingCompleted,
   storeSession,
@@ -230,7 +229,6 @@ function normalizeSnapshot(
     onboardingCompleted: result.onboardingCompleted,
     chatOnboardingCompleted: result.chatOnboardingCompleted,
     analyticsEnabled: result.analyticsEnabled,
-    meetAutoOrchestratorHandoff: result.meetAutoOrchestratorHandoff ?? false,
     localState: {
       encryptionKey: result.localState.encryptionKey ?? null,
       onboardingTasks: result.localState.onboardingTasks ?? null,
@@ -649,22 +647,6 @@ export default function CoreStateProvider({ children }: { children: ReactNode })
     [commitState, refresh]
   );
 
-  const setMeetAutoOrchestratorHandoff = useCallback(
-    async (enabled: boolean) => {
-      await openhumanUpdateMeetSettings({ auto_orchestrator_handoff: enabled });
-      // Optimistic commit so the toggle flips instantly; full snapshot
-      // refresh follows so the cached value matches what core just wrote.
-      commitState(previous => ({
-        ...previous,
-        snapshot: { ...previous.snapshot, meetAutoOrchestratorHandoff: enabled },
-      }));
-      await refresh().catch(err => {
-        log('refresh failed after setMeetAutoOrchestratorHandoff: %O', sanitizeError(err));
-      });
-    },
-    [commitState, refresh]
-  );
-
   const setOnboardingCompletedFlag = useCallback(
     async (value: boolean) => {
       await setOnboardingCompleted(value);
@@ -685,8 +667,8 @@ export default function CoreStateProvider({ children }: { children: ReactNode })
     async (params: Parameters<typeof updateCoreLocalState>[0]) => {
       await updateCoreLocalState(params);
       // The follow-up refresh is best-effort cache reconciliation, not part
-      // of the write contract — sibling helpers (setAnalyticsEnabled,
-      // setMeetAutoOrchestratorHandoff, …) already swallow here. An
+      // of the write contract — sibling helpers (setAnalyticsEnabled, …)
+      // already swallow here. An
       // un-caught `app_state_snapshot` timeout used to bubble out of
       // `setEncryptionKey` / `setOnboardingTasks` callers as an unhandled
       // rejection → OPENHUMAN-REACT-Z/Y. The next poll tick will reconcile.
@@ -924,7 +906,6 @@ export default function CoreStateProvider({ children }: { children: ReactNode })
       refreshTeamInvites,
       patchSnapshot,
       setAnalyticsEnabled,
-      setMeetAutoOrchestratorHandoff,
       setOnboardingCompletedFlag,
       setEncryptionKey: value => updateLocalState({ encryptionKey: value }),
       setOnboardingTasks: value => updateLocalState({ onboardingTasks: value }),
@@ -939,7 +920,6 @@ export default function CoreStateProvider({ children }: { children: ReactNode })
       refreshTeams,
       patchSnapshot,
       setAnalyticsEnabled,
-      setMeetAutoOrchestratorHandoff,
       setOnboardingCompletedFlag,
       state,
       storeSessionToken,

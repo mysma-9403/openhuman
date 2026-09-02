@@ -9,9 +9,9 @@ use serde::Deserialize;
 use serde_json::json;
 use std::fmt::Write;
 
-use crate::openhuman::config::rpc as config_rpc;
+use crate::openhuman::memory::api::provider::{ChunkQuery, MemoryProvider};
+use crate::openhuman::memory::ops::guard::active_memory_guard;
 use crate::openhuman::tools::traits::{Tool, ToolResult};
-use tinymemory_core::store::chunks::store::{get_chunk, list_chunks, ListChunksQuery};
 
 pub struct MemoryChunkContextTool;
 
@@ -76,12 +76,19 @@ impl Tool for MemoryChunkContextTool {
             window,
         );
 
-        let config = config_rpc::load_config_with_timeout()
+        // Chunks are read through the bound driver rather than by opening the
+        // store in this process — see the note in `vector_search.rs`.
+        let guard = active_memory_guard()
             .await
-            .map_err(|e| anyhow::anyhow!("memory_chunk_context: load config failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("memory_chunk_context: {e}"))?;
+        let chunk_reader = guard.as_chunks().ok_or_else(|| {
+            anyhow::anyhow!("memory_chunk_context: memory driver does not support the chunk family")
+        })?;
 
         // Look up the target chunk directly by ID
-        let target = get_chunk(&config, &parsed.chunk_id)
+        let target = chunk_reader
+            .get_chunk(&parsed.chunk_id)
+            .await
             .map_err(|e| anyhow::anyhow!("memory_chunk_context: get_chunk failed: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("memory_chunk_context: chunk_id not found"))?;
 
@@ -91,7 +98,10 @@ impl Tool for MemoryChunkContextTool {
         // Per-profile memory-source gate: if the target chunk belongs to a
         // source the active profile didn't allow, surface nothing (its window
         // shares the same source). Non-source chunks always pass.
-        if !tinymemory_core::source_scope::chunk_source_allowed(&target.metadata.tags, &source_id) {
+        if !crate::openhuman::memory::source_scope::chunk_source_allowed(
+            &target.metadata.tags,
+            &source_id,
+        ) {
             return Ok(ToolResult::success(
                 "Chunk is from a memory source not available to the active agent profile.",
             ));
@@ -100,14 +110,15 @@ impl Tool for MemoryChunkContextTool {
         // Get all chunks from the same source, ordered by timestamp. The
         // source-scope gate also applies here (the target was already checked
         // above; this keeps the window consistent). None = unrestricted.
-        let source_query = ListChunksQuery {
+        let source_query = ChunkQuery {
             source_kind: Some(source_kind),
             source_id: Some(source_id.clone()),
             limit: Some(500),
-            source_scope: tinymemory_core::source_scope::current_source_scope(),
             ..Default::default()
         };
-        let mut source_chunks = list_chunks(&config, &source_query)
+        let mut source_chunks = chunk_reader
+            .list_chunks(&source_query, None)
+            .await
             .map_err(|e| anyhow::anyhow!("memory_chunk_context: source query failed: {e}"))?;
 
         // Sort by seq_in_source (ascending) for natural reading order

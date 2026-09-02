@@ -11,11 +11,7 @@ use serde_json::{Map, Value};
 use crate::core::all::{ControllerFuture, RegisteredController};
 use crate::core::{ControllerSchema, FieldSchema, TypeSchema};
 
-use super::cache;
-use super::compress::route;
-use super::detect::detect_content_kind;
-use super::tool_integration::current_options;
-use super::types::{CompressInput, ContentHint};
+use super::types::ContentHint;
 
 pub fn all_controller_schemas() -> Vec<ControllerSchema> {
     vec![
@@ -237,8 +233,8 @@ fn handle_detect(params: Map<String, Value>) -> ControllerFuture {
             extension: str_param(&params, "extension"),
             ..Default::default()
         };
-        let kind = detect_content_kind(&content, &hint);
-        Ok(serde_json::json!({ "kind": kind.as_str() }))
+        let kind = super::detect(content, hint).await?;
+        Ok(serde_json::json!({ "kind": kind }))
     })
 }
 
@@ -249,17 +245,7 @@ fn handle_compress(params: Map<String, Value>) -> ControllerFuture {
             source_tool: str_param(&params, "tool_name"),
             ..Default::default()
         };
-        let opts = current_options();
-        let input = CompressInput {
-            content: &content,
-            kind: super::types::ContentKind::PlainText,
-            hint: &hint,
-            exit_code: None,
-            command: None,
-            argv: None,
-            original_bytes: content.len(),
-        };
-        let res = route(input, &opts).await;
+        let res = super::compress(content, hint).await?;
         Ok(serde_json::json!({
             "applied": res.applied,
             "kind": res.content_kind.as_str(),
@@ -275,15 +261,15 @@ fn handle_compress(params: Map<String, Value>) -> ControllerFuture {
 
 fn handle_cache_stats(_params: Map<String, Value>) -> ControllerFuture {
     Box::pin(async move {
-        let (entries, bytes) = cache::stats();
-        Ok(serde_json::json!({ "entries": entries, "bytes": bytes }))
+        let stats = super::cache_stats().await?;
+        Ok(serde_json::json!({ "entries": stats.entries, "bytes": stats.bytes }))
     })
 }
 
 fn handle_retrieve(params: Map<String, Value>) -> ControllerFuture {
     Box::pin(async move {
         let token = str_param(&params, "token").ok_or("missing 'token'")?;
-        match cache::retrieve(&token) {
+        match super::retrieve(token, None).await? {
             Some(content) => Ok(serde_json::json!({ "found": true, "content": content })),
             None => Ok(serde_json::json!({ "found": false, "content": Value::Null })),
         }
@@ -321,7 +307,7 @@ fn handle_settings_update(params: Map<String, Value>) -> ControllerFuture {
             .map_err(|e| format!("save config: {e}"))?;
 
         // Re-install so router flags / CCR limits / threshold take effect live.
-        crate::openhuman::inference::tokenjuice::install_from_config(&config);
+        crate::openhuman::inference::tokenjuice::install_from_config(&config).await?;
 
         let settings = serde_json::to_value(&config.tokenjuice)
             .map_err(|e| format!("serialize tokenjuice settings: {e}"))?;
@@ -331,14 +317,14 @@ fn handle_settings_update(params: Map<String, Value>) -> ControllerFuture {
 
 fn handle_savings_stats(_params: Map<String, Value>) -> ControllerFuture {
     Box::pin(async move {
+        let cache = super::cache_stats().await?;
         let agg = super::savings::stats();
-        let (entries, bytes) = cache::stats();
         Ok(serde_json::json!({
             "attributionModel": super::savings::attribution_model(),
             "total": agg.total,
             "byModel": agg.by_model,
             "byCompressor": agg.by_compressor,
-            "cache": { "entries": entries, "bytes": bytes },
+            "cache": { "entries": cache.entries, "bytes": cache.bytes },
         }))
     })
 }
@@ -351,31 +337,5 @@ fn handle_savings_reset(_params: Map<String, Value>) -> ControllerFuture {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn detect_handler_classifies_json() {
-        let mut p = Map::new();
-        p.insert(
-            "content".into(),
-            Value::String(r#"[{"a":1,"b":2},{"a":3,"b":4}]"#.into()),
-        );
-        let out = handle_detect(p).await.unwrap();
-        assert_eq!(out["kind"], "json");
-    }
-
-    #[tokio::test]
-    async fn cache_stats_handler_returns_counts() {
-        cache::offload("tokenjuice controller stats unique payload here");
-        let out = handle_cache_stats(Map::new()).await.unwrap();
-        assert!(out["entries"].as_u64().unwrap() >= 1);
-    }
-
-    #[test]
-    fn all_schemas_have_namespace() {
-        for s in all_controller_schemas() {
-            assert_eq!(s.namespace, "tokenjuice");
-        }
-    }
-}
+#[path = "schemas_tests.rs"]
+mod tests;

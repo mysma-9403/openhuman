@@ -17,6 +17,7 @@ import {
 import { setStatusForUser } from '../../store/socketSlice';
 import { clearAllThreads, loadThreads, setSelectedThread } from '../../store/threadSlice';
 import ChatRuntimeProvider from '../ChatRuntimeProvider';
+import { clearAllProactiveThreadPins } from '../proactiveThreadPins';
 
 vi.mock('../../services/chatService', async () => {
   const actual = await vi.importActual<typeof chatService>('../../services/chatService');
@@ -76,6 +77,9 @@ function resetRuntimeState() {
   // run order.
   store.dispatch(resetSessionTokenUsage());
   store.dispatch(setStatusForUser({ userId: '__pending__', status: 'disconnected' }));
+  // Pins live at module scope, so clear them between tests or a pinned voice
+  // surface would leak into the next test.
+  clearAllProactiveThreadPins();
 }
 
 describe('ChatRuntimeProvider — dedupe, proactive resolution, mid-turn invariants', () => {
@@ -789,6 +793,143 @@ describe('ChatRuntimeProvider — dedupe, proactive resolution, mid-turn invaria
       });
 
       await waitFor(() => expect(threadApi.appendMessage).toHaveBeenCalledTimes(1));
+    });
+
+    it('pins the realtime voice surface to one thread across turns', async () => {
+      // The realtime voice session delivers every deferred turn as a
+      // `proactive:voice` message. They all belong to ONE ongoing conversation,
+      // so they must land in a single thread — not spawn a fresh "Chat …" thread
+      // per turn. Turn 1 reuses the fresh selected thread and pins it; the pin
+      // then keeps turns 2 and 3 in that thread even though it now holds
+      // messages (which the fresh-or-create rule would otherwise treat as
+      // occupied, creating a new thread each time).
+      store.dispatch(
+        loadThreads.fulfilled(
+          { threads: [{ id: 'voice-thread', title: 'voice', messageCount: 0 }] as never, count: 1 },
+          'req-id',
+          undefined
+        )
+      );
+      store.dispatch(setSelectedThread('voice-thread'));
+      const listeners = renderProvider();
+
+      await act(async () => {
+        listeners.onProactiveMessage?.({
+          thread_id: 'proactive:voice',
+          request_id: 'voice-1',
+          full_response: 'here is your inbox summary',
+        });
+        listeners.onProactiveMessage?.({
+          thread_id: 'proactive:voice',
+          request_id: 'voice-2',
+          full_response: 'here is your calendar',
+        });
+        listeners.onProactiveMessage?.({
+          thread_id: 'proactive:voice',
+          request_id: 'voice-3',
+          full_response: 'and the weather',
+        });
+      });
+
+      await waitFor(() => expect(threadApi.appendMessage).toHaveBeenCalledTimes(3));
+      // No new thread was ever created, and every turn landed in the one thread.
+      expect(threadApi.createNewThread).not.toHaveBeenCalled();
+      for (const call of vi.mocked(threadApi.appendMessage).mock.calls) {
+        expect(call[0]).toBe('voice-thread');
+      }
+    });
+
+    it('pins the voice surface through the create path when no fresh thread exists', async () => {
+      vi.mocked(threadApi.createNewThread).mockResolvedValue({
+        id: 'voice-thread',
+        title: 'new',
+      } as never);
+      vi.mocked(threadApi.getThreads).mockResolvedValue({
+        threads: [{ id: 'voice-thread', title: 'new' }] as never,
+        count: 1,
+      });
+
+      // The user is mid-conversation, so turn 1 opens a dedicated thread rather
+      // than interrupting the busy one (#3713) — then PINS it, so turn 2 reuses
+      // that same thread instead of creating another.
+      store.dispatch(
+        loadThreads.fulfilled(
+          { threads: [{ id: 'busy-thread', title: 'chat', messageCount: 4 }] as never, count: 1 },
+          'req-id',
+          undefined
+        )
+      );
+      store.dispatch(setSelectedThread('busy-thread'));
+      const listeners = renderProvider();
+
+      await act(async () => {
+        listeners.onProactiveMessage?.({
+          thread_id: 'proactive:voice',
+          request_id: 'voice-1',
+          full_response: 'first voice answer',
+        });
+        listeners.onProactiveMessage?.({
+          thread_id: 'proactive:voice',
+          request_id: 'voice-2',
+          full_response: 'second voice answer',
+        });
+      });
+
+      await waitFor(() => expect(threadApi.appendMessage).toHaveBeenCalledTimes(2));
+      // Exactly ONE thread created for the whole voice session; the busy thread
+      // is never touched.
+      expect(threadApi.createNewThread).toHaveBeenCalledTimes(1);
+      for (const call of vi.mocked(threadApi.appendMessage).mock.calls) {
+        expect(call[0]).toBe('voice-thread');
+      }
+      expect(threadApi.appendMessage).not.toHaveBeenCalledWith('busy-thread', expect.anything());
+    });
+
+    it('re-resolves the voice surface when its pinned thread was deleted', async () => {
+      store.dispatch(
+        loadThreads.fulfilled(
+          { threads: [{ id: 'voice-thread', title: 'voice', messageCount: 0 }] as never, count: 1 },
+          'req-id',
+          undefined
+        )
+      );
+      store.dispatch(setSelectedThread('voice-thread'));
+      const listeners = renderProvider();
+
+      // Turn 1 pins the fresh selected thread.
+      await act(async () => {
+        listeners.onProactiveMessage?.({
+          thread_id: 'proactive:voice',
+          request_id: 'voice-1',
+          full_response: 'first',
+        });
+      });
+      await waitFor(() =>
+        expect(threadApi.appendMessage).toHaveBeenCalledWith('voice-thread', expect.anything())
+      );
+
+      // The pinned thread is deleted. A later voice turn must NOT deliver into
+      // the dead thread — it drops the stale pin and opens a new one.
+      vi.mocked(threadApi.createNewThread).mockResolvedValue({
+        id: 'voice-thread-2',
+        title: 'new',
+      } as never);
+      vi.mocked(threadApi.getThreads).mockResolvedValue({
+        threads: [{ id: 'voice-thread-2', title: 'new' }] as never,
+        count: 1,
+      });
+      store.dispatch(clearAllThreads());
+
+      await act(async () => {
+        listeners.onProactiveMessage?.({
+          thread_id: 'proactive:voice',
+          request_id: 'voice-2',
+          full_response: 'second',
+        });
+      });
+
+      await waitFor(() => expect(threadApi.createNewThread).toHaveBeenCalledTimes(1));
+      expect(threadApi.appendMessage).toHaveBeenCalledWith('voice-thread-2', expect.anything());
     });
   });
 

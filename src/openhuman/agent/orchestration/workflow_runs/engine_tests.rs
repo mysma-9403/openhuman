@@ -30,8 +30,8 @@ use crate::openhuman::agent::harness::fork_context::{with_parent_context, Parent
 use crate::openhuman::config::{AgentConfig, Config};
 use crate::openhuman::memory::{Memory, MemoryCategory, MemoryEntry, NamespaceSummary, RecallOpts};
 use crate::openhuman::tools::{Tool, ToolSpec};
-use tinyagents::harness::model::{ChatModel, ModelProfile, ModelRequest, ModelResponse};
-use tinyagents::session::run_ledger::{get_workflow_run, upsert_workflow_run, WorkflowRunUpsert};
+use tinyagents_session::run_ledger::{get_workflow_run, upsert_workflow_run, WorkflowRunUpsert};
+use tinyinference::model::{ChatModel, ModelProfile, ModelRequest, ModelResponse};
 
 use super::super::types::{WorkflowDefinition, WorkflowPhase, WorkflowSafetyTier};
 
@@ -136,7 +136,7 @@ impl ChatModel<()> for PeakModel {
         &self,
         _state: &(),
         request: ModelRequest,
-    ) -> tinyagents::Result<ModelResponse> {
+    ) -> tinyinference::Result<ModelResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.record_peak(current);
@@ -152,7 +152,7 @@ impl ChatModel<()> for PeakModel {
 
         if let Some(needle) = self.fail_on.lock().as_ref() {
             if flattened.contains(needle.as_str()) {
-                return Err(tinyagents::TinyAgentsError::Model(
+                return Err(tinyinference::Error::Model(
                     "mock model forced failure".to_string(),
                 ));
             }

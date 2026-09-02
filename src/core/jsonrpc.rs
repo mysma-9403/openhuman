@@ -131,11 +131,8 @@ pub async fn rpc_handler(State(state): State<AppState>, Json(req): Json<RpcReque
                     display_message
                 );
             } else if is_wallet_not_configured_error(&display_message) {
-                // A `tinyplace_*` RPC needs a wallet-derived signer but the user
-                // has not set one up. Expected user-state (the UI shows a
-                // "set up wallet" prompt), not an internal failure — skip Sentry
-                // here so the message is left untouched for direct (agent-tool)
-                // callers. See `is_wallet_not_configured_error`.
+                // A wallet-backed RPC cannot run before wallet setup. This is
+                // expected user state, not an internal failure.
                 tracing::info!(
                     method = %method,
                     "[rpc] wallet-not-configured (expected user-state) — skipping Sentry"
@@ -426,17 +423,9 @@ fn is_param_validation_error(msg: &str) -> bool {
 
 /// Returns `true` when the error is the wallet's "not configured yet" message.
 ///
-/// Several `tinyplace_*` RPCs derive a signer seed from the wallet before they
-/// can run (the feed, signal/messaging, etc. — backend `GraphQLAuth::Agent`
-/// requires a signer). For a user who has not set up a wallet, the wallet layer
-/// returns [`crate::openhuman::web3::wallet::WALLET_NOT_CONFIGURED_MESSAGE`]. That is
-/// an expected user-state, not an internal failure: the UI already renders a
-/// "set up wallet" prompt, and there is no local lever to make the call succeed
-/// until the user creates a wallet. Classifying it here — at the single Sentry
-/// boundary — keeps it out of Sentry for *every* path that surfaces it (the
-/// shared client builder and the direct `signal_store` seed call alike) without
-/// the controllers returning a structured envelope, which would leak the raw
-/// sentinel string to agent tools that call those handlers directly.
+/// Wallet-backed RPCs return
+/// [`crate::openhuman::web3::wallet::WALLET_NOT_CONFIGURED_MESSAGE`] before
+/// setup. That is expected user state, not an internal failure.
 ///
 /// Matched against the shared wallet constant (exact equality) so a wording
 /// change in the wallet layer fails the coupling test in `jsonrpc_tests.rs`
@@ -1172,7 +1161,7 @@ const MAX_RPC_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// 3. `http_request_log_middleware` — logs non-RPC HTTP requests with timing
 #[cfg(feature = "http-server")]
 pub fn build_core_http_router(socketio_enabled: bool) -> Router {
-    let mut router = Router::new()
+    let router = Router::new()
         .route("/", get(root_handler))
         .route("/health", get(health_handler))
         .route("/schema", get(schema_handler))
@@ -1199,50 +1188,11 @@ pub fn build_core_http_router(socketio_enabled: bool) -> Router {
         .route("/oauth/mcp/callback", get(oauth_mcp_callback_handler))
         // OpenAI-compatible inference endpoint (/v1/chat/completions, /v1/models)
         .nest("/v1", crate::openhuman::inference::http::router())
-        // Apply `AppState` here (before any state-less sub-routers such as
-        // AgentBox are merged below) so the outer router becomes
-        // `Router<()>` and matches them.
+        // Apply `AppState` here so the outer router becomes `Router<()>` and
+        // matches any state-less sub-router merged into it.
         .with_state(AppState {
             core_version: env!("CARGO_PKG_VERSION").to_string(),
         });
-
-    // Mount AgentBox marketplace routes when explicitly enabled.
-    //
-    // Gate is strict literal "1" — "true"/"yes"/etc. do NOT enable it. Auth
-    // bypass for `/run` and `/jobs/{id}` is unconditional in
-    // [`crate::core::auth`]; the router-side gate is what actually exposes
-    // the handlers. The spawned sweep loop lives until process exit.
-    if crate::openhuman::agent::agentbox::agentbox_mode_enabled() {
-        let store =
-            crate::openhuman::agent::agentbox::JobStore::new(std::time::Duration::from_secs(3600));
-        let invoker: std::sync::Arc<dyn crate::openhuman::agent::agentbox::invoker::AgentInvoker> =
-            std::sync::Arc::new(crate::openhuman::agent::agentbox::invoker::CoreAgentInvoker);
-        let job_timeout = std::env::var("OPENHUMAN_AGENTBOX_JOB_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(std::time::Duration::from_secs)
-            .unwrap_or_else(|| std::time::Duration::from_secs(600));
-
-        // Spawn sweep loop — bounds memory under sustained traffic.
-        let sweep_store = store.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                tick.tick().await;
-                let evicted = sweep_store.sweep_now();
-                if evicted > 0 {
-                    log::info!("[agentbox] sweep evicted {} terminal jobs", evicted);
-                }
-            }
-        });
-
-        log::info!("[agentbox] enabled; public routes: POST /run, GET /jobs/{{id}}, GET /health");
-        router = router.merge(crate::openhuman::agent::agentbox::agentbox_router(
-            store,
-            invoker,
-            job_timeout,
-        ));
-    }
 
     let router = router
         .fallback(not_found_handler)
@@ -1914,8 +1864,6 @@ pub struct DomainSubscriberPlan {
     pub flows: bool,
     /// memory conversation-persistence + sync-stage bridge.
     pub memory: bool,
-    /// agent_meetings calendar + meeting-event subscribers.
-    pub meet: bool,
     /// agent handlers + background delivery + run-ledger finalizer + orchestration ingest.
     pub agent: bool,
     /// hosted orchestration ingest.
@@ -1937,7 +1885,6 @@ impl DomainSubscriberPlan {
             channels: domains.allows(DomainGroup::Channels),
             flows: domains.allows(DomainGroup::Flows),
             memory: domains.allows(DomainGroup::Memory),
-            meet: domains.allows(DomainGroup::Meet),
             agent: domains.allows(DomainGroup::Agent),
             hosted: domains.allows(DomainGroup::Hosted),
             mcp: domains.allows(DomainGroup::Mcp),
@@ -2057,12 +2004,6 @@ fn register_domain_subscribers(
         // fall back to `Policy::Normal` and miss the initial throttle decision on
         // battery-powered hosts).
         crate::openhuman::cron::scheduler_gate::init_global(&config);
-
-        // Install the TokenJuice content-router runtime config (compressor
-        // toggles + CCR cache limits + optional on-disk tier). Compaction runs on
-        // every agent's tool output, so this must be set before any agent loop
-        // executes a tool.
-        crate::openhuman::inference::tokenjuice::install_from_config(&config);
 
         // Seed the scheduler-gate signed-out override from the on-disk session.
         // Without this, a sidecar that boots with no stored JWT would happily
@@ -2309,25 +2250,6 @@ fn register_domain_subscribers(
         );
     }
 
-    // Meet: calendar + meeting-event subscribers.
-    if plan.meet {
-        if group_first_time(DomainGroup::Meet) {
-            crate::openhuman::meet::backend_bot::calendar::register_meet_calendar_subscriber();
-            crate::openhuman::meet::backend_bot::bus::register_meeting_event_subscriber();
-        }
-    } else {
-        log::debug!("[event_bus] agent_meetings subscribers SKIPPED — Meet domain disabled");
-    }
-
-    // Hosted: ingest tiny.place harness session DMs off the stream bus.
-    if plan.hosted {
-        if group_first_time(DomainGroup::Hosted) {
-            crate::openhuman::hosted::orchestration::register_orchestration_ingest_subscriber();
-        }
-    } else {
-        log::debug!("[event_bus] orchestration ingest SKIPPED — Hosted domain disabled");
-    }
-
     // Agent: native agent handlers + background-completion delivery +
     // run-ledger finalizer.
     if plan.agent {
@@ -2359,9 +2281,16 @@ fn register_domain_subscribers(
     // spawn of installed servers (boot::spawn_installed_servers) runs later in
     // bootstrap_core_runtime; this subscriber must be live before then so those
     // connect events are observed (issue #3039 gap A1).
+    //
+    // What bringing the domain up means is the domain's own; this only says
+    // when. The service it opens is wanted here rather than later for the same
+    // reason as the subscriber: every RPC handler in the domain reaches for it,
+    // and opening it from the boot-connect job would leave a window where a
+    // handler answers "still starting" to a caller whose domain is, as far as
+    // anything else can tell, already up.
     if plan.mcp {
         if group_first_time(DomainGroup::Mcp) {
-            crate::openhuman::mcp::registry::bus::init();
+            crate::openhuman::mcp::start(&config);
         }
     } else {
         log::debug!("[event_bus] mcp_registry bus init SKIPPED — Mcp domain disabled");
@@ -2417,6 +2346,14 @@ pub async fn bootstrap_core_runtime(
     // frontend raises a one-shot "settings were reset" notice off it.
     crate::openhuman::desktop::app_state::latch_from_config(&cfg);
 
+    // --- Configurable hooks -------------------------------------------
+    // Read every `hooks.json` layer and, only if something is configured,
+    // install the harness bridge. Boot is the right moment: a hook that is
+    // meant to gate the first tool call of the first turn has to be loaded
+    // before any session exists, and the alternative — loading lazily on the
+    // first event — would let that first call through while the file is read.
+    crate::openhuman::hooks::init(&cfg).await;
+
     // --- Turn-state recovery -------------------------------------------
     // Any per-thread turn snapshots left on disk from a previous process
     // are stale by definition — there is no live driver to resume them.
@@ -2445,7 +2382,7 @@ pub async fn bootstrap_core_runtime(
     // the finalizer never settled it. Stamp such rows `interrupted` so they stop
     // rendering as perpetual "running" timeline entries on thread reopen.
     if agent_enabled {
-        match tinyagents::session::run_ledger::interrupt_orphaned_agent_runs(&cfg.workspace_dir) {
+        match tinyagents_session::run_ledger::interrupt_orphaned_agent_runs(&cfg.workspace_dir) {
             Ok(0) => {}
             Ok(count) => log::info!("[runtime] settled {count} orphaned agent run(s) on startup"),
             Err(err) => log::warn!("[runtime] failed to settle orphaned agent runs: {err}"),

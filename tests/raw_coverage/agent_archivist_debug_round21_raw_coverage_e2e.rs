@@ -15,7 +15,12 @@ use openhuman_core::openhuman::agent::context::prompt::ToolCallFormat;
 use openhuman_core::openhuman::memory::{
     Memory, MemoryCategory, MemoryEntry, NamespaceSummary, RecallOpts,
 };
-use openhuman_core::openhuman::memory::store::{events, fts5, profile, segments};
+use openhuman_core::openhuman::memory::api::provider::MemoryProvider;
+// Raw assertion reads against the engine the provider wraps — see the note in
+// `archivist_tests.rs`: production writes through the provider, the proof that
+// a row landed reads the store directly.
+use tinymemory_core::store::{events, fts5, profile, segments, MemoryClient};
+use tinymemory_tinycortex::engine::{EngineRuntimeConfig, TinycortexProvider};
 use openhuman_core::openhuman::inference::tokenjuice::AgentTokenjuiceCompression;
 use openhuman_core::openhuman::tools::{PermissionLevel, Tool, ToolResult};
 use parking_lot::Mutex;
@@ -25,10 +30,10 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tempfile::TempDir;
-use tinyagents::harness::message::{AssistantMessage, ContentBlock};
-use tinyagents::harness::model::{ChatModel, ModelProfile, ModelRequest, ModelResponse};
-use tinyagents::harness::tool::ToolCall;
-use tinyagents::harness::usage::Usage;
+use tinyinference::message::{AssistantMessage, ContentBlock};
+use tinyinference::model::{ChatModel, ModelProfile, ModelRequest, ModelResponse};
+use tinyinference::tool::ToolCall;
+use tinyinference::usage::Usage;
 
 struct ScriptedModel {
     responses: Mutex<VecDeque<anyhow::Result<ModelResponse>>>,
@@ -64,7 +69,7 @@ impl ChatModel<()> for ScriptedModel {
         &self,
         _state: &(),
         request: ModelRequest,
-    ) -> tinyagents::Result<ModelResponse> {
+    ) -> tinyinference::Result<ModelResponse> {
         self.requests.lock().push(
             request
                 .messages
@@ -77,7 +82,7 @@ impl ChatModel<()> for ScriptedModel {
             .lock()
             .pop_front()
             .unwrap_or_else(|| Ok(text_response("fallback final")))
-            .map_err(|error| tinyagents::TinyAgentsError::Model(error.to_string()))
+            .map_err(|error| tinyinference::Error::Model(error.to_string()))
     }
 }
 
@@ -169,17 +174,43 @@ impl Tool for EchoTool {
     }
 }
 
-fn setup_conn() -> Arc<Mutex<Connection>> {
-    let conn = Connection::open_in_memory().expect("in-memory sqlite");
-    conn.execute_batch(fts5::EPISODIC_INIT_SQL)
-        .expect("episodic schema");
-    conn.execute_batch(segments::SEGMENTS_INIT_SQL)
-        .expect("segments schema");
-    conn.execute_batch(events::EVENTS_INIT_SQL)
-        .expect("events schema");
-    conn.execute_batch(profile::PROFILE_INIT_SQL)
-        .expect("profile schema");
-    Arc::new(Mutex::new(conn))
+/// A real TinyCortex provider over a fresh workspace, with the engine client
+/// kept for raw assertion reads. Same fixture shape as `archivist_tests.rs`.
+fn setup_provider() -> (TempDir, Arc<MemoryClient>, Arc<dyn MemoryProvider>) {
+    // The cfg(test)-only installer is out of reach for an external test
+    // target; the public boot-shaped seam does the same job here.
+    openhuman_core::openhuman::memory::host_impls::install_memory_host_seams(Arc::new(
+        openhuman_core::openhuman::config::Config::default(),
+    ));
+    let tmp = TempDir::new().expect("tempdir");
+    let workspace = tmp.path().join("ws");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let client =
+        Arc::new(MemoryClient::from_workspace_dir(workspace.clone()).expect("engine client"));
+    let config = EngineRuntimeConfig {
+        workspace_dir: workspace.clone(),
+        config_path: workspace.join("config.toml"),
+        memory: Default::default(),
+        memory_tree: Default::default(),
+        scheduler_gate: Default::default(),
+        local_ai: Default::default(),
+        embeddings_provider: None,
+        memory_provider: None,
+        default_model: None,
+        default_temperature: 0.2,
+        output_language: None,
+        memory_sources: serde_json::Value::Null,
+        memory_sync_interval_secs: None,
+        composio_mode: String::new(),
+        backend_api_url: String::new(),
+        composio_entity_id: String::new(),
+    };
+    let provider: Arc<dyn MemoryProvider> = Arc::new(TinycortexProvider::new(
+        "tinycortex".into(),
+        config,
+        Arc::clone(&client),
+    ));
+    (tmp, client, provider)
 }
 
 fn turn(session_id: &str, user_message: &str, assistant_response: &str) -> TurnContext {
@@ -230,7 +261,6 @@ fn definition(max_iterations: usize) -> AgentDefinition {
         omit_identity: true,
         omit_memory_context: false,
         omit_safety_preamble: true,
-        omit_skills_catalog: true,
         omit_profile: true,
         omit_memory_md: true,
         trigger_memory_agent: Default::default(),
@@ -296,8 +326,9 @@ fn parent_context(workspace: &Path, model: Arc<ScriptedModel>) -> ParentExecutio
 
 #[tokio::test]
 async fn archivist_flush_finalizes_open_segment_and_extracts_profile_events() -> Result<()> {
-    let conn = setup_conn();
-    let hook = ArchivistHook::new(conn.clone(), true);
+    let (_tmp, client, provider) = setup_provider();
+    let conn = client.profile_conn();
+    let hook = ArchivistHook::new(provider.clone(), true);
     let session = "round21-archivist-session";
 
     hook.on_turn_complete(&turn(
@@ -334,7 +365,8 @@ async fn archivist_flush_finalizes_open_segment_and_extracts_profile_events() ->
 
 #[tokio::test]
 async fn archivist_disabled_and_unknown_session_paths_are_noops() -> Result<()> {
-    let conn = setup_conn();
+    let (_tmp, client, provider) = setup_provider();
+    let conn = client.profile_conn();
     let disabled = ArchivistHook::disabled();
     assert_eq!(disabled.name(), "archivist");
     disabled
@@ -357,7 +389,7 @@ async fn archivist_disabled_and_unknown_session_paths_are_noops() -> Result<()> 
         .await?;
 
     assert!(fts5::episodic_session_entries(&conn, "unknown")?.is_empty());
-    let enabled = ArchivistHook::new(conn, true);
+    let enabled = ArchivistHook::new(provider.clone(), true);
     enabled.flush_open_segment("missing-session").await;
     assert_eq!(enabled.rolling_segment_recap("missing-session").await, None);
     Ok(())
@@ -436,6 +468,10 @@ fn debug_dump_writer_sanitizes_names_and_writes_summary_sidecars() -> Result<()>
         workspace_dir: PathBuf::from("/tmp/round21-workspace"),
         text: "SYSTEM PROMPT\n".to_string(),
         tool_names: vec!["echo".to_string(), "search".to_string()],
+        tool_specs: vec![
+            json!({"name": "echo", "description": "echo back", "parameters": {}}),
+            json!({"name": "search", "description": "search docs", "parameters": {}}),
+        ],
         skill_tool_count: 1,
     }];
 
@@ -457,5 +493,14 @@ fn debug_dump_writer_sanitizes_names_and_writes_summary_sidecars() -> Result<()>
     let summary_text = std::fs::read_to_string(summary.summary_path)?;
     assert!(summary_text.contains("agent/with spaces@gmail:primary"));
     assert!(summary_text.contains("tools=2"));
+    // The per-dump tools sidecar carries the rendered tool schemas verbatim,
+    // one entry per tool in `tool_names` order.
+    let tools_json = std::fs::read_to_string(
+        tmp.path().join("1_agent_with_spaces_gmail_primary.tools.json"),
+    )?;
+    let specs: Vec<serde_json::Value> = serde_json::from_str(&tools_json)?;
+    assert_eq!(specs.len(), 2);
+    assert_eq!(specs[0]["name"], "echo");
+    assert_eq!(specs[1]["name"], "search");
     Ok(())
 }

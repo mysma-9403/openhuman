@@ -117,8 +117,8 @@ impl Channel for RecordingChannel {
 }
 
 fn runtime_context(workspace_dir: PathBuf) -> ChannelRuntimeContext {
-    let model: Arc<dyn tinyagents::harness::model::ChatModel<()>> =
-        Arc::new(tinyagents::harness::testkit::ScriptedModel::replies(vec![
+    let model: Arc<dyn tinyinference::model::ChatModel<()>> =
+        Arc::new(tinyagents_harness::testkit::ScriptedModel::replies(vec![
             "ok",
         ]));
     ChannelRuntimeContext {
@@ -127,7 +127,7 @@ fn runtime_context(workspace_dir: PathBuf) -> ChannelRuntimeContext {
             crate::openhuman::agent::tinyagents::TurnModelSource::from_model(model),
         ),
         default_provider: Arc::new("openai".into()),
-        memory: Arc::new(DummyMemory),
+        memory: crate::openhuman::memory::guard::in_memory::FixedRecallProvider::guarded(Vec::new()),
         tools_registry: Arc::new(vec![Box::new(DummyTool) as Box<dyn Tool>]),
         system_prompt: Arc::new("prompt".into()),
         model: Arc::new("reasoning-v1".into()),

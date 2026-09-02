@@ -23,8 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tinyagents::error::TinyAgentsError;
-use tinyagents::harness::model::{
+use tinyinference::model::{
     ChatModel, ModelProfile, ModelRequest, ModelResponse, ModelStream, ModelStreamItem,
 };
 use tokio::sync::Semaphore;
@@ -200,12 +199,12 @@ impl ClaudeCodeProvider {
     }
 }
 
-fn map_model_error(error: anyhow::Error) -> TinyAgentsError {
+fn map_model_error(error: anyhow::Error) -> tinyinference::Error {
     let message = format!("claude-code model call failed: {error}");
     if crate::openhuman::inference::provider::error_classify::is_non_retryable(&error) {
-        TinyAgentsError::Validation(message)
+        tinyinference::Error::Validation(message)
     } else {
-        TinyAgentsError::Model(message)
+        tinyinference::Error::Model(message)
     }
 }
 
@@ -219,7 +218,7 @@ impl ChatModel<()> for ClaudeCodeProvider {
         &self,
         _state: &(),
         request: ModelRequest,
-    ) -> tinyagents::Result<ModelResponse> {
+    ) -> tinyinference::Result<ModelResponse> {
         let messages = crate::openhuman::agent::tinyagents::model::native_chat_messages(&request);
         let response = self
             .run_chat(
@@ -236,7 +235,11 @@ impl ChatModel<()> for ClaudeCodeProvider {
         Ok(crate::openhuman::agent::tinyagents::model::native_model_response(&response))
     }
 
-    async fn stream(&self, _state: &(), request: ModelRequest) -> tinyagents::Result<ModelStream> {
+    async fn stream(
+        &self,
+        _state: &(),
+        request: ModelRequest,
+    ) -> tinyinference::Result<ModelStream> {
         let provider = self.clone();
         let label = self.model.clone();
         let (item_tx, item_rx) = tokio::sync::mpsc::unbounded_channel::<ModelStreamItem>();
@@ -318,44 +321,5 @@ fn thread_key_from_messages(messages: &[ChatMessage]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn chat_model_profile_advertises_native_streaming_tools() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let project = tempfile::tempdir().expect("project");
-        let provider = ClaudeCodeProvider::new(
-            "claude-sonnet-4-6",
-            PathBuf::from("claude"),
-            workspace.path().to_path_buf(),
-            project.path().to_path_buf(),
-            None,
-        );
-
-        let profile = provider.profile().expect("profile");
-        assert_eq!(profile.provider.as_deref(), Some("claude-code"));
-        assert_eq!(profile.model.as_deref(), Some("claude-sonnet-4-6"));
-        assert!(profile.tool_calling);
-        assert!(profile.parallel_tool_calls);
-        assert!(profile.streaming);
-        assert!(profile.streaming_tool_chunks);
-    }
-
-    #[test]
-    fn thread_key_is_stable_for_same_conversation() {
-        let a = vec![ChatMessage::user("hello world")];
-        let b = vec![
-            ChatMessage::user("hello world"),
-            ChatMessage::assistant("hi"),
-        ];
-        assert_eq!(thread_key_from_messages(&a), thread_key_from_messages(&b));
-    }
-
-    #[test]
-    fn thread_key_diverges_for_different_first_user() {
-        let a = vec![ChatMessage::user("alpha")];
-        let b = vec![ChatMessage::user("beta")];
-        assert_ne!(thread_key_from_messages(&a), thread_key_from_messages(&b));
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

@@ -89,7 +89,6 @@ const setCoreSession = ({
       onboardingCompleted: true,
       chatOnboardingCompleted: true,
       analyticsEnabled: false,
-      meetAutoOrchestratorHandoff: false,
       localState: { encryptionKey: null, onboardingTasks: null, keyringConsent: null },
       keyringStatus: {
         available: true,

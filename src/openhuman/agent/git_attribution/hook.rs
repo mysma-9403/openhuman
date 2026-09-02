@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 #[cfg(unix)]
+use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::OnceLock;
@@ -58,23 +60,50 @@ static HOOK_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// The result is intended for an agent-owned child process. It does not change
 /// repository configuration or the parent application's environment.
 #[cfg(unix)]
-pub fn hook_env() -> HashMap<String, String> {
+pub fn hook_env() -> HashMap<OsString, OsString> {
     let Some(dir) = HOOK_DIR.get_or_init(|| build_hook_dir().ok()).as_ref() else {
         return HashMap::new();
     };
+    build_hook_env(dir, std::env::var_os("GIT_CONFIG_PARAMETERS").as_deref())
+}
+
+#[cfg(unix)]
+fn build_hook_env(
+    dir: &std::path::Path,
+    inherited_parameters: Option<&OsStr>,
+) -> HashMap<OsString, OsString> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let mut parameters = inherited_parameters
+        .map(|value| value.as_bytes().to_vec())
+        .unwrap_or_default();
+    if !parameters.is_empty() {
+        parameters.push(b' ');
+    }
+    parameters.extend_from_slice(b"'core.hooksPath'='");
+    for byte in dir.as_os_str().as_bytes() {
+        if *byte == b'\'' {
+            parameters.extend_from_slice(b"'\\''");
+        } else {
+            parameters.push(*byte);
+        }
+    }
+    parameters.push(b'\'');
+
     HashMap::from([
-        ("OPENHUMAN_GIT_ATTRIBUTION".into(), TRAILER.into()),
-        ("GIT_CONFIG_COUNT".into(), "1".into()),
-        ("GIT_CONFIG_KEY_0".into(), "core.hooksPath".into()),
+        (OsString::from("OPENHUMAN_GIT_ATTRIBUTION"), TRAILER.into()),
+        // Parameters outrank GIT_CONFIG_COUNT. Preserve settings inherited
+        // from the parent harness, then append our hook so it wins if that
+        // harness also selected a hook path.
         (
-            "GIT_CONFIG_VALUE_0".into(),
-            dir.to_string_lossy().into_owned(),
+            OsString::from("GIT_CONFIG_PARAMETERS"),
+            OsString::from_vec(parameters),
         ),
     ])
 }
 
 #[cfg(not(unix))]
-pub fn hook_env() -> HashMap<String, String> {
+pub fn hook_env() -> HashMap<std::ffi::OsString, std::ffi::OsString> {
     HashMap::new()
 }
 
@@ -94,6 +123,7 @@ fn build_hook_dir() -> std::io::Result<PathBuf> {
 }
 
 #[cfg(all(unix, test))]
-pub(super) fn test_hook_dir() -> PathBuf {
-    build_hook_dir().expect("create OpenHuman hook directory")
+pub(super) fn test_hook_env(inherited_parameters: Option<&OsStr>) -> HashMap<OsString, OsString> {
+    let dir = build_hook_dir().expect("create OpenHuman hook directory");
+    build_hook_env(&dir, inherited_parameters)
 }

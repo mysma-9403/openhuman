@@ -8,10 +8,9 @@
 //! The binding is resolved by
 //! [`CoreContext::memory_binding`](crate::core::runtime::CoreContext::memory_binding),
 //! which keys on the context's workspace dir. The cache below is deliberately
-//! shaped like
-//! [`memory::people::store::for_workspace`](crate::openhuman::memory::people::store::for_workspace)
-//! — a **workspace-and-config-keyed map** — and deliberately *not* like
-//! [`memory::global`](crate::openhuman::memory::global), which is a single slot
+//! shaped like the engine's `people::store::for_workspace`
+//! — a **workspace-keyed map** — and deliberately *not* like the engine's
+//! `global` slot, which is a single slot
 //! holding "the one active-user workspace".
 //!
 //! That shape choice carries a real correctness property for free.
@@ -25,7 +24,7 @@
 //!
 //! ## Two vocabularies meet here, on purpose
 //!
-//! [`tinycortex_api`] is the *memory contract*: `MemoryProvider`,
+//! [`crate::openhuman::memory::api`] is the host-owned memory contract: `MemoryProvider`,
 //! `Capabilities`, `MemoryHealth`. [`crate::core::subsystem`] is the kernel's
 //! *generic* driver vocabulary shared with the subsystems that come after
 //! memory: `DriverClass`, `DriverCapabilities`, `DriverHealth`, `BoundDriver`.
@@ -34,69 +33,51 @@
 //! redefined here precisely because it is a *host* fact about how a driver was
 //! bound, identical for every subsystem.
 //!
-//! ## Scope of this step (M3d)
-//!
-//! The [`DriverClass::Embedded`] arm of [`build`] binds the real
-//! [`EmbeddedMemoryProvider`], which wraps the in-process tinycortex engine.
-//! [`DriverClass::Null`] still binds [`NullMemoryProvider`] — an operator who
-//! wrote `driver = "null"` asked for `/dev/null` and must get it — and so does
-//! every fallback.
-//!
-//! The embedded driver now implements **all thirteen** families, so a bound
-//! context and an unbound one advertise the same set. That was the whole point
-//! of M3: before it, binding *narrowed* the advertised set from thirteen
-//! families to the null placeholder's three, which made gating anything on
-//! `memory_capabilities()` actively dangerous. It is now safe, and M4 is where
-//! that gating lands.
-//!
-//! A fallback binding still advertises only the mandatory three, because a
-//! fallback really is the null placeholder — that is the honest answer, not a
-//! leftover.
+//! The built-in driver is the compiled TinyMemory TinyBus module. The host no
+//! longer exposes an embedded engine class for memory.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use tinycortex_api::capabilities::Capabilities;
-use tinycortex_api::health::MemoryHealth;
-use tinycortex_api::null::{NullMemoryProvider, NULL_DRIVER_ID};
-use tinycortex_api::provider::MemoryProvider;
-use tinycortex_api::CONTRACT_VERSION;
-
-use tinymemory::registry::{
-    ConfigLabels, DriverClass as ContractDriverClass, DriverEntry, DriverRegistry,
-};
+use crate::openhuman::memory::api::capabilities::Capabilities;
+use crate::openhuman::memory::api::health::MemoryHealth;
+use crate::openhuman::memory::api::provider::MemoryProvider;
+use crate::openhuman::memory::api::CONTRACT_VERSION;
+use crate::openhuman::memory::guard::{GuardPolicy, MemoryGuard};
+use tinymemory_api::null::{NullMemoryProvider, NULL_DRIVER_ID};
 
 use crate::core::subsystem::{
     BoundDriver, DriverCapabilities, DriverClass, DriverHealth, SubsystemSlot,
 };
-use crate::openhuman::memory::driver::embedded::EmbeddedMemoryProvider;
-use crate::openhuman::memory::guard::{GuardPolicy, MemoryGuard};
-use tinymemory_api::host::MemoryHooksConfig;
-use tinymemory_api::host::MemorySubsystemConfig;
+use crate::openhuman::config::schema::MemorySubsystemConfig;
+
+/// Registry id of the built-in TinyMemory module.
+pub(crate) const MODULE_ID: &str = "tinymemory";
 
 /// Why a bind fell back to the placeholder driver.
 ///
-/// Defined in [`tinymemory::registry`] alongside the admission rules that
-/// produce it. `reason` is operator-facing: it is logged, published on the
-/// event bus, and rendered in status, so it must never interpolate
-/// `credential_ref` or `endpoint` from
-/// [`tinymemory_api::host::MemoryDriverConfig`], which carries a
-/// manual redacting `Debug` for exactly that reason. The crate enforces this
-/// structurally — [`DriverEntry`] carries neither field, so a refusal built
-/// there cannot reach one. Pinned by
+/// `reason` is operator-facing: it is logged, published on the event bus, and
+/// rendered in status. It must therefore never interpolate `credential_ref` or
+/// `endpoint` from [`crate::openhuman::config::schema::MemoryDriverConfig`],
+/// which carries a manual redacting `Debug` for exactly that reason. Pinned by
 /// `fallback_reason_never_contains_credential_ref_or_endpoint`.
-pub use tinymemory::registry::FallbackReason;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackReason {
+    /// The driver id that was asked for in `[subsystems.memory] driver`.
+    pub configured_driver: String,
+    /// Why it was refused.
+    pub reason: String,
+}
 
 /// One bound memory driver, for one workspace.
 pub struct MemoryBinding {
     provider: Arc<dyn MemoryProvider>,
-    /// The policy decorator over [`Self::unguarded_provider`] — the handle product code
-    /// receives, via `CoreContext::memory()`. Built here rather than by each
-    /// caller so "every caller gets a guarded handle" holds by construction,
-    /// the same way `capabilities()` is asked exactly once by construction.
     guard: Arc<MemoryGuard>,
     driver_id: String,
+    /// The memory subtree this binding serves — `"memory"` for the shared tree,
+    /// `"memory-<id>"` for a profile that opted into dedicated memory.
+    memory_subdir: String,
     class: DriverClass,
     /// Asked **once**, at bind time, and cached here. The contract's
     /// `MemoryProvider::capabilities` doc is normative on this ("asked once at
@@ -107,39 +88,43 @@ pub struct MemoryBinding {
 }
 
 impl MemoryBinding {
-    /// The bound driver, **unguarded**.
-    ///
-    /// Retained for identity/health/status, which are liveness probes rather
-    /// than product code (`memory::ops::provider` is the one production
-    /// caller). New call sites want [`Self::guard`] — see
-    /// `CoreContext::memory()`.
-    ///
-    /// Named `unguarded_provider` rather than `provider` on purpose. The
-    /// enforcement lint in `memory::bypass_allowlist_tests` matches text, and a
-    /// `.provider(` needle would over-match `TaskSourceFilter::provider()` and
-    /// `ModelRef::provider()` — six junk allowlist entries, which is exactly
-    /// the rot `bypass_allowlist_has_no_stale_entries` exists to prevent. A
-    /// distinctive name gives the lint a needle with no false positives, and
-    /// puts the hazard in the reader's face at the call site.
-    ///
-    /// Visibility is narrowed to the memory family so the lint's text match is
-    /// backed by a *compiler*-enforced boundary: even if `MemoryBinding` grows
-    /// another reachable path, no module outside `openhuman::memory` can name
-    /// this accessor at all.
+    /// The bound driver.
+    pub fn provider(&self) -> &Arc<dyn MemoryProvider> {
+        &self.provider
+    }
+
     pub(crate) fn unguarded_provider(&self) -> &Arc<dyn MemoryProvider> {
         &self.provider
     }
 
-    /// The guarded driver — the only handle product code should hold
-    /// (`docs/specs/kernel.md` §3.4).
     pub fn guard(&self) -> Arc<MemoryGuard> {
         Arc::clone(&self.guard)
+    }
+
+    pub fn disables_memory(&self) -> bool {
+        self.class == DriverClass::Null && self.fallback.is_none()
     }
 
     /// The id of the driver that actually bound — `"null"` after a fallback,
     /// not the id that was asked for (that is in [`Self::fallback`]).
     pub fn driver_id(&self) -> &str {
         &self.driver_id
+    }
+
+    /// The memory subtree this binding resolved to.
+    ///
+    /// `"memory"` is the shared tree; `"memory-<id>"` is a profile that opted
+    /// into dedicated memory, and keeping the two apart is what makes
+    /// `dedicatedMemory` isolation hold.
+    ///
+    /// Worth an accessor because the routing decision is made **here**, at bind
+    /// time, but only reaches disk lazily: a module-backed driver opens the
+    /// subtree on its first call (`OpenStore`), so nothing observes the choice
+    /// until memory is actually used. Callers that need to report or assert
+    /// which tree they were bound to — status output, and the session-builder
+    /// tests — have no other way to see it.
+    pub fn memory_subdir(&self) -> &str {
+        &self.memory_subdir
     }
 
     /// How the bound driver was reached. A host fact, never self-reported.
@@ -156,27 +141,6 @@ impl MemoryBinding {
     /// driver bound as asked.
     pub fn fallback(&self) -> Option<&FallbackReason> {
         self.fallback.as_ref()
-    }
-
-    /// Whether the operator asked for memory to be **off**.
-    ///
-    /// True only for a deliberate `[subsystems.memory] driver = "null"` — the
-    /// class alone is not enough, because a *fallback* also binds the null
-    /// placeholder and a misconfiguration must not silently take memory away
-    /// with it. A fallback is loud (`fallback()` is `Some`, status reports it)
-    /// and keeps the surface present.
-    ///
-    /// Read by [`CoreContext::memory_capabilities`](crate::core::runtime::context::CoreContext::memory_capabilities),
-    /// which answers with the empty set here, so the memory RPC methods and
-    /// memory agent tools are **absent** rather than present-and-answering off
-    /// some other store. That matters because most memory handlers still reach
-    /// the engine directly through `active_memory_client()` — the guarded
-    /// re-point is incremental and tracked in
-    /// `docs/specs/memory-guard-allowlist.md` — so leaving the surface
-    /// registered under a null binding would read the embedded SQLite store an
-    /// operator believed they had turned off.
-    pub fn disables_memory(&self) -> bool {
-        self.class == DriverClass::Null && self.fallback.is_none()
     }
 
     /// This binding in the kernel's generic vocabulary, for the subsystem
@@ -223,67 +187,10 @@ pub fn unbound_default_capabilities() -> Capabilities {
     Capabilities::all()
 }
 
-/// The registry of driver ids whose class this host fixes.
-///
-/// [`DriverRegistry::builtin`] already reserves `null` and `tinycortex`, which
-/// are exactly this host's two built-in ids — so the builtin set is used as-is
-/// rather than re-declared. A host bundling an adapter the crate does not know
-/// about would add it here with `with_reserved`.
-fn registry() -> DriverRegistry {
-    DriverRegistry::builtin()
-}
-
-/// The config-path spellings quoted back to the operator in refusal messages.
-///
-/// The crate does not know what this host's config file looks like; these are
-/// the blocks an operator would actually edit.
-const CONFIG_LABELS: ConfigLabels<'static> = ConfigLabels {
-    section: "[subsystems.memory]",
-    drivers: "[subsystems.memory.drivers]",
-    driver_entry: "[subsystems.memory.drivers.<id>]",
-};
-
-/// The class a built-in driver id is *fixed* to, or `None` for any other id.
-///
-/// Both built-in ids name one specific implementation, so the registry is the
-/// authority for their class in every path — the implicit one and the explicit
-/// `class = …` line, which may only confirm what this returns.
-pub(crate) fn reserved_class(id: &str) -> Option<DriverClass> {
-    registry().reserved_class(id).map(from_contract_class)
-}
-
-/// The contract's driver class in the kernel's generic vocabulary.
-///
-/// A total three-arm match, which is why both enums were shaped one-for-one.
-/// The kernel's own enum is deliberately not replaced by the contract's: it is
-/// shared with the subsystems that come after memory, which must not inherit
-/// their vocabulary from a *memory* crate.
-fn from_contract_class(class: ContractDriverClass) -> DriverClass {
-    match class {
-        ContractDriverClass::Embedded => DriverClass::Embedded,
-        ContractDriverClass::External => DriverClass::External,
-        ContractDriverClass::Null => DriverClass::Null,
-    }
-}
-
 /// Decide, from config alone, whether the configured driver may bind.
 ///
 /// Pure — no I/O, no globals — so the fail-closed trust rule is unit-testable
 /// without booting anything.
-///
-/// The rules themselves live in [`tinymemory::registry`], because they are the
-/// one part of binding with the same correct answer for every host: a built-in
-/// id's class is fixed and an explicit `class` line may only confirm it, an
-/// unknown id is refused rather than guessed, and an external driver is
-/// fail-closed on trust. This function is the projection from *this* host's
-/// config shape onto that decision, and the conversion back into the kernel's
-/// generic driver vocabulary.
-///
-/// Note what is deliberately **not** passed to the crate: only the `class` and
-/// `trust_state` of the driver entry cross, never `credential_ref` or
-/// `endpoint`. A refusal message is operator-facing and logged, so the narrow
-/// projection is what makes "no secret can appear in a refusal" structural
-/// rather than a rule someone has to remember.
 ///
 /// # Errors
 ///
@@ -291,44 +198,119 @@ fn from_contract_class(class: ContractDriverClass) -> DriverClass {
 /// driver is refused. Callers fall back rather than failing: kernel.md §3.7
 /// requires the subsystem stay bound, loudly.
 pub fn admit(cfg: &MemorySubsystemConfig) -> Result<(String, DriverClass), FallbackReason> {
-    let id = cfg.driver.trim();
-    let entry = cfg.drivers.get(id).map(|entry| DriverEntry {
-        class: entry.class.as_deref(),
-        trust_state: entry.trust_state.as_str(),
-    });
+    let configured_id = cfg.driver.trim();
+    if configured_id.is_empty() {
+        return Err(FallbackReason {
+            configured_driver: String::new(),
+            reason: "[subsystems.memory] driver is empty".to_string(),
+        });
+    }
 
-    let admission = registry().admit(&cfg.driver, entry, CONFIG_LABELS)?;
-    Ok((admission.id, from_contract_class(admission.class)))
+    let refuse = |reason: &str| FallbackReason {
+        configured_driver: configured_id.to_string(),
+        reason: reason.to_string(),
+    };
+
+    // Temporary persisted-config alias. The schema still comes from the
+    // legacy contract until its remaining engine callers are moved onto the
+    // host-owned copy; both values bind the compiled module and report its
+    // actual id. Remove this alias with that final schema cutover.
+    const LEGACY_MODULE_ID: &str = "tinycortex";
+    let id = if configured_id == LEGACY_MODULE_ID {
+        MODULE_ID
+    } else {
+        configured_id
+    };
+
+    // The two built-ins need no `[subsystems.memory.drivers.<id>]` entry.
+    let Some(entry) = cfg
+        .drivers
+        .get(configured_id)
+        .or_else(|| cfg.drivers.get(id))
+    else {
+        return match id {
+            NULL_DRIVER_ID => Ok((id.to_string(), DriverClass::Null)),
+            MODULE_ID => Ok((id.to_string(), DriverClass::Module)),
+            _ => Err(refuse(&format!(
+                "driver '{id}' is not built in; add [subsystems.memory.drivers.{id}] with an explicit class line"
+            ))),
+        };
+    };
+
+    let class = match entry.class.as_deref() {
+        None if id == NULL_DRIVER_ID => DriverClass::Null,
+        None if id == MODULE_ID => DriverClass::Module,
+        None => {
+            return Err(refuse(&format!(
+                "driver '{id}' is not built in and requires an explicit class line"
+            )))
+        }
+        Some(raw) => DriverClass::parse(raw).map_err(|e| refuse(&e))?,
+    };
+
+    if class == DriverClass::Embedded {
+        return Err(refuse(
+            "embedded memory drivers are no longer supported; use the 'tinymemory' module driver",
+        ));
+    }
+
+    let built_in_class = match id {
+        NULL_DRIVER_ID => Some(DriverClass::Null),
+        MODULE_ID => Some(DriverClass::Module),
+        _ => None,
+    };
+    if let Some(expected) = built_in_class {
+        if class != expected {
+            return Err(refuse(&format!(
+                "built in driver '{configured_id}' has class '{expected}' and cannot be re-classed as '{class}'"
+            )));
+        }
+    }
+
+    if class == DriverClass::Module && id != MODULE_ID {
+        return Err(refuse(&format!(
+            "module driver '{id}' is not registered; the built-in memory module id is '{MODULE_ID}'"
+        )));
+    }
+
+    if class == DriverClass::External {
+        // kernel.md §3.4: fail-closed. Trust must be explicitly raised before
+        // an out-of-process driver is allowed to answer for memory.
+        if entry.trust_state != "trusted" {
+            return Err(refuse(
+                "external driver is untrusted: set trust_state = \"trusted\" \
+                 under [subsystems.memory.drivers] to allow this binding",
+            ));
+        }
+        // Distinct reason string from the trust refusal above, so the trust
+        // test cannot pass for the wrong reason.
+        return Err(refuse(
+            "external driver transport is not implemented yet (the http adapter lands in M4)",
+        ));
+    }
+
+    Ok((id.to_string(), class))
 }
 
 /// Build the binding for a workspace. Infallible by design: an inadmissible
 /// driver falls back to the placeholder rather than leaving the slot empty
 /// (kernel.md §3.7 — "logged loudly, surfaced in status, never silent").
-fn build(workspace_dir: &Path, cfg: &MemorySubsystemConfig) -> MemoryBinding {
+fn build(workspace_dir: &Path, memory_subdir: &str, cfg: &MemorySubsystemConfig) -> MemoryBinding {
     match admit(cfg) {
         Ok((driver_id, class)) => {
-            let provider: Arc<dyn MemoryProvider> = match class {
-                // Construction is deliberately sync and I/O-free: this runs on
-                // `CoreContext::memory_binding`, which ~4000 pre-boot tests
-                // call with no tokio runtime. The driver resolves its client on
-                // first use — see `driver::embedded`'s module docs.
-                DriverClass::Embedded => {
-                    Arc::new(EmbeddedMemoryProvider::new(workspace_dir, cfg.hooks))
-                }
-                DriverClass::Null => Arc::new(NullMemoryProvider::new()),
-                // Unreachable: `admit` refuses every external driver above, so
-                // this arm cannot bind a transport that does not exist yet.
-                DriverClass::External => Arc::new(NullMemoryProvider::new()),
-            };
-            // The configured trust state for the driver that actually bound.
-            // Absent `[subsystems.memory.drivers.<id>]` entry ⇒ the fail-closed
-            // default, which only ever matters for an external class.
-            let trust_state = cfg
-                .drivers
-                .get(&driver_id)
-                .map(|entry| entry.trust_state.clone())
-                .unwrap_or_else(|| crate::openhuman::memory::guard::policy::TRUSTED.to_string());
-            let binding = bind_provider(provider, driver_id, class, cfg.hooks, trust_state, None);
+            let (provider, reported_class): (Arc<dyn MemoryProvider>, DriverClass) =
+                if class == DriverClass::Null {
+                    (Arc::new(NullMemoryProvider::new()), DriverClass::Null)
+                } else {
+                    module_provider(workspace_dir, memory_subdir)
+                };
+            let binding = bind_provider(
+                provider,
+                driver_id,
+                memory_subdir.to_string(),
+                reported_class,
+                None,
+            );
             log::info!(
                 "[memory:binding] workspace={} bound driver='{}' class={} capabilities=[{}]",
                 workspace_dir.display(),
@@ -353,8 +335,8 @@ fn build(workspace_dir: &Path, cfg: &MemorySubsystemConfig) -> MemoryBinding {
             );
             // Sync, and a no-op when the bus is not yet initialized, so this is
             // safe to call pre-boot with no `#[cfg(test)]` guard.
-            crate::openhuman::memory::events::publish(
-                crate::openhuman::memory::events::MemoryEvent::DriverBindFailed {
+            crate::core::bus::BUS.publish(
+                crate::core::events::DomainEvent::MemoryDriverBindFailed {
                     configured_driver: fallback.configured_driver.clone(),
                     bound_driver: NULL_DRIVER_ID.to_string(),
                     reason: fallback.reason.clone(),
@@ -363,17 +345,73 @@ fn build(workspace_dir: &Path, cfg: &MemorySubsystemConfig) -> MemoryBinding {
             bind_provider(
                 Arc::new(NullMemoryProvider::new()),
                 NULL_DRIVER_ID.to_string(),
+                memory_subdir.to_string(),
                 DriverClass::Null,
-                cfg.hooks,
-                // The fallback binds the in-process placeholder, so there is no
-                // boundary to cross and nothing to trust-gate. The refused
-                // driver's own trust_state is deliberately NOT carried over —
-                // it describes a binding that did not happen.
-                crate::openhuman::memory::guard::policy::TRUSTED.to_string(),
                 Some(fallback),
             )
         }
     }
+}
+
+#[cfg(all(feature = "modules", not(test)))]
+fn module_provider(
+    _workspace_dir: &Path,
+    memory_subdir: &str,
+) -> (Arc<dyn MemoryProvider>, DriverClass) {
+    // The workspace itself still comes from the boot policy — the module is
+    // loaded once per process and captures it at setup. The **subtree** is per
+    // binding, and the module opens it on first use.
+    (
+        Arc::new(
+            crate::openhuman::modules::memory::ModuleMemoryProvider::from_boot_policy()
+                .in_subdir(memory_subdir),
+        ),
+        DriverClass::Module,
+    )
+}
+
+#[cfg(all(feature = "modules", test))]
+fn module_provider(
+    _workspace_dir: &Path,
+    memory_subdir: &str,
+) -> (Arc<dyn MemoryProvider>, DriverClass) {
+    // Unit tests do not run the full boot sequence that publishes the module
+    // policy. A native module is loaded once per process and therefore captures
+    // the first workspace it receives. Pin every test binding to the same
+    // workspace as the process-global test client so concurrent tests cannot
+    // win module initialization with an unrelated tempdir and split guarded
+    // writes from legacy read-back calls.
+    let workspace_dir = crate::openhuman::memory::ops::shared_memory_test_workspace();
+    let mut config = crate::openhuman::config::Config::default();
+    config.workspace_dir = workspace_dir.clone();
+    config.modules.install_dir = Some(workspace_dir.join("modules").to_string_lossy().into_owned());
+    if let Some(path) = std::env::var_os("TINYMEMORY_TEST_MODULE") {
+        config
+            .modules
+            .overrides
+            .push(crate::openhuman::config::schema::ModuleOverride {
+                id: MODULE_ID.to_string(),
+                path: path.to_string_lossy().into_owned(),
+            });
+    }
+    (
+        Arc::new(
+            crate::openhuman::modules::memory::ModuleMemoryProvider::new(Arc::new(config))
+                .in_subdir(memory_subdir),
+        ),
+        DriverClass::Module,
+    )
+}
+
+#[cfg(not(feature = "modules"))]
+fn module_provider(
+    _workspace_dir: &Path,
+    _memory_subdir: &str,
+) -> (Arc<dyn MemoryProvider>, DriverClass) {
+    log::warn!(
+        "[memory:binding] the 'modules' feature is disabled; binding the null memory provider"
+    );
+    (Arc::new(NullMemoryProvider::new()), DriverClass::Null)
 }
 
 /// The single place `capabilities()` is asked. Every construction path — real
@@ -382,27 +420,25 @@ fn build(workspace_dir: &Path, cfg: &MemorySubsystemConfig) -> MemoryBinding {
 fn bind_provider(
     provider: Arc<dyn MemoryProvider>,
     driver_id: String,
+    memory_subdir: String,
     class: DriverClass,
-    hooks: MemoryHooksConfig,
-    trust_state: String,
     fallback: Option<FallbackReason>,
 ) -> MemoryBinding {
     let capabilities = provider.capabilities();
-    // Built on the same single path, so a binding can never exist without its
-    // guard and no caller has to remember to construct one.
     let guard = Arc::new(MemoryGuard::new(
         Arc::clone(&provider),
         Arc::new(GuardPolicy::new(
             driver_id.clone(),
             class,
-            hooks,
-            trust_state,
+            crate::openhuman::config::schema::MemoryHooksConfig::default(),
+            "trusted",
         )),
     ));
     MemoryBinding {
         provider,
         guard,
         driver_id,
+        memory_subdir,
         class,
         capabilities,
         fallback,
@@ -419,33 +455,17 @@ pub(crate) fn bind_provider_for_test(
     class: DriverClass,
 ) -> MemoryBinding {
     let driver_id = provider.driver_id().to_string();
-    bind_provider(
-        provider,
-        driver_id,
-        class,
-        MemoryHooksConfig::default(),
-        crate::openhuman::memory::guard::policy::TRUSTED.to_string(),
-        None,
-    )
+    bind_provider(provider, driver_id, "memory".to_string(), class, None)
 }
 
 /// Per-workspace binding cache. Same shape as
 /// `memory::people::store::STORES` — see the module docs for why this is a map
 /// and not a slot.
-///
-/// Keyed on the **binding-relevant config as well as the path**, not the path
-/// alone, because a config change for an already-bound workspace must produce a
-/// fresh binding. `CoreContext::rebind_workspace` deliberately treats "same
-/// workspace, changed `[subsystems.memory]`" as a real rebind — a changed
-/// `driver` / `hooks` / `drivers` (trust) all feed `build`, so a path-only key
-/// would keep serving the previous driver until restart. Carrying
-/// `MemorySubsystemConfig` in the key (it derives `Hash`) means a changed
-/// config hits a different slot and binds fresh, while a returned-to config
-/// still resolves its original binding.
-type BindingCacheKey = (PathBuf, MemorySubsystemConfig);
-type BindingCache = RwLock<HashMap<BindingCacheKey, Arc<MemoryBinding>>>;
-
-static BINDINGS: OnceLock<BindingCache> = OnceLock::new();
+/// Keyed by workspace **and memory subtree**: a profile that opted into
+/// dedicated memory is a different store, so it must be a different binding.
+/// The subtree is `"memory"` for every ordinary caller.
+type BindingCacheKey = (PathBuf, String, MemorySubsystemConfig);
+static BINDINGS: OnceLock<RwLock<HashMap<BindingCacheKey, Arc<MemoryBinding>>>> = OnceLock::new();
 
 /// The bound memory driver for `workspace_dir`, constructing it on first use.
 ///
@@ -460,8 +480,172 @@ pub fn for_workspace(
     workspace_dir: &Path,
     cfg: &MemorySubsystemConfig,
 ) -> Result<Arc<MemoryBinding>, String> {
+    for_subtree(workspace_dir, "memory", cfg)
+}
+
+/// A driver that reports the diagnostics it was handed, and does nothing else.
+///
+/// Reads that used to hit the engine's tables go through the contract now, and
+/// the real driver is a compiled module that cannot load inside a unit test —
+/// so a test workspace binds the null driver and every diagnostic answers
+/// empty. A handler that used to be provable by writing rows and calling it
+/// needs a driver in between.
+///
+/// The split that leaves is the honest one. What a handler *derives* from the
+/// numbers is the host's rule and belongs in the host's tests, which is what
+/// this exists for. What a given store *is* — that an ingest raises the chunk
+/// count, that a deferred job stays ready without becoming eligible — is the
+/// driver's rule, pinned in the driver's own conformance suite against a real
+/// store.
+///
+/// Everything outside `Maintenance` delegates to the null driver: a test that
+/// needed those would be testing something this double is the wrong shape for.
+#[cfg(test)]
+pub(crate) struct FixedDiagnostics {
+    inner: NullMemoryProvider,
+    /// How many times the host has asked this driver to retry failed work,
+    /// and how many jobs it should say it requeued when asked.
+    ///
+    /// The gate in front of the ask is host logic — only an embedder change
+    /// should un-park anything — so a test needs to see whether the ask
+    /// happened, separately from what the driver would have done.
+    retry_calls: std::sync::atomic::AtomicUsize,
+    retry_requeues: u64,
+    /// How many times the host has asked this driver to re-embed.
+    ///
+    /// `reembed` enqueues work rather than doing it, so the host's side of that
+    /// contract is only that it *asked* — whether a row appears is the driver's
+    /// business, and pinning it here would test the driver through the host.
+    reembed_calls: std::sync::atomic::AtomicUsize,
+    store: crate::openhuman::memory::api::provider::types::StoreStats,
+    queue: crate::openhuman::memory::api::provider::types::QueueStats,
+    failure: Option<crate::openhuman::memory::api::provider::types::QueueFailure>,
+    /// What this driver says about a backfill running in its process.
+    ///
+    /// Separate from [`Self::queue`] on purpose, mirroring the contract: the
+    /// flag is not derivable from the counts, and a test that needs the gap
+    /// between them — nothing ready, nothing running, backfill unfinished —
+    /// has to set the two independently.
+    backfill: bool,
+    /// What [`MemoryMaintenance::flush_pending`] answers, when a test sets it.
+    flush: crate::openhuman::memory::api::provider::types::FlushOutcome,
+    /// What [`MemoryMaintenance::reset_derived_index`] answers, likewise.
+    reset: crate::openhuman::memory::api::provider::types::ResetOutcome,
+}
+
+#[cfg(test)]
+#[path = "binding_fixed_diagnostics_impl_tests.rs"]
+mod fixed_diagnostics_impl;
+
+/// Bind a driver reporting fixed diagnostics as this workspace's driver.
+///
+/// The shorthand every test needs that reaches a handler reading through
+/// `Maintenance`. Without a binding installed, resolving one attempts to load
+/// the compiled module, and in a test process that can block rather than
+/// fail — the module host's runtime belongs to whichever test created it, so
+/// a later test finds a broker whose tasks are already gone.
+#[cfg(test)]
+pub(crate) fn install_diagnostics_for_test(
+    workspace_dir: &Path,
+    cfg: &MemorySubsystemConfig,
+    store: crate::openhuman::memory::api::provider::types::StoreStats,
+    queue: crate::openhuman::memory::api::provider::types::QueueStats,
+) -> Arc<FixedDiagnostics> {
+    let driver = Arc::new(FixedDiagnostics::new(store, queue));
+    install_for_test(
+        workspace_dir,
+        cfg,
+        Arc::clone(&driver) as Arc<dyn MemoryProvider>,
+    );
+    driver
+}
+
+/// Bind a driver that reports `requeued` from `retry_failed` and counts the
+/// asks, for tests about *when* the host asks rather than what a queue does.
+#[cfg(test)]
+pub(crate) fn install_retrying_driver_for_test(
+    config: &crate::openhuman::config::Config,
+    requeued: u64,
+) -> Arc<FixedDiagnostics> {
+    let driver = Arc::new(
+        FixedDiagnostics::new(Default::default(), Default::default()).requeueing(requeued),
+    );
+    install_for_test(
+        &config.workspace_dir,
+        &config.subsystems.memory,
+        Arc::clone(&driver) as Arc<dyn MemoryProvider>,
+    );
+    driver
+}
+
+/// Install `provider` as the binding a workspace resolves to.
+///
+/// The cache below is normally filled by [`build`], which binds the compiled
+/// TinyMemory module — and that module is not loadable inside a unit test, so
+/// a test workspace otherwise resolves to the null driver and every read
+/// through the contract answers empty.
+///
+/// That matters more since reads moved off the engine: a handler that used to
+/// be provable by writing rows and calling it now needs a driver in between.
+/// This is the seam that puts one there.
+///
+/// Test-only. It writes a process-global map, so a test using it must own the
+/// workspace path it installs against — which a `tempdir` does.
+#[cfg(test)]
+pub(crate) fn install_for_test(
+    workspace_dir: &Path,
+    cfg: &MemorySubsystemConfig,
+    provider: Arc<dyn MemoryProvider>,
+) {
+    let binding = Arc::new(bind_provider_for_test(provider, DriverClass::Module));
+    let key = (
+        workspace_dir.to_path_buf(),
+        "memory".to_string(),
+        cfg.clone(),
+    );
+    BINDINGS
+        .get_or_init(Default::default)
+        .write()
+        .expect("binding cache lock")
+        .insert(key, binding);
+}
+
+/// The bound memory driver for the workspace a whole [`Config`] names.
+///
+/// The two pieces [`for_workspace`] needs sit in different halves of `Config`,
+/// so most call sites were spelling the same pair out. It is the same cached
+/// binding either way.
+///
+/// [`Config`]: crate::openhuman::config::Config
+///
+/// # Errors
+///
+/// Only lock poisoning, as [`for_workspace`].
+pub fn for_config(config: &crate::openhuman::config::Config) -> Result<Arc<MemoryBinding>, String> {
+    for_workspace(&config.workspace_dir, &config.subsystems.memory)
+}
+
+/// The bound memory driver for one **memory subtree** of `workspace_dir`.
+///
+/// `"memory"` is the shared tree and is what [`for_workspace`] passes;
+/// `"memory-<id>"` is a profile that opted into dedicated memory. Each subtree
+/// gets its own binding and therefore its own driver, which is the whole point
+/// — two profiles with dedicated memory must not see each other's entries.
+///
+/// # Errors
+///
+/// Only lock poisoning, as [`for_workspace`].
+pub fn for_subtree(
+    workspace_dir: &Path,
+    memory_subdir: &str,
+    cfg: &MemorySubsystemConfig,
+) -> Result<Arc<MemoryBinding>, String> {
     let cache = BINDINGS.get_or_init(Default::default);
-    let key = (workspace_dir.to_path_buf(), cfg.clone());
+    let key = (
+        workspace_dir.to_path_buf(),
+        memory_subdir.to_string(),
+        cfg.clone(),
+    );
     if let Some(binding) = cache
         .read()
         .map_err(|e| format!("[memory:binding] cache read lock poisoned: {e}"))?
@@ -470,15 +654,14 @@ pub fn for_workspace(
         return Ok(Arc::clone(binding));
     }
 
-    let binding = Arc::new(build(workspace_dir, cfg));
+    let binding = Arc::new(build(workspace_dir, memory_subdir, cfg));
 
     let mut guard = cache
         .write()
         .map_err(|e| format!("[memory:binding] cache write lock poisoned: {e}"))?;
     // Re-check under the write lock: a racing caller may have bound the same
-    // workspace (and config) while we were building. Reuse theirs so one
-    // workspace never has two live drivers for the same config (kernel.md §3.1)
-    // and `capabilities()` stays asked once.
+    // workspace while we were building. Reuse theirs so one workspace never has
+    // two live drivers (kernel.md §3.1) and `capabilities()` stays asked once.
     let entry = guard.entry(key).or_insert_with(|| Arc::clone(&binding));
     Ok(Arc::clone(entry))
 }

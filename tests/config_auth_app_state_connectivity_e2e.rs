@@ -1066,9 +1066,6 @@ fn config_schema_defaults_cover_dashboard_capability_memory_and_security_shapes(
     assert_eq!(audit.log_path, "audit.log");
     assert_eq!(audit.max_size_mb, 100);
 
-    let meet: openhuman_core::openhuman::config::schema::MeetConfig =
-        serde_json::from_value(json!({})).expect("meet defaults");
-    assert!(!meet.auto_orchestrator_handoff);
     let observability: openhuman_core::openhuman::config::schema::ObservabilityConfig =
         serde_json::from_value(json!({})).expect("observability defaults");
     assert!(observability.analytics_enabled);
@@ -2807,21 +2804,18 @@ async fn worker_a_controller_schemas_are_fully_exposed() {
                 "openhuman.config_get_dashboard_settings",
                 "openhuman.config_get_data_paths",
                 "openhuman.config_get_dictation_settings",
-                "openhuman.config_get_meet_settings",
                 "openhuman.config_get_memory_sync_settings",
                 "openhuman.config_get_onboarding_completed",
                 "openhuman.config_get_privacy_mode",
                 "openhuman.config_get_runtime_flags",
                 "openhuman.config_get_sandbox_settings",
                 "openhuman.config_get_search_settings",
-                "openhuman.config_get_super_context_enabled",
                 "openhuman.config_get_voice_server_settings",
                 "openhuman.config_reset_local_data",
                 "openhuman.config_resolve_api_url",
                 "openhuman.config_set_browser_allow_all",
                 "openhuman.config_set_onboarding_completed",
                 "openhuman.config_set_privacy_mode",
-                "openhuman.config_set_super_context_enabled",
                 "openhuman.config_update_activity_level_settings",
                 "openhuman.config_update_agent_paths",
                 "openhuman.config_update_agent_settings",
@@ -2831,7 +2825,6 @@ async fn worker_a_controller_schemas_are_fully_exposed() {
                 "openhuman.config_update_composio_trigger_settings",
                 "openhuman.config_update_dictation_settings",
                 "openhuman.config_update_local_ai_settings",
-                "openhuman.config_update_meet_settings",
                 "openhuman.config_update_memory_settings",
                 "openhuman.config_update_memory_sync_settings",
                 "openhuman.config_update_model_settings",
@@ -3282,30 +3275,6 @@ async fn config_runtime_flags_settings_readbacks_and_validation_paths_are_exerci
             .get("enabled")
             .and_then(Value::as_bool),
         Some(false)
-    );
-
-    ok(
-        &rpc(
-            &harness.rpc_base,
-            11_006,
-            "openhuman.config_update_meet_settings",
-            json!({ "auto_orchestrator_handoff": true }),
-        )
-        .await,
-        "update_meet_settings true",
-    );
-    let meet = rpc(
-        &harness.rpc_base,
-        11_007,
-        "openhuman.config_get_meet_settings",
-        json!({}),
-    )
-    .await;
-    assert_eq!(
-        payload(&meet, "get_meet_settings")
-            .get("auto_orchestrator_handoff")
-            .and_then(Value::as_bool),
-        Some(true)
     );
 
     let onboarding_before = rpc(

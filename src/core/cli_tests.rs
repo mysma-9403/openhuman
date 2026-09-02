@@ -1,6 +1,6 @@
 use super::{
     grouped_schemas, load_dotenv_for_cli, parse_function_params, parse_input_value,
-    should_auto_launch_tui, strip_no_tui,
+    parse_launch_options, should_auto_launch_tui,
 };
 use crate::core::types::HostKind;
 use crate::core::{ControllerSchema, FieldSchema, TypeSchema};
@@ -64,16 +64,52 @@ fn explicit_args_never_trigger_bare_cli_auto_launch() {
 }
 
 #[test]
-fn no_tui_is_stripped_before_normal_cli_dispatch() {
+fn launch_options_parse_model_provider_and_no_tui_before_command() {
     let args = vec![
         "--no-tui".to_string(),
+        "--model".to_string(),
+        "qwen3:8b".to_string(),
+        "--provider-id=ollama".to_string(),
         "run".to_string(),
         "--jsonrpc-only".to_string(),
     ];
-    assert_eq!(strip_no_tui(&args), &args[1..]);
+    let parsed = parse_launch_options(&args).expect("global options");
+    assert!(parsed.no_tui);
+    assert_eq!(parsed.model.as_deref(), Some("qwen3:8b"));
+    assert_eq!(parsed.provider.as_deref(), Some("ollama"));
+    assert_eq!(parsed.args, ["run", "--jsonrpc-only"]);
+}
 
-    let ordinary = vec!["run".to_string()];
-    assert_eq!(strip_no_tui(&ordinary), ordinary.as_slice());
+#[test]
+fn launch_options_support_short_flags_and_last_value_wins() {
+    let args = ["-m", "old", "--model=new", "-p", "p_openai", "tui"].map(str::to_string);
+    let parsed = parse_launch_options(&args).expect("global options");
+    assert_eq!(parsed.model.as_deref(), Some("new"));
+    assert_eq!(parsed.provider.as_deref(), Some("p_openai"));
+    assert_eq!(parsed.args, ["tui"]);
+}
+
+#[test]
+fn launch_options_stop_at_the_subcommand() {
+    let args = ["inference", "list_models", "--provider", "openai"].map(str::to_string);
+    let parsed = parse_launch_options(&args).expect("global options");
+    assert_eq!(parsed.args, args);
+    assert_eq!(parsed.provider, None);
+}
+
+#[test]
+fn launch_options_reject_missing_or_empty_values() {
+    for args in [
+        vec!["--model".to_string()],
+        vec!["--provider=".to_string()],
+        vec![
+            "--model".to_string(),
+            "--provider".to_string(),
+            "ollama".to_string(),
+        ],
+    ] {
+        assert!(parse_launch_options(&args).is_err());
+    }
 }
 
 /// Serialises env-mutating CLI tests via the crate-wide backend env lock —
@@ -330,7 +366,7 @@ use crate::core::all::{
     capability_for_parts, capability_for_rpc_method, sole_capability_for_namespace,
 };
 use crate::core::cli_capability::capability_verdict;
-use tinycortex_api::capabilities::Capabilities;
+use tinymemory_api::capabilities::Capabilities;
 
 #[test]
 fn capability_gated_namespace_reports_a_config_fact_not_a_typo() {
@@ -368,7 +404,7 @@ fn capability_gated_function_reports_a_config_fact_not_a_typo() {
 fn capability_gated_rpc_method_reports_its_family_unfiltered() {
     assert_eq!(
         capability_for_rpc_method("openhuman.memory_tree_wipe_all"),
-        Some(Some(tinycortex_api::capabilities::Capability::Tree))
+        Some(Some(tinymemory_api::capabilities::Capability::Tree))
     );
 }
 
@@ -410,15 +446,11 @@ fn default_build_leaves_the_generic_namespace_path_unchanged() {
     for ns in ["memory", "memory_tree", "memory_goals"] {
         assert!(grouped.contains_key(ns), "`{ns}` must still be listed");
     }
-    #[cfg(feature = "memory-git")]
-    assert!(
-        grouped.contains_key("memory_diff"),
-        "`memory_diff` must be listed when the memory-git feature is enabled"
-    );
-    #[cfg(not(feature = "memory-git"))]
+    // `memory_diff` was removed with the `memory-git` gate; it must not come
+    // back as a listed namespace.
     assert!(
         !grouped.contains_key("memory_diff"),
-        "`memory_diff` must be absent when the memory-git feature is disabled"
+        "`memory_diff` was removed and must not be listed"
     );
 }
 

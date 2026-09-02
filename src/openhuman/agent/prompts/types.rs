@@ -415,7 +415,6 @@ pub trait PromptSection: Send + Sync {
 pub struct SubagentRenderOptions {
     pub include_safety_preamble: bool,
     pub include_identity: bool,
-    pub include_skills_catalog: bool,
     pub include_profile: bool,
     pub include_memory_md: bool,
 }
@@ -431,14 +430,12 @@ impl SubagentRenderOptions {
     pub fn from_definition_flags(
         omit_identity: bool,
         omit_safety_preamble: bool,
-        omit_skills_catalog: bool,
         omit_profile: bool,
         omit_memory_md: bool,
     ) -> Self {
         Self {
             include_identity: !omit_identity,
             include_safety_preamble: !omit_safety_preamble,
-            include_skills_catalog: !omit_skills_catalog,
             include_profile: !omit_profile,
             include_memory_md: !omit_memory_md,
         }

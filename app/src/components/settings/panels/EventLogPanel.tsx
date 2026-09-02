@@ -28,18 +28,29 @@ const DOMAIN_BADGE_KEYS: Record<string, string> = {
   mcp_client: 'settings.developerMenu.eventLog.badge.mcp',
 };
 
+/**
+ * Domain tone table. Eleven domains, four themeable ramps — so the hue is spent
+ * on the three readings a reader scans for in a live log (who acted: the agent
+ * or a tool; and which rows are waiting on a human) and every other domain
+ * takes the neutral pair `system` already used. Coral is deliberately left
+ * unassigned: nothing here means "failure", and painting an ordinary domain in
+ * the danger ramp would make routine events read as errors. The badge prints
+ * the domain name either way. See `gitbooks/developing/theming.md`.
+ */
+const DOMAIN_NEUTRAL_TONE = { bg: 'bg-content-muted/20', text: 'text-content-secondary' } as const;
+
 const DOMAIN_BADGE_COLORS: Record<string, { bg: string; text: string }> = {
-  tool: { bg: 'bg-blue-500/20', text: 'text-blue-400' },
-  agent: { bg: 'bg-green-500/20', text: 'text-green-400' },
-  system: { bg: 'bg-slate-500/20', text: 'text-slate-400' },
-  memory: { bg: 'bg-purple-500/20', text: 'text-purple-400' },
-  channel: { bg: 'bg-cyan-500/20', text: 'text-cyan-400' },
-  cron: { bg: 'bg-orange-500/20', text: 'text-orange-400' },
-  webhook: { bg: 'bg-indigo-500/20', text: 'text-indigo-400' },
+  tool: { bg: 'bg-primary-500/20', text: 'text-primary-400' },
+  agent: { bg: 'bg-sage-500/20', text: 'text-sage-400' },
+  system: DOMAIN_NEUTRAL_TONE,
+  memory: DOMAIN_NEUTRAL_TONE,
+  channel: DOMAIN_NEUTRAL_TONE,
+  cron: DOMAIN_NEUTRAL_TONE,
+  webhook: DOMAIN_NEUTRAL_TONE,
   approval: { bg: 'bg-amber-500/20', text: 'text-amber-400' },
-  skill: { bg: 'bg-teal-500/20', text: 'text-teal-400' },
-  composio: { bg: 'bg-pink-500/20', text: 'text-pink-400' },
-  mcp_client: { bg: 'bg-violet-500/20', text: 'text-violet-400' },
+  skill: DOMAIN_NEUTRAL_TONE,
+  composio: DOMAIN_NEUTRAL_TONE,
+  mcp_client: DOMAIN_NEUTRAL_TONE,
 };
 
 const MAX_ENTRIES = 200;
@@ -282,7 +293,7 @@ const EventLogPanel = () => {
           )}
           {filteredEntries.map(entry => {
             const colors = DOMAIN_BADGE_COLORS[entry.domain] || {
-              bg: 'bg-neutral-500/20',
+              bg: 'bg-content-muted/20',
               text: 'text-content-faint',
             };
             return (

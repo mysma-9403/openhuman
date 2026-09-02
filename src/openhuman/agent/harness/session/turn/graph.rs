@@ -79,7 +79,7 @@ pub(crate) struct ChatTurnGraph {
     /// workspace — acting tools then resolve their default cwd to
     /// `<action_dir>/profiles/<id>` via `ToolExecutionContext.workspace`. `None`
     /// (the common case) keeps the shared-`action_dir` cwd behaviour.
-    pub workspace_descriptor: Option<tinyagents::harness::workspace::WorkspaceDescriptor>,
+    pub workspace_descriptor: Option<tinyagents_harness::workspace::WorkspaceDescriptor>,
     /// Declared sandbox mode for the top-level agent. The chat path scopes it
     /// around the shared harness so acting tools see the same mode as workers.
     pub sandbox_mode: SandboxMode,

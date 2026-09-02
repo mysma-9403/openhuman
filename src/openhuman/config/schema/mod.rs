@@ -17,11 +17,18 @@ mod agent;
 mod autonomy;
 mod capability_providers;
 mod channels;
+mod cli_overrides;
+#[doc(hidden)]
+pub use cli_overrides::AppliedInferenceOverride;
 mod context;
 mod dashboard;
 mod defaults;
 mod dictation;
+mod hooks;
+pub use hooks::HooksConfig;
 mod heartbeat_cron;
+pub mod hosting;
+pub use hosting::HostingConfig;
 mod identity_cost;
 mod learning;
 mod load;
@@ -41,11 +48,9 @@ pub(crate) use load::CONFIG_OWNER_MISMATCH_MARKER;
 pub mod claude_agent_sdk;
 pub use claude_agent_sdk::ClaudeAgentSdkConfig;
 mod local_ai;
-mod meet;
 mod modules;
 mod node;
 mod observability;
-mod orchestration;
 mod privacy;
 mod proxy;
 mod routes;
@@ -72,6 +77,7 @@ pub use channels::{
     ResourceLimitsConfig, SandboxBackend, SandboxConfig, SecurityConfig, SignalConfig, SlackConfig,
     StreamMode, TelegramConfig, WebhookConfig, WhatsAppConfig, YuanbaoConfig,
 };
+pub(crate) use cli_overrides::set_cli_inference_overrides;
 pub use context::ContextConfig;
 pub use dashboard::{DashboardConfig, DiagramViewerConfig, EventStreamConfig, ModelHealthConfig};
 pub use dictation::{DictationActivationMode, DictationConfig};
@@ -79,14 +85,9 @@ pub use heartbeat_cron::{CronConfig, HeartbeatConfig, SubconsciousMode};
 pub use identity_cost::{CostConfig, ModelPricing};
 pub use learning::{LearningConfig, ReflectionSource};
 pub use local_ai::{LocalAiConfig, LocalAiUsage};
-pub use meet::{AutoJoinPolicy, AutoSummarizePolicy, CalendarProvider, MeetConfig};
 pub use modules::{ModuleOverride, ModulesConfig};
 pub use node::NodeConfig;
 pub use observability::{AgentTracingBackend, AgentTracingConfig, ObservabilityConfig};
-pub use orchestration::{
-    MedullaClientConfig, MedullaCycleConfig, MedullaCycleLimits, MedullaPromptOverrides,
-    MedullaVerification, OrchestrationConfig,
-};
 pub use privacy::{PrivacyConfig, PrivacyMode};
 pub use proxy::{
     apply_runtime_proxy_to_builder, build_runtime_proxy_client,

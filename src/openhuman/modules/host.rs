@@ -27,19 +27,12 @@
 //! Everything here is created once and lives for the process. There is no
 //! shutdown path because there is nothing a shutdown could reclaim.
 //!
-//! # The runtime that gets here first owns the bus
-//!
-//! The broker and the connection are tokio tasks, so they belong to whichever
-//! runtime calls [`runtime`] first. In the core that is the one runtime the
-//! process has, and the question never arises.
-//!
-//! It arises in tests. Two `#[tokio::test]` functions each build their own
-//! runtime, and the second one to call a loaded module finds a broker whose tasks
-//! died with the first runtime — the call does not fail, it hangs until whatever
-//! deadline is above it fires. Any test that drives a real module therefore has
-//! to be the only one in its process, which is why the module-backed tool tests
-//! are `#[ignore]`d rather than merely gated on an artifact being present.
+//! The broker lives on a dedicated process-lifetime Tokio runtime. This keeps a
+//! module usable across short-lived caller runtimes (notably `#[tokio::test]`)
+//! and also prevents an embedding host from accidentally tying module lifetime
+//! to an independently managed application task runtime.
 
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use tinybus::broker::Broker;
@@ -56,6 +49,9 @@ pub struct ModuleRuntime {
     host: ModuleHost,
     /// This process's client connection, used to call into loaded modules.
     connection: Connection,
+    /// Handle for work that must spawn module transport tasks with process
+    /// lifetime rather than the caller runtime's lifetime.
+    handle: tokio::runtime::Handle,
 }
 
 impl ModuleRuntime {
@@ -69,6 +65,17 @@ impl ModuleRuntime {
     #[must_use]
     pub fn connection(&self) -> &Connection {
         &self.connection
+    }
+
+    /// Run module admission work on this runtime's blocking pool.
+    pub async fn blocking<F>(&self, work: F) -> Result<(), String>
+    where
+        F: FnOnce() -> Result<(), String> + Send + 'static,
+    {
+        self.handle
+            .spawn_blocking(work)
+            .await
+            .map_err(|error| format!("the module loader did not finish: {error}"))?
     }
 
     /// A proxy for one object on a loaded module.
@@ -97,6 +104,47 @@ pub async fn runtime() -> tinybus::Result<&'static ModuleRuntime> {
         return Ok(existing);
     }
 
+    static START: OnceLock<Result<(), String>> = OnceLock::new();
+    let started = START.get_or_init(|| {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("openhuman-module-bus".to_string())
+            .spawn(move || {
+                let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_name("openhuman-module-worker")
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                let result = tokio_runtime.block_on(build_runtime());
+                match result {
+                    Ok(runtime) => {
+                        let _ = RUNTIME.set(runtime);
+                        let _ = ready_tx.send(Ok(()));
+                        tokio_runtime.block_on(std::future::pending::<()>());
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error.to_string()));
+                    }
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        ready_rx.recv().map_err(|error| error.to_string())?
+    });
+    started
+        .as_ref()
+        .map_err(|error| tinybus::Error::Transport(error.clone()))?;
+    RUNTIME
+        .get()
+        .ok_or_else(|| tinybus::Error::Transport("module runtime did not start".to_string()))
+}
+
+async fn build_runtime() -> tinybus::Result<ModuleRuntime> {
     let transport = MemoryBus::new();
     let broker = Broker::new();
     // The broker task is deliberately not retained. It lives as long as the
@@ -126,10 +174,16 @@ pub async fn runtime() -> tinybus::Result<&'static ModuleRuntime> {
     let host = ModuleHost::new(broker);
     let connection = Connection::connect(transport.connect().await?).await?;
 
-    let runtime = ModuleRuntime { host, connection };
-    // A concurrent caller may have won the race. Its runtime is equivalent, so
-    // take the winner's and let ours drop.
-    Ok(RUNTIME.get_or_init(|| runtime))
+    if let Some(config) = super::memory::policy().cloned() {
+        super::memory_host::install(&connection, Arc::clone(&config)).await?;
+    }
+    super::tokenjuice_host::install(&connection).await?;
+
+    Ok(ModuleRuntime {
+        host,
+        connection,
+        handle: tokio::runtime::Handle::current(),
+    })
 }
 
 /// Whether the module runtime has been stood up.
@@ -142,41 +196,5 @@ pub fn is_started() -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{is_started, runtime};
-
-    /// Everything that touches the process-global module runtime, in one test.
-    ///
-    /// One test and not several, on purpose: `runtime()` is a process-global
-    /// started by whichever tokio runtime reaches it first, and each
-    /// `#[tokio::test]` builds its own. A second test function would find a
-    /// broker whose tasks died with the runtime that spawned it, and its call
-    /// would hang until something above it timed out rather than failing — the
-    /// same affinity hazard the module spec documents for the module-backed tool
-    /// tests. Splitting these up would reintroduce it.
-    #[tokio::test]
-    async fn the_module_bus_is_a_singleton_and_serves_proxies() {
-        let first = runtime().await.expect("runtime should start");
-        assert!(is_started());
-        let second = runtime().await.expect("runtime should be reused");
-        assert!(
-            std::ptr::eq(first, second),
-            "runtime() handed out two different runtimes"
-        );
-
-        // Building a proxy is a local operation — it validates names and nothing
-        // else. Nothing has claimed the name, so the call fails rather than
-        // hanging, which is what makes `ensure_loaded` worth having.
-        let proxy = first
-            .proxy(
-                "ai.tinyhumans.tinydocs.Documents",
-                "/ai/tinyhumans/tinydocs/Documents",
-            )
-            .expect("registry names should be well formed");
-        let result: tinybus::Result<serde_json::Value> = proxy.call("GenerateDocx", ()).await;
-        assert!(result.is_err(), "an unloaded module should not answer");
-
-        // A name that cannot be a bus name is refused without reaching the bus.
-        assert!(first.proxy("not a bus name", "/nope").is_err());
-    }
-}
+#[path = "host_tests.rs"]
+mod tests;

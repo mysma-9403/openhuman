@@ -5,15 +5,6 @@ import { getCoreStateSnapshot } from '../lib/coreState/store';
 import { SocketIOMCPTransportImpl } from '../lib/mcp';
 import { ingestRuntimeErrorSignal } from '../lib/userErrors/report';
 import { store } from '../store';
-import {
-  appendBackendMeetTranscriptDelta,
-  setBackendMeetError,
-  setBackendMeetHarness,
-  setBackendMeetJoined,
-  setBackendMeetLeft,
-  setBackendMeetReply,
-  setBackendMeetTranscript,
-} from '../store/backendMeetSlice';
 import { upsertChannelConnection } from '../store/channelConnectionsSlice';
 import { setBackend } from '../store/connectivitySlice';
 import { resetForUser, setSocketIdForUser, setStatusForUser } from '../store/socketSlice';
@@ -25,13 +16,21 @@ import { getCoreRpcToken, getCoreRpcUrl } from './coreRpcClient';
 import { createCoreSocket } from './coreSocket';
 
 // Socket service logger using debug package
-// Enable logging by setting DEBUG=socket* in environment or localStorage
+// To change these namespaces at runtime, set `localStorage.debug` — NOT the
+// DEBUG env var. Under jsdom (and in the browser) the `debug` package resolves
+// to its `browser` build, which reads `localStorage.debug` and ignores
+// `process.env.DEBUG` entirely, so `DEBUG=socket* pnpm test` silently does
+// nothing. The previous comment here claimed otherwise and cost real time.
 const socketLog = debug('socket');
 const socketWarn = debug('socket:warn');
 const socketError = debug('socket:error');
 
-// Enable socket logging in development by default
-if (IS_DEV) {
+// Enable socket logging in development by default — but never under test.
+// `IS_DEV` is truthy in vitest, so without the MODE guard this force-enable
+// floods every test file that imports this service (measured: 412 lines /
+// 46KB of `flow:approval_request` listener churn in a single run), inflating
+// runtime enough to push suites past the runner's foreground timeout.
+if (IS_DEV && import.meta.env.MODE !== 'test') {
   debug.enable('socket*');
 }
 
@@ -421,104 +420,6 @@ class SocketService {
       // provider text into the UI — classify() keys on `errorType` for this
       // path. Locks the no-leak contract FE-side (CodeRabbit #4169).
       ingestRuntimeErrorSignal(store.dispatch, { errorType, scope, sourceDomain, provider });
-    });
-
-    // Backend Meet bot events — forwarded from core's DomainEvent bus
-    this.socket.on('agent_meetings:joined', (data: unknown) => {
-      const obj = data as Record<string, unknown> | null;
-      const meetUrl = typeof obj?.meet_url === 'string' ? obj.meet_url : '';
-      const correlationId =
-        typeof obj?.correlation_id === 'string' ? obj.correlation_id : undefined;
-      socketLog(
-        'agent_meetings:joined meet_url_len=%d correlation_id=%s',
-        meetUrl.length,
-        correlationId ?? 'none'
-      );
-      store.dispatch(setBackendMeetJoined({ meetUrl, meetingId: correlationId }));
-    });
-    this.socket.on('agent_meetings:left', (data: unknown) => {
-      const obj = data as Record<string, unknown> | null;
-      const reason = typeof obj?.reason === 'string' ? obj.reason : 'unknown';
-      const correlationId =
-        typeof obj?.correlation_id === 'string' ? obj.correlation_id : undefined;
-      socketLog('agent_meetings:left reason=%s correlation_id=%s', reason, correlationId ?? 'none');
-      store.dispatch(setBackendMeetLeft({ reason, correlationId }));
-    });
-    this.socket.on('agent_meetings:reply', (data: unknown) => {
-      const obj = data as Record<string, unknown> | null;
-      if (!obj) return;
-      const correlationId = typeof obj.correlation_id === 'string' ? obj.correlation_id : undefined;
-      socketLog('agent_meetings:reply correlation_id=%s', correlationId ?? 'none');
-      store.dispatch(
-        setBackendMeetReply({
-          transcript: typeof obj.transcript === 'string' ? obj.transcript : '',
-          reply: typeof obj.reply === 'string' ? obj.reply : '',
-          emotion: typeof obj.emotion === 'string' ? obj.emotion : 'neutral',
-          correlationId,
-        })
-      );
-    });
-    this.socket.on('agent_meetings:harness', (data: unknown) => {
-      const obj = data as Record<string, unknown> | null;
-      if (!obj) return;
-      const correlationId = typeof obj.correlation_id === 'string' ? obj.correlation_id : undefined;
-      socketLog('agent_meetings:harness correlation_id=%s', correlationId ?? 'none');
-      store.dispatch(
-        setBackendMeetHarness({
-          transcript: typeof obj.transcript === 'string' ? obj.transcript : '',
-          instruction: typeof obj.instruction === 'string' ? obj.instruction : '',
-          emotion: typeof obj.emotion === 'string' ? obj.emotion : 'neutral',
-          correlationId,
-        })
-      );
-    });
-    this.socket.on('agent_meetings:transcript', (data: unknown) => {
-      const obj = data as Record<string, unknown> | null;
-      if (!obj) return;
-      const correlationId = typeof obj.correlation_id === 'string' ? obj.correlation_id : undefined;
-      socketLog('agent_meetings:transcript correlation_id=%s', correlationId ?? 'none');
-      store.dispatch(
-        setBackendMeetTranscript({
-          turns: Array.isArray(obj.turns) ? obj.turns : [],
-          duration_ms: typeof obj.duration_ms === 'number' ? obj.duration_ms : 0,
-          correlationId,
-        })
-      );
-    });
-    this.socket.on('agent_meetings:transcript_delta', (data: unknown) => {
-      const obj = data as Record<string, unknown> | null;
-      if (!obj) return;
-      const turn = obj.turn as Record<string, unknown> | null | undefined;
-      // Drop malformed deltas that carry no turn content.
-      if (!turn || typeof turn.role !== 'string' || typeof turn.content !== 'string') {
-        socketError('agent_meetings:transcript_delta dropped: missing/invalid turn');
-        return;
-      }
-      const correlationId = typeof obj.correlation_id === 'string' ? obj.correlation_id : undefined;
-      const index = typeof obj.index === 'number' ? obj.index : 0;
-      const isPartial = typeof obj.is_partial === 'boolean' ? obj.is_partial : false;
-      socketLog(
-        'agent_meetings:transcript_delta index=%d is_partial=%s correlation_id=%s',
-        index,
-        isPartial,
-        correlationId ?? 'none'
-      );
-      store.dispatch(
-        appendBackendMeetTranscriptDelta({
-          turn: { role: turn.role, content: turn.content },
-          index,
-          is_partial: isPartial,
-          correlationId,
-        })
-      );
-    });
-    this.socket.on('agent_meetings:error', (data: unknown) => {
-      const obj = data as Record<string, unknown> | null;
-      const error = typeof obj?.error === 'string' ? obj.error : 'Unknown error';
-      const correlationId =
-        typeof obj?.correlation_id === 'string' ? obj.correlation_id : undefined;
-      socketError('agent_meetings:error %s correlation_id=%s', error, correlationId ?? 'none');
-      store.dispatch(setBackendMeetError({ error, correlationId }));
     });
 
     this.socket.connect();

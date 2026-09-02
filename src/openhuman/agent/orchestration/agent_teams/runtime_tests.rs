@@ -21,11 +21,11 @@ use crate::openhuman::agent::harness::fork_context::{with_parent_context, Parent
 use crate::openhuman::config::{AgentConfig, Config};
 use crate::openhuman::memory::{Memory, MemoryCategory, MemoryEntry, NamespaceSummary, RecallOpts};
 use crate::openhuman::tools::{Tool, ToolSpec};
-use tinyagents::harness::model::{ChatModel, ModelRequest, ModelResponse};
-use tinyagents::session::run_ledger::{
+use tinyagents_session::run_ledger::{
     self, AgentTeamMemberStatus, AgentTeamMemberUpsert, AgentTeamStatus, AgentTeamTaskStatus,
     AgentTeamTaskUpsert, AgentTeamUpsert,
 };
+use tinyinference::model::{ChatModel, ModelRequest, ModelResponse};
 
 // ── Mocks (mirror workflow_runs::engine_tests) ──────────────────────────────
 
@@ -97,9 +97,9 @@ impl ChatModel<()> for CannedModel {
         &self,
         _state: &(),
         _request: ModelRequest,
-    ) -> tinyagents::Result<ModelResponse> {
+    ) -> tinyinference::Result<ModelResponse> {
         if self.fail {
-            return Err(tinyagents::TinyAgentsError::Model(
+            return Err(tinyinference::Error::Model(
                 "mock model forced failure".to_string(),
             ));
         }

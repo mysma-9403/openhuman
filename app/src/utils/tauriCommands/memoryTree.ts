@@ -880,6 +880,22 @@ export interface MemoryTreePipelineStatus {
    * structure ("empty-but-built wiki"). Optional for back-compat.
    */
   extraction_coverage?: number | null;
+  /**
+   * openhuman#5820: the most recent corrupt-store quarantine, derived from
+   * disk by the core so it survives restarts and reaches a renderer that was
+   * not connected when it happened. Absent when nothing was quarantined.
+   */
+  quarantine?: MemoryTreeQuarantine | null;
+}
+
+/** A corrupt-store quarantine as `memory_tree_pipeline_status` reports it. */
+export interface MemoryTreeQuarantine {
+  /** Epoch ms of the quarantine (from the `.corrupt-<ts>` file name). */
+  quarantined_at_ms: number;
+  /** Local path of the preserved damaged database. */
+  quarantined_path: string;
+  /** The rebuilt (initially empty) store holds a chunk again: the user re-synced. */
+  resynced: boolean;
 }
 
 /**
@@ -990,6 +1006,15 @@ export interface SyncAuditEntry {
   duration_ms: number;
   success: boolean;
   error?: string;
+  /**
+   * Items fetched-and-stored whose memory-tree ingest failed
+   * (openhuman#5820). Absent on rows written before the field existed and on
+   * fully-healthy rows; a non-zero count with `success: false` is the
+   * "fetched, not tree-ingested" partial verdict the panel renders as ⚠.
+   */
+  tree_ingest_failures?: number;
+  /** Why the tree half failed, when it did. Never memory content. */
+  tree_error?: string;
 }
 
 export async function memorySyncAuditLog(): Promise<SyncAuditEntry[]> {
@@ -1047,4 +1072,30 @@ export async function memorySyncStatusList(): Promise<MemorySyncStatusRow[]> {
   const rows = out.statuses ?? [];
   console.debug('[memory-tree-rpc] memorySyncStatusList: exit rows=%d', rows.length);
   return rows;
+}
+
+// ── memory_namespace_summaries (#5932 — sync-verification counts) ────────────
+
+/** One namespace's stored-document count, from the mandatory driver surface. */
+export interface NamespaceSummaryRow {
+  namespace: string;
+  count: number;
+  last_updated?: string | null;
+}
+
+export interface NamespaceSummariesResponse {
+  namespaces: NamespaceSummaryRow[];
+  total_documents: number;
+}
+
+/**
+ * Per-namespace stored-document counts plus the grand total — the number a
+ * user checks to verify a sync's items actually landed (`list_namespaces`
+ * answers names alone).
+ */
+export async function memoryNamespaceSummaries(): Promise<NamespaceSummariesResponse> {
+  const resp = await callCoreRpc<
+    NamespaceSummariesResponse | ResultEnvelope<NamespaceSummariesResponse>
+  >({ method: 'openhuman.memory_namespace_summaries', params: {} });
+  return unwrapResult(resp);
 }

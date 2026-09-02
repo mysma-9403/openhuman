@@ -1,6 +1,6 @@
 [package]
 name = "OpenHuman"
-version = "0.63.7"
+version = "0.63.19"
 description = "OpenHuman - AI-powered Super Assistant"
 authors = ["OpenHuman"]
 edition = "2021"
@@ -57,30 +57,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 directories = "5"
-# Native Save-As file dialog for artifact export (#3162). default-features
-# off + xdg-portal keeps Linux off GTK (the Downloads-copy fallback covers
-# headless CI where no portal is available); tokio drives the async backend.
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
-# Used by gmail/cdp_fetch for decoding binary IO.read chunks. Base64 is
-# only emitted by CDP IO.read when the stream contains non-UTF-8 bytes,
-# but we opt into the feature to stay robust against unexpected responses.
-base64 = "0.22"
 tokio = { version = "1", features = ["rt-multi-thread", "process", "sync", "time", "net"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-# WebSocket client + server for two uses:
-# - Client: Chrome DevTools Protocol connections to the embedded CEF
-#   instance over `--remote-debugging-port=9222` (IndexedDB reads,
-#   `Runtime.evaluate` for the WhatsApp recipe, DOMSnapshot / Network
-#   calls for the Gmail connector).
-# - Server: the `webview_apis` bridge at 127.0.0.1 that accepts
-#   JSON-RPC frames from the core sidecar so core-side handlers can
-#   reach the live-webview connectors via CDP.
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
 url = "2"
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rand = "0.9"
+# tinybox: reach (local/ssh) and confinement (passthrough/docker) as
+# independent axes, which is what lets one `GatewaySpec::Box` variant cover a
+# container here, a machine over there, and a container over there. Vendored as
+# a submodule and taken by path, the same shape as the other tiny* crates.
+tinybox-core = { path = "../../vendor/tinybox/crates/tinybox-core", optional = true }
+tinybox-host = { path = "../../vendor/tinybox/crates/tinybox-host", optional = true }
+tinybox-ssh = { path = "../../vendor/tinybox/crates/tinybox-ssh", optional = true }
+tinybox-docker = { path = "../../vendor/tinybox/crates/tinybox-docker", optional = true }
 hex = "0.4"
 # Tauri's vendored dev-server proxy (see `vendor/tauri-cef/.../protocol/tauri.rs`)
 # builds a reqwest 0.13 client that requires a process-wide rustls
@@ -89,37 +79,37 @@ hex = "0.4"
 # the ring provider at startup in `lib.rs::run()`.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 log = "0.4"
-env_logger = "0.11"
 
 # Sentry for the Tauri shell (desktop host) process — separate Sentry project
 # from the React frontend and the Rust core sidecar. DSN is baked at compile
 # time via `option_env!("OPENHUMAN_TAURI_SENTRY_DSN")` in `lib.rs::run()` and
 # can be overridden at runtime via the same env var. Feature set mirrors the
-# core sidecar (`Cargo.toml` at repo root) minus `tracing` since the shell
-# uses `log` + `env_logger`.
+# core sidecar (`Cargo.toml` at repo root) minus `tracing`.
 sentry = { version = "0.47.0", default-features = false, features = ["backtrace", "contexts", "panic", "debug-images", "httpdate"] }
 
 # Used by the imessage_scanner module.
 anyhow = "1.0"
-# SQLite for the shell-side whatsapp_data store (relocated from the core). All
-# platforms — the store persists on Windows/Linux/macOS. Pinned to match the
-# core crate so a single bundled SQLite is linked. (The macOS-only iMessage
-# scanner also uses rusqlite; this general dep covers it too.)
-rusqlite = { version = "=0.40.0", features = ["bundled"] }
+# SQLite for the macOS iMessage scanner, which reads ~/Library/Messages/chat.db
+# read-only. Declared in the general table rather than under the macOS target so
+# `cargo check` on Linux/Windows resolves the same graph. Pinned to match the
+# core crate so a single bundled SQLite is linked.
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
 parking_lot = "0.12"
 chrono = "0.4"
 async-trait = "0.1"
-# Desktop companion: native mic capture + POINT-tag parsing + session ids.
-cpal = "0.15"
-regex = "1"
-uuid = { version = "1", features = ["v4"] }
-# Mascot fake-camera pipeline (meet_call): rasterizes the OpenHuman
-# mascot SVG to a PNG once, converts it to a YUV420 Y4M frame, and
-# points CEF's `--use-file-for-fake-video-capture` flag at the cached
-# file so Meet sees the mascot as the agent's webcam. Pure Rust, no
-# system codecs needed.
-resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts"] }
-tiny-skia = "0.11"
+# NOTE (#5541): `resvg` + `tiny-skia` were removed here. They existed only for
+# the mascot fake-camera pipeline, which rasterized the mascot SVG to a Y4M
+# frame for CEF's `--use-file-for-fake-video-capture` flag. That whole path
+# (`meet_call`, `fake_camera`) was deleted in #5478 when the app moved off CEF
+# to Wry, but the two dependencies stayed behind — `cargo machete` found zero
+# references to either crate anywhere in `app/src-tauri/src/`.
+#
+# They were not cheap to leave: the pair carried the entire SVG rasterisation
+# stack, and dropping them takes the shipped app from 511 to 481 unique
+# crates — `usvg`, `fontdb`, `rustybuzz`, `ttf-parser`, `roxmltree`, `kurbo`,
+# `svgtypes`, `simplecss` and the unicode-bidi/script/ccc/vo tail, 30 crates
+# in total. If mascot SVG rasterisation ever comes back, re-add them here
+# rather than reaching for a heavier image stack.
 
 # Core domain logic, embedded in-process so the core's HTTP/JSON-RPC server
 # runs as a tokio task inside the Tauri host. Avoids the orphan-sidecar class
@@ -158,7 +148,6 @@ openhuman_core = { path = "../..", package = "openhuman", default-features = fal
     "documents",
     "modules",
     "flows",
-    "meet",
     "skills",
     "mcp",
     "crash-reporting",
@@ -175,12 +164,13 @@ openhuman_core = { path = "../..", package = "openhuman", default-features = fal
     "file-logging",
     "contacts",
     "runtime-node",
-    # Without this the memory_diff RPC namespace is unknown-method in the
-    # shipped app, the memory_diff agent tool is absent, and the embedded
-    # driver stops advertising Capability::Diff — the product keeps all three.
-    "memory-git",
+    # Declared "Default-OFF, product-ON" by its own gate comment in the root
+    # Cargo.toml, but it reached neither the product set nor this list, so the
+    # family was compiled in no configuration at all. Registration stays
+    # credential-gated in tools/ops.rs, so a host with no hosting credential
+    # sees no new tools.
+    "hosting",
 ] }
-tinyjuice = { version = "0.2.1", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", default-features = false, features = ["hostname", "signal", "user"] }
@@ -237,7 +227,21 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [features]
-default = []
+default = ["gateways"]
+# Routing the frontend to a core somewhere other than this process: a
+# container, a machine over SSH, or a container on a machine over SSH. Pulls in
+# the tinybox crates that provision and reach those boxes.
+#
+# This is a **shell-local** gate, unrelated to the feature-forwarding rules in
+# AGENTS.md: those govern which `openhuman_core` gates the shell forwards, and
+# `scripts/ci/check-feature-forwarding.mjs` reads the core dependency's feature
+# list, not this table. Nothing here belongs in `scripts/ci/product-features.txt`.
+gateways = [
+    "dep:tinybox-core",
+    "dep:tinybox-docker",
+    "dep:tinybox-host",
+    "dep:tinybox-ssh",
+]
 # `custom-protocol` switches Tauri from `devUrl` (vite dev server) to the
 # bundled `frontendDist` served via `tauri://localhost`. `cargo tauri build`
 # turns this on automatically for release; do not put it in `default` or
@@ -249,6 +253,21 @@ sandbox-bubblewrap = []
 # e2e-test-support`. See app/scripts/e2e-build.sh.
 e2e-test-support = ["openhuman_core/e2e-test-support"]
 
+# The tinycortex vendored above takes `tinymemory-api` by git (it re-exports
+# the TinyMemory contract instead of duplicating it, tinymemory#18 §A1).
+# Without this entry cargo resolves that git copy *and* the path copy under
+# vendor/tinymemory as two distinct crates, and `tinymemory_api::MemoryCategory`
+# from one is not the same type as from the other — the exact duplication §A1
+# deleted, reintroduced by dependency resolution. Same entry tinymemory's own
+# workspace carries; the key has no `.git` suffix, matching the dep URL.
+[patch."https://github.com/tinyhumansai/tinymemory"]
+tinymemory-api = { path = "../../vendor/tinymemory/crates/tinymemory-api" }
+
+[patch."https://github.com/tinyhumansai/tinyinference"]
+# tinycortex depends on tinyinference by git rev; without this the shell world
+# resolves TWO copies of the same types. Mirrors root Cargo.toml:1345.
+tinyinference = { path = "../../vendor/tinyagents/vendor/tinyinference/crates/tinyinference" }
+
 [patch.crates-io]
 # Keep reqwest defaults disabled in this independent Cargo world too. Without
 # this patch, the registry release reintroduces native-tls/OpenSSL on Linux.
@@ -256,20 +275,25 @@ motosan-ai-oauth = { path = "../../vendor/motosan-ai-oauth" }
 # TinyAgents vendored submodule (repo-root vendor/tinyagents, pinned at the
 # released tag) — same patch as the root Cargo world so both resolve the
 # in-tree SDK source. `git submodule update --init vendor/tinyagents` first.
-tinyagents = { path = "../../vendor/tinyagents" }
-# TinyFlows, TinyCortex, TinyJuice, TinyChannels, and TinyPlace are vendored beside
+# tinyagents is a workspace now — no patch entry (mirrors root Cargo.toml)
+# TinyTools rides in through tinyagents' own vendored checkout. The path must
+# match the one the core crate names, or cargo resolves two distinct packages
+# and the shell's `dyn Tool` stops being the core's. See the core manifest.
+tinytools = { path = "../../vendor/tinyagents/vendor/tinytools/crates/tinytools" }
+# tinymemory-core declares `tinyinference = "0.2"` (crates-io-shaped, unpublished),
+# so this world must patch it exactly as the root manifest does.
+tinyinference = { path = "../../vendor/tinyagents/vendor/tinyinference/crates/tinyinference" }
+# TinyFlows, TinyCortex, and TinyChannels are vendored beside
 # TinyAgents so integration work can test crate changes against OpenHuman before
 # publishing.
-tinyflows = { path = "../../vendor/tinyflows" }
+tinyflows = { path = "../../vendor/tinyflows/crates/tinyflows" }
 tinycortex = { path = "../../vendor/tinycortex" }
 # `tinymemory-core` (pulled in transitively through `openhuman_core`) names
 # `tinycortex-api` by version requirement, same as the root Cargo world —
 # patch it onto the same checkout here too, or this independent Cargo world
 # tries to resolve it from crates.io and fails (it was never published).
 tinycortex-api = { path = "../../vendor/tinycortex/api" }
-tinyjuice = { path = "../../vendor/tinyjuice" }
 tinychannels = { path = "../../vendor/tinychannels" }
-tinyplace = { path = "../../vendor/tinyplace/sdk/rust" }
 
 
 [dev-dependencies]
@@ -288,6 +312,23 @@ tempfile = "3"
 [profile.release]
 debug = "line-tables-only"
 split-debuginfo = "packed"
+# Binary-size settings (#5541) — kept in sync with the root `Cargo.toml`,
+# which carries the full rationale and the measurements. The short version:
+# the shell statically embeds the whole core crate, so it pays the same ~120k
+# monomorphized methods, and the same three settings apply. `strip` is safe
+# because Sentry symbolicates server-side from the separate dSYM/PDB/DWP that
+# `scripts/upload_sentry_symbols.sh` uploads, matched by a debug ID that
+# `strip` preserves; a build that lost its debug files fails that script
+# loudly (#1403) rather than shipping un-symbolicated.
+#
+# These are separate Cargo worlds (each its own `Cargo.lock`/`target/`) — a
+# change here needs the same change in the root `Cargo.toml` and in
+# `app/src-tauri-mobile/Cargo.toml` (the iOS/Android host).
+lto = "thin"
+# 16, not 1 — see the root `Cargo.toml` for why (#5595: one codegen unit cost
+# the desktop release matrix +82% build time and blocked every release).
+codegen-units = 16
+strip = "symbols"
 
 # Fast CI builds: trade runtime perf for compile speed
 [profile.ci]

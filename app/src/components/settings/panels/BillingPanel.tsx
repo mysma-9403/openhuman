@@ -10,18 +10,13 @@ const BillingPanel = () => {
   const { navigateBack } = useSettingsNavigation();
 
   return (
-    <SettingsPanel>
-      <div>
-        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-content-muted">
-          {t('settings.billing.movedToWeb')}
-        </p>
-        <h1 className="mt-2 text-2xl font-semibold text-content">
-          {t('settings.billing.openDashboard')}
-        </h1>
-        <p className="mt-2 text-sm leading-6 text-content-secondary">
-          {t('settings.billing.movedToWebDesc')}
-        </p>
-      </div>
+    // The description rides the scaffold's own slot: SettingsPanel already
+    // renders the page h1 (from the settings route registry), so a second
+    // `text-2xl` heading here stacked two page titles on one page.
+    <SettingsPanel description={t('settings.billing.movedToWebDesc')}>
+      <p className="text-xs font-semibold uppercase tracking-wide text-content-muted">
+        {t('settings.billing.movedToWeb')}
+      </p>
 
       <div className="flex flex-wrap gap-3">
         <Button

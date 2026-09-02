@@ -61,7 +61,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tempfile::tempdir;
 
@@ -71,7 +71,7 @@ use openhuman_core::openhuman::memory::ops::{
     KvSetParams, PutDocParams,
 };
 use openhuman_core::openhuman::memory::rpc_models::{RecallContextRequest, RecallMemoriesRequest};
-use openhuman_core::openhuman::memory::tinycortex::memory_config_from;
+use tinymemory_core::tinycortex::memory_config_from;
 
 // ── Env isolation (mirrors memory_roundtrip_e2e) ─────────────────────────────
 
@@ -101,12 +101,40 @@ impl Drop for EnvVarGuard {
 
 /// Serialises tests: `HOME` + `OPENHUMAN_WORKSPACE` are process-global.
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static MEMORY_SEAMS_INIT: OnceLock<()> = OnceLock::new();
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .expect("env lock poisoned")
+}
+
+/// This target calls the memory operations directly rather than through a core
+/// runtime, so install the host seams that normal startup wires first.
+fn ensure_memory_seams(workspace: &Path) {
+    MEMORY_SEAMS_INIT.get_or_init(|| {
+        let workspace = workspace.to_path_buf();
+        std::thread::Builder::new()
+            .name("memory-golden-parity-seams".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let config = Arc::new(Config {
+                    workspace_dir: workspace.clone(),
+                    action_dir: workspace.clone(),
+                    config_path: workspace.join("config.toml"),
+                    ..Config::default()
+                });
+                openhuman_core::openhuman::memory::host_impls::install_memory_host_seams(
+                    config.clone(),
+                );
+                #[cfg(feature = "modules")]
+                openhuman_core::openhuman::modules::memory::set_modules_policy(config);
+            })
+            .expect("spawn golden parity memory seam installer")
+            .join()
+            .expect("golden parity memory seam installer panicked");
+    });
 }
 
 // ── Expected schema tiers (authoritative names from the two engines) ─────────
@@ -375,6 +403,7 @@ async fn golden_workspace_composes_substrate_and_unified_tiers() {
     let workspace = tmp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("mkdir workspace");
     let _ws = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", &workspace);
+    ensure_memory_seams(&workspace);
 
     let tables = init_and_scan("golden-parity-e2e", &workspace).await;
 

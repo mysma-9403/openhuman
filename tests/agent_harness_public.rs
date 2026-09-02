@@ -99,7 +99,7 @@ fn stub_parent_context() -> ParentExecutionContext {
             .collect(),
         turn_model_source:
             openhuman_core::openhuman::agent::tinyagents::TurnModelSource::from_model(Arc::new(
-                tinyagents::harness::testkit::ScriptedModel::replies(vec!["ok"]),
+                tinyagents_harness::testkit::ScriptedModel::replies(vec!["ok"]),
             )),
         all_tools: Arc::new(vec![]),
         all_tool_specs: Arc::new(vec![]),

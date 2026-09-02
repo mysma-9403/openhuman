@@ -78,6 +78,8 @@ import {
   setSelectedThread,
 } from '../store/threadSlice';
 import { DERIVED_TRANSCRIPT_ENABLED, IS_PROD } from '../utils/config';
+import { AssistantUiRuntimeProvider } from './AssistantUiRuntimeProvider';
+import { isProactiveConversationSurface, proactiveThreadPins } from './proactiveThreadPins';
 
 const logChatRuntime = debug('openhuman:chat-runtime');
 const USER_FACING_AGENT_ERROR_MESSAGE =
@@ -351,6 +353,27 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
       }
 
       const state = store.getState().thread;
+
+      // A proactive *conversation surface* (today the realtime voice session's
+      // `proactive:voice`) delivers many sequential turns under one synthetic id.
+      // Once it has resolved to a visible thread, pin that thread and keep
+      // delivering into it for the rest of the session. Without the pin, the
+      // fresh-or-create rule below spawns a brand-new thread on every turn after
+      // the first — turn 1 fills the fresh thread, turn 2+ sees it as occupied and
+      // creates another — flooding the list with one "Chat …" thread per voice
+      // turn. The pin is dropped when its thread no longer exists (deleted) so we
+      // re-resolve instead of delivering into a dead thread.
+      const isConversationSurface = isProactiveConversationSurface(incomingThreadId);
+      if (isConversationSurface) {
+        const pinned = proactiveThreadPins.get(incomingThreadId);
+        if (pinned) {
+          if (state.threads.some(t => t.id === pinned)) {
+            return pinned;
+          }
+          proactiveThreadPins.delete(incomingThreadId);
+        }
+      }
+
       // Reuse an existing thread for proactive delivery ONLY when it is
       // fresh (no messages). Injecting a morning brief / subconscious
       // update into a thread that already holds a conversation interrupts
@@ -362,6 +385,9 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
       // longer used as a target here.
       const candidateThreadId = state.selectedThreadId ?? state.threads[0]?.id ?? null;
       if (candidateThreadId && !threadHasMessages(state, candidateThreadId)) {
+        if (isConversationSurface) {
+          proactiveThreadPins.set(incomingThreadId, candidateThreadId);
+        }
         return candidateThreadId;
       }
 
@@ -373,6 +399,9 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
         try {
           const newThread = await dispatch(createNewThread()).unwrap();
           dispatch(setSelectedThread(newThread.id));
+          if (isConversationSurface) {
+            proactiveThreadPins.set(incomingThreadId, newThread.id);
+          }
           return newThread.id;
         } catch (error) {
           rtLog('proactive_thread_create_failed', {
@@ -1380,7 +1409,11 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
     }
   }, [socketStatus, dispatch]);
 
-  return <>{children}</>;
+  // assistant-ui's runtime is mounted here, INSIDE the subscription provider,
+  // so it sits above every chat surface and below the Redux store this file
+  // already feeds. It is additive: it publishes the runtime context without
+  // taking ownership of any state. See `AssistantUiRuntimeProvider`.
+  return <AssistantUiRuntimeProvider>{children}</AssistantUiRuntimeProvider>;
 };
 
 export default ChatRuntimeProvider;
