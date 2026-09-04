@@ -119,6 +119,46 @@ fn debug_redacts_the_name() {
 }
 
 #[test]
+fn a_resolved_secret_redacts_the_value_under_debug() {
+    // The value this type guards is the secret itself, so a `{:?}` that
+    // rendered it would be strictly worse than the credential-name leak the
+    // rest of this module exists to prevent.
+    const SECRET_VALUE: &str = "sk-live-9f3a-do-not-print-me";
+
+    let resolved = ResolvedSecret::new(SECRET_VALUE.to_string());
+    let rendered = format!("{resolved:?}");
+    assert!(
+        !rendered.contains(SECRET_VALUE),
+        "secret leaked through Debug: {rendered}"
+    );
+    assert!(
+        rendered.contains("<redacted>"),
+        "redaction marker missing: {rendered}"
+    );
+    // Still reachable deliberately — redaction must not mean unusable.
+    assert_eq!(resolved.expose_secret(), SECRET_VALUE);
+}
+
+#[test]
+fn the_wrapper_is_needed_because_zeroizing_debug_prints_the_secret() {
+    // Guards the premise rather than the fix. `Zeroizing` is a
+    // `#[derive(Debug)]` tuple struct, and a derived Debug prints the field
+    // whatever its visibility — so returning `Zeroizing<String>` from
+    // `resolve` would have rendered the secret at any `{:?}` call site.
+    //
+    // If this ever fails, zeroize changed its Debug and `ResolvedSecret`'s
+    // redaction may have become redundant — which is worth knowing rather
+    // than carrying a wrapper whose reason has quietly expired.
+    const SECRET_VALUE: &str = "sk-live-9f3a-do-not-print-me";
+
+    let bare = zeroize::Zeroizing::new(SECRET_VALUE.to_string());
+    assert!(
+        format!("{bare:?}").contains(SECRET_VALUE),
+        "zeroize no longer leaks through Debug — re-check whether ResolvedSecret is still needed"
+    );
+}
+
+#[test]
 fn no_error_display_can_carry_a_name_or_a_secret() {
     // This is the property `memory::binding`'s FallbackReason depends on: any
     // of these may be rendered into `subsystems_status`, which is pinned by

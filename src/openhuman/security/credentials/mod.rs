@@ -18,7 +18,7 @@ pub use crate::api::rest::{
     BackendOAuthClient, ConnectResponse, IntegrationSummary, IntegrationTokensHandoff,
 };
 pub use core::*;
-pub use credential_ref::{CredentialRef, CredentialRefError, CredentialRefScheme};
+pub use credential_ref::{CredentialRef, CredentialRefError, CredentialRefScheme, ResolvedSecret};
 pub use http_creds::{
     HttpCredential, HttpCredentialScheme, HttpCredentialSummary, HttpCredentialsStore,
 };

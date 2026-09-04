@@ -61,11 +61,19 @@
 //! name-free variant and logged through [`keyring_error_kind`], which yields a
 //! fixed label and nothing else.
 //!
-//! **Scope of that promise.** It covers this module's errors and this module's
-//! logs. `keyring::get` itself logs its `key=` argument at `debug`, as the
-//! whole keyring surface has always done for its fixed-name callers; narrowing
-//! that is a shared-kernel decision affecting every subsystem in kernel.md §5,
-//! not something to settle here.
+//! The same rule applies to what is handed *back*: [`ResolvedSecret`] exists
+//! because `Zeroizing`'s derived `Debug` prints the secret, and a module that
+//! redacts the name while returning a type that renders the value would be
+//! protecting the wrong half.
+//!
+//! **Scope of that promise.** It covers this module's errors, this module's
+//! logs, and the types it returns. It does **not** cover `keyring::get`, which
+//! logs its `key=` argument at `debug` as the whole keyring surface has always
+//! done for its fixed-name callers — a `credential_ref` is simply the first
+//! *operator-configured* key to reach it. Narrowing that is a shared-kernel
+//! decision affecting every subsystem in kernel.md §5, so it is an open
+//! question on the memory-driver epic (tinyhumansai/openhuman#5372) rather
+//! than something settled here.
 
 use zeroize::Zeroizing;
 
@@ -218,6 +226,60 @@ impl CredentialRefScheme {
     }
 }
 
+/// A secret resolved from a [`CredentialRef`].
+///
+/// Wraps [`Zeroizing`] so the value is wiped on drop, and adds the half
+/// `Zeroizing` does not provide: a `Debug` that does not print it.
+///
+/// **`Zeroizing`'s own `Debug` renders the secret.** It is a
+/// `#[derive(Debug)]` tuple struct (`zeroize-1.9.0/src/lib.rs:602-604`), and a
+/// derived `Debug` prints the field regardless of its visibility — so
+/// `format!("{:?}", Zeroizing::new(secret))` yields `Zeroizing("s3cret")`.
+/// Returning one from this module would have been incoherent: the module
+/// redacts the credential *name* through a manual `Debug`, then hands back a
+/// type that prints the *value* it names. One `tracing::debug!(?secret, …)` at
+/// any future call site is all it would take.
+///
+/// The value is therefore reachable only through
+/// [`expose_secret`](Self::expose_secret), which is named for the `secrecy`
+/// crate's convention so that every place a secret leaves this type is
+/// greppable in an audit. There is deliberately no `Deref`, no `into_inner`
+/// and no `PartialEq`: each would be another exit this type's name does not
+/// mention.
+pub struct ResolvedSecret(Zeroizing<String>);
+
+// Manual `Debug` — deriving it here would defeat the entire point of the type.
+// NEVER derive `Debug`; `redacts_the_secret_under_debug` pins this, along with
+// the `Zeroizing` behaviour that makes the wrapper necessary.
+impl std::fmt::Debug for ResolvedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ResolvedSecret")
+            .field(&"<redacted>")
+            .finish()
+    }
+}
+
+impl ResolvedSecret {
+    /// Wrap a freshly-retrieved secret.
+    ///
+    /// Private on purpose: the only supported way to obtain one is
+    /// [`CredentialRef::resolve`], so a `ResolvedSecret` in hand always means
+    /// the consent and availability gates ran.
+    fn new(secret: String) -> Self {
+        Self(Zeroizing::new(secret))
+    }
+
+    /// Borrow the secret.
+    ///
+    /// Every call is a deliberate disclosure — keep the borrow as short as
+    /// possible, and do not `to_string()` it into a plain `String`, which
+    /// would leave an un-zeroized copy behind on drop.
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A parsed `credential_ref`.
 ///
 /// Deliberately **not** `derive(Debug)` — see the manual impl below and the
@@ -310,8 +372,9 @@ impl CredentialRef {
     /// parameter rather than something derived here so this module stays free
     /// of any one subsystem's notion of identity.
     ///
-    /// The returned secret is wrapped in [`Zeroizing`] so it is wiped when the
-    /// caller drops it rather than lingering in freed memory.
+    /// The secret comes back as a [`ResolvedSecret`]: zeroized on drop, and
+    /// redacted under `Debug` — see that type for why the second half is not
+    /// redundant.
     ///
     /// # Errors
     ///
@@ -320,13 +383,13 @@ impl CredentialRef {
     /// [`CredentialRefError::Unavailable`], [`CredentialRefError::NotFound`] or
     /// [`CredentialRefError::Backend`], in that order of checking. No variant
     /// carries the name or the secret.
-    pub fn resolve(&self, user_id: &str) -> Result<Zeroizing<String>, CredentialRefError> {
+    pub fn resolve(&self, user_id: &str) -> Result<ResolvedSecret, CredentialRefError> {
         match self.scheme {
             CredentialRefScheme::Keychain => self.resolve_keychain(user_id),
         }
     }
 
-    fn resolve_keychain(&self, user_id: &str) -> Result<Zeroizing<String>, CredentialRefError> {
+    fn resolve_keychain(&self, user_id: &str) -> Result<ResolvedSecret, CredentialRefError> {
         // `keyring::is_available` is passed unevaluated: a consent refusal must
         // return before the availability probe, whose first call is a real
         // backend round-trip. See `preflight`.
@@ -341,7 +404,7 @@ impl CredentialRef {
         match keyring::get(user_id, &self.name) {
             Ok(Some(secret)) => {
                 log::debug!("{LOG_PREFIX} resolved credential_ref user_id={user_id}");
-                Ok(Zeroizing::new(secret))
+                Ok(ResolvedSecret::new(secret))
             }
             Ok(None) => {
                 log::debug!("{LOG_PREFIX} no keychain entry for credential_ref user_id={user_id}");
