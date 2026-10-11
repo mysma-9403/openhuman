@@ -295,6 +295,30 @@ impl SecurityPolicy {
         self
     }
 
+    /// [`from_config`](Self::from_config) for a whole [`Config`], with that
+    /// config's own account root attached.
+    ///
+    /// This is the form almost every caller wants, and the reason it exists is
+    /// that the alternative is a footgun: the account root is not derivable
+    /// from `workspace_dir` (see [`SecurityPolicy::account_dir`]), so it has to
+    /// be chained on, and a carve-out that silently does not apply wherever one
+    /// call site forgot is worse than no carve-out — you cannot tell the two
+    /// apart by reading the predicate. Prefer this over `from_config` wherever
+    /// a `Config` is in hand.
+    #[must_use]
+    pub fn for_config(config: &crate::config::Config) -> Self {
+        Self::for_config_in(config, &config.action_dir)
+    }
+
+    /// [`for_config`](Self::for_config) with the action root overridden, for the
+    /// callers that scope a policy to a directory of their own (an attachment
+    /// root, a turn workspace) rather than the config's `action_dir`.
+    #[must_use]
+    pub fn for_config_in(config: &crate::config::Config, action_dir: &Path) -> Self {
+        Self::from_config(&config.autonomy, &config.workspace_dir, action_dir)
+            .with_account_dir(config.config_path.parent())
+    }
+
     /// Return a copy of this policy with the account / credential root set —
     /// `config_path`'s parent, which is not always `workspace_dir`'s parent
     /// (see [`SecurityPolicy::account_dir`]). Builder-style to match

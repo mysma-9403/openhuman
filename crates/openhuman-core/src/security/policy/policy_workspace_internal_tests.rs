@@ -371,6 +371,21 @@ async fn trusted_root_over_the_account_dir_cannot_reach_the_keyring_key() {
             "{shown}"
         );
     }
+
+    // Positive control, raised in review: a tempdir usually sits under a root
+    // that `SecurityPolicy::default()`'s `forbidden_paths` already lists, so
+    // without this the refusals above could be true for a reason that has
+    // nothing to do with the carve-out. A sibling file in the same account dir
+    // must still be reachable — which also re-pins #5505's "other files there
+    // stay reachable" through the full gate, not just the predicate.
+    let notes = account.join("notes.txt");
+    std::fs::write(&notes, "hello").expect("write notes");
+    let shown = notes.to_string_lossy();
+    assert!(
+        policy.is_path_string_allowed(&shown),
+        "the trusted root must still reach a non-carved-out file: {shown}"
+    );
+    assert!(policy.validate_path(&shown).await.is_ok(), "{shown}");
 }
 
 /// The account root is not always `workspace_dir`'s parent: `RuntimeBuilder::
@@ -478,4 +493,70 @@ fn symlinked_account_root_still_guards_a_file_that_does_not_exist_yet() {
         "the backing path of a symlinked account root must be guarded too"
     );
     assert!(policy.is_workspace_internal_path(&backing.join(".secret_key")));
+}
+
+/// Raised in review: with a split layout the union applied all five names to
+/// the workspace's parent too, so `/proj/.secret_key` — the user's own file in
+/// their project root — was classified as account state. Only the historical
+/// `config.toml` rule belongs to that parent once a root is configured.
+#[test]
+fn the_workspace_parent_keeps_only_the_config_rule_when_a_root_is_configured() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proj = tmp.path().join("proj");
+    let ws = proj.join("workspace");
+    let account = proj.join(".openhuman");
+    std::fs::create_dir_all(&ws).expect("create workspace");
+    std::fs::create_dir_all(&account).expect("create account dir");
+    let policy = SecurityPolicy {
+        workspace_dir: ws,
+        action_dir: proj.clone(),
+        ..SecurityPolicy::default()
+    }
+    .with_account_dir(Some(account.as_path()));
+
+    // The configured root holds all five.
+    for name in [
+        "config.toml",
+        "config.toml.bak",
+        ".secret_key",
+        "auth-profiles.json",
+        "claude_code_settings.json",
+    ] {
+        assert!(
+            policy.is_workspace_internal_path(&account.join(name)),
+            "{name} in the configured account root must be internal"
+        );
+    }
+    // The workspace's parent keeps the historical rule, and nothing more.
+    assert!(policy.is_workspace_internal_path(&proj.join("config.toml")));
+    for name in [
+        "config.toml.bak",
+        ".secret_key",
+        "auth-profiles.json",
+        "claude_code_settings.json",
+    ] {
+        assert!(
+            !policy.is_workspace_internal_path(&proj.join(name)),
+            "{name} beside the workspace is the user's file, not account state"
+        );
+    }
+}
+
+/// `for_config` is what every production call site now uses, so pin that it
+/// attaches the config's own account root rather than leaving the predicate on
+/// the `workspace_dir`-parent inference.
+#[test]
+fn for_config_attaches_the_configs_account_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let account = tmp.path().join("users").join("u1");
+    let config = crate::config::Config {
+        config_path: account.join("config.toml"),
+        workspace_dir: account.join("workspace"),
+        action_dir: tmp.path().join("projects"),
+        ..crate::config::Config::default()
+    };
+
+    let policy = SecurityPolicy::for_config(&config);
+    assert_eq!(policy.account_dir.as_deref(), Some(account.as_path()));
+    assert!(policy.is_workspace_internal_path(&account.join(".secret_key")));
 }

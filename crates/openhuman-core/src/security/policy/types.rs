@@ -199,8 +199,14 @@ pub(super) const ARTIFACTS_DIR: &str = "artifacts";
 /// — a trusted root over it grants its files (#5505) — so this is the
 /// carve-out list, not a containment boundary. See `is_workspace_internal_path`
 /// for why each entry is on it.
+/// The account config, the one name the workspace-parent fallback has always
+/// refused (#5505). Kept separate from the rest of
+/// [`ACCOUNT_INTERNAL_FILES`] because a configured account root and the
+/// workspace's parent are not always the same directory, and only this name
+/// applies to the latter once they diverge.
+pub(super) const ACCOUNT_CONFIG_FILE: &str = "config.toml";
 pub(super) const ACCOUNT_INTERNAL_FILES: &[&str] = &[
-    "config.toml",
+    ACCOUNT_CONFIG_FILE,
     "config.toml.bak",
     ".secret_key",
     "auth-profiles.json",

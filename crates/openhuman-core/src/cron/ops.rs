@@ -118,11 +118,7 @@ pub fn update_cron_job(
     };
 
     if let Some(ref cmd) = command {
-        let security = SecurityPolicy::from_config(
-            &config.autonomy,
-            &config.workspace_dir,
-            &config.action_dir,
-        );
+        let security = SecurityPolicy::for_config(config);
         if !security.is_command_allowed(cmd) {
             anyhow::bail!("Command blocked by security policy: {cmd}");
         }
@@ -182,11 +178,7 @@ pub async fn cron_update(
     }
 
     if let Some(command) = &patch.command {
-        let security = SecurityPolicy::from_config(
-            &config.autonomy,
-            &config.workspace_dir,
-            &config.action_dir,
-        );
+        let security = SecurityPolicy::for_config(config);
         if !security.is_command_allowed(command) {
             return Err(format!("Command blocked by security policy: {command}"));
         }

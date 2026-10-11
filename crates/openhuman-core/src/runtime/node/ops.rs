@@ -81,11 +81,7 @@ pub fn build_runtime_tools(config: &Config) -> Result<Vec<Box<dyn Tool>>, String
         workspace = %config.workspace_dir.display(),
         "[runtime_node::ops] build_runtime_tools: start"
     );
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-        &config.action_dir,
-    ));
+    let security = Arc::new(SecurityPolicy::for_config(config));
     // Phase 1 of #1401: see comment in channels/runtime/startup.rs.
     let audit = crate::security::get_or_create_workspace_audit_logger(
         crate::config::AuditConfig::default(),
@@ -133,8 +129,7 @@ pub fn classify_tool_call(
     args: &serde_json::Value,
 ) -> Result<CommandClass, String> {
     debug!(tool_name, "[runtime_node::ops] classify_tool_call: start");
-    let security =
-        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir, &config.action_dir);
+    let security = SecurityPolicy::for_config(config);
     let tools = build_runtime_tools(config)?;
     let tool = tools
         .into_iter()

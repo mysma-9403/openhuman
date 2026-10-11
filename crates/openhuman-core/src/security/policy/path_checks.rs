@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use super::types::{SecurityPolicy, TrustedAccess, POLICY_BLOCKED_MARKER};
 use super::types::{
-    ACCOUNT_INTERNAL_FILES, ARTIFACTS_DIR, ARTIFACT_TOOL_RESULTS_DIR, WORKSPACE_INTERNAL_DIRS,
-    WORKSPACE_INTERNAL_FILES,
+    ACCOUNT_CONFIG_FILE, ACCOUNT_INTERNAL_FILES, ARTIFACTS_DIR, ARTIFACT_TOOL_RESULTS_DIR,
+    WORKSPACE_INTERNAL_DIRS, WORKSPACE_INTERNAL_FILES,
 };
 
 impl SecurityPolicy {
@@ -380,37 +380,6 @@ impl SecurityPolicy {
         Ok(result)
     }
 
-    /// The directories whose own entries are account-level core state.
-    ///
-    /// The configured credential root ([`SecurityPolicy::account_dir`],
-    /// `config_path`'s parent) when the host set it, plus `workspace_dir`'s
-    /// parent — the same directory in the default layout and the only thing
-    /// available when nothing was set. Both are checked: the union can only
-    /// refuse more, so a call site that never sets `account_dir` keeps exactly
-    /// the behaviour it had.
-    ///
-    /// Each is offered in raw and canonical form, and so is the parent they are
-    /// compared against ([`Self::dir_forms`]). Comparing one raw path with one
-    /// canonical path never matches: a symlinked account root resolves to its
-    /// backing directory, and on macOS canonicalization also rewrites `/var`
-    /// to `/private/var`. The requested file itself usually cannot be
-    /// canonicalized at all — it does not exist yet, which is exactly the
-    /// case that matters for creating one.
-    fn account_state_dirs(&self, ws: &Path) -> Vec<PathBuf> {
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        for candidate in [self.account_dir.as_deref(), ws.parent()]
-            .into_iter()
-            .flatten()
-        {
-            for form in Self::dir_forms(candidate) {
-                if !dirs.contains(&form) {
-                    dirs.push(form);
-                }
-            }
-        }
-        dirs
-    }
-
     /// A directory as written and as the filesystem resolves it, so either side
     /// of a comparison can be matched whichever form the caller supplied.
     fn dir_forms(dir: &Path) -> Vec<PathBuf> {
@@ -458,25 +427,38 @@ impl SecurityPolicy {
         // Windows and a default case-insensitive macOS volume an agent that may
         // create `CLAUDE_CODE_SETTINGS.JSON` creates the very file the
         // provider later opens in lower case.
-        if let Some(parent) = check_path.parent() {
-            let is_account_file = check_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    ACCOUNT_INTERNAL_FILES
-                        .iter()
-                        .any(|entry| entry.eq_ignore_ascii_case(name))
-                });
+        if let Some((parent, name)) = check_path
+            .parent()
+            .zip(check_path.file_name().and_then(|name| name.to_str()))
+        {
             // Resolve the parent that exists rather than the file that may
             // not, so creating a protected name through a symlinked account
             // root is refused too.
             let parent_forms = Self::dir_forms(parent);
-            if is_account_file
-                && self
-                    .account_state_dirs(ws)
+            let under = |root: &Path, names: &[&str]| {
+                Self::dir_forms(root)
                     .iter()
                     .any(|dir| parent_forms.iter().any(|form| form == dir))
-            {
+                    && names.iter().any(|entry| entry.eq_ignore_ascii_case(name))
+            };
+            let configured = self.account_dir.as_deref();
+            // Which names count depends on which root matched. The configured
+            // credential root holds all of them. The workspace's parent keeps
+            // only the historical `config.toml` rule once a root is configured,
+            // because the two are then different directories and that parent
+            // may be the user's own project root — `/proj/.secret_key` beside
+            // `/proj/workspace` is their file, not account state. With nothing
+            // configured the parent *is* the account root, so it holds all.
+            let hit = configured.is_some_and(|root| under(root, ACCOUNT_INTERNAL_FILES))
+                || ws.parent().is_some_and(|root| {
+                    let names: &[&str] = if configured.is_some() {
+                        &[ACCOUNT_CONFIG_FILE]
+                    } else {
+                        ACCOUNT_INTERNAL_FILES
+                    };
+                    under(root, names)
+                });
+            if hit {
                 log::trace!(
                     "[security:policy] account-dir core state is not agent surface (path={})",
                     check_path.display()
