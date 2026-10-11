@@ -61,9 +61,17 @@ pub(crate) struct TurnModels {
     /// Whether the source provider is vision-capable — the harness uses this to
     /// gate multimodal placeholder rehydration. Captured at build time.
     supports_vision: bool,
+    /// Whether the source provider is local / self-hosted (Ollama, LM Studio,
+    /// ...). Selects the longer wall-clock ceilings (#6042).
+    is_local: bool,
 }
 
 impl TurnModels {
+    /// Whether the primary provider is local / self-hosted.
+    pub(crate) fn is_local(&self) -> bool {
+        self.is_local
+    }
+
     /// Adds a tier route to a test bundle (the injected-model builder has none).
     #[cfg(test)]
     pub(crate) fn with_test_route(mut self, name: &str, model: TurnChatModel) -> Self {
@@ -101,17 +109,10 @@ impl TurnModels {
 /// The **primary** is the model OpenHuman already chose for this turn — the
 /// user's per-thread `model_override`, else `config.default_model` — and for
 /// the turn's lead (the depth-0 agent, `is_team_lead`) it always wins. The
-/// harness forwards the definition's `[model] hint`/`model` as `model_pin`
-/// on every resolve; honouring it for the lead let the orchestrator's
-/// `hint = "coding"` silently reroute every chat turn onto `hint:coding`
-/// (DeepSeek V4 Pro) no matter which model the user picked in the UI, since
-/// `hint:coding` is always a registered tier route. A pin is advisory
-/// (`ModelResolveRequest::model_pin` docs) and the lead's selection is the
-/// stronger, more explicit signal.
-///
-/// Sub-agents (depth > 0) keep resolving their pin against the tier routes —
-/// that is how a sub-agent's `hint = "burst"` reaches `hint:burst` —
-/// and fall back to the primary when the pin names no built route.
+/// harness forwards exact model pins and typed routing hints separately.
+/// Both are advisory, so neither may replace the lead's stronger selection.
+/// Sub-agents resolve an exact pin first, otherwise `hint:<name>`, against
+/// prebuilt tier routes; an unavailable route falls back to the primary.
 ///
 /// Only the lead's model records into the turn's error slot (#6724). Sub-agents
 /// resolve through this same resolver, possibly in parallel, so they get the
@@ -154,7 +155,13 @@ impl ModelResolver<()> for TurnModelResolver {
         &self,
         request: &ModelResolveRequest,
     ) -> tinyagents_harness::Result<TurnChatModel> {
-        let pin = request.model_pin();
+        let hint_route = request
+            .model_hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|hint| !hint.is_empty())
+            .map(|hint| format!("hint:{hint}"));
+        let pin = request.model_pin().or(hint_route.as_deref());
         if request.is_team_lead {
             if let Some(pin) = pin.filter(|pin| self.routes.contains_key(*pin)) {
                 tracing::debug!(
@@ -199,6 +206,7 @@ fn build_turn_models_crate(
     provider_id: String,
     native_tools: bool,
     _supports_vision: bool,
+    is_local: bool,
     thread_id: Option<&str>,
 ) -> anyhow::Result<TurnModels> {
     use crate::inference::provider::factory;
@@ -206,6 +214,11 @@ fn build_turn_models_crate(
     // The primary honours an explicit provider-string override when the producer's
     // effective provider differs from `provider_for_role(role)` (triage #1257).
     let build_primary = |m: &str| -> anyhow::Result<TurnChatModel> {
+        if let Some(chat) = crate::core::runtime::CoreContext::current_host_overrides()
+            .and_then(|local| local.model_for(role))
+        {
+            return Ok(chat);
+        }
         let managed = primary_override
             .map(|provider| {
                 let provider = provider.trim();
@@ -272,6 +285,24 @@ fn build_turn_models_crate(
                     continue;
                 }
                 let tier_role = factory::role_for_model_tier(tier);
+                if let Some(custom) = crate::core::runtime::CoreContext::current_host_overrides()
+                    .and_then(|local| {
+                        local
+                            .role_models
+                            .get(tier)
+                            .or_else(|| local.role_models.get(tier_role))
+                            .cloned()
+                    })
+                {
+                    routes.push((
+                        tier.to_string(),
+                        crate::agent::attachments::provider::wrap_injected(
+                            custom,
+                            Arc::new(config.clone()),
+                        ),
+                    ));
+                    continue;
+                }
                 let route = if factory::resolves_to_managed_backend(tier_role, config) {
                     factory::make_openhuman_backend_model_for_thread(
                         tier_role, config, tier, true, thread_id,
@@ -313,7 +344,15 @@ fn build_turn_models_crate(
             }
 
             // The summarizer is a distinct adapter instance (own empty error slot).
-            let summarizer = build_primary(model)?;
+            let summarizer = match crate::core::runtime::CoreContext::current_host_overrides()
+                .and_then(|local| local.role_models.get("summarization").cloned())
+            {
+                Some(custom) => crate::agent::attachments::provider::wrap_injected(
+                    custom,
+                    Arc::new(config.clone()),
+                ),
+                None => build_primary(model)?,
+            };
 
             anyhow::Ok((primary, routes, summarizer))
         })?;
@@ -328,6 +367,7 @@ fn build_turn_models_crate(
         context_window,
         native_tools,
         supports_vision,
+        is_local,
     })
 }
 
@@ -456,6 +496,13 @@ impl TurnModelSource {
         let Some(source) = self.crate_native.as_ref() else {
             return crate::inference::model_context::context_window_for_model(model);
         };
+        if let Some(custom) = crate::core::runtime::CoreContext::current_host_overrides()
+            .and_then(|local| local.model_for(&source.role))
+        {
+            return custom
+                .profile()
+                .and_then(|profile| profile.max_input_tokens);
+        }
         let provider_string = source.primary_override.clone().unwrap_or_else(|| {
             crate::inference::provider::provider_for_role(&source.role, &source.config)
         });
@@ -477,6 +524,38 @@ impl TurnModelSource {
         context_window: Option<u64>,
         thread_id: Option<&str>,
     ) -> anyhow::Result<TurnModels> {
+        if let Some(source) = &self.crate_native {
+            if let Some(local) = crate::core::runtime::CoreContext::current_host_overrides() {
+                if let Some(custom) = local.model_for(&source.role) {
+                    let mut models = Self::from_model(custom)
+                        .with_attachment_config(source.config.clone())
+                        .build(model, temperature, context_window, thread_id)?;
+                    for &tier in routes::WORKLOAD_ROUTE_TIERS {
+                        let role = crate::inference::provider::factory::role_for_model_tier(tier);
+                        if let Some(custom) = local
+                            .role_models
+                            .get(tier)
+                            .or_else(|| local.role_models.get(role))
+                        {
+                            models.routes.push((
+                                tier.to_owned(),
+                                crate::agent::attachments::provider::wrap_injected(
+                                    custom.clone(),
+                                    source.config.clone(),
+                                ),
+                            ));
+                        }
+                    }
+                    if let Some(custom) = local.role_models.get("summarization") {
+                        models.summarizer = crate::agent::attachments::provider::wrap_injected(
+                            custom.clone(),
+                            source.config.clone(),
+                        );
+                    }
+                    return Ok(models);
+                }
+            }
+        }
         if let Some(direct) = &self.direct_model {
             let mut profile = direct.profile().cloned().unwrap_or_default();
             if let Some(window) = context_window.filter(|window| *window > 0) {
@@ -488,6 +567,8 @@ impl TurnModelSource {
                 .unwrap_or_else(|| "injected".to_string());
             let native_tools = profile.tool_calling;
             let supports_vision = profile.modalities.image_in;
+            let is_local =
+                crate::agent::tinyagents::turn_policy::provider_is_self_hosted(&provider_id, None);
             let context_window = context_window.or(profile.max_input_tokens);
             let primary: TurnChatModel = Arc::new(
                 ProfileOverrideModel::new(direct.clone(), profile)
@@ -513,13 +594,20 @@ impl TurnModelSource {
                 context_window,
                 native_tools,
                 supports_vision,
+                is_local,
             });
         }
         if let Some(cn) = &self.crate_native {
             let provider_string = cn.primary_override.clone().unwrap_or_else(|| {
                 crate::inference::provider::provider_for_role(&cn.role, &cn.config)
             });
+            // Tool/vision gating keeps its historical provider-name rule; only
+            // the wall-clock ceilings use endpoint-aware self-hosted detection.
             let is_local = tinyinference_local::profile::is_local_provider_string(&provider_string);
+            let self_hosted = crate::agent::tinyagents::turn_policy::provider_is_self_hosted(
+                &provider_string,
+                crate::agent::tinyagents::turn_policy::local_openai_endpoint(&cn.config).as_deref(),
+            );
             let provider_id = if provider_string == "openhuman"
                 || provider_string.is_empty()
                 || provider_string == "cloud"
@@ -542,6 +630,7 @@ impl TurnModelSource {
                 provider_id,
                 !is_local,
                 !is_local,
+                self_hosted,
                 thread_id,
             );
         }
@@ -574,6 +663,18 @@ impl TurnModelSource {
             });
         }
         if let Some(cn) = &self.crate_native {
+            if let Some(custom) = crate::core::runtime::CoreContext::current_host_overrides()
+                .and_then(|local| {
+                    local
+                        .model_for("summarization")
+                        .or_else(|| local.model_for(&cn.role))
+                })
+            {
+                return Ok(crate::agent::attachments::provider::wrap_injected(
+                    custom,
+                    cn.config.clone(),
+                ));
+            }
             let managed = cn
                 .primary_override
                 .as_deref()

@@ -8,6 +8,7 @@ set -euo pipefail
 
 OUT="${OUT:-lcov-core.info}"
 PRODUCT_FEATURES="$(bash scripts/ci/product-features.sh)"
+CORE_PRODUCT_FEATURES="$(bash scripts/ci/product-features.sh --core)"
 
 # Sandboxed acting-tool tests deliberately do not forward RUSTUP_HOME. The
 # container installs Rust outside HOME, so its rustup proxy otherwise tries
@@ -33,7 +34,7 @@ llvm_cov() {
       ;;
     *)
       bash scripts/ci-cancel-aware.sh cargo llvm-cov \
-        --features "${PRODUCT_FEATURES}" "$@"
+        --features "${CORE_PRODUCT_FEATURES}" "$@"
       ;;
   esac
 }
@@ -42,9 +43,13 @@ llvm_cov_package() {
   bash scripts/ci-cancel-aware.sh cargo llvm-cov "$@"
 }
 
-llvm_cov_embed() {
+llvm_cov_product_facade() {
   bash scripts/ci-cancel-aware.sh cargo llvm-cov \
-    --features "${PRODUCT_FEATURES}" "$@"
+    --features "${CORE_PRODUCT_FEATURES}" "$@"
+}
+
+llvm_cov_embed() {
+  llvm_cov_product_facade "$@"
 }
 
 integration_test_targets() {
@@ -154,6 +159,12 @@ run_integration_target() {
   fi
 }
 
+run_build_only_reaper_test() {
+  suite "openhuman reaper (isolated)" llvm_cov --no-report --no-fail-fast -p openhuman --lib -- \
+    agent::tinyagents::reaper::tests::a_build_only_runtime_is_swept_before_it_can_be_invoked \
+    --exact --test-threads=1
+}
+
 if [ "${OH_COV_RUNNER:-cargo}" = "nextest" ]; then
   # One process per test means one .profraw per process by default (the name
   # carries %p): ~11,800 files and ~50 GB for the core alone, which the report
@@ -210,9 +221,7 @@ else
     --skip a_build_only_runtime_is_swept_before_it_can_be_invoked
 
   log "running isolated build-only reaper test"
-  suite "openhuman reaper (isolated)" llvm_cov --no-report --no-fail-fast -p openhuman --lib -- \
-    openhuman::agent::tinyagents::reaper::tests::a_build_only_runtime_is_swept_before_it_can_be_invoked \
-    --exact --test-threads=1
+  run_build_only_reaper_test
 fi
 
 # Run every root-workspace Rust support crate rather than only crates named by
@@ -220,7 +229,7 @@ fi
 # remaining crates do not expose that feature vocabulary.
 suite "openhuman-embed" llvm_cov_embed --no-report --no-fail-fast -p openhuman-embed --all-targets
 suite "openhuman-rpc" llvm_cov_package --no-report --no-fail-fast -p openhuman-rpc --all-targets
-suite "openhuman-tinyhumans" llvm_cov_embed --no-report --no-fail-fast -p openhuman-tinyhumans --all-targets
+suite "openhuman-tinyhumans" llvm_cov_product_facade --no-report --no-fail-fast -p openhuman-tinyhumans --all-targets
 # The terminal frontend builds the core a third time (default features, not the
 # product set). It is on by default and on in the PR lane; OH_COV_TUI=0 is an
 # opt-out for local runs.

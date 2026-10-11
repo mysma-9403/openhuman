@@ -11,6 +11,7 @@ fn context(tool: &str, arguments: Value) -> ToolHookContext {
         output: None,
         error: None,
         session_id: Some("sess-1".into()),
+        cwd: None,
         agent_id: None,
     }
 }
@@ -111,4 +112,19 @@ fn timeout_text_classifies_as_a_timeout_failure() {
         "permission_denied"
     );
     assert_eq!(classify_failure("something else"), "error");
+}
+
+#[test]
+fn configured_hook_identity_uses_the_resolved_working_directory() {
+    let mut ctx = context("shell", serde_json::json!({"command": "pwd"}));
+    ctx.cwd = Some(std::path::PathBuf::from("/resolved/workspace"));
+    assert_eq!(
+        identity_from_tool(&ctx).cwd.as_deref(),
+        Some("/resolved/workspace")
+    );
+    ctx.arguments["cwd"] = serde_json::json!("relative/argument");
+    assert_eq!(
+        identity_from_tool(&ctx).cwd.as_deref(),
+        Some("/resolved/workspace")
+    );
 }

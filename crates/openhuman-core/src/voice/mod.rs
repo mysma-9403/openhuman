@@ -32,12 +32,10 @@ pub use compile_status::VOICE_COMPILED_IN;
 pub mod always_on;
 #[cfg(feature = "voice")]
 pub mod audio_capture;
-/// Podcast generation + email delivery (`audio_toolkit` RPC namespace). Part of
-/// the voice family: it is compiled out with the same `voice` gate.
-#[cfg(feature = "voice")]
-pub mod audio_toolkit;
 #[cfg(feature = "voice")]
 pub mod bus;
+#[cfg(feature = "voice")]
+pub(crate) mod capture_lease;
 #[cfg(feature = "voice")]
 pub use bus::publish_ptt_transcript_committed;
 #[cfg(feature = "voice")]

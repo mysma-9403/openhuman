@@ -92,3 +92,51 @@ async fn reading_an_agents_connections_does_not_create_its_host() {
     assert!(ambient, "the ambient lookup answers nothing connected");
     assert!(!temporary.path().join("agents").join("epsilon").exists());
 }
+
+/// A profile's context as the SaaS profile host derives it: the profile's
+/// own workspace, a profile id, and no agent id.
+fn profile_context(config: &Config, profile: &str) -> Arc<CoreContext> {
+    CoreContext::for_test_with_config(DomainSet::full(), config.clone()).derive_with(
+        ContextOverlay::new(config.clone(), DomainSet::full(), ToolGroups::none()).profile(profile),
+    )
+}
+
+#[tokio::test]
+async fn two_profiles_default_agents_get_their_own_hosts_and_never_the_default() {
+    let (one, two) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    let (alice, bob) = (workspace_config(one.path()), workspace_config(two.path()));
+
+    // Before either installed anything, neither sees a host — not each
+    // other's, not the process default — and a read creates none.
+    for (config, name) in [(&alice, "alice"), (&bob, "bob")] {
+        let seen = CoreContext::scope(profile_context(config, name), async { try_service() }).await;
+        assert!(seen.is_none(), "{name} saw a host it never opened");
+        assert!(!tinymcp::Store::path_for(&config.workspace_dir).exists());
+    }
+
+    let alice_host = CoreContext::scope(profile_context(&alice, "alice"), async {
+        for_config(&alice).expect("alice's host opens")
+    })
+    .await;
+    let bob_host = CoreContext::scope(profile_context(&bob, "bob"), async {
+        for_config(&bob).expect("bob's host opens")
+    })
+    .await;
+    assert!(!Arc::ptr_eq(&alice_host, &bob_host));
+    // The default agent's host sits at the profile's workspace root.
+    assert!(tinymcp::Store::path_for(one.path()).exists());
+    assert!(!one.path().join("agents").exists());
+
+    let ambient_alice =
+        CoreContext::scope(profile_context(&alice, "alice"), async { try_service() }).await;
+    let ambient_bob =
+        CoreContext::scope(profile_context(&bob, "bob"), async { try_service() }).await;
+    assert!(Arc::ptr_eq(
+        &ambient_alice.expect("alice's host"),
+        &alice_host
+    ));
+    assert!(Arc::ptr_eq(&ambient_bob.expect("bob's host"), &bob_host));
+}

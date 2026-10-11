@@ -240,7 +240,7 @@ const CodeBlockPre: FC<ComponentPropsWithoutRef<'pre'>> = ({ className, children
   );
 };
 
-const defaultComponents = memoizeMarkdownComponents({
+const memoizedComponents = memoizeMarkdownComponents({
   h1: ({ className, ...props }) => (
     <h1
       className={cn(
@@ -300,7 +300,10 @@ const defaultComponents = memoizeMarkdownComponents({
     if (source) return <CitationMarker index={citationIndex} source={source} />;
     return (
       <a
-        className={cn('aui-md-a text-primary hover:text-primary/80 no-underline', className)}
+        className={cn(
+          'aui-md-a text-primary hover:text-primary/80 underline underline-offset-2',
+          className
+        )}
         href={href}
         {...props}>
         {children}
@@ -340,10 +343,7 @@ const defaultComponents = memoizeMarkdownComponents({
   ),
   table: ({ className, ...props }) => (
     <table
-      className={cn(
-        'aui-md-table my-3 w-full border-separate border-spacing-0 overflow-y-auto',
-        className
-      )}
+      className={cn('aui-md-table w-full border-separate border-spacing-0', className)}
       {...props}
     />
   ),
@@ -383,7 +383,6 @@ const defaultComponents = memoizeMarkdownComponents({
   sup: ({ className, ...props }) => (
     <sup className={cn('aui-md-sup [&>a]:text-xs [&>a]:no-underline', className)} {...props} />
   ),
-  pre: CodeBlockPre,
   code: function Code({ className, ...props }) {
     const isCodeBlock = useIsMarkdownCodeBlock();
     return (
@@ -398,3 +397,8 @@ const defaultComponents = memoizeMarkdownComponents({
     );
   },
 });
+
+// The kit forwards pre props through an effect-updated callback, so its
+// hast node can lag behind the current code children. Comparing only that
+// node can freeze a streamed block; reconcile the wrapper's children normally.
+const defaultComponents = { ...memoizedComponents, pre: CodeBlockPre };

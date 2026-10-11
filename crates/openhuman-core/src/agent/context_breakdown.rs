@@ -126,12 +126,17 @@ async fn cached_report(agent_id: &str, config: &Config) -> Result<PromptSizeRepo
     Ok(report)
 }
 
-/// Adds a `"history"` section sized from a thread's last-turn input tokens
-/// (`threads.token_usage`), when `thread_id` is given and that thread has
+/// Adds a `"history"` section sized from the context a thread's last turn
+/// ended with (`threads.token_usage`'s `last_turn_context_tokens`, one
+/// request, not the turn's summed spend), when `thread_id` is given and that thread has
 /// recorded usage. Silent no-op (no section added) on any lookup failure —
 /// a context breakdown must never fail just because the optional history
 /// enrichment couldn't be computed.
-async fn history_section(thread_id: &str) -> Option<ContextSection> {
+fn history_tokens(context_tokens: usize, fixed_prompt_tokens: usize) -> usize {
+    context_tokens.saturating_sub(fixed_prompt_tokens)
+}
+
+async fn history_section(thread_id: &str, fixed_prompt_tokens: usize) -> Option<ContextSection> {
     let outcome = crate::threads::ops::token_usage(crate::threads::ops::ThreadTokenUsageRequest {
         thread_id: thread_id.to_string(),
     })
@@ -144,7 +149,7 @@ async fn history_section(thread_id: &str) -> Option<ContextSection> {
     // Tokens, not bytes, is what `token_usage` actually recorded — reverse
     // the module's own byte-per-token estimate so `bytes` stays a consistent
     // (if approximate) unit across every section in the response.
-    let est = usage.last_turn_input_tokens as usize;
+    let est = history_tokens(usage.last_turn_context_tokens as usize, fixed_prompt_tokens);
     let bytes = est.saturating_mul(crate::agent::debug::prompt_size::EST_BYTES_PER_TOKEN);
     Some(ContextSection {
         label: "history".to_string(),
@@ -190,6 +195,7 @@ pub async fn context_breakdown(
     let mut sections: Vec<ContextSection> =
         report.sections.iter().map(section_from_prompt).collect();
     sections.push(tools_section(&report.tools));
+    let fixed_prompt_tokens = sections.iter().map(|section| section.est_tokens).sum();
 
     if let Some(thread_id) = params
         .thread_id
@@ -197,7 +203,7 @@ pub async fn context_breakdown(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        if let Some(history) = history_section(thread_id).await {
+        if let Some(history) = history_section(thread_id, fixed_prompt_tokens).await {
             sections.push(history);
         }
     }

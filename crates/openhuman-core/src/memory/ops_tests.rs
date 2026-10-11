@@ -464,3 +464,85 @@ async fn erase_all_reports_memory_off_without_an_engine() {
         .unwrap_err();
     assert_eq!(error.code(), MEMORY_OFF);
 }
+
+#[tokio::test]
+async fn erasing_memory_cancels_queued_learning_so_restart_cannot_restore_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config_in(&tmp);
+    let engine = bind_reference(&config);
+    let facts = crate::memory::tools::CallFacts::of(
+        &config,
+        &crate::memory::scope::MemoryIdentity::agent("orchestrator"),
+    );
+    let queued = crate::memory::tool_writes::enqueue(
+        &config,
+        &serde_json::json!({"action":"learn","text":"Prefers tea"}),
+        &facts,
+    )
+    .unwrap();
+    assert!(queued["status"].as_str().unwrap().starts_with("queued"));
+    erase_all(&config, EraseAllParams { confirm: true })
+        .await
+        .unwrap();
+    let restarted = config.clone();
+    crate::memory::tool_writes::drain(&restarted).await;
+    assert!(stored(&engine, MetaFilter::default()).await.is_empty());
+}
+
+/// With a reach, forget by id goes to the engine's `forget_within` (through
+/// the scrubbing wrapper every bound engine sits in), so the engine never
+/// sweeps the tree for the ids; without one it stays a plain forget by id.
+#[tokio::test]
+async fn forget_with_a_reach_forgets_within_it() {
+    use tinymemory_api::MemoryEngine as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config_in(&tmp);
+    let engine = std::sync::Arc::new(crate::memory::test_fixtures::RecordingEngine::new());
+    crate::memory::test_fixtures::RecordingEngine::bind(&engine, &config);
+
+    let mine = learn(&config, learn_params("tea in the morning"), None)
+        .await
+        .unwrap();
+    let other = learn(&config, learn_params("coffee at night"), None)
+        .await
+        .unwrap();
+    let namespace = engine
+        .list(ListRequest {
+            filter: MetaFilter::default(),
+            limit: 10,
+            cursor: None,
+        })
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|hit| hit.id.0 == mine.id)
+        .expect("learned item listed")
+        .meta
+        .namespace;
+
+    let forgotten = forget(
+        &config,
+        ForgetParams {
+            ids: vec![mine.id.clone()],
+            reach: Some(tinymemory_api::Reach::exact(namespace)),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(forgotten.forgotten, 1);
+    assert_eq!(engine.calls(), vec!["forget_within"]);
+
+    let forgotten = forget(
+        &config,
+        ForgetParams {
+            ids: vec![other.id.clone()],
+            reach: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(forgotten.forgotten, 1);
+    assert_eq!(engine.calls(), vec!["forget_within", "forget"]);
+}

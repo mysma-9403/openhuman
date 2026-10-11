@@ -50,12 +50,35 @@ impl ApprovalGate {
         // `AgentTurnOrigin` around `run_turn`. Unlabelled callers map to
         // `Unknown`, which is denied — the gate refuses to execute an
         // external_effect tool from an unlabelled call site.
+        let origin = turn_origin::current().unwrap_or(AgentTurnOrigin::Unknown);
+        // Approval of job creation grants the scheduler permission to run the
+        // saved prompt and deliver its answer, not permission for arbitrary
+        // future external effects. Enforce this before global auto-approval,
+        // per-tool allowlists, and per-agent approval bypasses.
+        if let AgentTurnOrigin::TrustedAutomation {
+            source: TrustedAutomationSource::Cron,
+            job_id,
+        } = &origin
+        {
+            tracing::warn!(
+                tool = tool_name,
+                job_id = %job_id,
+                "[approval::gate] scheduled agent external effect denied"
+            );
+            return (
+                GateOutcome::Deny {
+                    reason: format!(
+                        "{POLICY_DENIED_MARKER} Scheduled agent turns cannot use '{tool_name}' for an external effect."
+                    ),
+                },
+                None,
+            );
+        }
         // SaaS has no per-user approval surface: never park, allow only what
         // the deployment's sandboxed tool groups open.
         if let Some(outcome) = saas_outcome_with(crate::core::runtime::is_saas(), tool_name) {
             return (outcome, None);
         }
-        let origin = turn_origin::current().unwrap_or(AgentTurnOrigin::Unknown);
         if forced
             && !matches!(
                 &origin,
@@ -250,13 +273,29 @@ impl ApprovalGate {
             } => Some((thread_id.clone(), client_id.clone())),
             _ => None,
         };
-        if chat_ctx.is_none() && origin_chat_route.is_some() {
+        // The fallback is taken exactly when the park runs on a task detached
+        // from the chat turn that shows it — an async-delegated sub-agent. Such
+        // a park can outlive that turn (the parent replies "I've asked the
+        // image agent…" and its `chat_done` fires while the child still waits
+        // here), so the route records it as `detached` and the web surface
+        // (`is_detached_request`) marks the card: the frontend
+        // keeps it across the parent's turn end instead of clearing it as a
+        // park that "cannot outlive its turn" — the clear that left every
+        // async `image_agent` / `video_agent` approval invisible until it
+        // expired at 600s.
+        let detached = !forced && chat_ctx.is_none() && origin_chat_route.is_some();
+        if detached {
             tracing::debug!(
                 tool = tool_name,
                 "[approval::gate] APPROVAL_CHAT_CONTEXT absent on a WebChat turn — routing the \
-                 approval via the origin's thread/client (async-delegated sub-agent path, #5499)"
+                 approval via the origin's thread/client (async-delegated sub-agent path, #5499); \
+                 marking the card detached so it survives the parent turn's end"
             );
         }
+        // Any park raised inside a sub-agent run — detached or inline — gets
+        // the shorter `SUBAGENT_APPROVAL_TTL` window.
+        let subagent_park = !forced
+            && (detached || tinyagents_harness::context::current_run_depth().is_some_and(|facts| facts.depth > 0));
         let chat_thread_id = chat_ctx
             .as_ref()
             .map(|c| c.thread_id.clone())
@@ -303,14 +342,16 @@ impl ApprovalGate {
             }
             AgentTurnOrigin::TrustedAutomation {
                 source: TrustedAutomationSource::Cron,
-                job_id,
+                ..
             } => {
-                tracing::debug!(
-                    tool = tool_name,
-                    job_id = %job_id,
-                    "[approval::gate] trusted cron automation — allowing without prompt"
+                return (
+                    GateOutcome::Deny {
+                        reason: format!(
+                            "{POLICY_DENIED_MARKER} Scheduled agent turns cannot use '{tool_name}' for an external effect."
+                        ),
+                    },
+                    None,
                 );
-                return (GateOutcome::Allow, None);
             }
             AgentTurnOrigin::TrustedAutomation {
                 source: TrustedAutomationSource::Background,
@@ -399,10 +440,13 @@ impl ApprovalGate {
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
-        let agent_id = crate::core::runtime::agent_scope::current_agent_id();
+        // Routes key on the tenant (profile and agent), so two SaaS profiles'
+        // default agents, which carry no agent id, never share one.
+        let route_tenant = super::gate::current_route_tenant();
+        let agent_id = route_tenant.agent.clone();
         let thread_key = chat_thread_id
             .as_deref()
-            .map(|thread_id| thread_route_key(agent_id.as_deref(), thread_id));
+            .map(|thread_id| thread_route_key(&route_tenant, thread_id));
         // Resolve the clamped park TTL up front so the persisted `expires_at`
         // and the actual wait below (see `resolve_park_ttl` further down)
         // use the same value — see `Self::resolve_park_ttl` and the
@@ -412,7 +456,8 @@ impl ApprovalGate {
         // waiting 180s, so a core restart or an `expire_stale` sweep mid-park
         // could leave the row "actionable" for the wrong window (CodeRabbit
         // + Codex review on PR #5112).
-        let effective_ttl = Self::resolve_park_ttl(self.effective_ttl(), copilot_stream);
+        let effective_ttl =
+            Self::resolve_park_ttl(self.effective_ttl(), copilot_stream, subagent_park);
         let expires_at = Some(now + chrono::Duration::from_std(effective_ttl).unwrap_or_default());
 
         // Correlation context (flow-approval-surface, PR2): a Workflow-origin
@@ -456,125 +501,130 @@ impl ApprovalGate {
         // to time out and return `Deny` incorrectly. (CodeRabbit
         // review on PR #2149.)
         let (tx, rx) = oneshot::channel::<ApprovalDecision>();
-        {
-            let mut waiters = self.waiters.lock();
-            waiters.insert(request_id.clone(), tx);
-        }
-        // Record the thread → request mapping so an inbound chat reply on this
-        // thread can be routed to `approval_decide` (see web channel ingress).
-        if let Some(thread_key) = thread_key.as_ref() {
-            self.thread_to_request
-                .lock()
-                .insert(thread_key.clone(), request_id.clone());
-        }
-        // Record the full routing correlation (thread/client/tool_call_id) so
-        // whichever path resolves this request's decision — `decide()`, the
-        // TTL timeout, or a dropped decision channel, all below — can mirror
-        // it onto `ApprovalDecided` without re-deriving it from ambient
-        // task-locals that may no longer be in scope by then.
-        self.insert_request_route(
-            &request_id,
-            RequestRoute {
+        let scope = crate::core::runtime::CoreContext::current_host_overrides()
+            .and_then(|overrides| overrides.approval_scope());
+        let register = |workspace| -> anyhow::Result<()> {
+            {
+                let mut waiters = self.waiters.lock();
+                waiters.insert(request_id.clone(), tx);
+            }
+            // Record the thread → request mapping so an inbound chat reply on this
+            // thread can be routed to `approval_decide` (see web channel ingress).
+            if let Some(thread_key) = thread_key.as_ref() {
+                self.thread_to_request
+                    .lock()
+                    .insert(thread_key.clone(), request_id.clone());
+            }
+            // Record the full routing correlation (thread/client/tool_call_id) so
+            // whichever path resolves this request's decision — `decide()`, the
+            // TTL timeout, or a dropped decision channel, all below — can mirror
+            // it onto `ApprovalDecided` without re-deriving it from ambient
+            // task-locals that may no longer be in scope by then.
+            self.insert_request_route(
+                &request_id,
+                RequestRoute {
+                    thread_id: chat_thread_id.clone(),
+                    client_id: chat_client_id.clone(),
+                    tool_call_id: tool_call_id.map(str::to_string),
+                    forced,
+                    agent_id: agent_id.clone(),
+                    approval_scope: scope.clone(),
+                    thread_key: thread_key.clone(),
+                    detached,
+                },
+            );
+            store::insert_pending(&self.config, &pending, &self.session_id)?;
+
+            tracing::info!(
+                request_id = %request_id,
+                tool = tool_name,
+                thread_id = chat_thread_id.as_deref().unwrap_or("<none>"),
+                client_id = chat_client_id.as_deref().unwrap_or("<none>"),
+                agent_id = agent_id.as_deref().unwrap_or("<none>"),
+                "[approval::gate] publishing ApprovalRequested (surface fires only if thread_id+client_id are both set)"
+            );
+            BUS.publish(DomainEvent::ApprovalRequested {
+                request_id: request_id.clone(),
+                tool_name: tool_name.to_string(),
+                action_summary: action_summary.to_string(),
+                args_redacted,
                 thread_id: chat_thread_id.clone(),
                 client_id: chat_client_id.clone(),
                 tool_call_id: tool_call_id.map(str::to_string),
-                forced,
-                agent_id: agent_id.clone(),
-            },
-        );
-        if let Err(err) = store::insert_pending(&self.config, &pending, &self.session_id) {
-            self.evict_waiter(&request_id);
-            self.clear_thread(&thread_key, &request_id);
-            self.take_request_route(&request_id);
-            tracing::error!(
-                error = %err,
-                tool = tool_name,
-                "[approval::gate] failed to persist pending row — failing closed"
-            );
-            return (
-                GateOutcome::Deny {
-                    reason: format!(
-                        "{POLICY_DENIED_MARKER} Approval gate could not persist the request — \
-                         denying for safety: {err}"
-                    ),
-                },
-                None,
-            );
-        }
-
-        tracing::info!(
-            request_id = %request_id,
-            tool = tool_name,
-            thread_id = chat_thread_id.as_deref().unwrap_or("<none>"),
-            client_id = chat_client_id.as_deref().unwrap_or("<none>"),
-            agent_id = agent_id.as_deref().unwrap_or("<none>"),
-            "[approval::gate] publishing ApprovalRequested (surface fires only if thread_id+client_id are both set)"
-        );
-        BUS.publish(DomainEvent::ApprovalRequested {
-            request_id: request_id.clone(),
-            tool_name: tool_name.to_string(),
-            action_summary: action_summary.to_string(),
-            args_redacted,
-            thread_id: chat_thread_id.clone(),
-            client_id: chat_client_id.clone(),
-            tool_call_id: tool_call_id.map(str::to_string),
-            expires_at: expires_at.map(|t| t.to_rfc3339()),
-            agent_id: agent_id.clone(),
-        });
-
-        // Flow-origin surface bridge (flow-approval-surface, PR3): a flow run
-        // has no chat thread/client to route the generic `ApprovalRequested`
-        // through (both are `None` above, so the web-channel bridge silently
-        // drops it — see `web_chat::event_bus`'s
-        // `ApprovalSurfaceSubscriber`), which is exactly the silent-deadlock
-        // bug this correlation fixes. Broadcast a dedicated
-        // `flow_approval_request` socket event (no thread/client required,
-        // unlike the chat path) plus a `CoreNotification` with the three
-        // flow-scoped decision actions, so the Workflows UI can surface and
-        // resolve the park without polling.
-        if let Some(ApprovalSourceContext::Flow {
-            flow_id, run_id, ..
-        }) = &source_context
-        {
-            tracing::info!(
-                request_id = %request_id,
-                flow_id = %flow_id,
-                run_id = %run_id,
-                tool = tool_name,
-                "[approval::gate] flow-origin park — surfacing flow_approval_request + notification"
-            );
-            BUS.publish(DomainEvent::FlowApprovalRequested {
-                request_id: request_id.clone(),
-                flow_id: flow_id.clone(),
-                run_id: run_id.clone(),
-                tool_name: tool_name.to_string(),
-                summary: action_summary.to_string(),
+                expires_at: expires_at.map(|t| t.to_rfc3339()),
                 agent_id: agent_id.clone(),
             });
-            // The workspace the flow parked in, so the approval banner is
-            // dropped by a client that has since switched away rather than
-            // approving this workspace's call from another one. Fails open on
-            // a resolve failure: an unbound notification still reaches the
-            // user, whereas not publishing recreates the silent deadlock this
-            // bridge exists to fix.
-            let workspace = match crate::config::active_workspace_snapshot().await {
-                Ok((dir, revision)) => Some((crate::config::workspace_handle(&dir), revision)),
-                Err(error) => {
-                    tracing::warn!(
-                        request_id = %request_id,
-                        "[approval::gate] could not resolve the active workspace for the flow approval notification ({error}); publishing it unbound"
-                    );
-                    None
+            // Publish every surface inside the same registration barrier.
+            // Workspace lookup cannot delay a flow surface after the generic
+            // request; scoped removal and decisions wait for every surface.
+            if let Some(ApprovalSourceContext::Flow {
+                flow_id, run_id, ..
+            }) = &source_context
+            {
+                tracing::info!(request_id = %request_id, flow_id = %flow_id,
+                    run_id = %run_id, tool = tool_name,
+                    "[approval::gate] flow-origin park — surfacing flow_approval_request + notification");
+                BUS.publish(DomainEvent::FlowApprovalRequested {
+                    request_id: request_id.clone(),
+                    flow_id: flow_id.clone(),
+                    run_id: run_id.clone(),
+                    tool_name: tool_name.to_string(),
+                    summary: action_summary.to_string(),
+                    agent_id: agent_id.clone(),
+                });
+                publish_flow_gate_notification(
+                    &request_id,
+                    flow_id,
+                    run_id,
+                    tool_name,
+                    action_summary,
+                    workspace,
+                );
+            }
+            Ok(())
+        };
+        let registered = super::flow_surface::register_after_workspace(
+            scope.as_deref(),
+            async {
+                if !matches!(&source_context, Some(ApprovalSourceContext::Flow { .. })) {
+                    return None;
                 }
-            };
-            publish_flow_gate_notification(
-                &request_id,
-                flow_id,
-                run_id,
-                tool_name,
-                action_summary,
-                workspace,
-            );
+                // Resolve before registration; never hold the barrier across
+                // asynchronous workspace I/O. An unbound live notification
+                // still surfaces the request when workspace lookup fails.
+                match crate::config::active_workspace_snapshot().await {
+                    Ok((dir, revision)) => Some((crate::config::workspace_handle(&dir), revision)),
+                    Err(error) => {
+                        tracing::warn!(request_id = %request_id,
+                            "[approval::gate] could not resolve the active workspace for the flow approval notification ({error}); publishing it unbound");
+                        None
+                    }
+                }
+            },
+            register,
+        ).await;
+        match registered {
+            Err(resolution) => {
+                return (
+                    GateOutcome::Deny {
+                        reason: format!("{POLICY_DENIED_MARKER} Agent approval registration closed: {resolution}"),
+                    },
+                    None,
+                );
+            }
+            Ok(Err(err)) => {
+                self.evict_waiter(&request_id);
+                self.clear_thread(&thread_key, &request_id);
+                self.take_request_route(&request_id);
+                tracing::error!(error = %err, tool = tool_name, "[approval::gate] failed to persist pending row — failing closed");
+                return (
+                    GateOutcome::Deny {
+                        reason: format!("{POLICY_DENIED_MARKER} Approval gate could not persist the request — denying for safety: {err}"),
+                    },
+                    None,
+                );
+            }
+            Ok(Ok(())) => {}
         }
 
         tracing::info!(
@@ -595,6 +645,14 @@ impl ApprovalGate {
                 ttl_secs = COPILOT_APPROVAL_TTL.as_secs(),
                 "[approval::gate] flows_build copilot-streaming park — clamping park window to \
                  COPILOT_APPROVAL_TTL"
+            );
+        }
+        if subagent_park {
+            tracing::debug!(
+                tool = tool_name,
+                detached,
+                ttl_secs = effective_ttl.as_secs(),
+                "[approval::gate] sub-agent park — clamping park window to SUBAGENT_APPROVAL_TTL"
             );
         }
 
@@ -619,7 +677,7 @@ impl ApprovalGate {
             gate: self,
             request_id: request_id.clone(),
             thread_key: thread_key.clone(),
-            docs: store::capture_docs(),
+            docs: store::capture_docs(&self.config),
             armed: true,
         };
 
@@ -655,7 +713,7 @@ pub(crate) fn saas_outcome_with(saas: bool, tool_name: &str) -> Option<GateOutco
     if !saas {
         return None;
     }
-    Some(saas_outcome(crate::user_agents::tools::gate_verdict(
+    Some(saas_outcome(crate::profiles::tools::gate_verdict(
         tool_name,
     )))
 }

@@ -117,7 +117,7 @@ macOS와 Linux 스크립트가 무엇을 하는지 미리 보려면 명령 끝�
 
 <h3>개발자를 위해 만들었습니다</h3>
 
-<p><a href="https://tinyhumans.gitbook.io/openhuman/developing/quickstart">Rust 퀵스타트</a> · <a href="https://tinyhumans.gitbook.io/openhuman/developing/embedding">임베딩 가이드</a> · <a href="../crates/openhuman-embed/examples">예제</a></p>
+<p><a href="https://tinyhumans.gitbook.io/openhuman/developing/quickstart">Rust 퀵스타트</a> · <a href="../gitbooks/developing/embed/README.md">임베딩 가이드</a> · <a href="../crates/openhuman-embed/examples">예제</a></p>
 
 <p>Rust 라이브러리로 사용하세요. 다른 함수처럼 에이전트를 호출하거나, 작은 서버 하나에서 수많은 에이전트를 실행할 수 있습니다.</p>
 
@@ -176,7 +176,7 @@ OpenHuman은 비용이 가장 많이 드는 부분을 다시 생각했습니다.
 
 <p><a href="https://tinyhumans.gitbook.io/openhuman/developing/loadable-modules">플러그인 작동 방식</a></p>
 
-<p>검색, 문서, 음성 같은 모든 기능이 하나의 Rust 버스에 연결됩니다. <a href="https://www.freedesktop.org/wiki/Software/dbus/">Linux 시스템 버스</a>에서 빌려 온 아이디어입니다. 기능은 필요할 때만 로드되고, 하나가 멈춰도 나머지는 계속 작동합니다.</p>
+<p>검색, 문서, 음성 같은 모든 기능이 하나의 Rust 버스에 연결됩니다. <a href="https://packages.debian.org/stable/dbus">Linux 시스템 버스</a>에서 빌려 온 아이디어입니다. 기능은 필요할 때만 로드되고, 하나가 멈춰도 나머지는 계속 작동합니다.</p>
 
 </td>
 
@@ -288,7 +288,7 @@ let reply = agent.run("Summarize what you can see in this directory.").await?;
 println!("{}", reply.reply);
 ```
 
-다음으로는 [Rust 퀵스타트](https://tinyhumans.gitbook.io/openhuman/developing/quickstart), [임베딩 가이드](https://tinyhumans.gitbook.io/openhuman/developing/embedding), [개발자 문서](https://tinyhumans.gitbook.io/openhuman/developing)를 보세요.
+다음으로는 [Rust 퀵스타트](https://tinyhumans.gitbook.io/openhuman/developing/quickstart), [임베딩 가이드](../gitbooks/developing/embed/README.md), [개발자 문서](https://tinyhumans.gitbook.io/openhuman/developing)를 보세요.
 
 ---
 

@@ -8,7 +8,7 @@
 //!   MCP servers, skills, working directory, access tier, provider and
 //!   prompt. [`Harness`] is the one-agent shorthand over the same two types.
 //! * **[`Core`]** — the typed facade over a [`CoreRuntime`] the host built
-//!   itself with [`CoreBuilder`](openhuman_core::core::runtime::CoreBuilder).
+//!   itself with [`CoreBuilder`].
 //!   [`CoreRuntime::invoke`] gives it JSON; this facade gives it real Rust
 //!   types, so a host never writes `serde_json::json!` or matches on an
 //!   error string.
@@ -54,17 +54,37 @@
 //! `core.workflows()` simply does not exist in a build without that feature —
 //! a compile error at the call site rather than a runtime surprise. For domains
 //! present at compile time but switched off at runtime via
-//! [`DomainSet`](openhuman_core::core::runtime::DomainSet), calls return
+//! [`DomainSet`], calls return
 //! [`CoreError::Unavailable`] so a host can hide the surface instead of
 //! reporting a failure.
 
+// The owned streaming task proves Send for the core’s deeply nested turn future.
+#![recursion_limit = "256"]
+#![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+/// Complete definition accepted by [`AgentDefinitionSpec::from_base`].
+pub use openhuman_core::agent::harness::definition::AgentDefinition;
 pub use openhuman_core::agent::turn_origin::{AgentTurnOrigin, TrustedAutomationSource};
+
+/// The origin of the executing turn, with its original chat or channel route.
+///
+/// Read this inside a host tool or permission callback. The value belongs to
+/// this task's turn, so overlapping messages never replace its sender or
+/// reply target. `None` means the caller installed no origin; it grants no
+/// authority. Scheduled turns retain their existing automation origin.
+pub fn current_turn_origin() -> Option<AgentTurnOrigin> {
+    openhuman_core::core::runtime::CoreContext::current_turn_origin()
+}
 pub use openhuman_core::backend::{
     install_backend_transport, installed_backend_transport, BackendRequest, BackendTransport,
     BackendTransportError, BaseUrlPurpose, TransportProfile,
 };
 pub use openhuman_core::config::ComposioHostCredential;
 pub use openhuman_core::config::Config as RuntimeConfig;
+pub use openhuman_core::config::{SearchHostCredential, UnknownKeyedSearchProvider};
+/// The exact ambient tenant, inherited across profile turns and their scoped tasks.
+pub use openhuman_core::core::runtime::{current_tenant, NoTenant, Tenant};
 pub use openhuman_core::security::TrustedAccess;
 pub use openhuman_core::tools::toolpacks::{GroupMode, ToolGroups};
 // The seam `AgentSpec::tools` needs: the belt types, and `Tool` itself from the
@@ -72,10 +92,12 @@ pub use openhuman_core::tools::toolpacks::{GroupMode, ToolGroups};
 // would build tools of a different, incompatible type.
 pub use openhuman_core::agent::tinyagents::host::LastTurnUsage;
 pub use openhuman_core::agent::{HostTools, HostTurnTools, TurnContext};
-pub use openhuman_core::tools::{Tool, ToolExposure};
+pub use openhuman_core::tools::{PermissionLevel, Tool, ToolExposure, ToolResult};
 pub use openhuman_core::{
     CoreBuilder, CoreRuntime, DaemonConfig, DomainSet, HostKind, ServiceSet, TokenSource,
 };
+/// Declarative execution requirements for host-owned tools, from the core's vendored contract.
+pub use tinytools::ToolPolicy;
 
 /// Live agent-turn progress for in-process embedders.
 pub mod agent_progress {
@@ -98,6 +120,7 @@ pub mod skill_registry {
 mod agent;
 pub mod artifacts;
 mod auth;
+pub mod budget;
 mod call;
 #[cfg(feature = "channels")]
 pub mod channels;
@@ -108,14 +131,25 @@ mod core_agent;
 pub mod cron;
 pub mod embeddings;
 mod error;
+pub mod fanout;
 mod harness;
 pub mod identity;
 pub mod memory;
-#[cfg(feature = "modules")]
 pub mod modules;
+mod permission;
+pub use permission::PermissionFuture;
+pub mod observe;
+
 pub mod process;
+#[cfg(feature = "profiles")]
+pub mod profiles;
+/// Explicit ordered fallback and truncation policies.
+pub mod routing;
 mod runtime;
+pub mod secret_storage;
 mod turn;
+mod turn_cancellation;
+mod turn_meter;
 
 /// Core internals for `openhuman-tinyhumans` and `openhuman-rpc` only; see
 /// the module docs. Not part of the host-facing API.
@@ -136,7 +170,7 @@ pub use openhuman_core::voice::VOICE_COMPILED_IN;
 pub use agent::ToolAttachmentError;
 pub use agent::{
     Agent, AgentDefinitionSpec, AgentError, AgentLayout, AgentSpec, ApprovalDecision, Approvals,
-    ApprovalsError, MemoryBinding, PendingApproval, SandboxModeSpec, ToolScopeSpec,
+    ApprovalsError, DefinitionBase, MemoryBinding, PendingApproval, SandboxModeSpec, ToolScopeSpec,
 };
 pub use auth::{Auth, AuthState, Session};
 #[cfg(feature = "channels")]
@@ -153,12 +187,22 @@ pub use harness::{
 };
 #[cfg(feature = "mcp")]
 pub use harness::{HttpHeader, McpAuthConfig, McpServer};
+#[cfg(feature = "profiles")]
+pub use profiles::{
+    ChatReply, CronDelivery, CronReply, CronSweepReport, DirectProfileProvider, JobOrigin,
+    OpenError, ProfileError, ProfileEvents, ProfileHandle, ProfileId, ProfileIdMode,
+    ProfileRuntime, ProfileRuntimeBuilder, ProfileSummary, Provisioned, SaasConfig,
+};
+#[cfg(all(feature = "profiles", feature = "channels"))]
+pub use profiles::{RelayAccepted, RelayMessage};
 pub use runtime::builder::DEFAULT_MAX_AGENTS;
 /// Read-only view of a [`RuntimeBuilder`], for the layered crates' tests.
 #[doc(hidden)]
 pub use runtime::BuilderSummary;
 pub use runtime::{
-    run_from_args, ApiKey, ConfigSource, RemoveAgent, Runtime, RuntimeBuilder, RuntimeError,
+    run_from_args, AgentDefaults, ApiKey, ConfigSource, ConfigurationInfo, DefaultsInfo,
+    LearningSettings, ModelDefaults, RemoveAgent, Runtime, RuntimeBuilder, RuntimeDefaults,
+    RuntimeError, RuntimeInfo, RuntimeModule, SkillsPolicy, StorageInfo, WeightClass,
 };
 
 /// The types the [`RuntimeBuilder`] seam options take: controller
@@ -170,17 +214,29 @@ pub use runtime::{
 pub mod seams {
     pub use openhuman_core::agent::hooks::{PostTurnHook, ToolHook};
     pub use openhuman_core::agent::hooks::{ToolHookContext, ToolHookDecision, TurnContext};
+    pub use openhuman_core::agent::stop_hooks::BudgetStopHook;
+    pub use openhuman_core::agent::stop_hooks::TurnCost;
+    pub use tinyagents_harness::middleware::{StopDecision, StopHook};
+    /// Product cost snapshot passed to harness-owned stop policies.
+    pub type TurnState<'a> = tinyagents_harness::middleware::TurnState<'a, TurnCost>;
     pub use openhuman_core::core::all::{ControllerExtension, DomainGroup};
     pub use openhuman_core::core::server_launcher::{HostBoot, ServeRequest, ServerLauncher};
     pub use openhuman_core::security::SecurityPolicy;
+    pub use openhuman_core::storage::{CollectionSpec, Precondition, Scope, StorageBackend};
+
+    pub use crate::runtime::StorageSource;
 }
 
 /// The session store port: what a host implements to keep every agent's
 /// conversations in its own database ([`RuntimeBuilder::session_store`]),
 /// with the in-memory provider and the conformance suites a host's provider
-/// is held to.
+/// is held to. The persisted record types are the harness's own serde codecs,
+/// so hosts can encode and decode stored state without duplicating wire shapes.
 pub mod session_store {
-    pub use openhuman_core::agent::session_store::{AgentStores, SessionStoreProvider};
+    pub use openhuman_core::agent::session_store::{
+        AgentEvent, AgentObservation, AgentStores, ExecutionStatus, HarnessRunStatus,
+        JournalMessage, SessionDescriptor, SessionStoreProvider, TodoList,
+    };
     pub use tinyagents_session::port::{
         AppendStore, InMemorySessionStores, InMemoryTranscriptLocator, InMemoryTurnStates, Store,
         TurnStates,
@@ -204,6 +260,7 @@ pub use complete::{
 };
 pub use session_store::{InMemorySessionStores, SessionStoreProvider};
 pub use turn::{absolute, Route, Turn, TurnOutcome, TurnRequest};
+pub use turn_cancellation::TurnCancellation;
 
 use std::sync::Arc;
 
@@ -235,7 +292,7 @@ impl Core {
     /// Typed access to the session store.
     ///
     /// Use this when the embedded workload calls authenticated TinyHumans
-    /// backend services. A [`HostKind::Library`](openhuman_core::core::types::HostKind::Library)
+    /// backend services. A [`HostKind::Library`]
     /// runtime does not need an app session for caller-supplied inference.
     pub fn auth(&self) -> Auth<'_> {
         Auth(&self.rt)
@@ -274,3 +331,27 @@ impl std::fmt::Debug for Core {
         f.debug_struct("Core").finish_non_exhaustive()
     }
 }
+
+/// Strict structured output failure metadata.
+pub mod structured;
+
+/// Acknowledged cancellation for stateless completion operations.
+pub mod cancellation;
+/// Runtime event subscriptions without content or credentials.
+pub mod events;
+/// Owned streaming turns and cooperative cancellation.
+pub mod stream;
+pub use agent::{ApprovalHandler, ApprovalSubscription};
+pub use events::{EventStreamError, RuntimeEvent, RuntimeEventKind, RuntimeEvents};
+pub use stream::{CancellationToken, StreamEvent, TurnStream};
+/// Native custom-provider contract and request/response types.
+pub mod providers {
+    pub use tinyinference_llm::message::MessageDelta;
+    pub use tinyinference_llm::model::{
+        ChatModel, DeferredHandle, DeferredStatus, ModelProfile, ModelRequest, ModelResponse,
+        ModelStream, ModelStreamItem, ModelStreamMetadata,
+    };
+    pub use tinyinference_llm::{Error, Result};
+}
+
+pub use agent_progress::AgentProgress;

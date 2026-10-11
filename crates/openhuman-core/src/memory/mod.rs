@@ -41,6 +41,8 @@ pub mod schemas;
 pub mod scope;
 pub mod sources;
 pub mod status;
+mod tool_budget;
+pub(crate) mod tool_writes;
 pub mod tools;
 pub mod types;
 pub mod user_scope;
@@ -56,3 +58,6 @@ pub use schemas::{
     all_registered_controllers as all_memory_registered_controllers,
 };
 pub use tools::{MemoryTool, MEMORY_TOOL_NAME};
+
+/// Host-specific connector prefix configuration for memory provenance.
+pub mod provenance;

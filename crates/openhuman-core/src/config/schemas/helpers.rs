@@ -26,7 +26,12 @@ pub(super) struct CloudProviderUpdate {
     /// Auth style: "bearer" | "anthropic" | "openhuman_jwt" | "none".
     #[serde(default)]
     pub(super) auth_style: Option<String>,
+    /// Optional PEM CA bundle for this provider. Empty string removes it.
+    #[serde(default)]
+    pub(super) ca_cert_pem: Option<String>,
     /// Legacy field — tolerated on read for back-compat but not required.
+    // keep until v0.66 (review after 2027-01-11): incoming RPC discriminator
+    // remains accepted until shipped-client parameter coverage exists.
     #[serde(rename = "type", default)]
     pub(super) legacy_type: Option<String>,
     /// Legacy field — tolerated on read.

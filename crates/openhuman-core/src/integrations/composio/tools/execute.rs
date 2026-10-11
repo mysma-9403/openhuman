@@ -9,11 +9,11 @@ use serde_json::{json, Value};
 
 use super::live_config::live_composio_config;
 use super::redact::redact_composio_outcome;
-use crate::agent::harness::current_sandbox_mode;
-use crate::agent::harness::current_task_recency_window;
 use crate::agent::harness::definition::SandboxMode;
+use crate::agent::tinyagents::host::run_context::sandbox_mode_for_tool;
 use crate::config::Config;
-use tinytools::{PermissionLevel, Tool, ToolCategory, ToolResult};
+use crate::integrations::composio::task_recency_context::current_task_recency_window;
+use tinytools::{PermissionLevel, Tool, ToolCallOptions, ToolCategory, ToolResult, ToolRunContext};
 
 use super::super::ops::load_user_scope_pref;
 use super::super::providers::{toolkit_from_slug, ToolScope};
@@ -100,7 +100,17 @@ impl Tool for ComposioExecuteTool {
         ToolCategory::Workflow
     }
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let (config, outcome) = Box::pin(self.execute_unredacted(args)).await;
+        let (config, outcome) = Box::pin(self.execute_unredacted(args, None)).await;
+        redact_composio_outcome(&config, outcome)
+    }
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        _options: ToolCallOptions,
+        context: Option<&dyn ToolRunContext>,
+    ) -> anyhow::Result<ToolResult> {
+        let (config, outcome) =
+            Box::pin(self.execute_unredacted(args, sandbox_mode_for_tool(context))).await;
         redact_composio_outcome(&config, outcome)
     }
 }
@@ -110,7 +120,11 @@ impl ComposioExecuteTool {
     /// so [`Tool::execute`] redacts against the same credential that ran —
     /// not the possibly-stale snapshot captured when this tool was
     /// registered.
-    async fn execute_unredacted(&self, args: Value) -> (Box<Config>, anyhow::Result<ToolResult>) {
+    async fn execute_unredacted(
+        &self,
+        args: Value,
+        sandbox_mode: Option<SandboxMode>,
+    ) -> (Box<Config>, anyhow::Result<ToolResult>) {
         let tool = args
             .get("tool")
             .and_then(|v| v.as_str())
@@ -164,7 +178,7 @@ impl ComposioExecuteTool {
         // composio surface. `SandboxMode::None` / `Sandboxed` (and the
         // `None` task-local value used by direct CLI / JSON-RPC / unit
         // tests) pass through unchanged.
-        if matches!(current_sandbox_mode(), Some(SandboxMode::ReadOnly)) {
+        if matches!(sandbox_mode, Some(SandboxMode::ReadOnly)) {
             let scope = resolve_action_scope(&tool).await;
             if matches!(scope, ToolScope::Write | ToolScope::Admin) {
                 tracing::info!(
@@ -236,8 +250,6 @@ impl ComposioExecuteTool {
             iana = %iana,
             "[composio][dispatcher] applying calendar query defaults pre-dispatch"
         );
-        let arguments =
-            tinyconnectors::execute::apply_calendar_query_defaults(&tool, arguments, &iana);
 
         // Task-recency window (morning briefing): when the calling agent
         // installed a window, inject best-effort server-side narrowing for
@@ -248,9 +260,22 @@ impl ComposioExecuteTool {
             chrono::Utc::now()
                 - chrono::Duration::from_std(w).unwrap_or_else(|_| chrono::Duration::zero())
         });
-        let arguments = match task_window_since {
-            Some(since) => tinyconnectors::execute::apply_window_args(&tool, arguments, since),
-            None => arguments,
+        let arguments = match super::super::processing::prepare(
+            self.config.as_ref(),
+            &tool,
+            arguments,
+            Some(iana),
+            task_window_since.map(|since| since.to_rfc3339()),
+        )
+        .await
+        {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                return (
+                    Box::new(self.config.as_ref().clone()),
+                    Ok(ToolResult::error(error)),
+                )
+            }
         };
 
         // Resolve the client through the mode-aware factory on every
@@ -289,7 +314,17 @@ impl ComposioExecuteTool {
                 // slug is a curated task-fetch action. Runs before the
                 // markdown/JSON body decision so the agent reads filtered data.
                 let resp = match task_window_since {
-                    Some(since) => tinyconnectors::execute::filter_response(&tool, resp, since),
+                    Some(since) => match super::super::processing::filter(
+                        &live_config,
+                        &tool,
+                        resp,
+                        since.to_rfc3339(),
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => return (live_config, Ok(ToolResult::error(error))),
+                    },
                     None => resp,
                 };
                 tracing::info!(

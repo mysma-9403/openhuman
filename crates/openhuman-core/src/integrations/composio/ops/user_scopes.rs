@@ -89,10 +89,12 @@ pub(crate) async fn save(
         return Err("user_scopes: toolkit must not be empty".to_string());
     }
     let path = file_store::path(config, USER_SCOPES_FILE);
-    let _guard = file_store::lock().await;
-    let mut prefs: ScopeFile = file_store::load(&path).await?;
-    prefs.insert(key.clone(), pref);
-    file_store::save(&path, &prefs).await?;
+    let entry_key = key.clone();
+    file_store::update(&path, move |prefs: &mut ScopeFile| {
+        prefs.insert(entry_key.clone(), pref);
+        ((), true)
+    })
+    .await?;
 
     tracing::info!(
         toolkit = %key,

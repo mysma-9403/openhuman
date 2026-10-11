@@ -31,74 +31,15 @@ use crate::agent::tinyagents::stop_hooks;
 use crate::agent::tinyagents::tools::EarlyExitHook;
 use crate::agent::tinyagents::turn_models::TurnModels;
 use crate::agent::tinyagents::turn_outcome::{HaltSummarySlot, ToolOutcomeSink};
-use crate::agent::tinyagents::turn_policy::{run_policy_for, REPEATED_TOOL_FAILURE_THRESHOLD};
+use crate::agent::tinyagents::turn_policy::{
+    run_policy_for_provider, REPEATED_TOOL_FAILURE_THRESHOLD,
+};
 use crate::agent::tinyagents::verify_before_finish;
 use tinyagents_harness::store::InMemoryStore as ToolResultArtifactIndexStore;
 
 use super::ToolPolicyEnforcement;
-
-/// Everything [`assemble_turn_harness`] wires up for one turn: the configured
-/// harness plus the shared slots/handles the run loop reads after the drive
-/// future returns.
-pub(super) struct AssembledTurnHarness {
-    /// The fully assembled harness: model, tools, and middleware registered in
-    /// the intended order.
-    pub(super) harness: AgentHarness<(), OpenHumanRunContext>,
-    /// Shared 1-based model-call cursor (event bridge advances, model adapter
-    /// reads for out-of-band thinking attribution).
-    pub(super) cursor: IterationCursor,
-    /// Shared `call_id → tool_name` map used by the event bridge to label
-    /// tool-argument fragments projected off the crate stream.
-    pub(super) tool_names: ToolNameMap,
-    /// Shared `call_id → (success, failure, elapsed_ms, output_chars)` side-channel:
-    /// middleware records each outcome for the event bridge's `ToolCallCompleted`.
-    pub(super) failure_map: ToolFailureMap,
-    /// Shared FIFO carry of per-call provider `BilledUsage`; the event bridge
-    /// reads it when recording usage to preserve charged-USD precedence (#4467).
-    pub(super) provider_usage_carry: ProviderUsageCarry,
-    /// Recovers the original (downcastable) provider error on run failure.
-    pub(super) error_slot: crate::agent::tinyagents::model::ModelErrorSlot,
-    /// Root-cause summary recorded by the repeated-tool-failure breaker.
-    pub(super) halt_summary: HaltSummarySlot,
-    /// Per-call tool success/content capture for honest `ToolCallRecord`s.
-    pub(super) tool_outcome_sink: ToolOutcomeSink,
-    /// The shared steering handle (mid-flight steer, early-exit, cap, stop-hook
-    /// pauses).
-    pub(super) handle: Option<SteeringHandle>,
-    /// Records the first early-exit tool round, when early-exit tools exist.
-    pub(super) early_exit_hook: Option<EarlyExitHook>,
-    /// Set by [`FinalCallWrapUpMiddleware`] when it turned the last permitted
-    /// model call into the turn's conclusion (issue #6014). `None` when the
-    /// middleware is not installed (a run that does not pause at its cap).
-    ///
-    /// A flag rather than an inference off the run, because this turn now ends
-    /// the way a finished one does — the model returns text and requests no
-    /// tools — so `final_response.is_none()` no longer tells the two apart.
-    pub(super) wrap_up_fired:
-        Option<Arc<tinyagents_harness::middleware::FinalCallWrapUpMiddleware>>,
-    /// Number of callable tools registered.
-    pub(super) tool_count: usize,
-    /// TinyAgents named-capability projection for this turn. The live run still
-    /// uses the harness registries above; this snapshot makes the projected
-    /// model/tool/graph inventory inspectable without changing dispatch.
-    pub(super) registry_snapshot: RegistrySnapshot,
-    /// Health diagnostics from the projected registry.
-    pub(super) registry_diagnostics: Vec<RegistryDiagnostic>,
-    /// TinyAgents store index for OpenHuman action-dir tool-result artifacts.
-    pub(super) tool_result_artifact_index: Option<Arc<ToolResultArtifactIndexStore>>,
-    /// Concrete handle to the installed [`ContextCompressionMiddleware`], when
-    /// summarization is active. Drained after the run to surface each compaction's
-    /// [`CompressionProvenance`][tinyagents_harness::summarization::CompressionProvenance]
-    /// via the observability path.
-    pub(super) compression_mw: Option<Arc<ContextCompressionMiddleware>>,
-    /// Crate prompt-cache guard (issue #4249, 03.2). Records a `CacheLayoutEvent`
-    /// whenever the cacheable prompt prefix (system prompt + tool set) changes
-    /// across model calls. Drained after the run and surfaced via
-    /// [`observability::surface_cache_layout_events`](crate::agent::tinyagents::observability::surface_cache_layout_events) —
-    /// the crate-native replacement for the deleted `CacheAlignMiddleware`
-    /// warn-log (C3).
-    pub(super) prompt_cache_guard: Arc<PromptCacheGuardMiddleware>,
-}
+mod assembled;
+pub(super) use assembled::AssembledTurnHarness;
 
 /// Assemble the turn harness for [`run_turn_via_tinyagents_shared`](super::run_turn_via_tinyagents_shared):
 /// register the provider model, every shared tool, and the full middleware
@@ -118,7 +59,9 @@ pub(super) fn assemble_turn_harness(
     context_window: Option<u64>,
     early_exit_tools: &[&str],
     context_mw: TurnContextMiddleware,
-    stop_hooks: Vec<Arc<dyn crate::agent::stop_hooks::StopHook>>,
+    stop_hooks: Vec<
+        Arc<dyn tinyagents_harness::middleware::StopHook<crate::agent::cost::TurnCost>>,
+    >,
     tool_policy: Option<ToolPolicyEnforcement>,
     required_capabilities: Option<CapabilitySet>,
     deterministic_cacheable: bool,
@@ -166,7 +109,11 @@ pub(super) fn assemble_turn_harness(
     // to a single attempt (see `run_policy_for`) — fallback and retry are
     // independent knobs, and only fallback is enabled here because `ReliableProvider`
     // (still wrapped) does not fail over across the registered tier routes.
-    let mut policy = run_policy_for(max_iterations, deterministic_cacheable);
+    let mut policy = run_policy_for_provider(
+        max_iterations,
+        deterministic_cacheable,
+        turn_models.is_local(),
+    );
     let route_fallback = routes::route_fallback_policy(model);
     policy.fallback = route_fallback.clone();
     // Tool discovery: the harness advertises its `tool_search` bridge over the
@@ -194,6 +141,7 @@ pub(super) fn assemble_turn_harness(
         "[models] assembling turn harness with SDK retry/fallback policy"
     );
     harness.with_policy(policy);
+    crate::tools::timeout::install_harness_tool_timeouts(&mut harness);
     // Deterministic internal runs (summarizer/triage/memory-scoring style) may
     // reuse a prior identical model response; attach an in-memory response cache
     // so the agent loop can short-circuit a recurring provider call and emit
@@ -309,10 +257,6 @@ pub(super) fn assemble_turn_harness(
         .as_ref()
         .map(|_| Arc::new(ToolResultArtifactIndexStore::new()));
 
-    // The explicit run carrier supplies the stop hooks; no middleware needs to
-    // recover policy from a task-local while the harness is driving.
-    let stop_hooks_installed = stop_hooks;
-
     // A steering handle is always created now: besides run-queue steering, the
     // early-exit / cap / stop-hook pauses, the repeated-tool-failure breaker
     // (below) also pauses through it, and it wants to fire on every path
@@ -368,34 +312,23 @@ pub(super) fn assemble_turn_harness(
         harness.push_middleware(mw.clone());
     }
 
-    // Repeated-failure circuit breaker: pause the run when a tool returns the same
-    // error `REPEATED_TOOL_FAILURE_THRESHOLD` times in a row, so a deterministic
-    // security/approval denial or terminal tool error surfaces its root cause
-    // instead of burning the whole iteration budget (legacy ProgressGuard parity).
+    // Repeated failures stop the run using each tool's declared side effects.
     let repeated_failure = handle.as_ref().map(|handle| {
-        Arc::new(middleware::RepeatedToolFailureMiddleware::new(
-            handle.clone(),
-            REPEATED_TOOL_FAILURE_THRESHOLD,
-            halt_summary.clone(),
-        ))
+        let (t, halt) = (REPEATED_TOOL_FAILURE_THRESHOLD, halt_summary.clone());
+        let mw = middleware::RepeatedToolFailureMiddleware::new(handle.clone(), t, halt);
+        Arc::new(mw.with_tool_facts(middleware::tool_sets_lookup(tool_sets.clone())))
     });
     if let Some(mw) = &repeated_failure {
         harness.push_middleware(mw.clone());
     }
 
-    // Policy-driven stop hooks (budget cap, thread-goal budget, ad-hoc iteration
-    // ceiling): fire after each model call and pause the run on the first stop
-    // vote. Replaces the legacy tool-call-loop firing point.
-    if let Some(handle) = &handle {
-        if !stop_hooks_installed.is_empty() {
-            harness.push_middleware(Arc::new(stop_hooks::StopHookMiddleware::new(
-                handle.clone(),
-                model,
-                max_iterations,
-                stop_hooks_installed,
-            )));
-        }
-    }
+    stop_hooks::install(
+        &mut harness,
+        handle.as_ref(),
+        model,
+        stop_hooks,
+        halt_summary.clone(),
+    );
     let early_exit_set: HashSet<&str> = early_exit_tools.iter().copied().collect();
     // One hook per run, shared by every early-exit adapter (records the first
     // early-exit and pauses). Requires the steering handle.
@@ -590,7 +523,14 @@ pub(super) fn assemble_turn_harness(
     );
     let is_subagent = subagent_scope.is_some();
     let agent_id = tool_policy.as_ref().map(|p| p.agent_definition_id.as_str());
-    verify_before_finish::install(&mut harness, is_subagent, agent_id, &wrap_up_fired);
+    let turn_wall_clock_ms = harness.policy().limits.max_wall_clock_ms;
+    verify_before_finish::install(
+        &mut harness,
+        is_subagent,
+        agent_id,
+        &wrap_up_fired,
+        turn_wall_clock_ms,
+    );
     // The rungs above all *tell* the turn to produce its deliverable; this one
     // looks, on the same scope as the requirements check.
     middleware::install_unmet_deliverable(&mut harness, is_subagent, agent_id);
@@ -699,7 +639,7 @@ pub(super) fn assemble_turn_harness(
     // observation-only (never mutates the result), so running first in the
     // reverse-order `after_tool` chain is safe — it cannot perturb the
     // summarization/cap or tool-outcome capture layers.
-    let embedder_tool_hooks = crate::agent::hooks::embedder_tool_hooks();
+    let embedder_tool_hooks = crate::agent::hooks::turn_tool_hooks();
     if !embedder_tool_hooks.is_empty() {
         harness.push_middleware(Arc::new(middleware::EmbedderToolHooksMiddleware::new(
             embedder_tool_hooks,

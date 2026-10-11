@@ -5,16 +5,7 @@ use std::pin::Pin;
 
 use openhuman_tinyhumans::embed::{RuntimeBuilder, ServiceSet};
 
-use crate::core_host::core::server_launcher::{install_server_launcher, ServeRequest};
-
-/// Install this crate's server as the one the core CLI's `run` / `serve`
-/// subcommands start. Call once, before
-/// `run_core_from_args`; later calls are
-/// no-ops.
-pub fn install_cli_server() {
-    crate::http_host::ensure_registered();
-    install_server_launcher(launch);
-}
+use crate::core_host::core::server_launcher::ServeRequest;
 
 /// The [`ServerLauncher`](openhuman_tinyhumans::embed::seams::ServerLauncher)
 /// behind `run` / `serve`: the standalone server shims.

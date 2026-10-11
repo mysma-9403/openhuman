@@ -10,6 +10,11 @@
 //!    through `tinyinference_llm::model::discover` (bounded, cached per
 //!    endpoint and model), lowered by any window the provider stated in a
 //!    context-overflow error on that endpoint (learned by the chat adapters).
+//!    Ollama's OpenAI-compatible listing carries no window, so for the local
+//!    Ollama provider and any endpoint that looks like an Ollama server
+//!    (including a custom OpenAI-compatible provider at `:11434/v1`) the same
+//!    discovery asks the native `POST /api/show`; its result, or its failure,
+//!    is cached and the whole lookup is time-bounded.
 //! 3. **Local runtime profile** for local providers (Ollama, LM Studio, ...).
 //! 4. **Static guess**: the tier aliases, the cost catalog, and the generic
 //!    id-pattern table ([`super::model_context::static_context_window_for_model`]),
@@ -23,7 +28,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use tinyinference_llm::model::discover::{
-    discover_model_limits_with, model_limits_cache, ModelLimitsCache, ModelListingFetcher,
+    discover_model_limits_with, model_limits_cache, DiscoveryRequest, ModelLimitsCache,
+    ModelListingFetcher,
 };
 
 use crate::config::Config;
@@ -132,23 +138,51 @@ fn warn_static_guess(model: &str, window: Option<u64>, provider: &str) {
     }
 }
 
+/// Discovery request for the built-in local Ollama provider: its OpenAI
+/// listing carries no window, so the native `/api/show` probe is forced on.
+/// A custom OpenAI-compatible provider pointed at an Ollama server gets the
+/// same probe from the endpoint auto-detection in `tinyinference-llm`.
+fn ollama_limits_request(model: &str, config: &Config) -> Option<DiscoveryRequest> {
+    let root = tinyinference_local::ollama::ollama_base_url_from_override(
+        config.local_ai.base_url.as_deref(),
+    );
+    let model = model
+        .split_once('@')
+        .map_or(model, |(model, _)| model)
+        .trim();
+    if model.is_empty() {
+        return None;
+    }
+    Some(
+        DiscoveryRequest::new(format!("{}/v1", root.trim_end_matches('/')), model)
+            .with_ollama_native(true),
+    )
+}
+
 /// The fetcher discovery uses. Unit tests never reach the network.
-fn default_fetcher() -> Box<dyn ModelListingFetcher> {
+fn default_fetcher(_config: &Config, _provider: &str) -> Box<dyn ModelListingFetcher> {
     #[cfg(test)]
     {
         Box::new(OfflineFetcher)
     }
     #[cfg(not(test))]
     {
-        Box::new(
-            tinyinference_llm::model::discover::ReqwestListingFetcher::new(
-                crate::config::build_runtime_proxy_client_with_timeouts(
-                    "inference.model_limits",
-                    5,
-                    3,
-                ),
-            ),
-        )
+        let provider_slug = _provider
+            .split_once(':')
+            .map_or(_provider, |(slug, _)| slug)
+            .trim();
+        let service_key = "inference.model_limits";
+        let client = _config
+            .cloud_provider_ca_certs
+            .get(provider_slug)
+            .filter(|pem| !pem.is_empty())
+            .and_then(|pem| {
+                crate::util::tls::client_with_ca_bundle_with_timeouts(pem, service_key, 5, 3).ok()
+            })
+            .unwrap_or_else(|| {
+                crate::config::build_runtime_proxy_client_with_timeouts(service_key, 5, 3)
+            });
+        Box::new(tinyinference_llm::model::discover::ReqwestListingFetcher::new(client))
     }
 }
 
@@ -177,7 +211,7 @@ pub(crate) async fn resolve_context_window(
     model: &str,
     config: &Config,
 ) -> Option<u64> {
-    let fetcher = default_fetcher();
+    let fetcher = default_fetcher(config, provider);
     resolve_context_window_with(
         fetcher.as_ref(),
         model_limits_cache(),
@@ -234,10 +268,17 @@ async fn resolve_inner(
     }
 
     let local_kind = tinyinference_local::profile::kind_from_provider_string(provider);
-    if local_kind.is_none() {
-        if let Some(request) =
+    let request = match local_kind {
+        None => {
             crate::inference::provider::factory::model_limits_request(role, provider, model, config)
-        {
+        }
+        Some(tinyinference_local::profile::LocalProviderKind::Ollama) => {
+            ollama_limits_request(model, config)
+        }
+        Some(_) => None,
+    };
+    {
+        if let Some(request) = request {
             let limits = discover_model_limits_with(fetcher, cache, &request).await;
             if let Some((window, limits)) = limits
                 .as_ref()

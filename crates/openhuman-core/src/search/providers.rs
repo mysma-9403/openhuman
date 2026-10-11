@@ -69,20 +69,24 @@ pub fn direct_configured(config: &Config, provider: &str) -> bool {
             .as_deref()
             .is_some_and(|key| !key.trim().is_empty()),
         "searxng" => !config.searxng.base_url.trim().is_empty(),
-        other => config
-            .search
-            .credentials(other)
-            .is_some_and(|credentials| credentials.has_key()),
+        // A key an embedder pinned on this agent counts as well as a stored one.
+        other => config.search.direct_key(other).is_some(),
     }
 }
 
 /// Whether the process holds a credential the managed backend accepts.
 pub fn backend_credential_available(config: &Config) -> bool {
+    if config.profile_providers.is_some() {
+        return false;
+    }
     crate::security::credentials::session_support::resolve_backend_credential(config).is_ok()
 }
 
 /// Resolve every known provider, in catalog order.
 pub fn resolve(config: &Config) -> Vec<ResolvedProvider> {
+    if let Some(binding) = &config.profile_providers {
+        return resolve_with(&binding.effective_search(config), false);
+    }
     resolve_with(config, backend_credential_available(config))
 }
 

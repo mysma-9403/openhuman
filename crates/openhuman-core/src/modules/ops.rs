@@ -150,6 +150,9 @@ pub async fn ensure_loaded_within(
     within: Option<Duration>,
 ) -> Result<(), LoadError> {
     if !config.modules.enabled {
+        if let Some(record) = registry::find(id) {
+            super::failure::report(record, super::failure::Reason::Disabled);
+        }
         return Err(LoadError::Failed(format!(
             "module '{id}' is unavailable: modules are disabled in configuration"
         )));
@@ -159,7 +162,13 @@ pub async fn ensure_loaded_within(
 
     let receiver = match resolution::global().claim(id) {
         Claim::Done(Resolution::Ready) => return Ok(()),
-        Claim::Done(Resolution::Failed(reason)) => return Err(LoadError::Failed(reason)),
+        Claim::Done(Resolution::Failed(reason)) => {
+            // The original resolution may have completed before a Sentry
+            // client was bound. Revisit reporting at the actual cached caller
+            // boundary; the report key suppresses duplicates once captured.
+            report_resolution_failure(id, &reason);
+            return Err(LoadError::Failed(reason));
+        }
         Claim::Wait(receiver) => receiver,
         Claim::Run { sender, receiver } => {
             start_resolution(config.clone(), record, sender).await;
@@ -168,7 +177,10 @@ pub async fn ensure_loaded_within(
     };
     match resolution::global().wait(id, receiver, within).await {
         Waited::Ready => Ok(()),
-        Waited::Failed(reason) => Err(LoadError::Failed(reason)),
+        Waited::Failed(reason) => {
+            report_resolution_failure(id, &reason);
+            Err(LoadError::Failed(reason))
+        }
         Waited::StillLoading => Err(LoadError::StillLoading),
     }
 }
@@ -204,7 +216,11 @@ async fn start_resolution(
                 Resolution::Ready
             }
             Err(reason) => {
-                log::warn!("[modules] '{id}' did not load: {reason}");
+                // Every resolution failure is terminal for the process (the
+                // outcome is cached), whichever path produced it; marking here
+                // makes later re-reports classify as `ModuleUnavailable`.
+                let reason = mark_terminal(reason);
+                report_resolution_failure(id, &reason);
                 Resolution::Failed(reason)
             }
         };
@@ -218,6 +234,26 @@ async fn start_resolution(
             log::warn!("[modules] the module bus could not start: {error}");
             work.await;
         }
+    }
+}
+
+/// Report a module that did not load — once per process.
+///
+/// A resolution runs once and its failure is cached for every later caller
+/// (see the module docs), so this is the single Sentry event a broken install
+/// produces. The failed resolution itself reports here, and cached callers
+/// revisit this function in case the original resolution happened before a
+/// Sentry client was bound. Its stable report key suppresses repeats. The
+/// report goes through [`report_error`] directly so the observability
+/// classifier cannot swallow the original terminal event.
+///
+/// [`report_error`]: crate::core::observability::report_error
+pub(super) fn report_resolution_failure(id: &str, reason: &str) {
+    // Loader errors can include download URLs or user paths. Keep their detail
+    // in the operation's returned error, never in the terminal Sentry report.
+    let _ = reason;
+    if let Some(record) = registry::find(id) {
+        super::failure::report(record, super::failure::Reason::ResolutionFailed);
     }
 }
 
@@ -307,21 +343,29 @@ async fn resolve(config: &Config, record: &'static ModuleRecord) -> Result<(), S
 ///
 /// A panic in the loader is reported rather than propagated: it would otherwise
 /// take down whichever task happened to be awaiting the load.
+///
+/// Every loader error is terminal for the process and says so once: tinybus'
+/// release-cache path and [`load_local`] already carry the marker, the rest
+/// get it appended here.
 async fn blocking<F>(work: F) -> Result<(), String>
 where
     F: FnOnce() -> Result<(), String> + Send + 'static,
 {
     host::runtime()
         .await
-        .map_err(|error| format!("the module bus could not start: {error}"))?
+        .map_err(|error| mark_terminal(format!("the module bus could not start: {error}")))?
         .blocking(work)
         .await
-        .map_err(|error| {
-            format!(
-                "{error}. {}; restart the app to try again",
-                crate::tools::status::MODULE_FAULT_MARKER
-            )
-        })
+        .map_err(mark_terminal)
+}
+
+/// Append the terminal-fault sentence to `error` unless it already has it.
+pub(super) fn mark_terminal(error: String) -> String {
+    let marker = crate::tools::status::MODULE_FAULT_MARKER;
+    if error.contains(marker) {
+        return error;
+    }
+    format!("{error}. {marker}; restart the app to try again")
 }
 
 /// Load the pinned release for this host through the release cache.
@@ -385,8 +429,7 @@ pub(super) fn load_local(
 /// for embedding and chat compute; the other modules need no host config.
 fn module_config(config: &Config, id: &str) -> serde_json::Value {
     if id == super::search::MODULE_ID {
-        return serde_json::to_value(super::search::module_config(config))
-            .expect("TinySearch config serializes");
+        return super::search::load_configuration(config);
     }
     if id == super::desktop::MODULE_ID {
         return super::desktop::module_config(config);
@@ -430,6 +473,14 @@ fn local_override(config: &Config, id: &str) -> Option<PathBuf> {
                 .map(PathBuf::from)
         })
         .or_else(|| {
+            // Integration tests compile the core as a dependency, without
+            // cfg(test), so fixture routing belongs in this shared loader.
+            (id == "tinyjuice")
+                .then(|| std::env::var_os("TINYJUICE_TEST_MODULE"))
+                .flatten()
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
             // TinyConnectors exposes its contract to the host, but has no
             // host-side module namespace: it is resolved by its registry ID.
             (id == "tinyconnectors")
@@ -442,7 +493,7 @@ fn local_override(config: &Config, id: &str) -> Option<PathBuf> {
 /// Where downloaded artifacts are kept.
 ///
 /// The user cache directory, falling back to the workspace when there is none —
-/// the same shape the Node and Python runtime installers use, for the same
+/// the same shape used by other module asset installers, for the same
 /// reason: a headless container often has no `XDG_CACHE_HOME`, and failing to
 /// install because of that would be worse than writing beside the workspace.
 #[must_use]

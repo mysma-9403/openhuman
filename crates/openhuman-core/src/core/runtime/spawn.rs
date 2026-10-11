@@ -47,6 +47,10 @@ where
 {
     let identity = crate::memory::scope::current();
     let ctx = captured();
+    // Box before either task-local wrapper. Their branching async states
+    // otherwise multiply a large task's inline size before Tokio can box it,
+    // overflowing the spawning thread (including the CLI's main stack).
+    let fut = Box::pin(fut);
     let fut = async move {
         match ctx {
             Some(ctx) => CoreContext::scope(ctx, fut).await,
@@ -54,6 +58,31 @@ where
         }
     };
     async move {
+        match identity {
+            Some(identity) => crate::memory::scope::within(identity, fut).await,
+            None => fut.await,
+        }
+    }
+}
+
+/// What [`CoreContext::propagate`] wraps a future in: the caller's context
+/// captured now and re-entered wherever the future is polled.
+///
+/// Single-user processes carry [`CoreContext::current`]. In SaaS only the
+/// caller's own task scope is carried (an unscoped caller's future runs with
+/// no context and so fails closed). Both carry the memory identity, exactly
+/// as [`scoped`] does — but without requiring
+/// the future to be `Send`.
+pub(crate) fn carry<F: Future>(fut: F) -> impl Future<Output = F::Output> {
+    let ctx = captured();
+    let identity = crate::memory::scope::current();
+    async move {
+        let fut = async move {
+            match ctx {
+                Some(ctx) => CoreContext::scope(ctx, fut).await,
+                None => fut.await,
+            }
+        };
         match identity {
             Some(identity) => crate::memory::scope::within(identity, fut).await,
             None => fut.await,

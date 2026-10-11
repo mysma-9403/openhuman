@@ -63,10 +63,15 @@ pub fn redact_url_for_log(raw: &str) -> String {
 /// untouched. Routing fields that already contain a `:` are assumed to be
 /// in the new `<slug>:<model>` form.
 pub(crate) fn migrate_cloud_provider_slugs(config: &mut Config) {
-    use super::super::cloud_providers::{migrate_legacy_fields, AuthStyle};
+    use super::super::cloud_providers::{builtin_cloud_provider, AuthStyle};
 
     for entry in &mut config.cloud_providers {
-        migrate_legacy_fields(entry);
+        if entry.label.is_empty() {
+            entry.label = builtin_cloud_provider(&entry.slug)
+                .map(|provider| provider.label)
+                .unwrap_or("Custom")
+                .to_string();
+        }
     }
 
     let slug_to_id: std::collections::HashMap<String, String> = config
@@ -164,7 +169,15 @@ pub(crate) fn migrate_cloud_provider_slugs(config: &mut Config) {
     rewrite(&mut config.coding_provider);
     rewrite(&mut config.vision_provider);
     rewrite(&mut config.memory_provider);
-    rewrite(&mut config.embeddings_provider);
+    // Embeddings have a deliberate opt-out, not a cloud-provider slug.
+    // Preserve it on every load, including whitespace the settings RPC trims.
+    if config
+        .embeddings_provider
+        .as_deref()
+        .is_none_or(|provider| provider.trim() != "none")
+    {
+        rewrite(&mut config.embeddings_provider);
+    }
 
     fn normalize_provider_endpoint(url: &str) -> String {
         url.trim().trim_end_matches('/').to_ascii_lowercase()

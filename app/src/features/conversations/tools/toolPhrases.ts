@@ -90,12 +90,6 @@ export const TOOL_PHRASES = {
   checkMediaModels: { active: 'Checking media models', done: 'Checked media models' },
   createDocument: { active: 'Creating document', done: 'Created document' },
   createPresentation: { active: 'Creating presentation', done: 'Created presentation' },
-  generatePodcast: { active: 'Generating podcast', done: 'Generated podcast' },
-  emailPodcast: { active: 'Emailing podcast', done: 'Emailed podcast' },
-  createAndEmailPodcast: {
-    active: 'Creating and emailing podcast',
-    done: 'Created and emailed podcast',
-  },
 
   // ── Memory ──────────────────────────────────────────────────────────────
   recallMemories: { active: 'Recalling memories', done: 'Recalled memories' },
@@ -157,7 +151,6 @@ export const TOOL_PHRASES = {
   searchPlaces: { active: 'Searching places', done: 'Searched places' },
   lookUpPlace: { active: 'Looking up place', done: 'Looked up place' },
   checkMarkets: { active: 'Checking markets', done: 'Checked markets' },
-  placeCall: { active: 'Placing call', done: 'Placed call' },
   checkTaskSources: { active: 'Checking task sources', done: 'Checked task sources' },
   updateTaskSources: { active: 'Updating task sources', done: 'Updated task sources' },
   fetchTasks: { active: 'Fetching tasks', done: 'Fetched tasks' },

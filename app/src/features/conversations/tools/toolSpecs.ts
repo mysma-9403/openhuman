@@ -70,9 +70,7 @@ import {
   PackageIcon,
   PackagePlusIcon,
   PackageSearchIcon,
-  PhoneIcon,
   PlugIcon,
-  PodcastIcon,
   PowerIcon,
   PresentationIcon,
   ReceiptIcon,
@@ -175,18 +173,6 @@ export const EXACT_TOOL_SPECS: Record<string, ToolSpec> = {
 
   // ── Shell and system ────────────────────────────────────────────────────
   shell: spec('runCommand', SquareTerminalIcon, 'shell', { chip: chip.command(), body: 'shell' }),
-  node_exec: spec('runCode', SquareTerminalIcon, 'shell', {
-    chip: chip.command('script_path', 'inline_code'),
-    body: 'shell',
-  }),
-  python_exec: spec('runCode', SquareTerminalIcon, 'shell', {
-    chip: chip.command('script_path', 'inline_code'),
-    body: 'shell',
-  }),
-  npm_exec: spec('runPackageManager', SquareTerminalIcon, 'shell', {
-    chip: chip.command('subcommand'),
-    body: 'shell',
-  }),
   detect_tools: spec('checkInstalledTools', ScanSearchIcon, 'system'),
   install_tool: spec('installTool', PackagePlusIcon, 'system', {
     chip: chip.text('package', 'tool_name'),
@@ -279,13 +265,6 @@ export const EXACT_TOOL_SPECS: Record<string, ToolSpec> = {
   generate_presentation: spec('createPresentation', PresentationIcon, 'media', {
     chip: chip.text('title'),
   }),
-  audio_generate_podcast: spec('generatePodcast', PodcastIcon, 'media', {
-    chip: chip.text('title', 'topic'),
-  }),
-  audio_email_podcast: spec('emailPodcast', PodcastIcon, 'media', { chip: chip.text('to') }),
-  audio_generate_and_email_podcast: spec('createAndEmailPodcast', PodcastIcon, 'media', {
-    chip: chip.text('title', 'topic'),
-  }),
 
   // ── Memory ──────────────────────────────────────────────────────────────
   // The single memory tool: recall asks a `question`, fetch a `query`, learn stores `text`.
@@ -376,7 +355,6 @@ export const EXACT_TOOL_SPECS: Record<string, ToolSpec> = {
   gmail_unsubscribe: spec('unsubscribe', MailXIcon, 'app', { chip: chip.text('sender', 'email') }),
   google_places_search: spec('searchPlaces', MapPinIcon, 'app', { chip: chip.query() }),
   google_places_details: spec('lookUpPlace', MapPinIcon, 'app', { chip: chip.text('place_id') }),
-  twilio_call: spec('placeCall', PhoneIcon, 'app', { chip: chip.text('to') }),
 
   // ── MCP ─────────────────────────────────────────────────────────────────
   mcp_list_servers: spec('checkMcpServers', ServerIcon, 'mcp'),

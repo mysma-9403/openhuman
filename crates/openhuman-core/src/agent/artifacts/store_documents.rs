@@ -1,0 +1,348 @@
+//! Artifact records on the `tinystoragedrivers` document port.
+//!
+//! Used instead of `<workspace>/artifacts/<id>/meta.json` and `args.json`
+//! when the host configured a storage backend ([`crate::storage`]);
+//! `store.rs` picks it per call, so the records live under the acting agent's
+//! storage scope (`local` on a single-user host).
+//!
+//! # Layout
+//!
+//! | Collection | Document id | Holds |
+//! | --- | --- | --- |
+//! | `artifacts` | artifact id | the [`ArtifactMeta`] fields, plus `created_ms` for ordering |
+//! | `artifact_args` | artifact id | `args`: the producer-tool arguments (the `args.json` sidecar) |
+//!
+//! # Content files
+//!
+//! Only the records move. An artifact's bytes are a file in the visible files
+//! folder (`ArtifactMeta::file`), which the user opens, edits and deletes
+//! outside OpenHuman; the port has no blob store for that, so the file stays
+//! where it is on every backend and the record names it. A shared database
+//! therefore shares the list, the status and the regenerate arguments, not the
+//! bytes.
+//!
+//! The first document-mode call of a process imports the workspace's legacy
+//! `meta.json` / `args.json` files into the acting backend and scope
+//! ([`Docs::import_legacy`], once per backend instance, scope and workspace).
+//! The import only creates records that are absent (`Precondition::Absent`),
+//! so it never overwrites a record written since and is safe to repeat; the
+//! files stay in place, and deleting an artifact in document mode removes its
+//! legacy directory too, so a restart does not bring it back.
+
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
+use tinystoragedrivers::{CollectionSpec, Precondition, Query, Sort};
+
+use super::types::ArtifactMeta;
+use crate::storage::documents::Repo;
+use crate::storage::DocumentStoreExt;
+
+const ARTIFACTS: &str = "artifacts";
+const ARGS: &str = "artifact_args";
+const DOMAIN: &str = "artifacts::store";
+
+fn collections() -> Vec<CollectionSpec> {
+    vec![CollectionSpec::new(ARTIFACTS), CollectionSpec::new(ARGS)]
+}
+
+/// The document store for this call, when the host configured one.
+pub(super) fn current() -> Result<Option<Docs>> {
+    #[cfg(test)]
+    if let Some(docs) = TEST_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return Ok(Some(docs));
+    }
+    Ok(Repo::current(DOMAIN, collections)?.map(Docs))
+}
+
+/// Runs `f` with `docs` standing in for the installed backend, on this thread
+/// only, so tests exercise the dispatch without the process-wide slot.
+#[cfg(test)]
+pub(super) fn with_override<T>(docs: Docs, f: impl FnOnce() -> T) -> T {
+    TEST_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(docs));
+    let out = f();
+    TEST_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    out
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_OVERRIDE: std::cell::RefCell<Option<Docs>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The artifact records over one scoped document handle.
+#[derive(Clone)]
+pub(super) struct Docs(Repo);
+
+impl Docs {
+    #[cfg(test)]
+    pub(super) fn over(scoped: &crate::storage::ScopedStorage) -> Self {
+        Self(Repo::over(scoped, DOMAIN, collections))
+    }
+
+    pub(super) fn put_meta(&self, meta: &ArtifactMeta) -> Result<()> {
+        let mut doc = serde_json::to_value(meta).context("serialize artifact meta")?;
+        doc["created_ms"] = Value::from(meta.created_at.timestamp_millis());
+        let id = meta.id.clone();
+        self.0.run(|docs| async move {
+            docs.put(ARTIFACTS, &id, doc, Precondition::None)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    /// Writes the record only when none exists, atomically (an import must
+    /// not overwrite a record created since, by this core or another).
+    /// `false` when one was already there.
+    fn put_meta_if_absent(&self, meta: &ArtifactMeta) -> Result<bool> {
+        let mut doc = serde_json::to_value(meta).context("serialize artifact meta")?;
+        doc["created_ms"] = Value::from(meta.created_at.timestamp_millis());
+        let id = meta.id.clone();
+        self.0
+            .run(|docs| async move { put_absent(&docs, ARTIFACTS, &id, doc).await })
+    }
+
+    /// The arguments' counterpart of [`Self::put_meta_if_absent`].
+    fn put_args_if_absent(&self, id: &str, args: &Value) -> Result<bool> {
+        let id = id.to_string();
+        let doc = json!({ "args": args });
+        self.0
+            .run(|docs| async move { put_absent(&docs, ARGS, &id, doc).await })
+    }
+
+    pub(super) fn get_meta(&self, id: &str) -> Result<Option<ArtifactMeta>> {
+        let id = id.to_string();
+        let stored = self
+            .0
+            .run(|docs| async move { docs.get(ARTIFACTS, &id).await })?;
+        stored
+            .map(|stored| serde_json::from_value(stored.doc).context("parse artifact meta"))
+            .transpose()
+    }
+
+    /// Every record, newest first. A document that no longer parses is skipped
+    /// with a warning, as a corrupt `meta.json` is.
+    pub(super) fn list_meta(&self) -> Result<Vec<ArtifactMeta>> {
+        let stored = self.0.run(|docs| async move {
+            docs.query_all(
+                ARTIFACTS,
+                &Query::all()
+                    .sort(Sort::desc("created_ms"))
+                    .sort(Sort::asc("_id")),
+            )
+            .await
+        })?;
+        Ok(stored
+            .into_iter()
+            .filter_map(|item| match serde_json::from_value(item.doc) {
+                Ok(meta) => Some(meta),
+                Err(error) => {
+                    log::warn!(
+                        "[artifacts] skipping artifact document id={} error={error}",
+                        item.id
+                    );
+                    None
+                }
+            })
+            .collect())
+    }
+
+    pub(super) fn put_args(&self, id: &str, args: &Value) -> Result<()> {
+        let id = id.to_string();
+        let doc = json!({ "args": args });
+        self.0.run(|docs| async move {
+            docs.put(ARGS, &id, doc, Precondition::None)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    pub(super) fn get_args(&self, id: &str) -> Result<Option<Value>> {
+        let id = id.to_string();
+        let stored = self
+            .0
+            .run(|docs| async move { docs.get(ARGS, &id).await })?;
+        Ok(stored.and_then(|stored| stored.doc.get("args").cloned()))
+    }
+
+    /// Removes the record and its arguments; `false` when there was no record.
+    /// The record goes first: if the arguments delete then fails, a retry
+    /// finds no record and only an orphaned arguments document is left, never
+    /// a listed artifact that lost its regenerate arguments.
+    pub(super) fn delete(&self, id: &str) -> Result<bool> {
+        let id = id.to_string();
+        self.0.run(|docs| async move {
+            let existed = docs.delete(ARTIFACTS, &id, Precondition::None).await?;
+            docs.delete(ARGS, &id, Precondition::None).await?;
+            Ok(existed)
+        })
+    }
+
+    /// Imports the workspace's legacy `meta.json` / `args.json` files and
+    /// returns how many records it created. Only absent records are written,
+    /// so a repeat is harmless, and an interrupted import (meta in, args not)
+    /// is completed by the next one. A missing folder or a folder without
+    /// `meta.json` is nothing to import and a corrupt `meta.json` is skipped,
+    /// but any other read error fails the import, so it is retried rather than
+    /// recorded as done.
+    pub(super) fn import_legacy(&self, artifacts_dir: &Path) -> Result<usize> {
+        let entries = match std::fs::read_dir(artifacts_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", artifacts_dir.display()))
+            }
+        };
+        let mut imported = 0;
+        for entry in entries {
+            let dir = entry
+                .with_context(|| format!("read {}", artifacts_dir.display()))?
+                .path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(raw) = read_optional(&dir.join("meta.json"))? else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_str::<ArtifactMeta>(&raw) else {
+                log::warn!(
+                    "[artifacts] legacy import: skipping corrupt meta.json in {}",
+                    dir.display()
+                );
+                continue;
+            };
+            // The file store keeps each record in `artifacts/<id>/`; a copy
+            // under another name is not the record, so the id is unique and
+            // the winner does not depend on directory order.
+            if dir.file_name().and_then(|name| name.to_str()) != Some(meta.id.as_str()) {
+                log::warn!(
+                    "[artifacts] legacy import: skipping meta.json whose id does not match its folder {}",
+                    dir.display()
+                );
+                continue;
+            }
+            if self.put_meta_if_absent(&meta)? {
+                imported += 1;
+            }
+            let args = read_optional(&dir.join("args.json"))?
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+            if let Some(args) = args {
+                self.put_args_if_absent(&meta.id, &args)?;
+            }
+        }
+        log::debug!("[artifacts] legacy import: imported={imported}");
+        Ok(imported)
+    }
+}
+
+/// Puts `doc` only when `id` is absent; `false` when it was already there.
+async fn put_absent(
+    docs: &std::sync::Arc<dyn crate::storage::DocumentStore>,
+    collection: &str,
+    id: &str,
+    doc: Value,
+) -> Result<bool, crate::storage::StorageError> {
+    match docs.put(collection, id, doc, Precondition::Absent).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == tinystoragedrivers::ErrorKind::Conflict => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// The file's contents, `None` when it does not exist.
+fn read_optional(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Runs a document-store call off the async worker (the port is reached
+/// through a blocking bridge).
+pub(super) async fn on_docs<T: Send + 'static>(
+    docs: Docs,
+    f: impl FnOnce(Docs) -> anyhow::Result<T> + Send + 'static,
+) -> Result<T, String> {
+    crate::core::runtime::spawn_blocking_scoped(move || f(docs))
+        .await
+        .map_err(|e| format!("[artifacts] storage task failed: {e}"))?
+        .map_err(|e| format!("[artifacts] storage: {e:#}"))
+}
+
+/// The document store for this call, when a storage backend is configured.
+/// The first call of a process for this backend instance, scope and workspace
+/// imports the workspace's legacy `meta.json` / `args.json` files (recorded
+/// only once the import succeeded, so a failed one is retried).
+pub(super) async fn documents(workspace_dir: &Path) -> Result<Option<Docs>, String> {
+    let Some(docs) = current().map_err(|e| format!("[artifacts] storage: {e:#}"))? else {
+        return Ok(None);
+    };
+    let legacy = workspace_dir.join("artifacts");
+    on_docs(docs.clone(), move |docs| {
+        let key = legacy.display().to_string();
+        docs.0
+            .once_per_backend(&key, || docs.import_legacy(&legacy).map(|_| ()))
+    })
+    .await?;
+    Ok(Some(docs))
+}
+
+/// Deletes artifact `id` in document mode. The legacy directory
+/// (`artifact_dir`) goes first: it is what a later import would bring back,
+/// so if anything after it fails (or the process dies) the artifact is still
+/// listed and a retry finishes the job, rather than a gone record coming back
+/// from a leftover `meta.json`. Not found when there was no record, as the
+/// file store reports.
+pub(super) async fn delete_record(docs: Docs, artifact_dir: &Path, id: &str) -> Result<(), String> {
+    match tokio::fs::remove_dir_all(artifact_dir).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "[artifacts] failed to delete legacy record for id={id}: {e}"
+            ))
+        }
+    }
+    let owned = id.to_string();
+    let existed = on_docs(docs, move |docs| docs.delete(&owned)).await?;
+    if !existed {
+        return Err(format!(
+            "[artifacts] failed to delete artifact id={id}: not found"
+        ));
+    }
+    log::debug!("[artifacts] delete_artifact: deleted record id={id}");
+    Ok(())
+}
+
+/// Sorts newest first, applies the thread filter and then the page.
+pub(super) fn page_of(
+    mut all: Vec<ArtifactMeta>,
+    offset: usize,
+    limit: usize,
+    thread_id: Option<&str>,
+) -> (Vec<ArtifactMeta>, usize) {
+    // Sort descending by created_at (newest first)
+    all.sort_by_key(|item| std::cmp::Reverse(item.created_at));
+
+    // Apply thread filter BEFORE pagination so `total` reflects the
+    // per-thread count the UI surfaces, and so a small page doesn't get
+    // silently emptied by filtering after the slice (#3226).
+    if let Some(tid) = thread_id {
+        all.retain(|m| m.thread_id.as_deref() == Some(tid));
+    }
+
+    let total = all.len();
+    let page = all.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+
+    log::debug!(
+        "[artifacts] list_artifacts: total={total} returning {} items",
+        page.len()
+    );
+    (page, total)
+}
+
+#[cfg(test)]
+#[path = "store_documents_tests.rs"]
+mod tests;

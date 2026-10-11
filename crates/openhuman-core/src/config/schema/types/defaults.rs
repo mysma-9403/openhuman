@@ -25,6 +25,7 @@ impl Default for Config {
         });
 
         Self {
+            profile_providers: None,
             workspace_dir: openhuman_dir.join("workspace"),
             action_dir: crate::config::default_action_dir(),
             action_dir_override: None,
@@ -91,6 +92,7 @@ impl Default for Config {
             local_ai: LocalAiConfig::default(),
             claude_agent_sdk: ClaudeAgentSdkConfig::default(),
             cloud_providers: Vec::new(),
+            cloud_provider_ca_certs: HashMap::new(),
             primary_cloud: None,
             chat_provider: None,
             reasoning_provider: None,
@@ -100,9 +102,6 @@ impl Default for Config {
             memory_provider: None,
             embeddings_provider: None,
             custom_embeddings: None,
-            node: NodeConfig::default(),
-            runtime_python: RuntimePythonConfig::default(),
-            runtime_pool: RuntimePoolConfig::default(),
             tokenjuice: TokenjuiceConfig::default(),
             hosting: HostingConfig::default(),
             storage: StorageConfig::default(),

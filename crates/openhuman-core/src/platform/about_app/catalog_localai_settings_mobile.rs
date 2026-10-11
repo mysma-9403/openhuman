@@ -67,22 +67,11 @@ Capability {
         privacy: None,
     },
 Capability {
-        id: "local_ai.python_runtime_installer",
-        name: "Managed Python Runtime",
-        domain: "runtime_python",
-        category: CapabilityCategory::LocalAI,
-        description:
-            "Download and reuse an OpenHuman-managed CPython runtime for Python-backed local integrations such as MCP servers, with a system-Python override reserved for development.",
-        how_to: "Configured by the core `runtime_python` module; future UI surfaces can expose install state and overrides.",
-        status: CapabilityStatus::Beta,
-        privacy: MODEL_DOWNLOAD,
-    },
-Capability {
         id: "settings.configure_ai",
         name: "Configure AI",
         domain: "settings",
         category: CapabilityCategory::Settings,
-        description: "Configure managed, local, custom, and built-in BYOK LLM providers, including SumoPod and other OpenAI-compatible gateways, plus per-workload routing preferences.",
+        description: "Configure managed, local, custom, and built-in BYOK LLM providers, including SumoPod and other OpenAI-compatible gateways. Custom providers can trust an uploaded PEM CA certificate for model listing and inference. Set per-workload routing preferences here too.",
         how_to: "Connections → API keys → LLM",
         status: CapabilityStatus::Stable,
         privacy: None,

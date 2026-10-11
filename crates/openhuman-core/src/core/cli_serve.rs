@@ -139,8 +139,9 @@ fn launch_server(request: crate::core::server_launcher::ServeRequest) -> Result<
         .build()?;
     let launcher = crate::core::server_launcher::installed_server_launcher().ok_or_else(|| {
         anyhow::anyhow!(
-            "this binary has no JSON-RPC server linked in; the host must call \
-             openhuman_rpc::server::install_cli_server() before run_core_from_args"
+            "this binary has no JSON-RPC server linked in; the host must boot \
+             through openhuman_rpc::host::cli or install a server launcher before \
+             run_core_from_args"
         )
     })?;
     rt.block_on(launcher(request))?;

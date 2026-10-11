@@ -21,8 +21,8 @@
 //! ## Compile-time gate (`web3` feature)
 //!
 //! `pub mod x402;` is ALWAYS compiled — it is a facade. The real payment
-//! machinery is gated behind the default-ON `web3` Cargo feature (shared with
-//! `openhuman::web3::wallet` + `openhuman::web3`). When the feature is off, [`stub`]
+//! machinery is gated behind the optional `web3` Cargo feature (shared with
+//! `openhuman::web3::wallet` + `openhuman::web3` and enabled in the desktop product). When the feature is off, [`stub`]
 //! takes its place and exposes the always-on entry points (`init_ledger`,
 //! `all_x402_registered_controllers`, `all_x402_controller_schemas`) with
 //! no-op / empty bodies. The `X402RequestTool` and the http_request 402-retry
@@ -32,6 +32,8 @@
 
 #[cfg(feature = "web3")]
 pub(crate) mod budget;
+#[cfg(feature = "web3")]
+mod proxy_compat;
 #[cfg(feature = "web3")]
 mod records;
 #[cfg(feature = "web3")]
@@ -82,10 +84,14 @@ pub async fn handle_402_and_pay(
 }
 
 /// The `x402_request` agent tool, wired to OpenHuman's wallet, chain
-/// transport and proxy policy.
+/// transport, proxy and network policy. `allowed_domains` is the same list
+/// passed to the other agent network tools.
 #[cfg(feature = "web3")]
-pub fn request_tool() -> tinywallet_x402::tools::X402RequestTool {
-    seams::request_tool()
+pub fn request_tool(
+    security: std::sync::Arc<crate::security::SecurityPolicy>,
+    allowed_domains: Vec<String>,
+) -> tinywallet_x402::tools::X402RequestTool {
+    seams::request_tool(security, allowed_domains)
 }
 
 // ---------------------------------------------------------------------------

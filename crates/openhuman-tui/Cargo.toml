@@ -15,7 +15,10 @@ publish = false
 # through a bare workspace `openhuman-core` dependency, which turned on the
 # core's whole `default`.
 [features]
+langfuse = ["openhuman-rpc/langfuse"]
+os-keyring = ["openhuman-rpc/os-keyring"]
 default = [
+    "os-keyring",
     "crash-reporting",
     "media",
     "skills",
@@ -25,6 +28,7 @@ default = [
     "scheduler-gate",
     "file-logging",
     "modules",
+    "storage-sqlite",
 ]
 crash-reporting = ["openhuman-rpc/crash-reporting"]
 jev = ["openhuman-rpc/jev"]
@@ -40,7 +44,6 @@ web3 = ["openhuman-rpc/web3"]
 storage-sqlite = ["openhuman-rpc/storage-sqlite"]
 storage-mongodb = ["openhuman-rpc/storage-mongodb"]
 storage-file = ["openhuman-rpc/storage-file"]
-runtime-node = ["openhuman-rpc/runtime-node"]
 media = ["openhuman-rpc/media"]
 flows = ["openhuman-rpc/flows"]
 skills = ["openhuman-rpc/skills"]
@@ -68,7 +71,7 @@ log = "0.4"
 ratatui = "0.30"
 serde_json = "1"
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util"] }
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"

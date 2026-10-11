@@ -9,6 +9,7 @@ use tinyagents_runtime::{RuntimeError, TranscriptCodec, TranscriptTurnOptions};
 use tinyagents_session::transcript::view::TOOL_RESULT_FAILURES_METADATA_KEY;
 use tinyagents_session::transcript::{
     MessageUsage, SessionTranscript, ToolFailure, TranscriptMessage, TranscriptToolCall, TurnUsage,
+    UsageCostSource,
 };
 use tinyinference_llm::message::Message;
 use tinytools_agent::dialect::parse_replayed_results;
@@ -19,7 +20,9 @@ pub struct OpenHumanTranscriptCodec;
 
 impl TranscriptCodec<OpenHumanRunContext> for OpenHumanTranscriptCodec {
     fn decode_history(&self, transcript: &SessionTranscript) -> Result<Vec<Message>, RuntimeError> {
-        Ok(message_convert::history_to_messages(&transcript.messages))
+        let rows = replayable_host_rows(&transcript.messages);
+        tinyagents_runtime::transcript::native_transcript_to_messages(&rows)?;
+        Ok(message_convert::history_to_messages(&rows))
     }
 
     fn reconcile(
@@ -29,9 +32,12 @@ impl TranscriptCodec<OpenHumanRunContext> for OpenHumanTranscriptCodec {
         next: &[Message],
         options: &TranscriptTurnOptions<OpenHumanRunContext>,
     ) -> Result<Vec<TranscriptMessage>, RuntimeError> {
+        // Match against the same adopted view used by decode_history; dropped
+        // legacy head results must not shift retained rows' metadata.
+        let prior = replayable_host_rows(prior);
         let mut rows = next
             .iter()
-            .filter_map(message_convert::message_to_native_chat_message)
+            .filter_map(tinyagents_runtime::transcript::message_to_native_transcript)
             .collect::<Vec<_>>();
 
         // `Message` intentionally cannot represent all durable transcript
@@ -142,7 +148,7 @@ impl TranscriptCodec<OpenHumanRunContext> for OpenHumanTranscriptCodec {
         if sidecar.input_tokens == 0
             && sidecar.output_tokens == 0
             && sidecar.cached_input_tokens == 0
-            && sidecar.cost_usd == 0.0
+            && sidecar.cost.known_usd == 0.0
             && route.is_none()
         {
             return Ok(None);
@@ -161,7 +167,14 @@ impl TranscriptCodec<OpenHumanRunContext> for OpenHumanTranscriptCodec {
                 output: sidecar.output_tokens,
                 cached_input: sidecar.cached_input_tokens,
                 context_window: sidecar.context_window,
-                cost_usd: sidecar.cost_usd,
+                cost_usd: sidecar.cost.known_usd,
+                cost_source: Some(match sidecar.cost.source {
+                    crate::agent::cost::CostSource::Charged => UsageCostSource::Charged,
+                    crate::agent::cost::CostSource::Estimated => UsageCostSource::Estimated,
+                    crate::agent::cost::CostSource::Unknown => UsageCostSource::Unknown,
+                }),
+                last_call_input: sidecar.last_call_input_tokens,
+                last_call_output: sidecar.last_call_output_tokens,
             },
             ts: chrono::Utc::now().to_rfc3339(),
             reasoning_content: None,
@@ -291,6 +304,7 @@ fn attach_text_dialect_rounds(
                 cached_input: 0,
                 context_window: 0,
                 cost_usd: 0.0,
+                ..Default::default()
             },
             ts: chrono::Utc::now().to_rfc3339(),
             reasoning_content: None,
@@ -299,3 +313,34 @@ fn attach_text_dialect_rounds(
         });
     }
 }
+
+/// Apply OpenHuman's historical orphan-head adoption to the replay view only.
+fn replayable_host_rows(rows: &[TranscriptMessage]) -> std::borrow::Cow<'_, [TranscriptMessage]> {
+    // Old unpaired trims could persist tool results immediately after the
+    // frozen system prefix (#6721). Later orphan results still fail native
+    // validation. Merely resuming never rewrites the durable source.
+    let prefix = rows.iter().take_while(|row| row.role == "system").count();
+    let orphan_count = rows[prefix..]
+        .iter()
+        .take_while(|row| row.role == "tool")
+        .count();
+    if orphan_count == 0 {
+        std::borrow::Cow::Borrowed(rows)
+    } else {
+        tracing::warn!(
+            orphan_count,
+            "[session_host::codec] repaired legacy orphaned tool head"
+        );
+        std::borrow::Cow::Owned(
+            rows[..prefix]
+                .iter()
+                .chain(&rows[prefix + orphan_count..])
+                .cloned()
+                .collect(),
+        )
+    }
+}
+
+#[cfg(test)]
+#[path = "codec_adoption_tests.rs"]
+mod adoption_tests;

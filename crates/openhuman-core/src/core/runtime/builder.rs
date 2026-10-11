@@ -15,10 +15,9 @@
 //!    [`CoreRuntime::start_services`], and serves until shutdown. A runtime
 //!    with no transport calls `start_services` itself.
 //!
-//! The server entry points in `openhuman-rpc` (`run_server`,
-//! `run_server_embedded`, `run_server_embedded_with_ready`) are thin shims over
-//! this builder, so the desktop shell, the standalone CLI, and any new embedder
-//! share one path.
+//! The host boot in `openhuman-rpc` (`host::{cli, desktop}`) and its
+//! `run_server*` entry points build on this builder, so the desktop shell, the
+//! standalone CLI, and any new embedder share one path.
 //! See the pluggable-core work (`core::runtime`) for how this fits with
 //! [`context`](crate::core::runtime::context) and `services`.
 
@@ -52,8 +51,6 @@ pub struct ServiceSet {
     pub update_scheduler: bool,
     /// Start memory queue workers during runtime bootstrap.
     pub memory_queue: bool,
-    /// Run one-shot harness initialization during runtime bootstrap.
-    pub harness_init: bool,
     /// Refresh the skill catalog during runtime bootstrap.
     pub skill_catalog_refresh: bool,
     /// Boot installed MCP servers and supervise reconnects during runtime bootstrap.
@@ -75,7 +72,6 @@ impl ServiceSet {
             login_gated: true,
             update_scheduler: true,
             memory_queue: true,
-            harness_init: true,
             skill_catalog_refresh: true,
             mcp_boot: true,
             integrations: true,
@@ -94,7 +90,6 @@ impl ServiceSet {
             login_gated: false,
             update_scheduler: false,
             memory_queue: false,
-            harness_init: false,
             skill_catalog_refresh: false,
             mcp_boot: false,
             integrations: false,
@@ -113,7 +108,6 @@ impl ServiceSet {
             login_gated: false,
             update_scheduler: false,
             memory_queue: false,
-            harness_init: false,
             skill_catalog_refresh: false,
             mcp_boot: false,
             integrations: false,
@@ -142,7 +136,6 @@ impl ServiceSet {
             login_gated: true,
             update_scheduler: false,
             memory_queue: true,
-            harness_init: true,
             skill_catalog_refresh: true,
             mcp_boot: false,
             integrations: false,
@@ -205,8 +198,7 @@ impl CoreBuilder {
     /// "backend unavailable" error while agents, memory, tools and RPC keep
     /// working. Library hosts that build one runtime per process prefer this
     /// builder form; the desktop shell and CLI, which boot the core through
-    /// `run_server_embedded_with_ready` / `run_core_from_args`, install the
-    /// global.
+    /// `openhuman_rpc::host`, install the global.
     pub fn backend_transport(
         mut self,
         transport: std::sync::Arc<dyn crate::backend::transport::BackendTransport>,
@@ -493,6 +485,9 @@ impl CoreRuntime {
     /// to stop either: the user runs Ollama / LM Studio / MLX themselves and
     /// OpenHuman never spawns it.
     pub async fn exit_cleanup(&self) {
+        if let Err(error) = crate::integrations::composio::trigger_history::close_global().await {
+            log::warn!("[composio][history] archive shutdown failed: {error}");
+        }
         log::debug!("[core] shutdown: exit cleanup done (no owned local runtime to stop)");
     }
 

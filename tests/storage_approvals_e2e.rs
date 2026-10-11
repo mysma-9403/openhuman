@@ -5,11 +5,15 @@
 //! storage slot, which would reroute every other suite's approvals in a
 //! shared process.
 
-use std::sync::Arc;
-
 use openhuman_core::config::Config;
 use openhuman_core::security::approval::store;
 use openhuman_core::security::approval::types::{ApprovalDecision, PendingApproval};
+
+#[macro_use]
+#[path = "support/storage_drivers.rs"]
+mod storage_drivers;
+
+use storage_drivers::Case;
 
 fn pending(id: &str) -> PendingApproval {
     PendingApproval::new(
@@ -21,14 +25,13 @@ fn pending(id: &str) -> PendingApproval {
     )
 }
 
-#[test]
-fn a_configured_backend_holds_the_approvals_instead_of_approval_db() {
+fn a_configured_backend_holds_the_approvals_instead_of_approval_db(case: Case) {
     let workspace = tempfile::tempdir().unwrap();
     let config = Config {
         workspace_dir: workspace.path().to_path_buf(),
         ..Config::default()
     };
-    openhuman_core::storage::install(Arc::new(openhuman_core::storage::MemoryStorage::new()));
+    case.install();
 
     store::insert_pending(&config, &pending("r1"), "session").unwrap();
     store::insert_flow_trust(&config, "flow-1", "shell").unwrap();
@@ -62,3 +65,5 @@ fn a_configured_backend_holds_the_approvals_instead_of_approval_db() {
         .join("approval.db")
         .exists());
 }
+
+driver_cases!(sync a_configured_backend_holds_the_approvals_instead_of_approval_db);

@@ -1,11 +1,8 @@
 //! A `HostOnly` agent sees the host's tools and nothing else.
 //!
-//! The scenario is a PR-review bot: it hands the agent read-only tools over a
-//! repository and must be certain the model can never act — no shell, no
-//! writes, no network, no memory, no skills, no MCP, no delegation. Every
-//! assertion here reads the request the provider actually received, or the
-//! filesystem the model tried to touch, rather than the agent's own account of
-//! itself.
+//! A document-analysis host supplies read-only tools and confines the agent
+//! to that catalog: no shell, writes, network, memory, skills, MCP or delegation.
+//! Assertions inspect provider requests and attempted filesystem effects.
 
 mod common;
 
@@ -14,8 +11,8 @@ use std::sync::Arc;
 
 use common::{chat_completion, chat_requests, offline_config, runtime, stub_backend, tool_names};
 use openhuman_embed::{
-    Access, AgentDefinitionSpec, AgentSpec, HostTurnTools, Provider, Runtime, Tool, ToolScopeSpec,
-    Workspace,
+    Access, AgentDefinitionSpec, AgentSpec, HostTurnTools, Provider, Runtime, Tool, ToolPolicy,
+    ToolScopeSpec, Workspace,
 };
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
@@ -24,7 +21,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 // Runtime is process-wide; tests in this file take turns.
 static RUNTIME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-const BARE_PROMPT: &str = "You review pull requests. Read code with the tools you have.";
+const BARE_PROMPT: &str = "Analyze documents with the tools you have.";
 
 /// A read-only host tool that counts its calls.
 struct HostTool {
@@ -38,14 +35,17 @@ impl Tool for HostTool {
         self.name
     }
     fn description(&self) -> &str {
-        "Read-only repository access supplied by the host"
+        "Read-only document access supplied by the host"
     }
     fn parameters_schema(&self) -> Value {
         json!({"type": "object", "properties": {"path": {"type": "string"}}})
     }
-    async fn execute(&self, _: Value) -> anyhow::Result<openhuman_core::tools::ToolResult> {
+    fn policy(&self) -> ToolPolicy {
+        ToolPolicy::read_only()
+    }
+    async fn execute(&self, _: Value) -> anyhow::Result<openhuman_embed::ToolResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(openhuman_core::tools::ToolResult::success(format!(
+        Ok(openhuman_embed::ToolResult::success(format!(
             "{}-host-result",
             self.name
         )))
@@ -127,7 +127,7 @@ fn host_only_spec(id: &str, provider: &MockServer, calls: Arc<AtomicUsize>) -> A
                     calls: calls.clone(),
                 }),
                 Box::new(HostTool {
-                    name: "find_callers",
+                    name: "find_documents",
                     calls: calls.clone(),
                 }),
             ])
@@ -157,7 +157,7 @@ fn host_only_advertises_exactly_the_host_tools_under_a_bare_prompt() {
     runtime().block_on(async {
         tokio::spawn(async {
             let backend = stub_backend().await;
-            let provider = scripted_provider(vec![chat_completion("LGTM")]).await;
+            let provider = scripted_provider(vec![chat_completion("complete")]).await;
             let runtime = Runtime::builder()
                 .config(offline_config())
                 .workspace(Workspace::Ephemeral)
@@ -167,16 +167,16 @@ fn host_only_advertises_exactly_the_host_tools_under_a_bare_prompt() {
                 .expect("runtime");
             let calls = Arc::new(AtomicUsize::new(0));
             let agent = runtime
-                .agent(host_only_spec("reviewer", &provider, calls))
+                .agent(host_only_spec("analyst", &provider, calls))
                 .expect("agent");
 
-            agent.run("Review this diff.").await.expect("turn");
+            agent.run("Analyze this document.").await.expect("turn");
 
             let requests = chat_requests(&provider).await;
             assert_eq!(requests.len(), 1);
             let mut advertised = tool_names(&requests[0]);
             advertised.sort();
-            assert_eq!(advertised, vec!["find_callers", "read_file"]);
+            assert_eq!(advertised, vec!["find_documents", "read_file"]);
             assert_eq!(system_text(&requests[0]), BARE_PROMPT);
         })
         .await
@@ -219,7 +219,7 @@ fn host_only_refuses_builtin_tools_the_model_names() {
                 .agent(host_only_spec("refuser", &provider, calls.clone()))
                 .expect("agent");
 
-            let _ = agent.run("Review this diff.").await;
+            let _ = agent.run("Analyze this document.").await;
 
             let action_dir = agent.action_dir().to_path_buf();
             assert!(!action_dir.join("shell-ran.txt").exists(), "shell executed");

@@ -47,15 +47,17 @@ pub mod contract_gate;
 pub(crate) mod direct_auth;
 pub mod execute_dispatch;
 pub(crate) mod file_store;
+mod file_store_documents;
 pub mod googlecalendar_args;
 pub mod identity;
 pub mod identity_store;
 pub mod module_client;
 pub mod ops;
+pub(crate) mod processing;
 pub mod providers;
 pub mod schemas;
 pub mod tools;
-pub mod trigger_history;
+pub(crate) mod trigger_history;
 pub mod types;
 
 pub use crate::agent::prompts::types::ConnectedIntegration;
@@ -67,9 +69,9 @@ pub use bus::{
 };
 pub use identity::connection_identity;
 pub use ops::{
-    cached_active_integrations, cached_active_integrations_including_expired, connected_set_hash,
-    fetch_connected_integrations, fetch_connected_integrations_status,
-    invalidate_connected_integrations_cache, FetchConnectedIntegrationsStatus,
+    cached_active_integrations, connected_set_hash, fetch_connected_integrations,
+    fetch_connected_integrations_status, invalidate_connected_integrations_cache,
+    FetchConnectedIntegrationsStatus,
 };
 pub use schemas::{
     all_controller_schemas as all_composio_controller_schemas,
@@ -86,3 +88,6 @@ pub use types::{
     ComposioToolsResponse, ComposioTriggerEvent, ComposioTriggerHistoryEntry,
     ComposioTriggerHistoryResult, ComposioTriggerMetadata,
 };
+
+/// Product-specific task recency scoping used by the briefing runner.
+pub(crate) mod task_recency_context;

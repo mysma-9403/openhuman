@@ -74,9 +74,29 @@ static UNSCOPED: LazyLock<AgentScopedState> = LazyLock::new(AgentScopedState::de
 
 /// The ambient context's slot of type `T`, or the unscoped one when no
 /// context exists.
+///
+/// In SaaS only the task's own scope counts, and a task without one gets a
+/// throwaway slot: never the shared unscoped one (which every user's lost
+/// work would meet in) and never the operator's.
 pub fn current_slot<T: Default + Send + Sync + 'static>() -> Arc<T> {
-    match CoreContext::current() {
+    let saas = super::is_saas();
+    slot_in::<T>(saas, super::tenant::context_in(saas).as_deref())
+}
+
+/// [`current_slot`] as a function of the mode and the resolved context.
+pub fn slot_in<T: Default + Send + Sync + 'static>(
+    saas: bool,
+    ctx: Option<&CoreContext>,
+) -> Arc<T> {
+    match ctx {
         Some(ctx) => ctx.agent_state().slot::<T>(),
+        None if saas => {
+            log::warn!(
+                "[core-context] unscoped state slot {} in SaaS; handing out a throwaway one",
+                std::any::type_name::<T>()
+            );
+            Arc::new(T::default())
+        }
         None => UNSCOPED.slot::<T>(),
     }
 }
@@ -158,6 +178,11 @@ pub fn agent_scope_dir(config: &crate::config::Config) -> PathBuf {
 }
 
 /// The agent id of the ambient context, when it was derived for one.
+///
+/// Genuinely per-agent only: a SaaS profile's default agent has none, so this
+/// is never a tenant key. Tables and stores that must keep tenants apart key
+/// on [`current_tenant`](super::current_tenant) instead; the remaining callers
+/// only log it.
 pub fn current_agent_id() -> Option<String> {
     CoreContext::current().and_then(|ctx| ctx.session_agent().map(str::to_owned))
 }

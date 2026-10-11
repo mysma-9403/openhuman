@@ -139,7 +139,7 @@ macOS اور Linux کی اسکرپٹ کیا کرے گی، یہ پہلے دیکھ
 
 <h3>ڈیولپرز کے لیے بنایا گیا</h3>
 
-<p><a href="https://tinyhumans.gitbook.io/openhuman/developing/quickstart">Rust کوئیک اسٹارٹ</a> · <a href="https://tinyhumans.gitbook.io/openhuman/developing/embedding">ایمبیڈنگ گائیڈ</a> · <a href="../crates/openhuman-embed/examples">مثالیں</a></p>
+<p><a href="https://tinyhumans.gitbook.io/openhuman/developing/quickstart">Rust کوئیک اسٹارٹ</a> · <a href="../gitbooks/developing/embed/README.md">ایمبیڈنگ گائیڈ</a> · <a href="../crates/openhuman-embed/examples">مثالیں</a></p>
 
 <p>اسے Rust لائبریری کے طور پر استعمال کریں: ایجنٹ کو کسی بھی عام فنکشن کی طرح کال کریں، یا ایک چھوٹے سرور سے پورا بیڑا چلائیں۔</p>
 
@@ -205,7 +205,7 @@ OpenHuman ان حصوں کو نئے سرے سے سوچتا ہے جن پر سب �
 
 <p><a href="https://tinyhumans.gitbook.io/openhuman/developing/loadable-modules">پلگ اِن کیسے کام کرتے ہیں</a></p>
 
-<p>سرچ، دستاویزات یا آواز جیسا ہر فیچر ایک ہی Rust بس میں جڑتا ہے، یہ خیال <a href="https://www.freedesktop.org/wiki/Software/dbus/">Linux سسٹم بس</a> سے لیا گیا ہے۔ فیچر صرف ضرورت پڑنے پر لوڈ ہوتا ہے، اور اگر کوئی ایک اٹک جائے تو باقی کام کرتے رہتے ہیں۔</p>
+<p>سرچ، دستاویزات یا آواز جیسا ہر فیچر ایک ہی Rust بس میں جڑتا ہے، یہ خیال <a href="https://packages.debian.org/stable/dbus">Linux سسٹم بس</a> سے لیا گیا ہے۔ فیچر صرف ضرورت پڑنے پر لوڈ ہوتا ہے، اور اگر کوئی ایک اٹک جائے تو باقی کام کرتے رہتے ہیں۔</p>
 
 </td>
 
@@ -333,7 +333,7 @@ println!("{}", reply.reply);
 
 <div dir="rtl" lang="ur">
 
-اگلا قدم: [Rust کوئیک اسٹارٹ](https://tinyhumans.gitbook.io/openhuman/developing/quickstart)، [ایمبیڈنگ گائیڈ](https://tinyhumans.gitbook.io/openhuman/developing/embedding) اور [ڈیولپر دستاویزات](https://tinyhumans.gitbook.io/openhuman/developing)۔
+اگلا قدم: [Rust کوئیک اسٹارٹ](https://tinyhumans.gitbook.io/openhuman/developing/quickstart)، [ایمبیڈنگ گائیڈ](../gitbooks/developing/embed/README.md) اور [ڈیولپر دستاویزات](https://tinyhumans.gitbook.io/openhuman/developing)۔
 
 ---
 

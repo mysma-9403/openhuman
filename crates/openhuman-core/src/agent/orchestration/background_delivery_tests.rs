@@ -6,29 +6,18 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tinyagents_tasks::DEFAULT_MAX_ATTEMPTS;
 use tokio::sync::MutexGuard;
-
 /// Serializes tests over the process-wide router registry (`clear_all` in the
 /// thread-purge tests sweeps every open workspace).
 async fn test_guard() -> MutexGuard<'static, ()> {
     crate::config::TEST_ENV_LOCK.lock().await
 }
-
 fn workspace() -> TestWorkspace {
     TestWorkspace::new()
 }
-
 async fn record(ws: &Path, session: &str, task: &str, summary: &str, thread: &str) {
-    record_completion(
-        ws,
-        session,
-        task,
-        "researcher",
-        summary,
-        Some(thread.to_owned()),
-    )
-    .await;
+    let thread = Some(thread.to_owned());
+    record_completion(ws, session, task, "researcher", summary, thread).await;
 }
-
 fn pending_ids(ws: &Path, thread: &str) -> Vec<String> {
     pending_for(ws, thread)
         .into_iter()
@@ -37,7 +26,12 @@ fn pending_ids(ws: &Path, thread: &str) -> Vec<String> {
 }
 
 fn mark_busy(session: &str) {
-    busy().lock().expect("busy").insert(session.to_string());
+    busy()
+        .lock()
+        .expect("busy")
+        .entry(session.to_string())
+        .or_default()
+        .insert(u64::MAX);
 }
 
 fn clear_busy(session: &str) {
@@ -176,33 +170,22 @@ async fn persistence_failure_releases_batch_without_terminal_announcement() {
 }
 
 #[tokio::test]
-async fn handler_tracks_busy_across_turn_and_error_events() {
-    let h = BackgroundDeliveryHandler;
+async fn a_turn_is_busy_until_its_guard_drops() {
     let sid = r#"{"client_id":"c","thread_id":"bd-turn-thread"}"#.to_string();
 
-    h.handle(&DomainEvent::AgentTurnStarted {
-        session_id: sid.clone(),
-        channel: "test".into(),
-    })
-    .await;
+    let turn = TurnBusy::start(&sid);
     assert!(is_busy("bd-turn-thread"));
-
-    h.handle(&DomainEvent::AgentTurnCompleted {
-        session_id: sid.clone(),
-        text_chars: 0,
-        iterations: 0,
-    })
-    .await;
+    drop(turn);
     assert!(!is_busy("bd-turn-thread"));
 
-    // A failed turn (AgentError) must also clear busy so delivery isn't stuck.
-    mark_busy(&sid);
-    h.handle(&DomainEvent::AgentError {
-        session_id: sid.clone(),
-        message: "boom".into(),
-        recoverable: true,
-    })
-    .await;
+    // The bus events no longer mark busy: the subscriber runs off-task and
+    // cannot tell which profile a session belongs to.
+    BackgroundDeliveryHandler
+        .handle(&DomainEvent::AgentTurnStarted {
+            session_id: sid.clone(),
+            channel: "test".into(),
+        })
+        .await;
     assert!(!is_busy("bd-turn-thread"));
 }
 
@@ -688,6 +671,22 @@ async fn boot_recovery_schedules_a_delivery_for_every_thread_with_undelivered_re
 }
 
 #[tokio::test]
+async fn recover_on_open_rescans_a_workspace_already_recovered() {
+    let _g = test_guard().await;
+    let ws = workspace();
+    let w = ws.path();
+    record(w, "bd-open", "sub-1", "left pending", "thread-open-resc").await;
+    forget_workspace_for_test(w);
+    assert_eq!(recover_on_boot(w), 1);
+    assert_eq!(recover_on_boot(w), 0, "boot recovery claims once");
+    assert_eq!(
+        recover_on_open(w, DrainFence::none()),
+        1,
+        "a re-open scans again"
+    );
+}
+
+#[tokio::test]
 async fn a_cancelled_turn_does_not_leave_the_thread_busy() {
     // A cooperatively cancelled turn publishes no terminal event; Stop clears it.
     let _g = test_guard().await;
@@ -704,41 +703,5 @@ async fn a_cancelled_turn_does_not_leave_the_thread_busy() {
     clear_busy(other);
 }
 
-#[tokio::test]
-async fn a_mixed_batch_that_partly_gives_up_still_retries_the_rest() {
-    let _g = test_guard().await;
-    let ws = workspace();
-    let w = ws.path();
-    record(w, "bd-mixed", "sub-old", "old", "thread-mixed").await;
-    let router = router_for_workspace(w);
-    for _ in 0..(DEFAULT_MAX_ATTEMPTS - 1) {
-        try_deliver_with(
-            "thread-mixed".into(),
-            router.clone(),
-            |_t, _n| async move { Err::<String, String>("checkout failed".to_string()) },
-            |_t, _n| async move { unreachable!("below the ceiling") },
-        )
-        .await;
-    }
-    // A newer result joins the old one, which is on its last attempt.
-    record(w, "bd-mixed", "sub-new", "new", "thread-mixed").await;
-
-    let gave_up = Arc::new(Mutex::new(String::new()));
-    let sink = Arc::clone(&gave_up);
-    let retry = try_deliver_with(
-        "thread-mixed".into(),
-        router,
-        |_t, _n| async move { Err::<String, String>("checkout failed".to_string()) },
-        move |_t, notice| async move {
-            *sink.lock().expect("sink") = notice;
-        },
-    )
-    .await;
-
-    assert!(gave_up.lock().expect("sink").contains("sub-old"));
-    assert!(
-        retry.is_some(),
-        "the newer record must still be rescheduled"
-    );
-    assert_eq!(pending_ids(w, "thread-mixed"), ["sub-new"]);
-}
+#[path = "background_delivery_recovery_tests.rs"]
+mod recovery_tests;

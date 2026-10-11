@@ -6,6 +6,7 @@
 //! registry from a loaded [`Config`]. Per-turn behaviour lives in
 //! [`super::turn`]; accessors and run-helpers live in [`super::runtime`].
 
+#[cfg(feature = "flows")]
 pub(crate) use factory::provider_role_for_definition;
 
 mod builder_build;
@@ -15,6 +16,7 @@ mod host_only;
 mod host_tools;
 mod iteration_cap;
 mod permanent_tool;
+mod profile_factory;
 mod setters;
 
 pub use host_only::HostOnlyToolPolicy;

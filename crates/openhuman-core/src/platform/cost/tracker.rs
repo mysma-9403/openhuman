@@ -194,12 +194,16 @@ impl CostTracker {
                     cost_usd: 0.0,
                     total_tokens: 0,
                     request_count: 0,
+                    unpriced_request_count: 0,
                 });
             model_entry.cost_usd += record.usage.cost_usd;
             model_entry.total_tokens = model_entry
                 .total_tokens
                 .saturating_add(record.usage.total_tokens);
             model_entry.request_count += 1;
+            if record.usage.cost_source == CostSource::Unknown {
+                model_entry.unpriced_request_count += 1;
+            }
         })?;
 
         let mut out = Vec::with_capacity(span as usize);
@@ -340,10 +344,12 @@ impl CostTracker {
                         cost_usd: 0.0,
                         total_tokens: 0,
                         request_count: 0,
+                        unpriced_request_count: 0,
                     });
                 entry.cost_usd += stats.cost_usd;
                 entry.total_tokens = entry.total_tokens.saturating_add(stats.total_tokens);
                 entry.request_count += stats.request_count;
+                entry.unpriced_request_count += stats.unpriced_request_count;
             }
         }
         let mut by_model: Vec<ModelStats> = by_model_totals.into_values().collect();
@@ -426,11 +432,15 @@ fn build_session_model_stats(session_costs: &[CostRecord]) -> HashMap<String, Mo
                 cost_usd: 0.0,
                 total_tokens: 0,
                 request_count: 0,
+                unpriced_request_count: 0,
             });
 
         entry.cost_usd += record.usage.cost_usd;
         entry.total_tokens += record.usage.total_tokens;
         entry.request_count += 1;
+        if record.usage.cost_source == CostSource::Unknown {
+            entry.unpriced_request_count += 1;
+        }
     }
 
     by_model
@@ -455,7 +465,11 @@ struct CostStorage {
 impl CostStorage {
     /// Create or open cost storage.
     fn new(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
+        // With a storage backend the ledger lives in documents under the
+        // acting agent's scope, which is only known per call: no directory to
+        // make, and no aggregate to prime here.
+        let documents = crate::storage::installed().is_some();
+        if let Some(parent) = path.parent().filter(|_| !documents) {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
@@ -472,11 +486,13 @@ impl CostStorage {
             cached_month: now.month(),
         };
 
-        storage.rebuild_aggregates(
-            storage.cached_day,
-            storage.cached_year,
-            storage.cached_month,
-        )?;
+        if !documents {
+            storage.rebuild_aggregates(
+                storage.cached_day,
+                storage.cached_year,
+                storage.cached_month,
+            )?;
+        }
 
         Ok(storage)
     }
@@ -485,6 +501,16 @@ impl CostStorage {
     where
         F: FnMut(CostRecord),
     {
+        if let Some(docs) = super::tracker_documents::current()? {
+            self.import_legacy_once(&docs)?;
+            for record in docs.all()? {
+                if !is_legacy_host_duplicate(&record) {
+                    on_record(record);
+                }
+            }
+            return Ok(());
+        }
+
         if !self.path.exists() {
             return Ok(());
         }
@@ -521,6 +547,17 @@ impl CostStorage {
         }
 
         Ok(())
+    }
+
+    /// The workspace's JSONL ledger predates the backend and belongs to the
+    /// single-user (`local`) scope; import it into that scope once.
+    /// Once per process for the backend instance (see
+    /// `CostDocs::import_legacy_once`).
+    fn import_legacy_once(&self, docs: &super::tracker_documents::CostDocs) -> Result<()> {
+        if crate::storage::current_scope().ok() != Some(crate::storage::Scope::local()) {
+            return Ok(());
+        }
+        docs.import_legacy_once(&self.path)
     }
 
     fn rebuild_aggregates(&mut self, day: NaiveDate, year: i32, month: u32) -> Result<()> {
@@ -576,6 +613,16 @@ impl CostStorage {
 
     /// Add a new record.
     fn add_record(&mut self, record: CostRecord) -> Result<()> {
+        // The period aggregates are one cache for the whole process, so they
+        // are not kept for a document ledger, whose scope changes per call;
+        // `get_aggregated_costs` recomputes them from the scope's records.
+        if let Some(docs) = super::tracker_documents::current()? {
+            // The legacy ledger goes in before the first document, so history
+            // is never split across the two.
+            self.import_legacy_once(&docs)?;
+            return docs.add(&record);
+        }
+
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
@@ -617,6 +664,11 @@ impl CostStorage {
     /// [`Self::get_aggregated_managed_costs`] for anything that gates a
     /// request.
     fn get_aggregated_costs(&mut self) -> Result<(f64, f64)> {
+        if super::tracker_documents::current()?.is_some() {
+            let now = Utc::now();
+            self.rebuild_aggregates(now.date_naive(), now.year(), now.month())?;
+            return Ok((self.daily_cost_usd, self.monthly_cost_usd));
+        }
         self.ensure_period_cache_current()?;
         Ok((self.daily_cost_usd, self.monthly_cost_usd))
     }

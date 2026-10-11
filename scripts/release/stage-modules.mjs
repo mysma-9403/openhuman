@@ -18,6 +18,8 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -94,8 +96,8 @@ export function bundledAssets(source, hostKey) {
     if (!urls.has(record.id)) throw new Error(`missing release URL for ${record.id}`);
     return record.id;
   });
-  // A module that publishes nothing for this OS (tinycomputer has no Linux
-  // build) is not bundled there; one that publishes the OS but not this key is
+  // A module that publishes nothing for this OS is not bundled there;
+  // one that publishes the OS but not this key is
   // a registry hole and fails below.
   const osPrefix = hostKey.split("-")[0];
   const byId = new Map([...records.values()].map((r) => [r.id, r]));
@@ -157,6 +159,26 @@ export function extractArchive(archive, dir) {
   execFileSync("tar", ["-xzf", archive, "-C", dir], { stdio: "pipe" });
 }
 
+/**
+ * Reset every directory under `root` (and `root` itself) to 0755 and every
+ * regular file to 0644. tinybus refuses a module whose directory, or any
+ * ancestor of it, another account can write ("module directory is writable by
+ * another user"), and the staged tree ships in the AppImage/deb as-is, so it
+ * must not inherit the build host's umask (002 on Ubuntu) or the release
+ * tarball's mode bits. Libraries need no execute bit: `dlopen` maps them
+ * without it, and Debian policy ships shared objects 0644. Symlinks are left
+ * alone; `chmod` would follow them out of the tree.
+ */
+export function normalizeStagedPermissions(root) {
+  const stat = lstatSync(root);
+  if (stat.isDirectory()) {
+    chmodSync(root, 0o755);
+    for (const name of readdirSync(root)) normalizeStagedPermissions(join(root, name));
+  } else if (stat.isFile()) {
+    chmodSync(root, 0o644);
+  }
+}
+
 const DOWNLOAD_TIMEOUT_MS = 120_000;
 
 /**
@@ -212,6 +234,7 @@ export async function stageModules({
     if (!keepsArchive(asset.hostKey)) replaceArchiveWithMarker(archive, actual);
     console.log(`[bundled-modules] staged ${asset.id} ${asset.version} (${asset.hostKey})`);
   }
+  normalizeStagedPermissions(output);
   console.log(`[bundled-modules] staged ${assets.length} verified releases for ${hostKey}`);
   return output;
 }

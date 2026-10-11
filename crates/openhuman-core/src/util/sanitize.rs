@@ -1,16 +1,26 @@
-//! Sanitization helpers for untrusted text bound for a model's context.
+//! Sanitization adapters for untrusted text bound for a model's context.
 //!
-//! The implementation moved to `tinymcp_bus`, which is where the MCP transports
-//! apply it to every remote tool description before a caller sees one. Two
-//! copies of a security-relevant stripping rule in two repositories would
-//! drift, and this one is also used for *skill* descriptions from the
-//! orchestrator prompt builder — so both need the same rule, and one of them
-//! has to name the other's.
-//!
-//! Re-exported under the path this module has always been at, so callers keep
-//! their spelling.
+//! TinyTools owns the lexical rules, shared with TinyMCP. These thin adapters
+//! retain the host utility API without re-exporting an upstream implementation.
 
-pub use tinymcp_bus::sanitize::{
-    sanitize_for_llm, strip_control_chars, strip_instruction_fences, truncate_utf8_safe,
-    MAX_DESCRIPTION_BYTES, MAX_TITLE_BYTES,
-};
+pub use tinymcp_bus::sanitize::{MAX_DESCRIPTION_BYTES, MAX_TITLE_BYTES};
+
+/// Strip control characters through TinyTools' shared sanitization rules.
+pub fn strip_control_chars(input: &str) -> String {
+    tinytools_std::sanitize::strip_control_chars(input)
+}
+
+/// Remove instruction delimiters from untrusted text.
+pub fn strip_instruction_fences(input: &str) -> String {
+    tinytools_std::sanitize::strip_instruction_fences(input)
+}
+
+/// Apply a byte limit without splitting a UTF-8 character.
+pub fn truncate_utf8_safe(input: &str, max_bytes: usize) -> String {
+    tinytools_std::sanitize::truncate_utf8_safe(input, max_bytes)
+}
+
+/// Sanitize untrusted text and limit its size through the shared helper.
+pub fn sanitize_for_llm(input: &str, max_bytes: usize) -> String {
+    tinytools_std::sanitize::sanitize_for_llm(input, max_bytes)
+}

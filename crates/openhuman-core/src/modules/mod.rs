@@ -35,35 +35,63 @@
 //!   assembles transactions while the signing key stays in this process.
 //! - [`host`] — the module broker, connection and loader.
 //! - [`ops`] — resolving, loading, and reporting status.
-//! - [`runtime`] — calling `tinyruntime`: resolving a language runtime and
-//!   running code on it.
 //! - [`schemas`] — the `modules` RPC surface.
 //! - [`boot`] — what happens at startup.
 
+pub mod accessibility;
+#[cfg(feature = "modules")]
 pub mod boot;
+#[cfg(feature = "modules")]
 pub mod browser;
+#[cfg(feature = "modules")]
 pub(crate) mod browser_sites;
+#[cfg(feature = "modules")]
 pub mod browser_task;
+#[cfg(feature = "modules")]
 mod browser_task_report;
+#[cfg(feature = "channels")]
+pub(crate) mod channel_controller;
+pub(crate) mod channel_health;
+pub mod client;
+#[cfg(feature = "modules")]
 pub mod computer;
+#[cfg(feature = "modules")]
 pub mod computer_config;
+#[cfg(feature = "modules")]
 pub mod connectors;
+#[cfg(feature = "modules")]
 pub mod desktop;
 #[cfg(feature = "documents")]
+#[cfg(feature = "modules")]
 pub mod documents;
+mod failure;
+#[cfg(feature = "modules")]
 pub mod host;
+#[cfg(feature = "modules")]
 pub mod ops;
 pub mod registry;
-pub mod runtime;
+#[cfg(feature = "modules")]
 pub mod schemas;
+#[cfg(feature = "modules")]
 pub mod search;
+#[cfg(feature = "modules")]
+pub mod tinybox;
+#[cfg(feature = "modules")]
 mod tokenjuice_host;
 pub mod types;
 #[cfg(feature = "voice")]
+#[cfg(feature = "modules")]
 pub mod voice;
 #[cfg(feature = "web3")]
+#[cfg(feature = "modules")]
 pub mod wallet;
+#[cfg(feature = "web3")]
+mod wallet_host;
+#[cfg(feature = "web3")]
+pub(crate) mod wallet_service;
 
+#[cfg(feature = "modules")]
 pub use ops::{ensure_loaded, ensure_loaded_within, state_of, LoadError};
+#[cfg(feature = "modules")]
 pub use schemas::{all_controller_schemas, all_registered_controllers};
 pub use types::{LoadPolicy, ModuleRecord, ModuleState, ModuleStatus, PlatformAsset};

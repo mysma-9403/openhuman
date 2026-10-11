@@ -53,6 +53,15 @@ impl OpenHumanTurnPrelude {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         mutable.recorded_integration_actions = actions;
+        mutable.recorded_tool_snapshot_adopted = true;
+        {
+            mutable.recorded_repl_tools = recorded
+                .specs()
+                .iter()
+                .filter(|spec| crate::inference::tokenjuice::is_repl_tool(&spec.name))
+                .cloned()
+                .collect();
+        }
         // MCP tools are rebuilt from the tool cache every turn; all a resumed
         // thread needs remembered is which names it was sent, so a tool it
         // knew under the pre-readable hashed name keeps resolving.
@@ -120,6 +129,32 @@ impl OpenHumanTurnPrelude {
         ));
         #[cfg(not(feature = "modules"))]
         let _ = base;
+        {
+            let recorded_repl_tools = self
+                .mutable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recorded_repl_tools
+                .clone();
+            let live_names = base
+                .iter()
+                .chain(synthesized.iter())
+                .map(|tool| tool.name())
+                .collect::<std::collections::HashSet<_>>();
+            let missing = recorded_repl_tools
+                .into_iter()
+                .filter(|spec| !live_names.contains(spec.name.as_str()))
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                rebuilt.extend(
+                    crate::inference::tokenjuice::repl_tools::repl_tools_for_recorded(
+                        self.runtime_config.as_deref(),
+                        &self.workspace_dir,
+                        &missing,
+                    ),
+                );
+            }
+        }
         rebuilt
     }
 
@@ -249,18 +284,7 @@ impl OpenHumanTurnPrelude {
             .mutable
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        mutable.connected_integrations = connected;
-        // A stale fallback is useful for announcements but cannot authorize
-        // restored executors. Leave hydration pending so a later turn retries
-        // the live lookup rather than pinning this session to the snapshot.
-        mutable.connected_integrations_initialized = authoritative;
-        mutable.connected_integrations_authoritative = authoritative;
-        mutable.announced_integrations = mutable
-            .connected_integrations
-            .iter()
-            .map(|item| item.toolkit.clone())
-            .collect();
-        mutable.announced_mcp_servers = mcp_servers;
+        apply_cold_hydration(&mut mutable, connected, authoritative, mcp_servers);
     }
 
     pub(super) async fn refresh_dynamic_announcements(&self) {
@@ -284,21 +308,12 @@ impl OpenHumanTurnPrelude {
                     .mutable
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let current_slugs: std::collections::HashSet<_> =
-                    current.iter().map(|item| item.toolkit.clone()).collect();
-                mutable
-                    .announced_integrations
-                    .retain(|slug| current_slugs.contains(slug));
-                mutable
-                    .pending_integration_announcement
-                    .retain(|slug| current_slugs.contains(slug));
-                for slug in &current_slugs {
-                    if mutable.announced_integrations.insert(slug.clone())
-                        && !mutable.pending_integration_announcement.contains(slug)
-                    {
-                        mutable.pending_integration_announcement.push(slug.clone());
-                    }
-                }
+                let state = &mut *mutable;
+                merge_integration_announcements(
+                    &mut state.announced_integrations,
+                    &mut state.pending_integration_announcement,
+                    &current,
+                );
                 mutable.connected_integrations = current;
                 mutable.connected_integrations_authoritative = authoritative;
             }
@@ -371,8 +386,7 @@ async fn load_connected_integrations(
     match crate::integrations::composio::fetch_connected_integrations_status(config).await {
         FetchConnectedIntegrationsStatus::Authoritative(connected) => Some((connected, true)),
         FetchConnectedIntegrationsStatus::Unavailable => {
-            let stale =
-                crate::integrations::composio::cached_active_integrations_including_expired(config);
+            let stale = crate::integrations::composio::cached_active_integrations(config);
             log::warn!(
                 "[session] integrations fetch unavailable; using stale snapshot={}",
                 stale.as_ref().map_or(0, Vec::len)
@@ -381,3 +395,103 @@ async fn load_connected_integrations(
         }
     }
 }
+
+/// Store a cold-hydration result on the prelude state.
+///
+/// The announced sets are seeded only on the first hydration of this session
+/// instance. A stale fallback leaves hydration pending, so a later turn
+/// hydrates again; reseeding then would mark a toolkit connected in between
+/// as already announced and the model would never hear of it. Later
+/// hydrations therefore diff against the existing sets instead.
+pub(super) fn apply_cold_hydration(
+    state: &mut super::OpenHumanTurnPreludeMutable,
+    connected: Vec<crate::agent::prompts::ConnectedIntegration>,
+    authoritative: bool,
+    mcp_servers: std::collections::HashSet<String>,
+) {
+    // A stale fallback is useful for announcements but cannot authorize
+    // restored executors. Leave hydration pending so a later turn retries
+    // the live lookup rather than pinning this session to the snapshot.
+    state.connected_integrations_initialized = authoritative;
+    state.connected_integrations_authoritative = authoritative;
+    if state.integration_announcements_seeded {
+        log::debug!(
+            "[session] re-hydrating integrations after a stale snapshot; diffing announcements"
+        );
+        merge_integration_announcements(
+            &mut state.announced_integrations,
+            &mut state.pending_integration_announcement,
+            &connected,
+        );
+        for server in &mcp_servers {
+            if state.announced_mcp_servers.insert(server.clone())
+                && !state.pending_mcp_announcement.contains(server)
+            {
+                state.pending_mcp_announcement.push(server.clone());
+            }
+        }
+        state
+            .announced_mcp_servers
+            .retain(|server| mcp_servers.contains(server));
+        state
+            .pending_mcp_announcement
+            .retain(|server| mcp_servers.contains(server));
+    } else {
+        // Seed only the toolkits the user actually connected: the list also
+        // carries every allowlisted-but-unconnected toolkit (`connected:
+        // false`), and seeding those made a later diff announce them as
+        // "connected" (feedback: "100+ services connected").
+        state.announced_integrations = connected_toolkit_slugs(&connected);
+        state.announced_mcp_servers = mcp_servers;
+        state.integration_announcements_seeded = true;
+    }
+    state.connected_integrations = connected;
+}
+
+/// Toolkit slugs the user has an active connection for. The integration list
+/// also carries every allowlisted toolkit with `connected: false`; those are
+/// available to connect, not connected, and must never be announced as such.
+fn connected_toolkit_slugs(
+    items: &[crate::agent::prompts::ConnectedIntegration],
+) -> std::collections::HashSet<String> {
+    items
+        .iter()
+        .filter(|item| item.connected)
+        .map(|item| item.toolkit.clone())
+        .collect()
+}
+
+/// Diff the live integration list against what this session already
+/// announced: drop announcements for toolkits that are no longer connected
+/// and queue an `[integration update]` for each newly connected one. Only
+/// `connected` items count (see [`connected_toolkit_slugs`]).
+fn merge_integration_announcements(
+    announced: &mut std::collections::HashSet<String>,
+    pending: &mut Vec<String>,
+    current: &[crate::agent::prompts::ConnectedIntegration],
+) {
+    let current_slugs = connected_toolkit_slugs(current);
+    announced.retain(|slug| current_slugs.contains(slug));
+    pending.retain(|slug| current_slugs.contains(slug));
+    let mut added: Vec<&String> = current_slugs
+        .iter()
+        .filter(|slug| !announced.contains(*slug))
+        .collect();
+    added.sort();
+    for slug in added {
+        announced.insert(slug.clone());
+        if !pending.contains(slug) {
+            pending.push(slug.clone());
+        }
+    }
+    tracing::debug!(
+        connected = current_slugs.len(),
+        listed = current.len(),
+        pending = pending.len(),
+        "[session] integration announcements diffed against connected toolkits"
+    );
+}
+
+#[cfg(test)]
+#[path = "prelude_integrations_tests.rs"]
+mod tests;

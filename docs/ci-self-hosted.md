@@ -21,16 +21,17 @@ provisioning, deploys and the runner token.
 
 ## Lanes
 
-| Lane             | What runs                                                                                                                                                                       |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `static`         | fmt, layout, runtime boundary, ignored-tests, TLS policy, gated-test allowlist, orch-ip gate, feature forwarding, module pins and monotonicity, toolchain drift, test inventory |
-| `frontend`       | pnpm install, tsc, prettier, eslint, i18n, docs, script self-tests                                                                                                              |
-| `frontend-tests` | the complete vitest suite with coverage                                                                                                                                         |
-| `rust-cov`       | test modules from the registry, then `scripts/ci/rust-coverage.sh`                                                                                                              |
-| `rust-lint`      | clippy (product set; embed's clippy covers the core's contributor set), embed and tinyhumans lint, embed gates-off check                                                        |
-| `rust-gates-off` | gates-off checks and gate-contract tests, kernel floor, dep-sim calibration                                                                                                     |
-| `tauri`          | Tauri clippy and coverage                                                                                                                                                       |
-| `pester`         | `install.ps1` tests                                                                                                                                                             |
+| Lane              | What runs                                                                                                                                                                                                                                                                 |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `static`          | fmt, layout, runtime boundary, ignored-tests, TLS policy, gated-test allowlist, orch-ip gate, feature forwarding, module pins and monotonicity, toolchain drift, test inventory                                                                                           |
+| `frontend`        | pnpm install, tsc, prettier, eslint, i18n, docs, script self-tests                                                                                                                                                                                                        |
+| `frontend-tests`  | the complete vitest suite with coverage                                                                                                                                                                                                                                   |
+| `rust-cov`        | test modules from the registry, then `scripts/ci/rust-coverage.sh`                                                                                                                                                                                                        |
+| `rust-lint`       | clippy (product set; embed's clippy covers the core's contributor set), embed and tinyhumans lint, embed gates-off check                                                                                                                                                  |
+| `rust-gates-off`  | gates-off checks and gate-contract tests, kernel floor, dep-sim calibration                                                                                                                                                                                               |
+| `storage-drivers` | the `storage_*_e2e` targets and `cli_storage_url_e2e` once per driver (memory, sqlite, file), plus the lib tests of the stores on the storage ports, with `storage-sqlite,storage-file`; armed by the `storage` area. MongoDB has its own workflow, `storage-mongodb.yml` |
+| `tauri`           | Tauri clippy and coverage                                                                                                                                                                                                                                                 |
+| `pester`          | `install.ps1` tests                                                                                                                                                                                                                                                       |
 
 How lanes behave:
 
@@ -122,8 +123,8 @@ for any commit without posting it.
   - Target dirs are not kept between jobs.
   - vitest runs with 8 workers.
 - **`hosted`**: lanes grouped into jobs sized for 4-core, ~14 GB runners:
-  `checks`, `rust-lint` (lint and gates-off in turn), `rust-cov`, `tauri`
-  and `pester`. Groups whose areas are untouched don't start.
+  `checks`, `rust-lint` (lint and gates-off in turn), `rust-cov`, `tauri`,
+  `storage` (the `storage-drivers` lane) and `pester`. Groups whose areas are untouched don't start.
 
 ## Why the EX63 cannot run outsider code
 

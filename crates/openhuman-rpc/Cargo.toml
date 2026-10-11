@@ -11,7 +11,10 @@ publish = false
 # to embed and then the core (chain: core -> embed -> tinyhumans -> rpc ->
 # hosts). `http-client`, `server` and `session-store` are this crate's own.
 [features]
-default = ["http-client", "server"]
+langfuse = ["openhuman-tinyhumans/langfuse"]
+default = ["http-client", "server", "os-keyring"]
+# Host-owned OS credential and master-key providers.
+os-keyring = ["dep:keyring", "dep:tinystoragedrivers", "dep:zeroize", "dep:hex"]
 # Authenticated HTTP client for reaching a core's `/rpc` endpoint.
 http-client = ["dep:reqwest"]
 # The core's JSON-RPC server: HTTP router, Socket.IO, and the listener bind.
@@ -19,6 +22,7 @@ http-client = ["dep:reqwest"]
 # handlers (the `/v1` inference router, the dictation WebSocket) the router
 # mounts.
 server = [
+    "os-keyring",
     "http-server",
     "dep:axum",
     "dep:socketioxide",
@@ -58,7 +62,6 @@ web3 = ["openhuman-tinyhumans/web3"]
 storage-sqlite = ["openhuman-tinyhumans/storage-sqlite"]
 storage-mongodb = ["openhuman-tinyhumans/storage-mongodb"]
 storage-file = ["openhuman-tinyhumans/storage-file"]
-runtime-node = ["openhuman-tinyhumans/runtime-node"]
 media = ["openhuman-tinyhumans/media"]
 flows = ["openhuman-tinyhumans/flows"]
 skills = ["openhuman-tinyhumans/skills"]
@@ -75,9 +78,13 @@ scheduler-gate = ["openhuman-tinyhumans/scheduler-gate"]
 e2e-test-support = ["openhuman-tinyhumans/e2e-test-support"]
 
 [dependencies]
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"], optional = true }
+tinystoragedrivers = { path = "../../vendor/tinyagents/vendor/tinystoragedrivers/crates/tinystoragedrivers", default-features = false, features = ["secrets", "keyring"], optional = true }
+zeroize = { version = "1", optional = true }
+hex = { version = "0.4", optional = true }
 # The only openhuman crate this layer depends on. Core internals the server
 # needs come through embed's `#[doc(hidden)]` `__host` list (reached as
-# `openhuman_tinyhumans::embed::__host`); there is no direct `openhuman-core`
+# `openhuman_tinyhumans::__host`, which tinyhumans forwards); there is no direct `openhuman-core`
 # edge (chain: core -> embed -> tinyhumans -> rpc -> hosts).
 openhuman-tinyhumans = { path = "../openhuman-tinyhumans", default-features = false }
 log = "0.4"
@@ -106,6 +113,9 @@ tinyagents-session = { path = "../../vendor/tinyagents/crates/tinyagents-session
 tinyagents-harness = { path = "../../vendor/tinyagents/crates/tinyagents-harness", default-features = false, optional = true }
 
 [dev-dependencies]
+# Property tests for the SaaS gateway's header handling; same spelling as the
+# core's dev-dependency.
+proptest = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sentry = { version = "0.47.0", default-features = false, features = ["test"] }
 tempfile = "3"

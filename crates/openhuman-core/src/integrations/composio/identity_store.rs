@@ -43,38 +43,40 @@ pub async fn persist_provider_profile(
     }
 
     let path = file_store::path(config, IDENTITIES_FILE);
-    let _guard = file_store::lock().await;
-    let mut identities: Vec<ConnectedIdentity> = file_store::load(&path).await?;
-    let index = match identities
-        .iter()
-        .position(|id| id.source == toolkit && id.identifier == identifier)
-    {
-        Some(index) => index,
-        None => {
-            identities.push(ConnectedIdentity {
-                source: toolkit.clone(),
-                identifier: identifier.clone(),
-                ..ConnectedIdentity::default()
-            });
-            identities.len() - 1
-        }
-    };
-    let entry = &mut identities[index];
     let written = rows.len();
-    for (kind, value) in rows {
-        let slot = match kind {
-            IdentityKind::DisplayName => &mut entry.display_name,
-            IdentityKind::Email => &mut entry.email,
-            IdentityKind::Handle => &mut entry.handle,
-            IdentityKind::Phone => &mut entry.phone,
-            IdentityKind::UserId => &mut entry.user_id,
-            IdentityKind::AvatarUrl => &mut entry.avatar_url,
-            IdentityKind::ProfileUrl => &mut entry.profile_url,
+    let (key_source, key_identifier) = (toolkit.clone(), identifier.clone());
+    file_store::update(&path, move |identities: &mut Vec<ConnectedIdentity>| {
+        let index = match identities
+            .iter()
+            .position(|id| id.source == key_source && id.identifier == key_identifier)
+        {
+            Some(index) => index,
+            None => {
+                identities.push(ConnectedIdentity {
+                    source: key_source.clone(),
+                    identifier: key_identifier.clone(),
+                    ..ConnectedIdentity::default()
+                });
+                identities.len() - 1
+            }
         };
-        *slot = Some(value);
-    }
-    identities.sort_by(|a, b| (&a.source, &a.identifier).cmp(&(&b.source, &b.identifier)));
-    file_store::save(&path, &identities).await?;
+        let entry = &mut identities[index];
+        for (kind, value) in rows.iter().cloned() {
+            let slot = match kind {
+                IdentityKind::DisplayName => &mut entry.display_name,
+                IdentityKind::Email => &mut entry.email,
+                IdentityKind::Handle => &mut entry.handle,
+                IdentityKind::Phone => &mut entry.phone,
+                IdentityKind::UserId => &mut entry.user_id,
+                IdentityKind::AvatarUrl => &mut entry.avatar_url,
+                IdentityKind::ProfileUrl => &mut entry.profile_url,
+            };
+            *slot = Some(value);
+        }
+        identities.sort_by(|a, b| (&a.source, &a.identifier).cmp(&(&b.source, &b.identifier)));
+        ((), true)
+    })
+    .await?;
 
     tracing::debug!(
         toolkit = %toolkit,
@@ -157,21 +159,19 @@ pub async fn delete_connected_identity_facets(
     let identifier = normalize_connection_identifier(identifier);
 
     let path = file_store::path(config, IDENTITIES_FILE);
-    let _guard = file_store::lock().await;
-    let mut identities: Vec<ConnectedIdentity> = file_store::load(&path).await?;
-    let mut deleted = 0usize;
-    identities.retain(|id| {
-        if id.source == source && id.identifier == identifier {
-            deleted += field_count(id);
-            false
-        } else {
-            true
-        }
-    });
-    if deleted > 0 {
-        file_store::save(&path, &identities).await?;
-    }
-    Ok(deleted)
+    file_store::update(&path, move |identities: &mut Vec<ConnectedIdentity>| {
+        let mut deleted = 0usize;
+        identities.retain(|id| {
+            if id.source == source && id.identifier == identifier {
+                deleted += field_count(id);
+                false
+            } else {
+                true
+            }
+        });
+        (deleted, deleted > 0)
+    })
+    .await
 }
 
 /// How many identity fields an identity carries.

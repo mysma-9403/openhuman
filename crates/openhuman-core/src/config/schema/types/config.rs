@@ -54,6 +54,12 @@ pub struct CustomEmbeddingsConfig {
 /// `Clone` is implemented by hand in `config_clone.rs` so it is emitted once.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
+    /// Immutable operator provider binding, absent from the user wire format.
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[doc(hidden)]
+    pub profile_providers:
+        Option<std::sync::Arc<crate::profiles::provider_settings::ProfileProviderSettings>>,
     #[serde(skip)]
     pub workspace_dir: PathBuf,
     /// Agent action sandbox root — the default cwd for shell/file/git tools.
@@ -357,6 +363,10 @@ pub struct Config {
     #[serde(default)]
     pub cloud_providers: Vec<crate::config::schema::cloud_providers::CloudProviderCreds>,
 
+    /// Optional PEM CA bundles keyed by cloud provider slug.
+    #[serde(default)]
+    pub cloud_provider_ca_certs: HashMap<String, String>,
+
     /// Id of the `cloud_providers` entry that "cloud" and "primary" resolve to.
     /// When `None`, the factory falls back to the OpenHuman entry.
     #[serde(default)]
@@ -406,20 +416,6 @@ pub struct Config {
     /// [`CustomEmbeddingsConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_embeddings: Option<CustomEmbeddingsConfig>,
-
-    /// Node.js managed runtime configuration (skills that need `node`/`npm`).
-    #[serde(default)]
-    pub node: NodeConfig,
-
-    /// Python managed runtime configuration (Python-backed MCP servers and
-    /// other Python subprocess integrations).
-    #[serde(default)]
-    pub runtime_python: RuntimePythonConfig,
-
-    /// Shared language-runtime pool (long-lived `node`/`python` workers reused
-    /// across skill runs and `node_exec` instead of one child per run, #5106).
-    #[serde(default)]
-    pub runtime_pool: RuntimePoolConfig,
 
     /// TokenJuice content-router / compaction configuration.
     #[serde(default)]

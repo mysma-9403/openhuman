@@ -1,10 +1,35 @@
 use super::{
-    grouped_schemas, load_dotenv_for_cli, parse_function_params, parse_input_value,
+    grouped_schemas, is_help_only, load_dotenv_for_cli, parse_function_params, parse_input_value,
     parse_launch_options,
 };
 use crate::config::test_env::EnvVarGuard;
 use crate::core::{ControllerSchema, FieldSchema, TypeSchema};
 use tempfile::tempdir;
+
+#[test]
+fn help_only_cli_calls_skip_keyring_initialization() {
+    for args in [
+        vec![],
+        vec!["--help".to_string()],
+        vec![
+            "--model".to_string(),
+            "qwen3:8b".to_string(),
+            "--help".to_string(),
+        ],
+        vec!["call".to_string()],
+        vec!["agent".to_string(), "--help".to_string()],
+        vec!["auth".to_string(), "--help".to_string()],
+    ] {
+        assert!(
+            is_help_only(&args),
+            "expected help-only invocation: {args:?}"
+        );
+    }
+    assert!(!is_help_only(&[
+        "run".to_string(),
+        "--jsonrpc-only".to_string()
+    ]));
+}
 
 #[test]
 fn launch_options_parse_model_and_provider_before_command() {

@@ -315,6 +315,37 @@ fn parse_composio_connect_timeout_defaults_when_absent_or_garbage() {
 }
 
 #[test]
+fn composio_connect_outlives_its_approval_park() {
+    // The per-tool deadline must not race the in-execute approval park: the
+    // tool's budget is the park bound plus slack, and unbounded when the
+    // operator opted out of the bound.
+    let bound = std::time::Duration::from_secs(DEFAULT_COMPOSIO_CONNECT_TIMEOUT_SECS);
+    match composio_connect_tool_timeout(Some(bound)) {
+        tinytools::ToolTimeout::Millis(ms) => {
+            assert!(
+                ms > bound.as_millis() as u64,
+                "budget {ms}ms must exceed the park bound"
+            );
+        }
+        other => panic!("expected an explicit budget, got {other:?}"),
+    }
+    assert_eq!(
+        composio_connect_tool_timeout(None),
+        tinytools::ToolTimeout::Unbounded
+    );
+}
+
+#[test]
+fn composio_connect_timeout_saturates_instead_of_overflowing() {
+    // `u64::MAX` seconds plus the slack must not panic in `Duration` addition.
+    let bound = std::time::Duration::from_secs(u64::MAX);
+    assert_eq!(
+        composio_connect_tool_timeout(Some(bound)),
+        tinytools::ToolTimeout::Millis(u64::MAX)
+    );
+}
+
+#[test]
 fn parse_composio_connect_timeout_honors_override_and_zero_opt_out() {
     // Explicit value → that many seconds.
     assert_eq!(
@@ -328,4 +359,29 @@ fn parse_composio_connect_timeout_honors_override_and_zero_opt_out() {
     );
     // `0` → opt out of the composio-side bound (fall back to the gate TTL).
     assert_eq!(parse_composio_connect_timeout(Some("0")), None);
+}
+
+#[test]
+fn composio_connect_charges_pre_gate_work_to_the_park_bound() {
+    use std::time::Duration;
+    let bound = Duration::from_secs(DEFAULT_COMPOSIO_CONNECT_TIMEOUT_SECS);
+    let tool_budget = match composio_connect_tool_timeout(Some(bound)) {
+        tinytools::ToolTimeout::Millis(ms) => Duration::from_millis(ms),
+        other => panic!("expected an explicit budget, got {other:?}"),
+    };
+    // 50 s of slow config/connection/catalog reads before the card is raised:
+    // pre-gate + park must still end before the tool deadline, with the
+    // remaining slack left for the post-approval liveness check.
+    let pre_gate = Duration::from_secs(50);
+    let park = remaining_park_bound(Some(bound), pre_gate).unwrap();
+    assert_eq!(park, bound - pre_gate);
+    assert!(pre_gate + park < tool_budget);
+
+    // Pre-gate work that used the whole bound still raises a short park.
+    assert_eq!(
+        remaining_park_bound(Some(bound), bound * 2),
+        Some(Duration::from_secs(1))
+    );
+    // Opting out of the bound stays unbounded.
+    assert_eq!(remaining_park_bound(None, pre_gate), None);
 }

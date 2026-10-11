@@ -71,6 +71,10 @@ The subscriber derives a thread id from (channel, sender, reply target, thread) 
                                BackendProgressiveSender --> backend REST
 ```
 
+### Path 3: gateway-relayed inbound (`channel_relay_inbound`)
+
+A gateway that owns a hosted platform's webhook (the SaaS cloud gateway for Telegram, iMessage and Discord) relays each message in as its user with `openhuman.channel_relay_inbound` ([`providers/relay/`](./providers/relay/README.md)). The message is recorded on the caller's `channel:<channel>/<sender>/<chat>` thread (`derive_inbound_thread_id`), then runs through the Path 1 pipeline (`process_channel_message`, `ExternalChannel` origin) with a runtime context built from the caller's own config. Replies go to `RelayChannel`, which publishes them as `channel_outbound` events on the caller's `/events` stream for the gateway to deliver, and are recorded on the thread.
+
 ### Outbound: proactive messages
 
 [`proactive.rs`](./proactive.rs) subscribes to `DomainEvent::ProactiveMessageRequested`. Every proactive message goes to the web channel (`web_chat::publish_web_channel_event`). If the user has set an active external channel and that channel is in the started channel map, it is sent there too. The always-on boot registers a web-only variant (`register_web_only_proactive_subscriber`); the full runtime registers one with the real channel map and publishes its active-channel handle, so `channels.set_default` (through `set_runtime_active_channel`) takes effect without a restart.
@@ -144,13 +148,15 @@ The in-app web chat (RPC namespace `channel`, singular) is a separate domain in 
 - Config schema types come from `tinychannels_bus::config` through [`config/schema/channels.rs`](../config/schema/channels.rs).
 - Conversation memory ingestion and `forget_channel` are in `memory/conversations/`.
 - Backend REST calls go through `backend::BackendClient`; Telegram and Discord link flows that need a TinyHumans account live in `openhuman-tinyhumans`.
+- Discord bot guild/channel discovery and permission checks call the released TinyChannels module through the confidential `ChannelController` member. The host resolves stored credentials and proxy scope, and the bus contract preserves the existing RPC response fields.
+- `channels.test` delegates field validation and email IMAP verification to the same confidential controller member. It never persists credentials or configuration, and an unavailable module fails the test instead of reporting local validation as success.
 - Speech-to-text and text-to-speech are the `voice/` domain, reached through the `host/` adapters.
 - Web-chat turns, the web-channel event stream, and the surface subscribers are `web_chat/`.
 - Cron delivery is [`cron/bus.rs`](../cron/bus.rs) (`CronDeliverySubscriber`) and [`cron/channel_bridge.rs`](../cron/channel_bridge.rs); `start_channels` hands them the started channel map.
 
 ## Gotchas
 
-- The `channels` feature (default on; `channels = ["dep:tinychannels", "tinychannels/email", "tinychannels/lark"]` in [`crates/openhuman-core/Cargo.toml`](../../Cargo.toml)) gates almost everything. Three pieces stay ungated because always-on code names them: `traits` (the agent session host's interactive loop and `cron::bus`), `CliChannel` (re-exported from the unconditional `tinychannels-runtime` crate), and `contract_schema` (used by `openhuman-tinyhumans`). The config schema, the `DomainEvent` inbound envelope and security pairing resolve through `tinychannels-bus`, which is unconditional. The gate sheds no transitive packages; its value is compile surface and binary size. The `voice` feature also enables `dep:tinychannels` (for `EmailChannel` only), so a build without `channels` still links the crate unless `voice` is off too. `WhatsAppWebChannel` additionally needs the `whatsapp-web` feature.
+- The default `channels` feature gates provider orchestration and enables the module loader. Serialized config, messages, and controller declarations use the unconditional `tinychannels-bus` contract. Legacy provider traits and runtime helpers remain linked as explicit migration exceptions. The CLI REPL is host-owned orchestration. `WhatsAppWebChannel` additionally needs the `whatsapp-web` feature.
 - `start_channels` is skipped on cores with no listening integrations, which includes most desktop installs. Anything every core needs (the `ChannelInboundSubscriber`, the web-only proactive subscriber, tool-timeout seeding, self-improvement subscribers, the flows trigger subscriber) is registered in `core/runtime/subscribers.rs`, not in `start_channels`. Put new always-needed wiring there.
 - Several registrations in `start_channels` overlap with `bootstrap_core_runtime` (agent handlers, the agent definition registry). They are written to be idempotent; keep them that way.
 - The channel session token must be captured before the first `await` on config loading. Otherwise a logout during startup leaves a listener running for the old account.

@@ -85,6 +85,8 @@ impl SpawnSubagentTool {
         let agent_id = args
             .get("agent_id")
             .and_then(|v| v.as_str())
+            // keep until v0.66 (review after 2027-01-11): frozen session schemas
+            // and stored calls may still use archetype; see the parameter schema.
             .or_else(|| args.get("archetype").and_then(|v| v.as_str()))
             .unwrap_or("")
             .trim()
@@ -403,6 +405,7 @@ impl SpawnSubagentTool {
                                         worktree_path: None,
                                         changed_files: Vec::new(),
                                         dirty_status: None,
+                                        stop: None,
                                     })
                                     .await;
                             }
@@ -481,6 +484,7 @@ impl SpawnSubagentTool {
                                         worktree_path: None,
                                         changed_files: Vec::new(),
                                         dirty_status: None,
+                                        stop: incomplete_stop(reason),
                                     })
                                     .await;
                             }
@@ -499,7 +503,13 @@ impl SpawnSubagentTool {
                              delegation unchanged.",
                             outcome.task_id, outcome.agent_id, outcome.output,
                         );
-                        Ok(ToolResult::success(envelope))
+                        Ok(stopped_subagent_result(
+                            "spawn_subagent",
+                            &outcome.agent_id,
+                            &outcome.task_id,
+                            reason,
+                            envelope,
+                        ))
                     }
                     SubagentRunStatus::Cancelled => {
                         tracing::info!(

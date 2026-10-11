@@ -69,6 +69,8 @@ pub fn start_request(config: &Config, task: &BrowserTask) -> StartTaskRequest {
             allow_destructive: false,
             browser_endpoint: None,
             headed: !config.browser.headless,
+            browser_executable: None,
+            browser_profile: None,
         },
         budget: TaskBudget {
             max_actions: Some(task.max_actions),

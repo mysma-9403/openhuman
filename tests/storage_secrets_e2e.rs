@@ -3,26 +3,40 @@
 //!
 //! Its own test binary because it installs a backend into the process-wide
 //! storage slot and sets the keyring master-key environment, which would
-//! reroute every other suite's secrets in a shared process. One test, so
-//! nothing in this binary races either.
-
-use std::sync::Arc;
+//! reroute every other suite's secrets in a shared process. Each driver is its
+//! own test case (`support/storage_drivers.rs`), and the cases take turns.
 
 use openhuman_core::security::credentials::http_creds::{HttpCredential, HttpCredentialsStore};
 use openhuman_core::security::credentials::profiles::{AuthProfile, AuthProfilesStore};
-use openhuman_core::security::keyring;
+use openhuman_core::security::secret_storage;
 
-#[test]
-fn a_configured_backend_holds_keyring_and_credential_secrets() {
-    let workspace = tempfile::tempdir().unwrap();
+#[macro_use]
+#[path = "support/storage_drivers.rs"]
+mod storage_drivers;
+
+use storage_drivers::Case;
+
+/// The workspace every case shares. The process keyring caches the backend it
+/// first resolves (a `dev-keychain.json` under the workspace in effect then),
+/// so a later case in the same process must find it in the same place. The
+/// credential files live in a directory of each case's own.
+fn keyring_workspace() -> &'static std::path::Path {
+    static WORKSPACE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    WORKSPACE
+        .get_or_init(|| tempfile::tempdir().unwrap())
+        .path()
+}
+
+fn a_configured_backend_holds_keyring_and_credential_secrets(case: Case) {
+    let workspace = keyring_workspace();
     // Keep any process-backend fallback inside the temp workspace, and give
     // the storage secrets a master key without touching an OS keychain.
-    std::env::set_var("OPENHUMAN_WORKSPACE", workspace.path());
+    std::env::set_var("OPENHUMAN_WORKSPACE", workspace);
     std::env::set_var("OPENHUMAN_KEYRING_BACKEND", "file");
     std::env::set_var("OPENHUMAN_KEYRING_MASTER_KEY", "11".repeat(32));
 
     // Credentials written before any backend existed (the classic files).
-    let state = workspace.path().join("state");
+    let state = case.data_dir.path().join("state");
     AuthProfilesStore::new(&state, false)
         .upsert_profile(
             AuthProfile::new_token("legacy", "default", "sk-legacy".to_string()),
@@ -32,35 +46,43 @@ fn a_configured_backend_holds_keyring_and_credential_secrets() {
     HttpCredentialsStore::new(&state, false)
         .upsert(&HttpCredential::bearer("legacy-http", "ghp-legacy"))
         .unwrap();
-    keyring::set("legacy-user", "old_token", "old-value").unwrap();
+    secret_storage::set("legacy-user", "old_token", "old-value").unwrap();
     let profiles_file = std::fs::read(state.join("auth-profiles.json")).unwrap();
     let http_file = std::fs::read(state.join("http-credentials.json")).unwrap();
 
     let before: std::collections::HashMap<&str, Option<Vec<u8>>> =
         ["secrets.enc", "dev-keychain.json"]
             .into_iter()
-            .map(|f| (f, std::fs::read(workspace.path().join(f)).ok()))
+            .map(|f| (f, std::fs::read(workspace.join(f)).ok()))
             .collect();
 
-    openhuman_core::storage::install(Arc::new(openhuman_core::storage::MemoryStorage::new()));
+    case.install();
 
-    keyring::set("user-1", "api_token", "tok-123").unwrap();
+    secret_storage::set("user-1", "api_token", "tok-123").unwrap();
     assert_eq!(
-        keyring::get("user-1", "api_token").unwrap().as_deref(),
+        secret_storage::get("user-1", "api_token")
+            .unwrap()
+            .as_deref(),
         Some("tok-123")
     );
-    assert!(keyring::is_available());
-    keyring::delete("user-1", "api_token").unwrap();
-    assert!(keyring::get("user-1", "api_token").unwrap().is_none());
+    assert!(secret_storage::is_available());
+    secret_storage::delete("user-1", "api_token").unwrap();
+    assert!(secret_storage::get("user-1", "api_token")
+        .unwrap()
+        .is_none());
 
     // A secret the process keyring held is adopted on first read, and a
     // delete removes it from both places so it cannot resurface.
     assert_eq!(
-        keyring::get("legacy-user", "old_token").unwrap().as_deref(),
+        secret_storage::get("legacy-user", "old_token")
+            .unwrap()
+            .as_deref(),
         Some("old-value")
     );
-    keyring::delete("legacy-user", "old_token").unwrap();
-    assert!(keyring::get("legacy-user", "old_token").unwrap().is_none());
+    secret_storage::delete("legacy-user", "old_token").unwrap();
+    assert!(secret_storage::get("legacy-user", "old_token")
+        .unwrap()
+        .is_none());
 
     let profiles = AuthProfilesStore::new(&state, false);
     profiles
@@ -91,11 +113,11 @@ fn a_configured_backend_holds_keyring_and_credential_secrets() {
     // `secrets.enc` was not touched, and nothing of the storage-side secret
     // reached the process keychain file.
     assert_eq!(
-        std::fs::read(workspace.path().join("secrets.enc")).ok(),
+        std::fs::read(workspace.join("secrets.enc")).ok(),
         before.get("secrets.enc").cloned().flatten(),
         "secrets.enc unchanged"
     );
-    let dev = std::fs::read_to_string(workspace.path().join("dev-keychain.json")).unwrap();
+    let dev = std::fs::read_to_string(workspace.join("dev-keychain.json")).unwrap();
     assert!(!dev.contains("user-1") && !dev.contains("tok-123"), "{dev}");
 
     // Without a backend the files are back in use.
@@ -104,3 +126,5 @@ fn a_configured_backend_holds_keyring_and_credential_secrets() {
     assert!(http.get("legacy-http").unwrap().is_some());
     assert_eq!(profiles.load().unwrap().profiles.len(), 1);
 }
+
+driver_cases!(sync a_configured_backend_holds_keyring_and_credential_secrets);

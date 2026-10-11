@@ -25,15 +25,6 @@ export interface ModelRoute {
 /** Authentication header style. Matches Rust AuthStyle enum. */
 export type AuthStyle = 'bearer' | 'anthropic' | 'openhuman_jwt' | 'none';
 
-/** @deprecated Use AuthStyle. Kept for back-compat with old wire format. */
-export type CloudProviderType =
-  | 'openhuman'
-  | 'openai'
-  | 'anthropic'
-  | 'openrouter'
-  | 'orcarouter'
-  | 'custom';
-
 /**
  * Endpoint config for one cloud LLM provider (new slug-keyed shape).
  * API keys are NOT carried here — they live in `auth-profiles.json`
@@ -48,6 +39,8 @@ export interface CloudProviderCreds {
   label: string;
   endpoint: string;
   auth_style: AuthStyle;
+  /** Optional PEM CA bundle trusted only for this provider. */
+  ca_cert_pem?: string | null;
 }
 
 /**
@@ -484,7 +477,7 @@ export async function openhumanGetAutonomySettings(): Promise<CommandResponse<Au
  * already-canonicalised path strings; the UI renders them verbatim instead of
  * hard-coding defaults like `~/OpenHuman/projects`.
  *
- * - `action_dir` — agent CWD for `shell` / `node_exec` / `npm_exec` / file
+ * - `action_dir` — agent CWD for `shell` / file
  *   writes. Defaults to `projects_dir`; overridable via `OPENHUMAN_ACTION_DIR`.
  * - `workspace_dir` — internal product state (memory / sessions / vault).
  *   Agent-blocked.

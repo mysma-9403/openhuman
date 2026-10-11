@@ -175,11 +175,23 @@ fn default_search_timeout_secs() -> u64 {
 
 /// Credentials for a BYO search provider. Considered configured iff the
 /// trimmed value is non-empty.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct SearchEngineCredentials {
+    /// Optional direct provider base URL. Operator profile settings validate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for SearchEngineCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchEngineCredentials")
+            .field("has_key", &self.has_key())
+            .field("has_base_url", &self.base_url.is_some())
+            .finish()
+    }
 }
 
 impl SearchEngineCredentials {
@@ -299,7 +311,7 @@ impl SearchProviderSettings {
 }
 
 /// Search configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct SearchConfig {
     /// Settings format; see [`SEARCH_SCHEMA_VERSION`]. Absent in legacy files.
@@ -373,6 +385,13 @@ pub struct SearchConfig {
     #[serde(default, skip_serializing)]
     #[schemars(skip)]
     pub gemini_route: Option<String>,
+
+    /// Keys an embedder pinned for one agent, by provider. Never persisted
+    /// or printed. While any is set, this config is authoritative for the
+    /// agent's search calls. Set them with [`SearchConfig::pin_host_credential`].
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub host_credentials: BTreeMap<String, SearchHostCredential>,
 }
 
 impl Default for SearchConfig {
@@ -397,6 +416,7 @@ impl Default for SearchConfig {
             gemini_route: None,
             parallel: SearchEngineCredentials::default(),
             tinyfish: SearchEngineCredentials::default(),
+            host_credentials: BTreeMap::new(),
         }
     }
 }
@@ -480,6 +500,10 @@ impl SearchConfig {
 
 #[path = "search_migrate.rs"]
 mod migrate;
+
+#[path = "search_host.rs"]
+mod host;
+pub use host::{SearchHostCredential, UnknownKeyedSearchProvider};
 
 #[cfg(test)]
 #[path = "search_search_config_tests_tests.rs"]

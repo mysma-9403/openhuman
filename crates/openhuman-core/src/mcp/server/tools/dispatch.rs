@@ -11,7 +11,7 @@ use super::super::write_dispatch;
 use super::params::{build_rpc_params, validate_controller_params};
 use super::specs::{base_tool_specs, tool_specs_for_loaded_config};
 use super::types::McpToolSpec;
-use tinymcp::ToolCallError;
+use tinymcp_bus::ToolCallError;
 
 /// The tools `tools/list` advertises and `tools/call` accepts: every tool the
 /// loaded config can serve, or only the config-independent base set when the
@@ -328,13 +328,12 @@ async fn run_subagent_tool(params: &Map<String, Value>) -> Result<Value, ToolCal
     // Guard BEFORE incrementing so a forged/clamped depth at the cap cannot
     // overflow `chain_depth + 1` (panic in debug, wrap-to-0 in release).
     let chain_depth = subagent_depth::current_depth();
-    if chain_depth >= subagent_depth::MAX_SUBAGENT_DEPTH {
-        return Err(ToolCallError::Internal(format!(
-            "agent.run_subagent delegation depth limit reached (chain depth {chain_depth} ≥ {}); refusing to spawn another nested subagent",
-            subagent_depth::MAX_SUBAGENT_DEPTH
-        )));
-    }
-    let child_depth = chain_depth + 1;
+    let child_depth = tinyagents_harness::context::RunConfig::checked_child_depth(
+        chain_depth, subagent_depth::MAX_SUBAGENT_DEPTH,
+    ).map_err(|_| ToolCallError::Internal(format!(
+        "agent.run_subagent delegation depth limit reached (chain depth {chain_depth} ≥ {}); refusing to spawn another nested subagent",
+        subagent_depth::MAX_SUBAGENT_DEPTH
+    )))?;
 
     let config = load_config_and_init_registry().await?;
     let mut agent =

@@ -48,7 +48,7 @@ pub const EPHEMERAL_ROUTE_SLUG: &str = "ephemeral-route";
 ///
 /// Never serialized — see the module docs. `JsonSchema` is derived only because
 /// [`Config`](crate::config::Config) derives it for the whole struct.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct EphemeralRoute {
     /// OpenAI-compatible base URL, as a `cloud_providers` endpoint would be
     /// spelled (`/chat/completions` is appended to it).
@@ -60,6 +60,22 @@ pub struct EphemeralRoute {
     /// and only for [`EPHEMERAL_ROUTE_SLUG`], so it cannot be handed to a
     /// provider the caller did not name.
     pub api_key: String,
+    /// Custom headers scoped to this endpoint, never copied to unrelated providers.
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for EphemeralRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EphemeralRoute")
+            .field(
+                "endpoint",
+                &crate::inference::provider::factory::redact_endpoint(&self.endpoint),
+            )
+            .field("api_key", &"[redacted]")
+            .field("header_count", &self.headers.len())
+            .finish()
+    }
 }
 
 impl EphemeralRoute {
@@ -71,7 +87,17 @@ impl EphemeralRoute {
     pub fn from_params(endpoint: Option<String>, api_key: Option<String>) -> Option<Self> {
         let endpoint = endpoint?.trim().to_string();
         let api_key = api_key?.trim().to_string();
-        (!endpoint.is_empty() && !api_key.is_empty()).then_some(Self { endpoint, api_key })
+        (!endpoint.is_empty() && !api_key.is_empty()).then_some(Self {
+            endpoint,
+            api_key,
+            headers: Vec::new(),
+        })
+    }
+
+    /// Attach the embedding host's per-route headers.
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
+        self
     }
 }
 
@@ -118,7 +144,6 @@ pub fn apply(config: &mut crate::config::Config, route: EphemeralRoute) {
         label: "Per-call route".to_string(),
         endpoint: route.endpoint.clone(),
         auth_style: AuthStyle::Bearer,
-        legacy_type: None,
         default_model: Some(model.clone()),
     });
 

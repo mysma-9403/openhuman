@@ -26,6 +26,8 @@ const V41_FLASH: &str = "deepseek/deepseek-v4.1-flash";
 #[derive(Default)]
 struct FakeFetcher {
     routes: Vec<(String, Value)>,
+    posts: Vec<(String, Value)>,
+    post_calls: StdMutex<Vec<String>>,
     calls: StdMutex<Vec<String>>,
 }
 
@@ -33,6 +35,15 @@ impl FakeFetcher {
     fn with(mut self, url: &str, body: Value) -> Self {
         self.routes.push((url.to_string(), body));
         self
+    }
+
+    fn with_post(mut self, url: &str, body: Value) -> Self {
+        self.posts.push((url.to_string(), body));
+        self
+    }
+
+    fn post_count(&self) -> usize {
+        self.post_calls.lock().unwrap().len()
     }
 
     fn call_count(&self) -> usize {
@@ -53,6 +64,20 @@ impl ModelListingFetcher for FakeFetcher {
             .find(|(route, _)| route == url)
             .map(|(_, body)| body.clone())
             .ok_or_else(|| tinyinference_llm::Error::Catalog(format!("GET {url} returned 404")))
+    }
+
+    async fn post_json(
+        &self,
+        url: &str,
+        _headers: &[(String, String)],
+        _body: &Value,
+    ) -> tinyinference_llm::Result<Value> {
+        self.post_calls.lock().unwrap().push(url.to_string());
+        self.posts
+            .iter()
+            .find(|(route, _)| route == url)
+            .map(|(_, body)| body.clone())
+            .ok_or_else(|| tinyinference_llm::Error::Catalog(format!("POST {url} returned 404")))
     }
 }
 
@@ -230,7 +255,7 @@ async fn unknown_model_without_provider_data_is_unknown() {
 }
 
 #[tokio::test]
-async fn local_routes_use_the_local_profile_without_discovery() {
+async fn local_ollama_without_a_reachable_server_falls_back_to_the_local_profile() {
     let tmp = TempDir::new().unwrap();
     let config = openrouter_config(&tmp);
     let fetcher = FakeFetcher::default();
@@ -245,7 +270,93 @@ async fn local_routes_use_the_local_profile_without_discovery() {
     .await;
     assert!(resolved.window.is_some());
     assert_eq!(resolved.source, WindowSource::LocalProfile);
-    assert_eq!(fetcher.call_count(), 0);
+}
+
+fn ollama_show() -> Value {
+    json!({
+        "model_info": { "general.architecture": "qwen3", "qwen3.context_length": 40960 },
+        "capabilities": ["completion", "tools"]
+    })
+}
+
+#[tokio::test]
+async fn builtin_local_ollama_reads_the_window_from_api_show() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = openrouter_config(&tmp);
+    config.local_ai.base_url = Some("http://127.0.0.1:11434".to_string());
+    let fetcher =
+        FakeFetcher::default().with_post("http://127.0.0.1:11434/api/show", ollama_show());
+    let resolved = resolve_context_window_with(
+        &fetcher,
+        &ModelLimitsCache::default(),
+        "chat",
+        "ollama:qwen3:14b",
+        "qwen3:14b",
+        &config,
+    )
+    .await;
+    assert_eq!(resolved.window, Some(40_960));
+    assert_eq!(resolved.source, WindowSource::ProviderReported);
+}
+
+#[tokio::test]
+async fn custom_openai_provider_at_ollama_v1_reads_the_window_from_api_show() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = openrouter_config(&tmp);
+    config.cloud_providers.push(CloudProviderCreds {
+        id: "p_ollama".to_string(),
+        slug: "myollama".to_string(),
+        label: "Ollama".to_string(),
+        endpoint: "http://127.0.0.1:11434/v1".to_string(),
+        auth_style: AuthStyle::None,
+        ..Default::default()
+    });
+    // `/v1/models` lists the model without any window, as Ollama does.
+    let fetcher = FakeFetcher::default()
+        .with(
+            "http://127.0.0.1:11434/v1/models",
+            json!({"data": [{"id": "qwen3:14b", "object": "model", "owned_by": "library"}]}),
+        )
+        .with_post("http://127.0.0.1:11434/api/show", ollama_show());
+    let cache = ModelLimitsCache::default();
+    let resolve = || {
+        resolve_context_window_with(
+            &fetcher,
+            &cache,
+            "chat",
+            "myollama:qwen3:14b",
+            "qwen3:14b",
+            &config,
+        )
+    };
+    let resolved = resolve().await;
+    assert_eq!(resolved.window, Some(40_960));
+    assert_eq!(resolved.source, WindowSource::ProviderReported);
+    // Cached: the second turn makes no further requests.
+    resolve().await;
+    assert_eq!(fetcher.post_count(), 1);
+}
+
+#[tokio::test]
+async fn failed_ollama_probe_is_remembered_and_not_retried() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = openrouter_config(&tmp);
+    config.local_ai.base_url = Some("http://127.0.0.1:11434".to_string());
+    let fetcher = FakeFetcher::default();
+    let cache = ModelLimitsCache::default();
+    for _ in 0..3 {
+        let resolved = resolve_context_window_with(
+            &fetcher,
+            &cache,
+            "chat",
+            "ollama:qwen3:14b",
+            "qwen3:14b",
+            &config,
+        )
+        .await;
+        assert_eq!(resolved.source, WindowSource::LocalProfile);
+    }
+    assert_eq!(fetcher.post_count(), 1);
 }
 
 #[test]

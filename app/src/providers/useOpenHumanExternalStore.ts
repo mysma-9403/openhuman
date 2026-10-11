@@ -3,10 +3,13 @@ import type {
   AppendMessage,
   ThreadMessage as AuiThreadMessage,
   RespondToToolApprovalOptions,
+  ThreadMessageLike,
   ThreadSuggestion,
 } from '@assistant-ui/react';
+import debug from 'debug';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+import { toast } from '../components/ui/Toast';
 import { useOpenHumanQueueAdapter } from '../features/conversations/aui/queueAdapter';
 import { mapDisplayItems } from '../features/conversations/derived/mapDisplayItems';
 import { useT } from '../lib/i18n/I18nContext';
@@ -24,6 +27,7 @@ import { useAppDispatch, useAppSelector } from '../store/hooks';
 import {
   FEEDBACK_ROW_IDS_METADATA_KEY,
   persistMessageFeedback,
+  removeMessagesById,
   truncateMessagesFrom,
 } from '../store/threadSlice';
 import type { DerivedDisplayItem } from '../types/derivedTranscript';
@@ -31,6 +35,8 @@ import type { ThreadMessage } from '../types/thread';
 import { buildRuntimeMessages, STREAMING_TAIL_ID } from './assistantUiMessages';
 import { getChatSurface } from './chatSurfaceHandlers';
 import { openHumanSpeechAdapter } from './speechAdapter';
+
+const log = debug('openhuman:chat:external-store');
 
 const EMPTY_MESSAGES: ThreadMessage[] = [];
 const EMPTY_SUGGESTIONS: readonly ThreadSuggestion[] = [];
@@ -72,6 +78,8 @@ export type OpenHumanThreadExtras = {
   /** Running subagent row, used to title the `subagent` phase. */
   activeSubagentEntry?: ToolTimelineEntry | undefined;
 };
+
+const convertRuntimeMessage = (message: ThreadMessageLike) => message;
 
 const EMPTY_EXTRAS: OpenHumanThreadExtras = { inferenceStatus: null };
 
@@ -153,9 +161,11 @@ export function useCoreTranscriptProjection(
     }
     let cancelled = false;
     const skipRequestIds = liveRequestId ? new Set([liveRequestId]) : undefined;
-    const project = (items: DerivedDisplayItem[]) => {
+    const project = (items: DerivedDisplayItem[], partial = false) => {
       const mapped = mapDisplayItems(items, { skipRequestIds });
       setProjection(previous => {
+        if (partial && previous.threadId === threadId && Object.keys(previous.timelines).length > 0)
+          return previous;
         if (previous.threadId !== threadId) {
           return { threadId, timelines: mapped.timelines, transcripts: mapped.transcripts };
         }
@@ -183,7 +193,7 @@ export function useCoreTranscriptProjection(
         // page that begins mid-turn hides that turn's leading tool calls until
         // its boundary is in view — both only resolve with the full list.
         let items = first.items;
-        project(items);
+        project(items, first.hasMore);
         let cursor = first.hasMore ? first.nextCursor : undefined;
         let pages = 1;
         while (cursor && pages < DERIVED_TRANSCRIPT_MAX_PAGES) {
@@ -202,9 +212,8 @@ export function useCoreTranscriptProjection(
       } catch {
         // A missing/older core has no settled process trail; message text and
         // the live socket projection remain usable. Navigation must not fail.
-        if (!cancelled) {
-          setProjection({ threadId, timelines: EMPTY_TURN_MAP, transcripts: EMPTY_TURN_MAP });
-        }
+        // A transient refresh failure must not erase the last complete trail.
+        // The return below already masks projections belonging to another thread.
       }
     })();
     return () => {
@@ -336,6 +345,43 @@ function appendMessageQuote(message: AppendMessage): string {
     .join('\n')}\n\n`;
 }
 
+/** Prefix of the core's deterministic assistant-reply ids (`agent:<request_id>`). */
+const AGENT_REPLY_ID_PREFIX = 'agent:';
+
+/**
+ * Which id to hand `threads.regenerate` for the reply `sourceId`, or `null`
+ * when it cannot be regenerated.
+ *
+ * The core accepts only an assistant reply id (`agent:<request_id>`) or no id
+ * (redo the thread's last turn), so in order:
+ * - `sourceId` is already an `agent:` reply id → send it;
+ * - the reply carries its turn's `requestId` (older rows persisted under a
+ *   `msg_<uuid>` id do) → send `agent:<requestId>`;
+ * - it is the thread's last assistant message, or no reply was named at all →
+ *   send no id, which the core reads as "the last turn";
+ * - anything else is an earlier reply the core has no handle on → `null`.
+ */
+export function resolveRegenerateTarget(
+  runtimeMessages: readonly ThreadMessageLike[],
+  sourceId: string | null
+): { messageId: string | undefined } | null {
+  if (!sourceId) return { messageId: undefined };
+  if (sourceId.startsWith(AGENT_REPLY_ID_PREFIX)) return { messageId: sourceId };
+  const source = runtimeMessages.find(message => message.id === sourceId);
+  const custom = source?.metadata?.custom as
+    | { extraMetadata?: Record<string, unknown> }
+    | undefined;
+  const requestId = custom?.extraMetadata?.requestId;
+  if (typeof requestId === 'string' && requestId.length > 0) {
+    return { messageId: `${AGENT_REPLY_ID_PREFIX}${requestId}` };
+  }
+  const lastAssistant = [...runtimeMessages]
+    .reverse()
+    .find(message => message.role === 'assistant');
+  if (source && lastAssistant?.id === sourceId) return { messageId: undefined };
+  return null;
+}
+
 /**
  * Build the `ExternalStoreAdapter` that backs `useExternalStoreRuntime`.
  *
@@ -357,6 +403,7 @@ export function useOpenHumanExternalStore(
   } = {}
 ) {
   const dispatch = useAppDispatch();
+  const { t } = useT();
   const messages = useAppSelector(state =>
     threadId ? (state.thread.messagesByThreadId[threadId] ?? EMPTY_MESSAGES) : EMPTY_MESSAGES
   );
@@ -501,7 +548,12 @@ export function useOpenHumanExternalStore(
       submit: ({ message, type }: { message: AuiThreadMessage; type: 'positive' | 'negative' }) => {
         // The live tail is not a persisted row; there is nothing to attach a
         // rating to until the turn settles.
-        if (!threadId || message.id === STREAMING_TAIL_ID) return;
+        if (
+          !threadId ||
+          message.id === STREAMING_TAIL_ID ||
+          (message.metadata?.custom as { streaming?: boolean })?.streaming
+        )
+          return;
         const custom = message.metadata?.custom as
           | { extraMetadata?: Record<string, unknown> }
           | undefined;
@@ -564,23 +616,94 @@ export function useOpenHumanExternalStore(
   );
 
   /**
-   * Re-run the turn after `parentId` (the assistant message being reloaded,
-   * or the message immediately before the point to regenerate from), via the
-   * `threads.regenerate` RPC. Same capability-gating rule as `onEdit`:
-   * supplying `onReload` is what turns `capabilities.reload` on, which
-   * un-gates the Reload button in `AssistantActionBar` (`useAuiReloadCapability`).
+   * Regenerate an assistant reply via the `threads.regenerate` RPC. Same
+   * capability-gating rule as `onEdit`: supplying `onReload` is what turns
+   * `capabilities.reload` on, which un-gates the Reload button in
+   * `AssistantActionBar` (`useAuiReloadCapability`).
+   *
+   * assistant-ui's `MessageRuntime.reload()` calls this with `parentId` = the
+   * USER prompt that preceded the reply and `config.sourceId` = the reply
+   * itself. The core only regenerates an assistant reply id
+   * (`agent:<request_id>`) or, with no id, the thread's last turn — a user
+   * prompt's `msg_<uuid>` is rejected as "not a regenerable assistant reply".
+   * See {@link resolveRegenerateTarget} for how the reply id is resolved.
+   *
+   * The local cache is trimmed only once the core has accepted the
+   * regenerate, and a failure is reported to the user rather than rethrown —
+   * the runtime has no error channel for a reload, so a rethrow surfaced as an
+   * unhandled rejection.
    */
   const onReload = useCallback(
-    async (parentId: string | null) => {
+    async (parentId: string | null, config?: { sourceId?: string | null }) => {
       if (!threadId) {
-        throw new Error('No thread selected for reload');
+        log('reload skipped: no thread selected');
+        return;
       }
+      // assistant-ui always sends the reply as `sourceId`; if only the user
+      // prompt (`parentId`) arrives, the reply is the first agent row after it.
+      let sourceId = config?.sourceId ?? null;
+      if (!sourceId && parentId) {
+        const parentIndex = messages.findIndex(m => m.id === parentId);
+        if (parentIndex >= 0) {
+          sourceId = messages.slice(parentIndex + 1).find(m => m.sender === 'agent')?.id ?? null;
+        }
+      }
+      const target = resolveRegenerateTarget(runtimeMessages, sourceId);
+      if (!target) {
+        log('reload refused: reply has no regenerable id thread=%s', threadId);
+        toast.add({ type: 'error', title: t('chat.regenerate.unavailable') });
+        return;
+      }
+      // Snapshot the rows this regenerate discards — the reply (and anything
+      // after it) — BEFORE the RPC. The new turn can stream in over the socket
+      // before the RPC resolves, and trimming by position afterwards would drop
+      // it too.
+      let discardFrom = -1;
+      let discardedIds: string[] = [];
       if (parentId) {
-        dispatch(truncateMessagesFrom({ threadId, messageId: parentId, inclusive: false }));
+        const parentIndex = messages.findIndex(m => m.id === parentId);
+        if (parentIndex >= 0) discardFrom = parentIndex + 1;
+      } else if (sourceId) {
+        discardFrom = messages.findIndex(m => m.id === sourceId);
+      } else {
+        // No ids at all: the core regenerates the thread's last turn. Discard
+        // every cached row of the final assistant bubble (it can span several).
+        const lastAssistant = [...runtimeMessages]
+          .reverse()
+          .find(message => message.role === 'assistant');
+        const custom = lastAssistant?.metadata?.custom as
+          | { extraMetadata?: Record<string, unknown> }
+          | undefined;
+        const rowIds = custom?.extraMetadata?.[FEEDBACK_ROW_IDS_METADATA_KEY];
+        const turnRowIds =
+          Array.isArray(rowIds) && rowIds.length > 0
+            ? rowIds.filter((id): id is string => typeof id === 'string')
+            : lastAssistant?.id
+              ? [lastAssistant.id]
+              : [];
+        const turnRowIdSet = new Set(turnRowIds);
+        discardedIds = messages.filter(m => turnRowIdSet.has(m.id)).map(m => m.id);
       }
-      await regenerateMessage({ threadId, messageId: parentId ?? undefined });
+      if (discardFrom >= 0) {
+        discardedIds = messages.slice(discardFrom).map(m => m.id);
+      }
+      try {
+        await regenerateMessage({ threadId, messageId: target.messageId });
+      } catch (err) {
+        log(
+          'reload failed thread=%s error=%s',
+          threadId,
+          err instanceof Error ? err.name : typeof err
+        );
+        toast.add({ type: 'error', title: t('chat.regenerate.failed') });
+        return;
+      }
+      // The regenerate RPC returns no message list, and the socket events
+      // that follow only carry the new turn, so drop the discarded rows from
+      // the cache now that the core has forked.
+      dispatch(removeMessagesById({ threadId, messageIds: discardedIds }));
     },
-    [dispatch, threadId]
+    [dispatch, messages, runtimeMessages, t, threadId]
   );
 
   /**
@@ -733,7 +856,7 @@ export function useOpenHumanExternalStore(
       // reply, otherwise empty — see `useWelcomeSuggestions`.
       suggestions,
       // Already `ThreadMessageLike`; the runtime's converter is the identity.
-      convertMessage: (m: (typeof runtimeMessages)[number]) => m,
+      convertMessage: convertRuntimeMessage,
       onNew,
       onCancel,
       queue,
@@ -753,9 +876,15 @@ export function useOpenHumanExternalStore(
       // support speech." That is the #5897 defect shape, and Reload already
       // sits in the same trap today.
       // No `dictation` key here — see the Web Speech note above this object.
-      adapters: { feedback: feedbackAdapter, speech: openHumanSpeechAdapter },
+      adapters: {
+        feedback: feedbackAdapter,
+        speech: openHumanSpeechAdapter,
+        // Native viewport and composer resets need the real conversation identity.
+        threadList: { threadId: threadId ?? undefined },
+      },
     }),
     [
+      threadId,
       runtimeMessages,
       isRunning,
       isLoading,

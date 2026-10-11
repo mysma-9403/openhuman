@@ -171,6 +171,7 @@ async fn export_and_erase_reach_the_wrapped_engine() {
 struct Recording {
     inner: ReferenceEngine,
     waits: std::sync::Mutex<Vec<WaitFor>>,
+    reaches: std::sync::Mutex<Vec<Reach>>,
 }
 
 #[async_trait::async_trait]
@@ -204,9 +205,29 @@ impl MemoryEngine for Recording {
     ) -> Result<tinymemory_api::ForgetReport> {
         self.inner.forget(target).await
     }
+    async fn forget_within(&self, ids: Vec<ItemId>, reach: Reach) -> Result<ForgetReport> {
+        self.reaches.lock().unwrap().push(reach.clone());
+        self.inner.forget_within(ids, reach).await
+    }
     async fn list(&self, req: ListRequest) -> Result<tinymemory_api::ListPage> {
         self.inner.list(req).await
     }
+}
+
+#[tokio::test]
+async fn forget_within_reaches_the_wrapped_engine_with_its_reach() {
+    let recording = Arc::new(Recording::default());
+    let guarded = ScrubbingEngine::wrap(recording.clone());
+    let reach = Reach::subtree("agent:ann".parse::<tinymemory_api::Namespace>().unwrap());
+    guarded
+        .forget_within(vec![ItemId::new("a")], reach.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        *recording.reaches.lock().unwrap(),
+        vec![reach],
+        "the guard forwards forget_within instead of the default's forget by id"
+    );
 }
 
 #[tokio::test]

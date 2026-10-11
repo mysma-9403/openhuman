@@ -30,13 +30,9 @@ use crate::Session;
 // the default triples through this module.
 pub(crate) use super::build::apply_provider;
 
-/// Whether `services` asks for any background work beyond the one-shot
-/// harness init, which a library runtime has never started on its own.
+/// Whether `services` asks for any background work.
 pub(crate) fn requests_background_services(services: ServiceSet) -> bool {
-    ServiceSet {
-        harness_init: false,
-        ..services
-    } != ServiceSet::none()
+    services != ServiceSet::none()
 }
 
 #[cfg(test)]
@@ -66,12 +62,12 @@ pub enum ConfigSource {
     /// would edit a config (`config`, `backend_url`, `workspace_dir`,
     /// `action_dir`, `api_key`), because there is no config in hand to edit.
     /// [`RuntimeBuilder::access`] and [`RuntimeBuilder::provider`] then only
-    /// set the defaults of agents created with [`Runtime::agent`](super::Runtime::agent).
+    /// set the defaults of agents created with [`crate::Runtime::agent`](super::Runtime::agent).
     Discovered,
 }
 
 /// Builder for a [`Runtime`](super::Runtime). Obtain with
-/// [`Runtime::builder`](super::Runtime::builder) or one of the host presets
+/// [`crate::Runtime::builder`](super::Runtime::builder) or one of the host presets
 /// ([`RuntimeBuilder::library`], [`desktop`](RuntimeBuilder::desktop),
 /// [`cli`](RuntimeBuilder::cli), [`tui`](RuntimeBuilder::tui)).
 pub struct RuntimeBuilder {
@@ -97,6 +93,9 @@ pub struct RuntimeBuilder {
     pub(super) session_store: Option<Arc<dyn SessionStoreProvider>>,
     pub(super) seams: HostSeams,
     pub(super) max_agents: usize,
+    pub(super) agent_defaults: super::AgentDefaults,
+    pub(super) config_knobs: super::info::ConfigKnobs,
+    pub(super) selection: Option<super::ModuleSelection>,
 }
 
 /// Live agents a runtime hosts unless [`RuntimeBuilder::max_agents`] says
@@ -138,7 +137,76 @@ impl RuntimeBuilder {
             session_store: None,
             seams: HostSeams::default(),
             max_agents: DEFAULT_MAX_AGENTS,
+            agent_defaults: super::AgentDefaults::default(),
+            config_knobs: super::info::ConfigKnobs::default(),
+            selection: None,
         }
+    }
+
+    /// Replace the runtime-wide agent defaults. Explicit individual setters still win.
+    pub fn agent_defaults(mut self, defaults: super::AgentDefaults) -> Self {
+        self.provider = defaults.provider.clone();
+        self.access = defaults.access.clone();
+        self.domains = Some(defaults.domains);
+        self.tool_groups = Some(defaults.tool_groups.clone());
+        self.agent_defaults = defaults;
+        self
+    }
+    /// Sampling defaults inherited by agents and then overridden per turn.
+    pub fn model_defaults(mut self, model: super::ModelDefaults) -> Self {
+        self.agent_defaults.model = model;
+        self
+    }
+    /// Default confinement for new agents.
+    pub fn sandbox(mut self, mode: crate::SandboxModeSpec) -> Self {
+        self.agent_defaults.sandbox = mode;
+        self
+    }
+    /// Default definition extended by each agent.
+    pub fn definition_base(mut self, definition: crate::AgentDefinitionSpec) -> Self {
+        self.agent_defaults.definition = definition;
+        self
+    }
+    /// Runtime-wide skill installation and discovery policy.
+    pub fn skills(mut self, policy: super::SkillsPolicy) -> Self {
+        self.agent_defaults.skills = policy;
+        self
+    }
+    /// Servers inherited by every agent, with agent declarations added afterwards.
+    #[cfg(feature = "mcp")]
+    pub fn mcp_baseline(mut self, servers: impl IntoIterator<Item = crate::McpServer>) -> Self {
+        self.agent_defaults.mcp_baseline = servers.into_iter().collect();
+        self
+    }
+    /// Detailed autonomy settings; access tiers are subsequently applied to each agent.
+    pub fn autonomy(mut self, value: openhuman_core::config::schema::AutonomyConfig) -> Self {
+        self.config_knobs.autonomy = Some(value);
+        self
+    }
+    /// Tool rules applied to every agent, which agents may only narrow.
+    pub fn tool_rules(mut self, value: tinytools::ToolRules) -> Self {
+        self.config_knobs.tool_rules = Some(value);
+        self
+    }
+    /// Data egress policy for this runtime.
+    pub fn privacy(mut self, value: openhuman_core::config::schema::PrivacyConfig) -> Self {
+        self.config_knobs.privacy = Some(value);
+        self
+    }
+    /// Credential encryption policy.
+    pub fn secrets(mut self, value: openhuman_core::config::schema::SecretsConfig) -> Self {
+        self.config_knobs.secrets = Some(value);
+        self
+    }
+    /// Background memory learning defaults.
+    pub fn learning(mut self, value: super::LearningSettings) -> Self {
+        self.config_knobs.learning = Some(value);
+        self
+    }
+    /// Cron scheduler configuration; `services` separately controls its lifecycle.
+    pub fn cron(mut self, value: openhuman_core::config::schema::CronConfig) -> Self {
+        self.config_knobs.cron = Some(value);
+        self
     }
 
     /// The transport the runtime reaches the hosted TinyHumans backend
@@ -155,7 +223,7 @@ impl RuntimeBuilder {
         self
     }
 
-    /// The memory engine every agent and [`Runtime::memory`](super::Runtime::memory)
+    /// The memory engine every agent and [`crate::Runtime::memory`](super::Runtime::memory)
     /// use, in place of the configured `[memory]` engine (TinyHumans over the
     /// backend credential, or CortexDB with a stored key).
     ///
@@ -184,7 +252,7 @@ impl RuntimeBuilder {
         self
     }
 
-    /// The most agents this runtime hosts at once; [`Runtime::agent`]
+    /// The most agents this runtime hosts at once; [`crate::Runtime::agent`]
     /// returns [`AgentError::AgentLimit`](crate::AgentError::AgentLimit)
     /// beyond it. Removed and dropped agents do not count. Defaults to
     /// [`DEFAULT_MAX_AGENTS`].
@@ -275,15 +343,15 @@ impl RuntimeBuilder {
 
     /// Override which background services run.
     ///
-    /// The library default is deliberately minimal (only the harness init
-    /// step): cron, the login-gated services and the memory queue each write
+    /// The library default is deliberately minimal (no services): cron, the
+    /// login-gated services and the memory queue each write
     /// to the workspace on their own schedule, turning a library call into a
     /// background process the caller did not ask for.
     ///
-    /// A set that selects anything beyond `harness_init` (`cron: true` to let
-    /// [`Runtime::cron`] jobs fire on their own, say) is started by
+    /// A set that selects background work (`cron: true` to let
+    /// [`crate::Runtime::cron`] jobs fire on their own, say) is started by
     /// [`build`](Self::build) and stopped when the runtime drops; see
-    /// [`Runtime::start_services`] / [`Runtime::stop_services`]. Starting is
+    /// [`crate::Runtime::start_services`] / [`crate::Runtime::stop_services`]. Starting is
     /// idempotent, so a transport that serves the runtime
     /// (`openhuman-rpc`) and calls `start_services` once its listener is
     /// bound does not start them twice.

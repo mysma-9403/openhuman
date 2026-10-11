@@ -70,7 +70,7 @@ pub(crate) async fn append_to_origin_transcript(
         FileTranscriptLocator, SessionRef, TranscriptMessage,
     };
     let session = SessionRef::scoped(append.thread_id.to_string(), append.agent_id.to_string());
-    if let Some(agent) = crate::core::runtime::agent_scope::current_agent_id() {
+    if let Some(agent) = crate::agent::session_store::current_embedded_agent() {
         use tinyagents_session::transcript::TranscriptLocator;
         crate::agent::session_store::AgentTranscriptFiles::new(workspace_dir, &agent)
             .session_exists(&session);
@@ -148,6 +148,30 @@ pub(crate) async fn deliver_to_origin(
         ));
     };
     let text = output.trim();
+
+    // A hosted profile's host routes the reply itself.
+    if let (Some(sink), Some(profile_id)) = (
+        crate::cron::host_delivery::installed(),
+        crate::core::runtime::current_tenant()
+            .ok()
+            .and_then(|tenant| tenant.profile),
+    ) {
+        let thread_id = match origin {
+            JobOrigin::Web { thread_id, .. } => Some(thread_id.clone()),
+            JobOrigin::Channel { thread_id, .. } => thread_id.clone(),
+        };
+        sink.deliver(crate::cron::host_delivery::CronReply {
+            profile_id,
+            job_id: job.id.clone(),
+            run_id: run_id.to_string(),
+            thread_id,
+            origin: Some(origin.clone()),
+            text: text.to_string(),
+        })
+        .await
+        .map_err(|e| anyhow!("the host could not deliver the reply: {e}"))?;
+        return Ok(DeliveryStatus::Delivered);
+    }
 
     match origin {
         JobOrigin::Web {

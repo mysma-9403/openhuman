@@ -1,0 +1,176 @@
+---
+# Storage drivers on MongoDB: the `storage_*_e2e` targets and
+# `cli_storage_url_e2e` run once per driver (tests/support/storage_drivers.rs);
+# this workflow builds them with `--features storage-mongodb` and points them
+# at a real single-node replica set, so the `mongodb` case of every target
+# runs (it skips itself when TSD_MONGO_URL is unset, as on a laptop).
+#
+# The memory, sqlite and file cases run in the main PR lanes (the
+# `storage-drivers` lane in scripts/ci/self-hosted/lanes-plan.mjs). MongoDB
+# lives here because it needs Docker and a `--replSet` mongod, which GitHub
+# service containers cannot start, and because its build is a feature set no
+# other lane compiles.
+#
+# When it runs:
+#   - on pull requests that touch the storage ports or the domains on them
+#     (the same paths as the `storage` area in .github/ci-paths-filter.yml);
+#   - nightly on main, so a driver regression that slipped past a path filter
+#     (for instance a vendor bump) is still caught within a day;
+#   - on demand.
+# It is not a required check: it is a workflow of its own, so a slow mongod
+# never holds up the PR lanes.
+name: Storage (MongoDB)
+
+on:
+  pull_request:
+    branches: [main, release]
+    paths:
+      - ".github/workflows/storage-mongodb.yml"
+      - ".github/ci-paths-filter.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/openhuman-*/Cargo.toml"
+      - ".cargo/config.toml"
+      - "rust-toolchain.toml"
+      - "crates/openhuman-core/src/storage/**"
+      - "crates/openhuman-core/src/cron/**"
+      - "crates/openhuman-core/src/flows/**"
+      - "crates/openhuman-core/src/security/approval/**"
+      - "crates/openhuman-core/src/security/devices/**"
+      - "crates/openhuman-core/src/security/secret_storage/**"
+      - "crates/openhuman-core/src/security/credentials/**"
+      - "crates/openhuman-core/src/desktop/notifications/**"
+      - "crates/openhuman-core/src/integrations/task_sources/**"
+      - "crates/openhuman-core/src/agent/orchestration/**"
+      - "crates/openhuman-core/src/agent/session_store/**"
+      - "crates/openhuman-core/src/profiles/**"
+      - "crates/openhuman-core/src/integrations/composio/**"
+      - "crates/openhuman-core/src/config/workspace/**"
+      - "crates/openhuman-core/src/desktop/app_state/**"
+      - "crates/openhuman-core/src/desktop/control/**"
+      - "crates/openhuman-core/src/platform/cost/**"
+      - "crates/openhuman-core/src/inference/tokenjuice/**"
+      - "crates/openhuman-core/src/web3/wallet/**"
+      - "crates/openhuman-core/src/config/schema/storage.rs"
+      - "crates/openhuman-core/src/config/schema/load/source/**"
+      - "crates/openhuman-rpc/src/session_store/**"
+      - "tests/storage_*.rs"
+      - "tests/cli_storage_url_e2e.rs"
+      - "tests/support/storage_drivers.rs"
+      - ".gitmodules"
+      - "vendor/**"
+      # The helpers this workflow invokes, and the root build script the
+      # test targets compile through.
+      - "scripts/ci/checkout-submodules.sh"
+      - "scripts/ci-cancel-aware.sh"
+      - "build.rs"
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  # `actions: read` lets scripts/ci-cancel-aware.sh poll the run status, so a
+  # cancelled run stops its own cargo/docker client.
+  actions: read
+  contents: read
+
+concurrency:
+  group: storage-mongodb-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI_IMAGE: ghcr.io/tinyhumansai/openhuman_ci:latest
+  # The replica set start-mongo-replset.sh brings up (published on 27017).
+  # directConnection: the member advertises `localhost`, not a resolvable name.
+  TSD_MONGO_URL: mongodb://127.0.0.1:27017/tsd_test?directConnection=true
+
+jobs:
+  mongodb:
+    name: Storage e2e on MongoDB
+    # Scheduled runs only make sense on the canonical repository.
+    if: github.event_name != 'schedule' || github.repository == 'tinyhumansai/openhuman'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+          # Submodules come from the step below (only the ones a build reads).
+          submodules: false
+          persist-credentials: false
+
+      - name: Check out submodules
+        run: bash scripts/ci/checkout-submodules.sh
+
+      - name: Verify the replica-set script was checked out
+        run: |
+          script=vendor/tinyagents/vendor/tinystoragedrivers/.github/scripts/start-mongo-replset.sh
+          if [ ! -f "$script" ]; then
+            echo "::error::$script is missing: scripts/ci/checkout-submodules.sh did not populate vendor/tinyagents/vendor/tinystoragedrivers"
+            exit 1
+          fi
+
+      - name: Start a MongoDB replica set
+        # tinystoragedrivers' own script: GitHub service containers cannot pass
+        # `--replSet` to mongod, and a replica set is what lets the driver
+        # report and exercise transactions.
+        run: bash vendor/tinyagents/vendor/tinystoragedrivers/.github/scripts/start-mongo-replset.sh 27017
+
+      - name: Restore Rust build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            target
+            .cargo-registry
+          key: storage-mongodb-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            storage-mongodb-${{ runner.os }}-
+
+      - name: Test the storage targets and the session store with the MongoDB driver
+        env:
+          # Consumed by scripts/ci-cancel-aware.sh's cancellation watchdog;
+          # only this step needs it, not the submodule script above.
+          GH_TOKEN: ${{ github.token }}
+        # Runs in the CI image (toolchain, mold, system libraries) on the host
+        # network, so 127.0.0.1:27017 reaches the replica set above.
+        run: |
+          set -euo pipefail
+          mkdir -p target .cargo-registry
+          # Through the cancellation wrapper: a cancelled run TERMs the docker
+          # client, and the `Stop` step below removes the named container.
+          bash scripts/ci-cancel-aware.sh docker run --rm --name oh-storage-test --network host --init \
+            -v "$PWD:/work" -w /work \
+            -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
+            -e TSD_MONGO_URL \
+            -e CARGO_INCREMENTAL=0 \
+            -e RUSTFLAGS='-C link-arg=-fuse-ld=mold' \
+            -e CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+            -e CARGO_BUILD_JOBS=2 \
+            -e RUST_MIN_STACK=16777216 \
+            "$CI_IMAGE" bash -euo pipefail -c '
+              git config --global --add safe.directory "*"
+              cargo test --no-fail-fast -p openhuman-cli --features storage-mongodb \
+                --test storage_approvals_e2e \
+                --test storage_domains_e2e \
+                --test storage_flows_e2e \
+                --test storage_secrets_e2e \
+                --test storage_scope_e2e \
+                --test storage_agent_scopes_e2e \
+                --test storage_delegation_e2e \
+                --test cli_storage_url_e2e
+              cargo test --no-fail-fast -p openhuman-rpc --features session-store,storage-mongodb --lib -- session_store::
+            '
+
+      - name: Fix ownership of the build output
+        # The container ran as root; the cache step saves as the runner user.
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" target .cargo-registry || true
+
+      - name: MongoDB log on failure
+        if: failure()
+        run: docker logs tsd-mongo 2>&1 | tail -n 100 || true
+
+      - name: Stop the containers
+        if: always()
+        run: docker rm -f oh-storage-test tsd-mongo >/dev/null 2>&1 || true

@@ -1,4 +1,6 @@
 use super::*;
+use crate::config::DelegateAgentConfig;
+use crate::tools::ops::default_tools;
 
 #[test]
 fn all_tools_includes_browser_when_enabled() {
@@ -126,100 +128,6 @@ fn all_tools_excludes_delegate_when_no_agents() {
 }
 
 #[test]
-#[cfg(feature = "runtime-node")]
-fn all_tools_registers_node_exec_when_node_enabled() {
-    // Default NodeConfig has `enabled = true`, so both `node_exec` and
-    // `npm_exec` must appear in the registry. Regression guard for the
-    // skills integration — if this fires, managed-node skills silently
-    // lose both tools.
-    let tmp = TempDir::new().unwrap();
-    let security = Arc::new(SecurityPolicy::default());
-
-    let browser = BrowserConfig::default();
-    let http = crate::config::HttpRequestConfig::default();
-    let cfg = test_config(&tmp);
-
-    let tools = all_tools(
-        Arc::new(Config::default()),
-        &security,
-        AuditLogger::disabled(),
-        &browser,
-        &http,
-        tmp.path(),
-        &HashMap::new(),
-        &cfg,
-    );
-    let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-    assert!(
-        names.contains(&"node_exec"),
-        "node_exec must be registered when node.enabled=true; got: {names:?}"
-    );
-    assert!(
-        names.contains(&"npm_exec"),
-        "npm_exec must be registered when node.enabled=true; got: {names:?}"
-    );
-}
-
-#[test]
-fn all_tools_registers_python_exec_when_python_enabled() {
-    // Default RuntimePythonConfig has `enabled = true`, so `python_exec` must
-    // appear in the registry (routes inline code through the runtime pool, #5106).
-    let tmp = TempDir::new().unwrap();
-    let security = Arc::new(SecurityPolicy::default());
-
-    let browser = BrowserConfig::default();
-    let http = crate::config::HttpRequestConfig::default();
-    let cfg = test_config(&tmp);
-
-    let tools = all_tools(
-        Arc::new(Config::default()),
-        &security,
-        AuditLogger::disabled(),
-        &browser,
-        &http,
-        tmp.path(),
-        &HashMap::new(),
-        &cfg,
-    );
-    let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-    assert!(
-        names.contains(&"python_exec"),
-        "python_exec must be registered when runtime_python.enabled=true; got: {names:?}"
-    );
-}
-
-#[test]
-fn all_tools_excludes_node_exec_when_node_disabled() {
-    let tmp = TempDir::new().unwrap();
-    let security = Arc::new(SecurityPolicy::default());
-
-    let browser = BrowserConfig::default();
-    let http = crate::config::HttpRequestConfig::default();
-    let mut cfg = test_config(&tmp);
-    cfg.node.enabled = false;
-
-    let tools = all_tools(
-        Arc::new(Config::default()),
-        &security,
-        AuditLogger::disabled(),
-        &browser,
-        &http,
-        tmp.path(),
-        &HashMap::new(),
-        &cfg,
-    );
-    let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-    assert!(
-        !names.contains(&"node_exec"),
-        "node_exec must NOT be registered when node.enabled=false; got: {names:?}"
-    );
-    assert!(
-        !names.contains(&"npm_exec"),
-        "npm_exec must NOT be registered when node.enabled=false; got: {names:?}"
-    );
-}
-
-#[test]
 fn all_tools_registers_integration_families_when_enabled_and_signed_in() {
     let tmp = TempDir::new().unwrap();
     let security = Arc::new(SecurityPolicy::default());
@@ -231,7 +139,6 @@ fn all_tools_registers_integration_families_when_enabled_and_signed_in() {
     cfg.integrations.parallel.enabled = true;
     cfg.integrations.tinyfish.enabled = true;
     cfg.integrations.stock_prices.enabled = true;
-    cfg.integrations.twilio.enabled = true;
     cfg.composio.enabled = true;
     store_test_session_token(&cfg);
 
@@ -257,13 +164,18 @@ fn all_tools_registers_integration_families_when_enabled_and_signed_in() {
             "stock_options",
             "stock_crypto_series",
             "stock_commodity",
-            "twilio_call",
             "composio_list_toolkits",
             "composio_list_connections",
             "composio_authorize",
             "composio_list_tools",
             "composio_execute",
         ],
+    );
+    // The backend retired its Twilio route; the agent must not be offered a
+    // tool that can only fail.
+    assert!(
+        !names.iter().any(|n| n == "twilio_call"),
+        "twilio_call must no longer be registered"
     );
 }
 

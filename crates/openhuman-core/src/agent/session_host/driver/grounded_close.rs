@@ -7,12 +7,13 @@
 //! its usage in a sidecar; it never owns transcript history or persistence.
 
 use futures::StreamExt;
+use tinyagents_runtime::transcript::message_to_native_transcript as message_to_native_chat_message;
 use tinyagents_session::transcript::TranscriptMessage;
 use tinyinference_llm::model::{ModelRequest, ModelStreamItem};
 use tinytools_agent::dialect::ToolDialect;
 
 use crate::agent::{
-    message_convert::{dialect_response_from_provider, message_to_native_chat_message},
+    message_convert::dialect_response_from_provider,
     session_host::turn_checkpoint::{
         self, build_deterministic_checkpoint, build_deterministic_final_summary,
         close_repair_instruction, close_verification_prompt, final_answer_instruction,
@@ -30,17 +31,37 @@ pub(super) struct RepairUsage {
     pub(super) input_tokens: u64,
     pub(super) output_tokens: u64,
     pub(super) cached_input_tokens: u64,
-    pub(super) charged_amount_usd: f64,
+    /// Cost of these calls: reported charge, catalog estimate, or unknown.
+    pub(super) cost: crate::agent::cost::CostTally,
+    /// Model the calls ran on, for pricing a call that reported no charge.
+    pub(super) pricing_model: String,
+    /// The newest repair call's own input/output: a repair runs after the
+    /// harness loop, so when one happened it is the turn's final call.
+    pub(super) last_call_input_tokens: u64,
+    pub(super) last_call_output_tokens: u64,
 }
 
 impl RepairUsage {
-    fn record(&mut self, usage: Option<BilledUsage>) {
+    /// Empty accounting for calls made on `model`.
+    pub(super) fn for_model(model: &str) -> Self {
+        Self {
+            pricing_model: model.to_string(),
+            ..Self::default()
+        }
+    }
+
+    fn record(&mut self, usage: Option<BilledUsage>, measures_context: bool) {
         self.model_calls += 1;
         if let Some(usage) = usage {
+            if measures_context {
+                self.last_call_input_tokens = usage.input_tokens;
+                self.last_call_output_tokens = usage.output_tokens;
+            }
             self.input_tokens += usage.input_tokens;
             self.output_tokens += usage.output_tokens;
             self.cached_input_tokens += usage.cached_input_tokens();
-            self.charged_amount_usd += usage.charged_amount_usd;
+            self.cost
+                .add(crate::agent::cost::call_cost(&self.pricing_model, &usage));
         }
     }
 }
@@ -98,8 +119,8 @@ pub(super) async fn repair_required_output(
     )));
     let (candidate, candidate_usage) =
         completion(source, model, temperature, thread_id, prompt_history).await;
-    let mut usage = RepairUsage::default();
-    usage.record(candidate_usage);
+    let mut usage = RepairUsage::for_model(model);
+    usage.record(candidate_usage, true);
     let candidate = candidate.trim().to_owned();
     let candidate_is_usable = !candidate.is_empty()
         && !contains_tool_call(dispatcher, &candidate)
@@ -241,7 +262,7 @@ pub(super) async fn close_if_needed(
     };
 
     let (output, usage) =
-        close_with_one_repair(instruction, stop_reason, ask, verify, fallback).await;
+        close_with_one_repair(model, instruction, stop_reason, ask, verify, fallback).await;
     Some(GroundedClose { output, usage })
 }
 
@@ -259,6 +280,7 @@ pub(super) async fn close_if_needed(
 /// exercised without a provider; the deterministic guard stays here, ahead of
 /// `verify`, because it is the one check that cannot fail open.
 async fn close_with_one_repair<A, AF, V, VF>(
+    model: &str,
     instruction: String,
     stop_reason: Option<&str>,
     ask: A,
@@ -271,11 +293,11 @@ where
     V: Fn(String) -> VF,
     VF: std::future::Future<Output = (Option<CloseViolation>, Option<BilledUsage>)>,
 {
-    let mut usage = RepairUsage::default();
+    let mut usage = RepairUsage::for_model(model);
     let mut prompt = instruction.clone();
     for attempt in 0..2 {
         let (candidate, candidate_usage) = ask(prompt).await;
-        usage.record(candidate_usage);
+        usage.record(candidate_usage, true);
         let candidate = candidate.trim().to_owned();
         let violation = if candidate.is_empty() {
             Some(CloseViolation::NoReply)
@@ -283,7 +305,9 @@ where
             Some(CloseViolation::QuotedHarnessText)
         } else {
             let (violation, verify_usage) = verify(candidate.clone()).await;
-            usage.record(verify_usage);
+            // The verifier sees one synthetic prompt, not the conversation
+            // context that will be resumed, so it must not replace the gauge.
+            usage.record(verify_usage, false);
             violation
         };
         let Some(violation) = violation else {

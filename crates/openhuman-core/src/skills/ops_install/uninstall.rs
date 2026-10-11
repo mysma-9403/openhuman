@@ -59,6 +59,10 @@ pub fn uninstall_workflow(
             .into_iter()
             .rev()
             .collect(),
+        // A SaaS task with no tenant scope must not reach the operator's home.
+        None if crate::core::runtime::is_saas() => {
+            return Err("no tenant scope for a workflow uninstall".to_string());
+        }
         None => vec![
             openhuman_dir.join("workflows"),
             openhuman_dir.join("skills"),

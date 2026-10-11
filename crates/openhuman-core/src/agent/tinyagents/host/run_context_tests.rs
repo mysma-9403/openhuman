@@ -170,6 +170,7 @@ fn child_ledgers_are_isolated_and_parent_keeps_completed_child_totals() {
             output_tokens: 2,
             cached_input_tokens: 1,
             charged_amount_usd: 0.01,
+            cost_source: crate::agent::cost::CostSource::Charged,
         },
     });
     assert!(right.subagent_usage_entries().is_empty());
@@ -379,5 +380,45 @@ fn attach_parent_keeps_the_snapshot_sink_when_the_run_has_none() {
         &mut rx,
         "a run without its own sink must keep the snapshot's, and keep the \
          CLI/cron receiver that snapshot was carrying",
+    );
+}
+
+#[test]
+fn child_inherits_shared_model_budget_and_narrowed_depth_limit() {
+    use crate::agent::tinyagents::budget::{Budget, CallBudget, ModelBudget, Spend, SpendLimits};
+    let ledger = Budget::new(SpendLimits {
+        tokens: Some(100),
+        cost_micros: None,
+    });
+    let mut parent = OpenHumanRunContext::new();
+    parent.model_budget = Some(ModelBudget {
+        ledger: ledger.clone(),
+        call: CallBudget {
+            input_tokens: 50,
+            output_tokens: 10,
+            cost_micros: 1,
+        },
+    });
+    parent.max_spawn_depth = Some(1);
+    let child = parent.child();
+    assert_eq!(child.max_spawn_depth, Some(1));
+    assert_eq!(child.spawn_depth, 1);
+    let reservation = child
+        .model_budget
+        .unwrap()
+        .ledger
+        .reserve(Spend {
+            tokens: 60,
+            cost_micros: 0,
+        })
+        .unwrap();
+    assert_eq!(ledger.snapshot().reserved.tokens, 60);
+    reservation.settle(Spend {
+        tokens: 10,
+        cost_micros: 0,
+    });
+    assert_eq!(
+        parent.model_budget.unwrap().ledger.snapshot().spent.tokens,
+        10
     );
 }

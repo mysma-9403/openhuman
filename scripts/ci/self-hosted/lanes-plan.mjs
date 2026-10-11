@@ -25,6 +25,7 @@ export const AREA_ENV = {
   inventory: "CI_AREA_INVENTORY",
   toolchainImage: "CI_AREA_TOOLCHAIN_IMAGE",
   installPs1: "CI_AREA_INSTALL_PS1",
+  storage: "CI_AREA_STORAGE",
 };
 
 /** Read the area flags from an environment object. Missing means false. */
@@ -54,11 +55,54 @@ export const HOSTED_GROUPS = [
   },
   { group: "rust-cov", lanes: ["rust-cov"], maxParallel: 1, container: true },
   { group: "tauri", lanes: ["tauri"], maxParallel: 1, container: true },
+  // The storage drivers build the core with features no other lane enables,
+  // so they get a runner (and a `target/`) of their own.
+  {
+    group: "storage",
+    lanes: ["storage-drivers"],
+    maxParallel: 1,
+    container: true,
+  },
   // pwsh ships on the bare ubuntu-latest image, not in the CI container.
   { group: "pester", lanes: ["pester"], maxParallel: 1, container: false },
 ];
 
-const PRODUCT = '"$(bash scripts/ci/product-features.sh)"';
+const CORE_PRODUCT = '"$(bash scripts/ci/product-features.sh --core)"';
+
+// The storage-drivers lane: the drivers it turns on, the root e2e targets that
+// run once per driver (tests/support/storage_drivers.rs), and the lib-test
+// filters of the domains that sit on the storage ports.
+const STORAGE_DRIVERS = "storage-sqlite,storage-file";
+const STORAGE_E2E_TARGETS = [
+  "storage_approvals_e2e",
+  "storage_domains_e2e",
+  "storage_flows_e2e",
+  "storage_secrets_e2e",
+  "storage_scope_e2e",
+  "storage_agent_scopes_e2e",
+  "storage_delegation_e2e",
+  "storage_default_import_e2e",
+  "cli_storage_url_e2e",
+];
+const STORAGE_LIB_FILTERS = [
+  "storage::",
+  "cron::",
+  "flows::",
+  "security::approval::",
+  "security::devices::",
+  "security::secret_storage::",
+  "security::credentials::",
+  "desktop::notifications::",
+  "integrations::task_sources::",
+  "integrations::composio::file_store",
+  "agent::orchestration::",
+  "config::workspace::",
+  "desktop::app_state::",
+  "desktop::control::",
+  "platform::cost::",
+  "inference::tokenjuice::",
+  "config::schema::load::source::",
+];
 
 /**
  * Build the lane plan.
@@ -187,6 +231,11 @@ export function buildPlan({ profile, areas, env = {}, isPullRequest = true }) {
           name: "crate-chain",
           when: true,
           run: "node scripts/ci/check-crate-chain.mjs",
+        },
+        {
+          name: "module-boundaries",
+          when: rust || areas.scripts,
+          run: "bash scripts/ci-cancel-aware.sh node scripts/ci/check-module-boundaries.mjs",
         },
         {
           name: "module-pins",
@@ -356,7 +405,7 @@ export function buildPlan({ profile, areas, env = {}, isPullRequest = true }) {
         {
           name: "clippy-product",
           when: core,
-          run: `cargo clippy -p openhuman --features ${PRODUCT} -- -D warnings`,
+          run: `cargo clippy -p openhuman --features ${CORE_PRODUCT} -- -D warnings`,
         },
         // No separate `cargo clippy -p openhuman` (contributor set): clippy
         // lints every workspace crate in the graph, and openhuman-embed's
@@ -371,6 +420,22 @@ export function buildPlan({ profile, areas, env = {}, isPullRequest = true }) {
           name: "embed-check-no-default",
           when: core,
           run: "cargo check -p openhuman-embed --no-default-features",
+        },
+        {
+          name: "embed-doctests",
+          when: core,
+          run: "bash scripts/ci-cancel-aware.sh cargo test -p openhuman-embed --doc",
+        },
+        {
+          name: "embed-rustdoc",
+          when: core,
+          env: { RUSTDOCFLAGS: "-D warnings" },
+          run: "bash scripts/ci-cancel-aware.sh cargo doc -p openhuman-embed --no-deps",
+        },
+        {
+          name: "embed-offline-examples",
+          when: core,
+          run: "node scripts/run-embed-examples.mjs",
         },
         {
           name: "tinyhumans-clippy",
@@ -398,20 +463,17 @@ export function buildPlan({ profile, areas, env = {}, isPullRequest = true }) {
             " openhuman::config:: openhuman::platform::socket::event_handlers:: tools::schemas:: tools::ops::tests::",
         },
         {
-          // One core build for both feature-gated suites: `mcp` and
-          // `e2e-test-support` gate disjoint code (mcp::server::resources
-          // does not touch test_support, and vice versa), so each suite sees
-          // the same code it would under its feature alone. Separately they
-          // were two full core test builds. The introspect filter is scoped
-          // on purpose; see ci-lite.yml for the hole. The `cargo check` of
-          // the e2e-test-support set runs on pushes to main (CI Lite): this
-          // build already compiles that set, under cfg(test).
+          // Share one build for these disjoint test surfaces. Enable the
+          // module host while keeping web3 disabled, so its wallet callback
+          // gate is exercised rather than silently selecting zero tests.
+          // MCP resources do not touch test_support; introspection stays
+          // scoped to avoid tests that require the complete product.
           name: "gate-contract-tests-features",
           when: gateSmoke,
           run:
             "cargo test --manifest-path Cargo.toml -p openhuman --no-default-features" +
-            " --features mcp,e2e-test-support --lib --" +
-            " mcp::server::resources:: test_support::introspect::",
+            " --features modules,mcp,e2e-test-support --lib --" +
+            " modules::host:: modules::registry:: mcp::server::resources:: test_support::introspect::",
         },
         {
           name: "kernel-floor",
@@ -451,6 +513,41 @@ export function buildPlan({ profile, areas, env = {}, isPullRequest = true }) {
             " && cargo llvm-cov clean --manifest-path crates/openhuman-app/Cargo.toml" +
             " && cargo llvm-cov --no-rustc-wrapper --manifest-path crates/openhuman-app/Cargo.toml" +
             " --lcov --output-path ci-out/lcov/lcov-tauri.info",
+        },
+      ],
+    },
+    {
+      // The sqlite and file storage drivers, which no other lane compiles in:
+      // every `storage_*_e2e` target runs once per driver (memory, sqlite,
+      // file) and the stores that sit on the storage ports run their lib
+      // tests with the drivers on. The MongoDB driver needs a replica set and
+      // has its own workflow (storage-mongodb.yml). Armed by the `storage`
+      // area (.github/ci-paths-filter.yml).
+      name: "storage-drivers",
+      // Compiles the core crate with its own feature set: holds one of the
+      // VM's heavy-compile slots (lanes.mjs). Lower number = served first.
+      heavy: 2,
+      targetDir: targetDir("storage"),
+      env: { ...rustEnv, ...sccache, RUST_MIN_STACK: "16777216" },
+      checks: [
+        {
+          name: "storage-e2e",
+          when: areas.storage,
+          run:
+            `cargo test --no-fail-fast -p openhuman-cli --features ${STORAGE_DRIVERS}` +
+            STORAGE_E2E_TARGETS.map((t) => ` --test ${t}`).join(""),
+        },
+        {
+          name: "storage-lib-tests",
+          when: areas.storage,
+          run:
+            `cargo test -p openhuman --features ${STORAGE_DRIVERS} --lib --` +
+            STORAGE_LIB_FILTERS.map((f) => ` ${f}`).join(""),
+        },
+        {
+          name: "storage-session-store-tests",
+          when: areas.storage,
+          run: `cargo test -p openhuman-rpc --features session-store,${STORAGE_DRIVERS} --lib -- session_store::`,
         },
       ],
     },

@@ -48,3 +48,65 @@ fn help_output_closed_pipe_does_not_panic() {
         output.status
     );
 }
+
+#[test]
+fn help_does_not_require_a_keyring_master_key() {
+    use std::process::Command;
+
+    let workspace = tempfile::tempdir().unwrap();
+    for args in [Vec::<&str>::new(), vec!["--help"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_openhuman-core"))
+            .args(args)
+            .current_dir(workspace.path())
+            .env("OPENHUMAN_WORKSPACE", workspace.path())
+            .env("OPENHUMAN_KEYRING_MASTER_KEY", "invalid")
+            .env_remove("OPENHUMAN_KEYRING_MASTER_KEY_FILE")
+            .env_remove("OPENHUMAN_APP_ENV")
+            .env_remove("OPENHUMAN_KEYRING_BACKEND")
+            .env_remove("OPENHUMAN_MODE")
+            .output()
+            .expect("run help-only CLI invocation");
+        assert!(
+            output.status.success(),
+            "help should not initialize the keyring: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn headless_default_keyring_stores_provider_secrets_encrypted() {
+    use std::process::Command;
+
+    let workspace = tempfile::tempdir().expect("temporary OpenHuman workspace");
+    let secret = "provider-secret-e2e";
+    let params = format!(r#"{{"provider":"openai","token":"{secret}"}}"#);
+    let output = Command::new(env!("CARGO_BIN_EXE_openhuman-core"))
+        .args([
+            "call",
+            "--method",
+            "openhuman.auth_store_provider_credentials",
+            "--params",
+            &params,
+        ])
+        .current_dir(workspace.path())
+        .env("OPENHUMAN_WORKSPACE", workspace.path())
+        .env("OPENHUMAN_KEYRING_MASTER_KEY", "42".repeat(32))
+        .env_remove("OPENHUMAN_KEYRING_MASTER_KEY_FILE")
+        .env_remove("OPENHUMAN_APP_ENV")
+        .env_remove("OPENHUMAN_KEYRING_BACKEND")
+        .env_remove("OPENHUMAN_MODE")
+        .output()
+        .expect("run provider credential store command");
+    assert!(
+        output.status.success(),
+        "credential store failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let encrypted = std::fs::read(workspace.path().join("secrets.enc"))
+        .expect("default backend should create the encrypted keyring file");
+    assert!(!encrypted
+        .windows(secret.len())
+        .any(|window| window == secret.as_bytes()));
+}

@@ -1,30 +1,21 @@
 import debugFactory from 'debug';
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useStore } from 'react-redux';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 
 import { type ChatSendError, chatSendError } from '../../chat/chatSendError';
 import { checkPromptInjection, promptGuardMessage } from '../../chat/promptInjectionGuard';
 import { trackAnalyticsEvent } from '../../components/analytics';
-import { AgentStatus } from '../../components/assistant-ui/elements/agent-status';
 import ChatFilesChip from '../../components/chat/ChatFilesChip';
 import WorkflowProposalCard from '../../components/chat/WorkflowProposalCard';
 import { ConfirmationModal } from '../../components/intelligence/ConfirmationModal';
 import { SidebarContent } from '../../components/layout/shell/SidebarSlot';
 import { ArtifactCardAdapter } from '../../features/conversations/aui/ArtifactCardAdapter';
 import { ContextUsage } from '../../features/conversations/aui/ContextUsage';
-import { PinnedTodoCard } from '../../features/conversations/aui/PinnedTodoCard';
 import { PlanReviewCardCore } from '../../features/conversations/aui/PlanReviewPart';
-import { toAuiTodoItems } from '../../features/conversations/aui/TodoListPart';
 import { useRunMode } from '../../features/conversations/aui/useRunMode';
-import {
-  formatTokens,
-  useLoadThreadGoal,
-  useThreadGoal,
-} from '../../features/conversations/aui/useThreadGoal';
-import {
-  useLoadThreadTodos,
-  useThreadTodos,
-} from '../../features/conversations/aui/useThreadTodos';
+import { useLoadThreadGoal } from '../../features/conversations/aui/useThreadGoal';
+import { useLoadThreadTodos } from '../../features/conversations/aui/useThreadTodos';
 import { AssistantUiChat } from '../../features/conversations/components/AssistantUiChat';
 import { TranscriptOverlays } from '../../features/conversations/components/aui/TranscriptOverlays';
 import {
@@ -69,6 +60,7 @@ import {
   useRustChat,
 } from '../../services/chatService';
 import { callCoreRpc } from '../../services/coreRpcClient';
+import type { RootState } from '../../store';
 import {
   beginInferenceTurn,
   clearRuntimeForThread,
@@ -89,6 +81,7 @@ import {
   clearThreadInferenceActive,
   createNewThread,
   deleteThread,
+  invalidateThreadSelection,
   loadThreadMessages,
   loadThreads,
   markThreadInferenceActive,
@@ -269,6 +262,7 @@ const Conversations = ({
   const composer = composerOverride ?? composerProp;
   const { t } = useT();
   const dispatch = useAppDispatch();
+  const store = useStore<RootState>();
   const navigate = useNavigate();
   const location = useLocation();
   const { threadId: routeThreadId } = useParams<{ threadId?: string }>();
@@ -357,6 +351,9 @@ const Conversations = ({
   const persistedFailedMessageByThreadRef = useRef<Map<string, ThreadMessage>>(new Map());
   const createThreadErrorRef = useRef(createThreadError);
   createThreadErrorRef.current = createThreadError;
+  // The Redux selection intent is updated by every setSelectedThread action,
+  // including worker-thread cards rendered inside the transcript. Async
+  // startup/create continuations compare against it before selecting a thread.
   const displayedSendError = deriveChatErrorBanner(
     sendError,
     createThreadError,
@@ -454,10 +451,6 @@ const Conversations = ({
   const rustChat = useRustChat();
   // Inline thread-title rename in the sidebar thread list — keyed by the
   // thread id being edited (null = none) so any row can rename in place.
-  const [editingThreadId, setEditingThreadId] = useState<string | null>(null);
-  const [editTitleValue, setEditTitleValue] = useState('');
-  const editTitleInputRef = useRef<HTMLInputElement>(null);
-  const ignoreNextTitleBlurRef = useRef(false);
 
   const {
     isAtLimit,
@@ -735,9 +728,20 @@ const Conversations = ({
   // foreground turn's timer alive.
   const turnSignatureByThreadRef = useRef<Map<string, readonly unknown[]>>(new Map());
 
-  const handleCreateNewThread = async () => {
+  const handleCreateNewThread = async (fromInitialLoad = false) => {
+    if (!fromInitialLoad) dispatch(invalidateThreadSelection());
+    const selectionIntentAtCreate = store.getState().thread.selectionIntentVersion ?? 0;
     try {
       const thread = await dispatch(createNewThread()).unwrap();
+      const currentSelectionIntent = store.getState().thread.selectionIntentVersion ?? 0;
+      if (currentSelectionIntent !== selectionIntentAtCreate) {
+        debug(
+          '[chat] create thread selection superseded; dropping result intent_at_create=%d current_intent=%d',
+          selectionIntentAtCreate,
+          currentSelectionIntent
+        );
+        return;
+      }
       dispatch(setSelectedThread(thread.id));
       void dispatch(loadThreadMessages(thread.id));
       if (shouldSyncChatRoute) {
@@ -750,45 +754,6 @@ const Conversations = ({
       debug('[chat] create thread failed: %O', error);
       setSendError(chatSendError('create_thread_failed', t('chat.createThreadFailed')));
     }
-  };
-
-  const handleStartEditTitle = (threadId: string) => {
-    const thr = threads.find(t => t.id === threadId);
-    debug('[chat] thread rename: start thread=%s', threadId);
-    setEditTitleValue(thr?.title ?? '');
-    ignoreNextTitleBlurRef.current = true;
-    setEditingThreadId(threadId);
-    const scheduleSelect = window.requestAnimationFrame ?? window.setTimeout;
-    scheduleSelect(() => {
-      editTitleInputRef.current?.select();
-      ignoreNextTitleBlurRef.current = false;
-    });
-  };
-
-  const handleCommitTitle = (threadId: string) => {
-    const trimmed = editTitleValue.trim();
-    setEditingThreadId(null);
-    // Title length only — never log the title text itself (may carry PII).
-    if (!threadId || !trimmed) {
-      debug('[chat] thread rename: commit skipped thread=%s empty=%s', threadId, !trimmed);
-      return;
-    }
-    const currentTitle = threads.find(t => t.id === threadId)?.title?.trim();
-    if (trimmed === currentTitle) {
-      debug('[chat] thread rename: commit skipped thread=%s (unchanged)', threadId);
-      return;
-    }
-    debug('[chat] thread rename: commit thread=%s len=%d', threadId, trimmed.length);
-    void dispatch(updateThreadTitle({ threadId, title: trimmed }))
-      .unwrap()
-      .then(() => debug('[chat] thread rename: committed thread=%s', threadId))
-      .catch(err =>
-        debug(
-          '[chat] thread rename: failed thread=%s err=%s',
-          threadId,
-          err instanceof Error ? err.message : String(err)
-        )
-      );
   };
 
   // Seed the composer footer with the selected thread's persisted token/cost
@@ -816,10 +781,12 @@ const Conversations = ({
             outputTokens: u.outputTokens,
             cachedTokens: u.cachedInputTokens,
             costUsd: u.costUsd,
+            costSource: u.costSource,
             turns: u.turnCount,
             contextWindow: u.contextWindow,
             lastTurnInputTokens: u.lastTurnInputTokens,
             lastTurnOutputTokens: u.lastTurnOutputTokens,
+            lastTurnContextTokens: u.lastTurnContextTokens,
             subAgents: u.subagents,
           })
         );
@@ -834,11 +801,21 @@ const Conversations = ({
 
   useEffect(() => {
     let cancelled = false;
+    const selectionIntentAtLoad = store.getState().thread.selectionIntentVersion ?? 0;
 
     void dispatch(loadThreads())
       .unwrap()
       .then(data => {
-        if (cancelled) return;
+        const currentSelectionIntent = store.getState().thread.selectionIntentVersion ?? 0;
+        if (cancelled || currentSelectionIntent !== selectionIntentAtLoad) {
+          debug(
+            '[chat] initial thread load selection superseded; dropping result cancelled=%s intent_at_load=%d current_intent=%d',
+            cancelled,
+            selectionIntentAtLoad,
+            currentSelectionIntent
+          );
+          return;
+        }
         // Match the sidebar's default General filter here so initial/resume
         // selection can't auto-pick a thread hidden by the selected tab.
         const visibleThreads = data.threads.filter(t => isThreadVisibleInTab(t, GENERAL_TAB_VALUE));
@@ -891,7 +868,7 @@ const Conversations = ({
           dispatch(setSelectedThread(emptyThread.id));
           void dispatch(loadThreadMessages(emptyThread.id));
         } else {
-          void handleCreateNewThread();
+          void handleCreateNewThread(true);
         }
       })
       .catch(err => {
@@ -1811,12 +1788,12 @@ const Conversations = ({
   // and its goal — driven by the dedicated `thread_todos_changed` /
   // `thread_goal_updated` core events (`aui/useThreadTodos.ts` /
   // `aui/useThreadGoal.ts`), primed on thread open by the RPC pair below.
-  // Rendered above the composer next to the gate cards so a five-step task
-  // shows as a checklist ticking off while the agent works through it.
-  useLoadThreadTodos(selectedThreadId ?? null);
-  useLoadThreadGoal(selectedThreadId ?? null);
-  const liveTodos = useThreadTodos(selectedThreadId ?? null);
-  const threadGoal = useThreadGoal(selectedThreadId ?? null);
+  // Progress cards are presented in the transcript by TurnTaskProvider.
+  const harnessStateRevision = selectedThreadId
+    ? (inferenceTurnLifecycleByThread[selectedThreadId] ?? 'idle')
+    : '';
+  useLoadThreadTodos(selectedThreadId ?? null, harnessStateRevision);
+  useLoadThreadGoal(selectedThreadId ?? null, harnessStateRevision);
   // A plan the orchestrator parked for interactive review (request_plan_review
   // gate). When present, the PlanReviewCard renders above the composer and
   // resolves the parked turn.
@@ -1930,7 +1907,7 @@ const Conversations = ({
     <ThreadList
       threads={sortedThreads}
       selectedThreadId={selectedThreadId ?? null}
-      onCreateThread={() => void handleCreateNewThread()}
+      onCreateThread={() => handleCreateNewThread()}
       onSelectThread={id => {
         dispatch(setSelectedThread(id));
         void dispatch(loadThreadMessages(id));
@@ -1963,22 +1940,8 @@ const Conversations = ({
           onCancel: () => {},
         })
       }
-      editingThreadId={editingThreadId}
-      editTitleValue={editTitleValue}
-      editTitleInputRef={editTitleInputRef}
-      onEditTitleValueChange={setEditTitleValue}
-      onStartEditTitle={handleStartEditTitle}
-      onCommitTitle={handleCommitTitle}
-      onCancelEditTitle={() => {
-        ignoreNextTitleBlurRef.current = true;
-        setEditingThreadId(null);
-      }}
-      onBlurTitle={id => {
-        if (ignoreNextTitleBlurRef.current) {
-          ignoreNextTitleBlurRef.current = false;
-          return;
-        }
-        handleCommitTitle(id);
+      onRenameThread={async (threadId, title) => {
+        await dispatch(updateThreadTitle({ threadId, title })).unwrap();
       }}
     />
   );
@@ -1989,40 +1952,6 @@ const Conversations = ({
   // doubles up.
   const agentGateCards = (
     <>
-      {/* Harness work state: the thread goal (as a compact `AgentStatus`
-          pill) and the agent's live todo list. Both are read-only progress
-          the agent wrote via its tools; they sit above the gate cards so a
-          parked decision is always the closest thing to the composer. */}
-      {selectedThreadId && threadGoal && (
-        <AgentStatus
-          data-testid="goal-banner"
-          data-goal-status={threadGoal.status}
-          state={
-            threadGoal.status === 'complete'
-              ? 'done'
-              : threadGoal.status === 'active'
-                ? 'working'
-                : 'waiting'
-          }
-          label={threadGoal.objective}
-          trailing={
-            <span data-testid="goal-objective" className="text-[10px] tabular-nums">
-              {threadGoal.token_budget !== undefined
-                ? `${formatTokens(threadGoal.tokens_used)} / ${formatTokens(threadGoal.token_budget)}`
-                : formatTokens(threadGoal.tokens_used)}
-            </span>
-          }
-          className="mb-2 self-start"
-        />
-      )}
-      {selectedThreadId && liveTodos && liveTodos.length > 0 && (
-        <PinnedTodoCard
-          threadId={selectedThreadId}
-          items={toAuiTodoItems(liveTodos)}
-          className="mb-2"
-        />
-      )}
-
       {/* Plan-mode review: the orchestrator parked the live turn on a
           thread-scoped plan (request_plan_review gate). Surface it for the
           user to Approve / Reject / send feedback on before anything
@@ -2252,7 +2181,9 @@ const Conversations = ({
     ) : null;
 
   const assistantComposerHeader = (
-    <>
+    <div
+      data-slot="composer-overlays"
+      className="chat-composer-surfaces pointer-events-none absolute inset-x-0 bottom-full z-20 flex max-h-[60dvh] min-w-0 flex-col items-start gap-2 overflow-y-auto pb-2 empty:hidden [&>*]:pointer-events-auto [&>*]:bg-background">
       {/* Turn gates first: a parked plan review and a drafted workflow both
           block progress until the user decides, so they sit above the transient
           attach error and the queued-followup strip. `ComposerHeader` is the
@@ -2287,7 +2218,7 @@ const Conversations = ({
           input; renders only while the thread has no messages, since the
           core fixes the folder at the first send. */}
       <ThreadWorkspaceChip threadId={selectedThreadId ?? null} />
-    </>
+    </div>
   );
 
   // Left-hand controls in the assistant-ui composer toolbar.
@@ -2310,7 +2241,7 @@ const Conversations = ({
   // the host's voice-chat control and the push-to-talk mic.
   const voiceComposer =
     composer === 'mic-cloud' ? (
-      <div className="flex flex-col gap-2" data-testid="voice-composer">
+      <div className="relative flex flex-col gap-2" data-testid="voice-composer">
         {assistantComposerHeader}
         {isSending && rustChat && (
           <div className="flex justify-start px-1">

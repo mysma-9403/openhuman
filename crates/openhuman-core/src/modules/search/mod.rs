@@ -4,7 +4,9 @@
 //! (`crate::search::providers`) into the module's private configuration.
 //! Secrets enter only through that configuration, delivered at TinyBus
 //! initialization and reinitialization; they never ride an ordinary method
-//! call or a settings RPC response. `proxy` holds the call path.
+//! call or a settings RPC response. A key an embedder pinned on one agent's
+//! config ([`crate::config::SearchHostCredential`]) enters the same way, for
+//! that agent's calls. `proxy` holds the call path.
 
 use std::collections::BTreeMap;
 
@@ -19,6 +21,16 @@ use crate::search::providers::{self, ResolvedProvider, ROLES};
 mod proxy;
 
 pub use proxy::{execute_tool, list_tools, refresh_loaded};
+
+/// [`module_config`] as the JSON the module is loaded with, recorded as the
+/// configuration the module holds so the first call knows whether to
+/// reconfigure it.
+pub(crate) fn load_configuration(config: &Config) -> serde_json::Value {
+    let configuration =
+        serde_json::to_value(module_config(config)).expect("TinySearch config serializes");
+    proxy::record_load_configuration(&configuration);
+    configuration
+}
 
 pub const MODULE_ID: &str = "tinysearch";
 
@@ -50,9 +62,16 @@ fn direct_settings(config: &Config, provider: &str) -> ProviderConfig {
             settings.default_language = Some(config.searxng.default_language.clone());
         }
         other => {
-            settings.credential = search
-                .credentials(other)
-                .and_then(|c| c.key())
+            // A key pinned on this agent's config wins over the stored one.
+            settings.credential = search.direct_key(other).map(str::to_owned);
+            settings.base_url = search
+                .host_credential(other)
+                .and_then(|pinned| pinned.base_url())
+                .or_else(|| {
+                    search
+                        .credentials(other)
+                        .and_then(|c| c.base_url.as_deref())
+                })
                 .map(str::to_owned);
         }
     }
@@ -76,18 +95,31 @@ fn provider_config(config: &Config, provider: &ResolvedProvider) -> ProviderConf
 
 /// The complete private configuration for TinySearch.
 pub fn module_config(config: &Config) -> ModuleSearchConfig {
-    let credential =
-        crate::security::credentials::session_support::resolve_backend_credential(config).ok();
+    let private = config
+        .profile_providers
+        .as_ref()
+        .map(|binding| binding.effective_search(config));
+    let config = private.as_ref().unwrap_or(config);
+    let direct_profile = config.profile_providers.is_some();
+    let credential = if direct_profile {
+        None
+    } else {
+        crate::security::credentials::session_support::resolve_backend_credential(config).ok()
+    };
     let resolved = providers::resolve_with(config, credential.is_some());
-    let backend = BackendConfig {
-        base_url: crate::backend::base_url(&config.api_url).ok(),
-        auth_mode: if credential.as_ref().is_some_and(|c| c.is_api_key()) {
-            BackendAuthMode::ApiKey
-        } else {
-            BackendAuthMode::Session
-        },
-        credential: credential.map(|c| c.into_secret()),
-        sdk_name: crate::backend::product_identity(),
+    let backend = if direct_profile {
+        BackendConfig::default()
+    } else {
+        BackendConfig {
+            base_url: crate::backend::base_url(&config.api_url).ok(),
+            auth_mode: if credential.as_ref().is_some_and(|c| c.is_api_key()) {
+                BackendAuthMode::ApiKey
+            } else {
+                BackendAuthMode::Session
+            },
+            credential: credential.map(|c| c.into_secret()),
+            sdk_name: crate::backend::product_identity(),
+        }
     };
 
     let mut module_providers: BTreeMap<String, ProviderConfig> = resolved
@@ -97,7 +129,8 @@ pub fn module_config(config: &Config) -> ModuleSearchConfig {
         .collect();
     // Deep research runs on the direct Gemini API and needs the user's key,
     // even when grounded Gemini answers go through the managed route.
-    if module_providers.contains_key("gemini")
+    if !direct_profile
+        && module_providers.contains_key("gemini")
         && !module_providers.contains_key("gemini_deep_research")
     {
         let mut deep = direct_settings(config, "gemini_deep_research");
@@ -147,7 +180,11 @@ pub fn configured_tool_specs(config: &Config) -> Vec<tinysearch_bus::ToolSpec> {
     }
     let available =
         tinysearch_bus::configured_provider_tools(&module, &tinysearch_bus::provider_tool_specs());
-    tinysearch_bus::select_tools(&available, &module.presentation).tools
+    let mut specs = tinysearch_bus::select_tools(&available, &module.presentation).tools;
+    if let Some(binding) = &config.profile_providers {
+        binding.present(&mut specs);
+    }
+    specs
 }
 
 #[cfg(test)]

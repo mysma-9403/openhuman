@@ -1,8 +1,8 @@
 //! Text embedding models, re-exported for hosts that index or search.
 //!
 //! The same models the core's memory layer embeds with, exposed directly so a
-//! host that keeps its own vector index (a code-search service, a reviewer's
-//! retrieval step) depends on one OpenHuman pin rather than a second copy of
+//! host that keeps its own vector index (a document-search service, a retrieval
+//! step) depends on one OpenHuman pin rather than a second copy of
 //! the inference crates.
 //!
 //! These are re-exports, not wrappers, on purpose: the embedding signature

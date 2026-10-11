@@ -91,9 +91,15 @@ pub(crate) struct TranscriptSnapshot {
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) cached_input_tokens: u64,
-    /// Provider-reported cost where available, otherwise the host's per-call
-    /// estimate. This covers only model calls the provider answered.
-    pub(crate) charged_amount_usd: f64,
+    /// Input and output tokens of the newest answered call alone. The fields
+    /// above sum every call, so they measure spend; these measure how full the
+    /// context window was, which is what the context gauge shows.
+    pub(crate) last_call_input_tokens: u64,
+    pub(crate) last_call_output_tokens: u64,
+    /// Cost of the model calls the provider answered: each call's reported
+    /// charge, else its catalog estimate, else unknown (see
+    /// [`crate::agent::cost::call_cost`]).
+    pub(crate) cost: crate::agent::cost::CostTally,
     /// The last accepted model route. A failed follow-up has no response of
     /// its own, so this remains the route that incurred the snapshot usage.
     pub(crate) resolved_route: Option<ResolvedModelRoute>,
@@ -281,6 +287,12 @@ impl Middleware<(), crate::agent::tinyagents::host::OpenHumanRunContext>
             guard
                 .messages
                 .push(Message::Assistant(response.message.clone()));
+            // A cache replay spent nothing, but its request was still this
+            // size, so the context figure follows every answered call.
+            if let Some(usage) = response.usage.as_ref() {
+                guard.last_call_input_tokens = usage.input_tokens;
+                guard.last_call_output_tokens = usage.output_tokens;
+            }
             // A cache replay consumed no provider tokens.
             if let Some(usage) = response
                 .usage
@@ -314,8 +326,13 @@ impl Middleware<(), crate::agent::tinyagents::host::OpenHumanRunContext>
                     })
                     .or(guard.pricing_model.as_deref())
                     .unwrap_or_default();
-                guard.charged_amount_usd +=
-                    crate::agent::cost::call_cost_usd(cost_model, &host_usage);
+                let call_cost = crate::agent::cost::call_cost(cost_model, &host_usage);
+                tracing::debug!(
+                    model = cost_model,
+                    ?call_cost,
+                    "[cost] per-call cost (charged, catalog estimate, or unknown)"
+                );
+                guard.cost.add(call_cost);
             }
             if route.is_some() {
                 guard.resolved_route = route;

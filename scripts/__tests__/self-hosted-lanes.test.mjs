@@ -155,7 +155,7 @@ test("a core-only change still installs the node deps rust-core-coverage's mock 
   assert.deepEqual(orderProblems(sub), []);
 });
 
-test("doctests and module-gated tests are outside the PR lane, tui tests run on PRs", () => {
+test("core doctests remain outside PR coverage; embed doctests and tui tests run on PRs", () => {
   for (const plan of plans()) {
     const cov = plan.lanes
       .find((l) => l.name === "rust-cov")
@@ -164,7 +164,12 @@ test("doctests and module-gated tests are outside the PR lane, tui tests run on 
     assert.equal(cov.env.OH_COV_TUI, "1");
     const runs = allRuns(plan).join("\n");
     assert.doesNotMatch(runs, /cargo test -p openhuman --doc/);
-    assert.doesNotMatch(runs, /cargo test -p openhuman-(embed|tinyhumans)\b/);
+    assert.doesNotMatch(runs, /cargo test -p openhuman-(embed|tinyhumans)\b(?! --doc)/);
+    assert.match(runs, /cargo test -p openhuman-embed --doc/);
+    const doc = plan.lanes.find(l => l.name === "rust-lint").checks.find(c => c.name === "embed-rustdoc");
+    assert.equal(doc.env.RUSTDOCFLAGS, "-D warnings");
+    assert.match(doc.run, /cargo doc -p openhuman-embed --no-deps/);
+    assert.match(runs, /node scripts\/run-embed-examples.mjs/);
     assert.doesNotMatch(runs, /-p openhuman --no-default-features$/m);
     assert.doesNotMatch(runs, /tool_output_tabulates_a_large_graph/);
   }
@@ -232,6 +237,85 @@ test("untouched areas leave only the always-on gates", () => {
   assert.deepEqual(
     hostedMatrix(plan).map((g) => g.group),
     ["checks"],
+  );
+});
+
+test("the storage area arms only the storage-drivers lane, with the sqlite and file drivers on", () => {
+  for (const profile of ["hosted", "ex63"]) {
+    const plan = buildPlan({
+      profile,
+      areas: { ...NONE, storage: true },
+      env: profile === "ex63" ? EX63_ENV : {},
+    });
+    const on = plan.lanes.flatMap((l) =>
+      l.checks.filter((c) => c.when).map((c) => `${l.name}:${c.name}`),
+    );
+    // Only the always-on gates plus this lane: the storage area arms no
+    // frontend, Rust or other area lane.
+    assert.deepEqual(
+      on.filter((id) => !id.startsWith("static:")),
+      [
+        "storage-drivers:storage-e2e",
+        "storage-drivers:storage-lib-tests",
+        "storage-drivers:storage-session-store-tests",
+      ],
+      profile,
+    );
+    assert.deepEqual(
+      on.filter((id) => id.startsWith("static:")),
+      [
+        "static:orch-ip-gate",
+        "static:feature-forwarding",
+        "static:crate-chain",
+        "static:module-pins",
+        "static:submodule-monotonic",
+      ],
+      profile,
+    );
+    const lane = plan.lanes.find((l) => l.name === "storage-drivers");
+    assert.equal(lane.active, true, profile);
+    for (const check of lane.checks) {
+      assert.match(
+        check.run,
+        /--features (?:session-store,)?storage-sqlite,storage-file(?:\s|$)/,
+      );
+    }
+    // Every root storage target runs in the lane, so a new one cannot be
+    // forgotten: the targets on disk are exactly the targets in the command.
+    const e2e = lane.checks.find((c) => c.name === "storage-e2e").run;
+    const onDisk = fs
+      .readdirSync(path.join(repoRoot, "tests"))
+      .filter((f) => /^(storage_.*_e2e|cli_storage_url_e2e)\.rs$/.test(f))
+      .map((f) => f.replace(/\.rs$/, ""))
+      .sort();
+    const inLane = [...e2e.matchAll(/--test (\S+)/g)].map((m) => m[1]).sort();
+    assert.deepEqual(inLane, onDisk, profile);
+    // MongoDB runs the shared storage targets that support its feature set.
+    // SQLite-only targets belong to the driver lane above, not MongoDB.
+    const mongo = fs.readFileSync(
+      path.join(repoRoot, ".github/workflows/storage-mongodb.yml"),
+      "utf8",
+    );
+    const inMongo = [...mongo.matchAll(/--test (\S+)/g)]
+      .map((m) => m[1])
+      .sort();
+    assert.deepEqual(
+      inMongo,
+      onDisk.filter((target) => target !== "storage_default_import_e2e"),
+      "storage-mongodb.yml",
+    );
+    if (profile === "hosted") {
+      assert.deepEqual(
+        hostedMatrix(plan).map((g) => g.group),
+        ["checks", "storage"],
+      );
+    }
+  }
+  // Without the area the lane stays off.
+  const off = buildPlan({ profile: "hosted", areas: NONE });
+  assert.equal(
+    off.lanes.find((l) => l.name === "storage-drivers").active,
+    false,
   );
 });
 
@@ -565,5 +649,29 @@ test("the rust-core path filter arms the lane for every crate the tui depends on
   const block = filter.split(/^rust-tauri:/m)[0].split(/^rust-core:/m)[1];
   for (const crate of ["core", "embed", "tinyhumans", "rpc", "cli", "tui"]) {
     assert.ok(block.includes(`'crates/openhuman-${crate}/**'`), crate);
+  }
+});
+
+test("module boundaries run for Rust and scripts changes in both profiles", () => {
+  for (const profile of ["hosted", "ex63"]) {
+    for (const area of ["rustCore", "rustTauri", "scripts"]) {
+      const plan = buildPlan({
+        profile,
+        areas: { ...NONE, [area]: true },
+        env: profile === "ex63" ? EX63_ENV : {},
+      });
+      const check = plan.lanes.flatMap(lane => lane.checks).find(check => check.name === "module-boundaries");
+      assert.equal(check.when, true, `${profile}:${area}`);
+      assert.equal(check.run, "bash scripts/ci-cancel-aware.sh node scripts/ci/check-module-boundaries.mjs");
+    }
+  }
+});
+
+
+test("module boundary policy and checker changes arm their own scripts lane", () => {
+  const filters = fs.readFileSync(path.join(repoRoot, ".github/ci-paths-filter.yml"), "utf8");
+  const scripts = filters.split(/^scripts:\s*$/m)[1].split(/^\S[^\n]*:/m)[0];
+  for (const file of ["scripts/ci/check-module-boundaries.mjs", "scripts/ci/module-boundaries.json"]) {
+    assert.ok(scripts.includes(`'${file}'`), `${file} must arm the scripts area`);
   }
 });

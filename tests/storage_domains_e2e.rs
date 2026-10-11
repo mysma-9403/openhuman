@@ -3,9 +3,7 @@
 //!
 //! Its own test binary because it installs a backend into the process-wide
 //! storage slot, which would reroute every other suite's stores in a shared
-//! process. One test, so nothing in this binary races the slot either.
-
-use std::sync::Arc;
+//! process. Each driver runs as its own test case (see `support/storage_drivers.rs`), and the cases take turns on the slot.
 
 use chrono::Utc;
 use openhuman_core::config::Config;
@@ -15,6 +13,12 @@ use openhuman_core::integrations::composio::providers::NormalizedTask;
 use openhuman_core::integrations::task_sources::store as task_sources;
 use openhuman_core::integrations::task_sources::types::{FilterSpec, ProviderSlug, SourceTarget};
 use openhuman_core::security::devices::store as devices;
+
+#[macro_use]
+#[path = "support/storage_drivers.rs"]
+mod storage_drivers;
+
+use storage_drivers::Case;
 
 fn notification(id: &str) -> IntegrationNotification {
     IntegrationNotification {
@@ -33,14 +37,13 @@ fn notification(id: &str) -> IntegrationNotification {
     }
 }
 
-#[test]
-fn a_configured_backend_holds_devices_notifications_and_task_sources() {
+fn a_configured_backend_holds_devices_notifications_and_task_sources(case: Case) {
     let workspace = tempfile::tempdir().unwrap();
     let config = Config {
         workspace_dir: workspace.path().to_path_buf(),
         ..Config::default()
     };
-    openhuman_core::storage::install(Arc::new(openhuman_core::storage::MemoryStorage::new()));
+    case.install();
 
     devices::insert_device(&config, "ch-1", "iPhone", "pk", "hash").unwrap();
     assert_eq!(devices::list_devices(&config).unwrap().len(), 1);
@@ -95,3 +98,5 @@ fn a_configured_backend_holds_devices_notifications_and_task_sources() {
     assert!(task_sources::list_sources(&config).unwrap().is_empty());
     assert!(workspace.path().join("devices/devices.db").exists());
 }
+
+driver_cases!(sync a_configured_backend_holds_devices_notifications_and_task_sources);

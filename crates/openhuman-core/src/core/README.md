@@ -155,7 +155,7 @@ and the host is the one that knows `E`. [`events.rs`](./events.rs) is the event 
 `DomainEvent`, a `#[non_exhaustive]` enum whose `domain()` value is appended
 to `EVENTS_ROOT` (`/ai/tinyhumans/openhuman/events`) as the routing key.
 The catalog is published under `EVENTS_INTERFACE`
-(`ai.tinyhumans.openhuman.Events`) at `EVENTS_VERSION`, currently `1.8.0`.
+(`ai.tinyhumans.openhuman.Events`) at `EVENTS_VERSION`, currently `1.10.0`.
 
 `bus::init()` starts the in-process broker and announces a peer manifest
 (advisory; failure only logs). Every accessor is safe before `init`:
@@ -241,8 +241,8 @@ the JSON-RPC server.
 
 `run` and `serve` need a server, which the core does not contain.
 [`server_launcher.rs`](./server_launcher.rs) holds a `ServerLauncher` port; the host installs one
-(`openhuman_rpc::server::install_cli_server()` in the `openhuman-core` binary
-and the desktop app) before calling `run_from_cli_args`. Without it those
+(`openhuman_rpc::host::cli` for the `openhuman-core` binary, the desktop
+builder for the app) before calling `run_from_cli_args`. Without it those
 subcommands fail with an explanation.
 
 ### Logging, redaction and crash reporting
@@ -411,10 +411,6 @@ surface.
   (`approval_gate_boot_decision`). `HostKind::detect_standalone` picks
   `Docker` from `/.dockerenv` or `OPENHUMAN_DOCKER=1`; the shell must pass
   `TauriShell` explicitly.
-- `openhuman.harness_init_status` is in `KNOWN_PROBE_METHODS` because older
-  cores, narrowed `DomainSet`s and slim builds legitimately lack it, not
-  because it is retired. It is a live method, and a test pins that it is
-  registered in a full build.
 - `openhuman.auth_clear_session` is a legacy alias whose params get
   `kind: "session"` filled in during dispatch, preserving its session-only
   contract while the canonical method clears every kind by default.

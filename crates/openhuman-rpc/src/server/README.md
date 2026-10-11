@@ -20,9 +20,9 @@ connected on the builder; `host::cli` hands that builder to the core CLI and
 
 ```text
  openhuman-core run|serve                 desktop shell (core_process.rs)
-   RuntimeBuilder::run_from_args(args)      run_server_embedded_with_ready(
-     -> core::run_core_from_args_with         host, port, socketio, cancel,
-        (args, HostBoot(builder))             ready_tx, Some(bearer))
+   RuntimeBuilder::run_from_args(args)      host::desktop(options, cancel, ready_tx)
+     -> core::run_core_from_args_with         desktop_builder(options)
+        (args, HostBoot(builder))             -> serve_desktop(builder, ..)
    -> core::server_launcher                     |
    launch(ServeRequest)                         |
      --mode saas? run_server_saas (own boot)    |
@@ -31,12 +31,12 @@ connected on the builder; `host::cli` hands that builder to the core CLI and
           flagged_builder(base, flags)          |
              \                                  /
               v                                v
-          run_server_with_services(host, port, ServiceSet, ...)   (desktop path)
+          (desktop path: desktop_builder in host.rs)
             preset: RuntimeBuilder::desktop() (HostKind::TauriShell)
                     both presets: DomainSet::full, discovered config,
                     OPENHUMAN_E2E set -> ToolGroups::advertised()
-            server_builder: services, TokenSource::Fixed(bearer) if handed
-                    in (else EnvOrFile), listen host/port if given
+            services, TokenSource::Fixed(bearer) if handed in (else
+                    EnvOrFile), listen host/port if given
           build_and_serve(builder, ready_tx, shutdown_token)
             session_store::install_for_host()   (before boot: recovery; skipped when
                                                  the builder carries its own store)
@@ -54,7 +54,7 @@ host's builder, the preset. `--headless-api` replaces the services with
 `ServiceSet::headless_api()` (request/response only, no detached background
 jobs); `--jsonrpc-only` only clears Socket.IO on the builder's services.
 `--mode saas` ignores the builder and boots the operator's config.
-`run_server` and `run_server_embedded` (the older shims) use
+`run_server` (a bare shim, not connected to the backend) uses
 `ServiceSet::desktop()` with Socket.IO set by the caller. An embedder that
 built its own `CoreRuntime` can call `serve` directly.
 
@@ -113,6 +113,44 @@ outermost to innermost:
 The bearer is the per-launch RPC token the core owns
 (`openhuman::core::auth`); [`auth.rs`](auth.rs) is only the route policy over it.
 
+### SaaS mode
+
+`run_server_saas` (`--mode saas --saas-config <file>`) boots the operator's
+config instead of a builder. Before boot it installs the session store for
+the operator's storage URL (`OPENHUMAN_STORAGE_URL`, else `storage_url`)
+through `session_store::install_for_saas`: the on-disk store with no URL,
+else `DriverSessionStores` over that backend with `recover_on_open(false)`,
+because a profile's turns are recovered when its lease is taken over, not
+when its stores open. On shutdown it releases the leases of idle profiles.
+
+In place of the single-context layer, [`saas_gateway.rs`](saas_gateway.rs)
+picks each request's context (the decision is
+`openhuman::profiles::gateway`):
+
+- routes a SaaS core never serves (`/v1`, `/events/*`, `/ws/*`,
+  `/socket.io`, `/dev/connect`, `/oauth/*`) answer `404`, and so does
+  `/events` without a user;
+- no `X-OpenHuman-User`: the operator plane;
+- with one: the bearer first (`401`), then a duplicate or unreadable header
+  (`400`), the signature (`401`), and the user's profile, which is opened
+  and leased: `403` when it is not provisioned, `503` when every slot is
+  busy or storage fails.
+
+A profile another core hosts answers **`409 Conflict`**:
+
+```text
+X-OpenHuman-Profile-Owner: <owner node id>
+
+{"error": "profile_held", "owner": "<node id>",
+ "endpoint": "<owner's advertise_url, or null>", "retry_after_ms": <ms>}
+```
+
+`endpoint` is where the owner can be reached (null for a node that
+advertises none) and `retry_after_ms` how long its lease lasts unless it is
+renewed. A gateway routes the user to the owner, or retries after that
+long; a dead owner's lease lapses within `lease_ttl_secs`. The refusal comes
+after the bearer check, so an unauthenticated caller learns nothing.
+
 ### A failed call
 
 `rpc_handler` decodes the controller's `StructuredRpcError` (if any), then
@@ -163,8 +201,8 @@ directly.
 | --- | --- |
 | [`mod.rs`](mod.rs) | Module wiring and the public re-exports. |
 | [`serve.rs`](serve.rs) | `serve` and `EmbeddedReadySignal`. |
-| [`shims.rs`](shims.rs) | `run_server`, `run_server_headless`, `run_server_embedded`, `run_server_embedded_with_ready`, plus host and port defaults. |
-| [`cli.rs`](cli.rs) | `install_cli_server` and the launcher it installs. |
+| [`shims.rs`](shims.rs) | `run_server`, `run_server_headless`, `run_server_saas`, `build_and_serve` (shared with `host`), plus host and port defaults. |
+| [`cli.rs`](cli.rs) | `launch`, the server launcher `host::cli` and `host::desktop` install, and `flagged_builder`. |
 | [`auth.rs`](auth.rs) | `rpc_auth_middleware`: public paths, query-token paths, and the `/v1` external-key check. |
 | [`classify.rs`](classify.rs) | `classify_failure` and `FailureDisposition`. Pure. |
 | [`socketio.rs`](socketio.rs) | Socket.IO handshake auth, client event handlers, the event bridge, the companion seam, and the event payload types. |
@@ -181,11 +219,9 @@ directly.
 
 ## Key entry points
 
-- `install_cli_server()` ([`cli.rs`](cli.rs)): call once before `run_core_from_args`.
-  It also registers the `http_host` controllers.
 - `serve(&CoreRuntime, Option<oneshot::Sender<EmbeddedReadySignal>>,
   Option<CancellationToken>)` (`serve.rs`).
-- `run_server_embedded_with_ready(..., rpc_token)` ([`shims.rs`](shims.rs)): pass the
+- `host::desktop(DesktopOptions { rpc_token, .. }, ..)` (`host.rs`): pass the
   bearer the shell already holds so the server never reads it from the
   environment.
 - `build_core_http_router(socketio_enabled)` and `rpc_handler`

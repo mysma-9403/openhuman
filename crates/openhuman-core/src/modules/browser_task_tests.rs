@@ -27,6 +27,8 @@ fn start_request_confines_the_task_to_the_browser_under_host_policy() {
     assert_eq!(request.constraints.payment, PaymentMode::StopAtPayment);
     assert!(!request.constraints.allow_destructive);
     assert!(request.constraints.headed);
+    assert!(request.constraints.browser_executable.is_none());
+    assert!(request.constraints.browser_profile.is_none());
     assert_eq!(request.budget.max_actions, Some(12));
     assert_eq!(request.budget.max_elapsed_ms, Some(90_000));
     assert_eq!(request.budget.max_rescues, Some(2));

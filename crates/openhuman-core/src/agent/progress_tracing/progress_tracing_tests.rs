@@ -84,7 +84,13 @@ fn spawn(task: &str, display: &str) -> AgentProgress {
 fn one_turn_spans() -> Vec<TraceSpan> {
     let mut c = collect(&[
         (AgentProgress::TurnStarted, 0),
-        (AgentProgress::TurnCompleted { iterations: 1 }, 10),
+        (
+            AgentProgress::TurnCompleted {
+                iterations: 1,
+                stop: None,
+            },
+            10,
+        ),
     ]);
     c.finish(10);
     c.into_spans()
@@ -105,7 +111,7 @@ fn model_call(model: &str, reasoning: u64, cache_write: u64) -> AgentProgress {
         cached_input_tokens: 300,
         cache_creation_tokens: cache_write,
         reasoning_tokens: reasoning,
-        cost_usd: 0.0042,
+        cost_usd: Some(0.0042),
     }
 }
 
@@ -139,15 +145,21 @@ fn model_call_with_content(subagent_task_id: Option<&str>) -> AgentProgress {
         cached_input_tokens: 0,
         cache_creation_tokens: 0,
         reasoning_tokens: 0,
-        cost_usd: 0.001,
+        cost_usd: Some(0.001),
     }
 }
 
+#[path = "progress_tracing_accuracy_tests.rs"]
+mod accuracy_tests;
 #[path = "progress_tracing_attribution_tests.rs"]
 mod attribution_tests;
 #[path = "progress_tracing_content_gate_tests.rs"]
 mod content_gate_tests;
 #[path = "progress_tracing_span_tree_tests.rs"]
 mod span_tree_tests;
+#[path = "progress_tracing_stop_tests.rs"]
+mod stop_tests;
+#[path = "progress_tracing_tool_span_tests.rs"]
+mod tool_span_tests;
 #[path = "progress_tracing_ttft_tests.rs"]
 mod ttft_tests;

@@ -5,6 +5,7 @@
 //! reachable without touching the network, which is what keeps them in the unit
 //! suite instead of behind an ignore.
 
+use super::*;
 use crate::config::Config;
 use crate::modules::ops::{self, install_dir, list};
 use crate::modules::registry;
@@ -276,6 +277,86 @@ async fn a_bounded_wait_with_nothing_cached_and_downloads_off_fails_rather_than_
     }
 }
 
+#[cfg(feature = "crash-reporting")]
+#[test]
+fn terminal_resolution_cached_failure_is_reported_when_a_client_becomes_available() {
+    const MODULE: &str = "tinycomputer";
+    let table = tinybus::module::resolution::global();
+    table.forget(MODULE);
+
+    // Model resolution finishing before core/Sentry startup, then publish its
+    // terminal outcome into the same process-wide table read by ensure_loaded.
+    let hub = std::sync::Arc::new(sentry::Hub::new_from_top(sentry::Hub::current()));
+    hub.bind_client(None);
+    sentry::Hub::run(hub, || {
+        ops::report_resolution_failure(MODULE, "private token /home/private-user/module.so");
+    });
+    let sender = table.mark_in_flight(MODULE);
+    table.complete(
+        MODULE,
+        tinybus::module::resolution::Resolution::Failed(
+            "private token /home/private-user/module.so".to_string(),
+        ),
+        sender,
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let events = sentry::test::with_captured_events(|| {
+        runtime.block_on(async {
+            let config = Config::default();
+            let (first, second) = tokio::join!(
+                ops::ensure_loaded_within(&config, MODULE, None),
+                ops::ensure_loaded_within(&config, MODULE, None),
+            );
+            for result in [first, second] {
+                assert!(matches!(result, Err(ops::LoadError::Failed(_))));
+            }
+            let repeated = ops::ensure_loaded_within(&config, MODULE, None)
+                .await
+                .expect_err("the same cached failure remains terminal");
+            assert!(matches!(repeated, ops::LoadError::Failed(_)));
+        });
+    });
+    table.forget(MODULE);
+    assert_eq!(events.len(), 1, "{events:?}");
+    let captured = format!("{:?}", events[0]);
+    assert!(!captured.contains("private token"));
+    assert!(!captured.contains("/home/private-user"));
+    assert_eq!(
+        events[0].tags.get("reason_code").map(String::as_str),
+        Some("resolution_failed")
+    );
+}
+
+#[cfg(feature = "crash-reporting")]
+#[test]
+fn terminal_resolution_wait_timeout_is_not_reported_as_terminal() {
+    const MODULE: &str = "tinyvoice";
+    let table = tinybus::module::resolution::global();
+    table.forget(MODULE);
+    let _sender = table.mark_in_flight(MODULE);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let events = sentry::test::with_captured_events(|| {
+        runtime.block_on(async {
+            let result = ops::ensure_loaded_within(
+                &Config::default(),
+                MODULE,
+                Some(std::time::Duration::ZERO),
+            )
+            .await;
+            assert!(matches!(result, Err(ops::LoadError::StillLoading)));
+        });
+    });
+    table.forget(MODULE);
+    assert!(events.is_empty(), "{events:?}");
+}
+
 #[test]
 fn every_shipped_registry_entry_names_a_cache_directory() {
     // Every shipped registry entry names a directory on every host it claims.
@@ -310,6 +391,84 @@ fn load_errors_render_for_callers_that_cannot_wait_again() {
     );
     let message = ops::LoadError::StillLoading.into_message();
     assert!(message.contains("still loading"), "{message}");
+}
+
+#[tokio::test]
+async fn a_loader_error_carries_the_terminal_marker_exactly_once() {
+    // `blocking` marks a loader error terminal, but tinybus' release-cache path
+    // and `load_local` already say so; appending again doubled the sentence.
+    // The failure policy keys on both phrases, so each must stay, once.
+    let marker = crate::tools::status::MODULE_FAULT_MARKER;
+    for loader_error in [
+        "module 'tinydocs' could not be loaded: digest mismatch. This is terminal for the \
+         running process; restart the app to try again",
+        "module 'tinydocs' could not be loaded from the installer bundle: refused. Restart the \
+         app after repairing the installation",
+    ] {
+        let owned = loader_error.to_string();
+        let error = ops::blocking(move || Err(owned)).await.unwrap_err();
+        assert_eq!(error.matches(marker).count(), 1, "{error}");
+        assert_eq!(
+            error.matches("restart the app to try again").count(),
+            1,
+            "{error}"
+        );
+    }
+}
+
+/// The Sentry payload of TAURI-RUST-117K: a load refused at admission, with the
+/// terminal marker the loader adds.
+const REFUSED_LOAD: &str = "module 'tinyconnectors' could not be loaded from the installer \
+     bundle: module `windows-2022-x86_64` refused: module directory is writable by another \
+     user. Restart the app after repairing the installation. This is terminal for the running \
+     process; restart the app to try again";
+
+#[cfg(feature = "crash-reporting")]
+#[test]
+fn a_failed_resolution_is_reported_once_with_the_module_id() {
+    // The resolution runs once per process and caches its failure, so this
+    // report is the one Sentry event per broken install. Every later caller's
+    // re-report is demoted as `ModuleUnavailable`; this one must not be.
+    let events = sentry::test::with_captured_events(|| {
+        ops::report_resolution_failure(
+            "tinyconnectors",
+            "private-test-token /home/private-user/document.txt",
+        );
+    });
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        events[0].message.as_deref(),
+        Some("loadable module operation failed")
+    );
+    let captured = format!("{:?}", events[0]);
+    assert!(!captured.contains("private-test-token"));
+    assert!(!captured.contains("/home/private-user"));
+    let tags = &events[0].tags;
+    assert_eq!(
+        tags.get("reason_code").map(String::as_str),
+        Some("resolution_failed")
+    );
+    assert_eq!(
+        tags.get("version").map(String::as_str),
+        Some(registry::find("tinyconnectors").unwrap().version)
+    );
+    assert_eq!(tags.get("domain").map(String::as_str), Some("modules"));
+    assert_eq!(tags.get("operation").map(String::as_str), Some("resolve"));
+    assert_eq!(
+        tags.get("module").map(String::as_str),
+        Some("tinyconnectors")
+    );
+
+    // The same reason re-reported by a caller is demoted.
+    let repeats = sentry::test::with_captured_events(|| {
+        crate::core::observability::report_error_or_expected(
+            REFUSED_LOAD,
+            "composio",
+            "list_connections",
+            &[],
+        );
+    });
+    assert!(repeats.is_empty(), "{repeats:?}");
 }
 
 #[test]
@@ -365,5 +524,50 @@ fn bundled_dir_skips_a_missing_candidate_for_a_valid_later_one() {
             Some(exe_dir.clone())
         ),
         Some(exe_dir.join("bundled-modules"))
+    );
+}
+
+/// A module-bus startup failure is cached like any loader error, so it must
+/// carry the terminal marker the observability classifier demotes on.
+#[test]
+fn a_marked_bus_startup_failure_is_classified_as_module_unavailable() {
+    let marked = ops::mark_terminal("the module bus could not start: no runtime".to_string());
+    assert!(marked.ends_with("restart the app to try again"), "{marked}");
+    assert!(crate::core::observability::is_module_unavailable_message(
+        &marked
+    ));
+    // Idempotent: an already-marked error is not annotated twice.
+    assert_eq!(ops::mark_terminal(marked.clone()), marked);
+}
+
+#[tokio::test]
+async fn disabled_modules_are_reported_then_demoted_at_product_boundaries() {
+    let mut config = Config::default();
+    config.modules.enabled = false;
+    let reason = ops::ensure_loaded(&config, "tinyjuice").await.unwrap_err();
+    assert!(crate::core::observability::is_module_unavailable_message(
+        &reason
+    ));
+}
+
+#[test]
+fn native_juice_fixture_is_resolved_without_a_unit_test_adapter() {
+    let fixture = std::path::PathBuf::from("fixture/libtinyjuice_module.so");
+    let _env = crate::config::test_env::EnvVarGuard::locked_set("TINYJUICE_TEST_MODULE", &fixture);
+    assert_eq!(
+        local_override(&Config::default(), "tinyjuice"),
+        Some(fixture)
+    );
+    let mut configured = Config::default();
+    configured
+        .modules
+        .overrides
+        .push(crate::config::schema::ModuleOverride {
+            id: "tinyjuice".into(),
+            path: "explicit/libtinyjuice_module.so".into(),
+        });
+    assert_eq!(
+        local_override(&configured, "tinyjuice"),
+        Some("explicit/libtinyjuice_module.so".into())
     );
 }

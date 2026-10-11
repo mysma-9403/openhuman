@@ -20,7 +20,7 @@ fn classified_halt_returns_partial_work_without_provider_usage() {
         input_tokens: 100,
         output_tokens: 20,
         cached_input_tokens: 0,
-        charged_amount_usd: 0.0,
+        cost: crate::agent::cost::CostTally::default(),
         early_exit_tool: None,
         hit_cap: false,
         wrap_up_injected: false,
@@ -35,7 +35,16 @@ fn classified_halt_returns_partial_work_without_provider_usage() {
     let close = classified_halt_close(&outcome).expect("classified halt");
     assert_eq!(close.usage.model_calls, 0);
     assert!(close.output.contains("permission"), "{}", close.output);
-    assert!(close.output.contains("three items"), "{}", close.output);
+    assert!(
+        close.output.contains("`list` succeeded"),
+        "{}",
+        close.output
+    );
+    assert!(
+        !close.output.contains("three items"),
+        "no raw tool output: {}",
+        close.output
+    );
     assert!(close.output.contains("403 Forbidden"), "{}", close.output);
 }
 
@@ -72,10 +81,11 @@ async fn run(candidates: Vec<String>, verdicts: Vec<Option<CloseViolation>>) -> 
         async move { (violation, None) }
     };
 
-    let (output, usage) = close_with_one_repair(instruction.clone(), None, ask, verify, || {
-        FALLBACK.to_string()
-    })
-    .await;
+    let (output, usage) =
+        close_with_one_repair("test-model", instruction.clone(), None, ask, verify, || {
+            FALLBACK.to_string()
+        })
+        .await;
 
     Shipped {
         output,
@@ -197,7 +207,7 @@ fn blank_outcome(truncated: bool) -> TinyagentsTurnOutcome {
         input_tokens: 0,
         output_tokens: 0,
         cached_input_tokens: 0,
-        charged_amount_usd: 0.0,
+        cost: crate::agent::cost::CostTally::default(),
         early_exit_tool: None,
         hit_cap: false,
         wrap_up_injected: false,

@@ -414,14 +414,14 @@ impl SpawnAsyncSubagentTool {
             register_parent_thread_id.as_deref().unwrap_or("none")
         );
         let background_prompt = add_background_contract(&prompt);
-        // The detached child starts on a fresh task. Its explicit carrier keeps authority, origin,
-        // thread, and workspace while deliberately dropping the originating turn's accounting,
-        // dispatch refusal, and cancellation. Approval/origin and workspace policy remain
-        // task-local until B2h moves the security boundary onto this carrier, so propagation
-        // below is a staging bridge for those two scopes only.
+        // The detached child's carrier keeps authority, origin, thread and workspace but drops the
+        // turn's accounting, dispatch refusal and cancellation; origin/workspace propagation below
+        // bridges until B2h. Spawned scoped, so the child keeps the caller's `CoreContext` (in SaaS
+        // the user's profile): its completion lands in that profile's tables and notes the owner
+        // the off-task delivery subscriber resolves.
         let detached_run_context = detached_parent.data.child();
         let mut abort_report = AbortReport::arm(progress_sink.clone(), &definition.id, &task_id);
-        let join = tokio::spawn(crate::agent::turn_origin::propagate(
+        let join = crate::core::runtime::spawn_scoped(crate::agent::turn_origin::propagate(
             crate::agent::turn_workspace::propagate(async move {
                 let options = SubagentRunOptions {
                     skill_filter_override: None,
@@ -511,17 +511,15 @@ impl SpawnAsyncSubagentTool {
                                             iterations: outcome.iterations as u32,
                                             output_chars: outcome.output.chars().count(),
                                             output: outcome.output.clone(),
-                                            // Detached by construction:
-                                            // this tool takes
-                                            // `detached_child()`, so this
-                                            // child's spend never reached
-                                            // the parent turn's ledger and
-                                            // `chat_done` does not contain
-                                            // it. See the field's docs.
+                                            // Detached by construction: this tool
+                                            // takes `detached_child()`, so this child's
+                                            // spend never reached the parent turn's
+                                            // ledger or `chat_done`. See the field docs.
                                             usage: Some(outcome.usage),
                                             worktree_path: None,
                                             changed_files: Vec::new(),
                                             dirty_status: None,
+                                            stop: None,
                                         })
                                         .await;
                                 }
@@ -586,17 +584,15 @@ impl SpawnAsyncSubagentTool {
                                             iterations: outcome.iterations as u32,
                                             output_chars: outcome.output.chars().count(),
                                             output: outcome.output.clone(),
-                                            // Detached by construction:
-                                            // this tool takes
-                                            // `detached_child()`, so this
-                                            // child's spend never reached
-                                            // the parent turn's ledger and
-                                            // `chat_done` does not contain
-                                            // it. See the field's docs.
+                                            // Detached by construction: this tool
+                                            // takes `detached_child()`, so this child's
+                                            // spend never reached the parent turn's
+                                            // ledger or `chat_done`. See the field docs.
                                             usage: Some(outcome.usage),
                                             worktree_path: None,
                                             changed_files: Vec::new(),
                                             dirty_status: None,
+                                            stop: incomplete_stop(reason),
                                         })
                                         .await;
                                 }

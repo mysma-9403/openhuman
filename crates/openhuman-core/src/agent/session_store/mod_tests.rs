@@ -71,3 +71,75 @@ async fn without_a_store_transcripts_are_workspace_files() {
     .await;
     assert_eq!(found, expected);
 }
+
+fn derived(profile: Option<&str>, agent: Option<&str>) -> Arc<crate::core::runtime::CoreContext> {
+    use crate::core::runtime::{ContextOverlay, CoreContext, DomainSet};
+    let mut overlay = ContextOverlay::new(
+        crate::config::Config::default(),
+        DomainSet::kernel(),
+        crate::tools::toolpacks::ToolGroups::none(),
+    );
+    if let Some(profile) = profile {
+        overlay = overlay.profile(profile);
+    }
+    if let Some(agent) = agent {
+        overlay = overlay.session_agent(agent);
+    }
+    CoreContext::for_test(DomainSet::full(), None).derive_with(overlay)
+}
+
+async fn under<T>(ctx: Arc<crate::core::runtime::CoreContext>, f: impl FnOnce() -> T) -> T {
+    crate::core::runtime::CoreContext::scope(ctx, async move { f() }).await
+}
+
+#[tokio::test]
+async fn desktop_session_keys_and_transcript_roots_are_unchanged() {
+    let ws = std::path::Path::new("/ws");
+    assert_eq!(current_agent_key_or("orchestrator"), "orchestrator");
+    assert_eq!(transcript_root(ws), ws.to_path_buf());
+    let (key, root) = under(derived(None, Some("alpha")), || {
+        (current_agent_key_or("orchestrator"), transcript_root(ws))
+    })
+    .await;
+    assert_eq!(key, "alpha");
+    assert_eq!(root, agent_transcript_root(ws, "alpha"));
+}
+
+#[tokio::test]
+async fn two_profiles_default_agents_keep_separate_session_keys_and_stores() {
+    let ws = std::path::Path::new("/ws-profile");
+    let (alice_key, alice_root) = under(derived(Some("alice"), None), || {
+        (current_agent_key_or("orchestrator"), transcript_root(ws))
+    })
+    .await;
+    let bob_key = under(derived(Some("bob"), None), || {
+        current_agent_key_or("orchestrator")
+    })
+    .await;
+    assert_eq!(alice_key, "alice~default");
+    assert_eq!(bob_key, "bob~default");
+    // The default agent's transcripts sit at the profile's workspace root.
+    assert_eq!(alice_root, ws.to_path_buf());
+
+    let provider: Arc<dyn SessionStoreProvider> = Arc::new(InMemorySessionStores::new());
+    let stores_of = |profile: &'static str| {
+        let provider = provider.clone();
+        scope(provider, async move {
+            crate::core::runtime::CoreContext::scope(derived(Some(profile), None), async {
+                current().map(|stores| stores.transcripts.destination_key())
+            })
+            .await
+        })
+    };
+    let (alice, bob) = (stores_of("alice").await, stores_of("bob").await);
+    assert_ne!(alice, bob);
+    assert_eq!(
+        alice,
+        Some(
+            provider
+                .for_agent("alice~default")
+                .transcripts
+                .destination_key()
+        )
+    );
+}

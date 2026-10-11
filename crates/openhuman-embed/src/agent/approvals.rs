@@ -31,18 +31,34 @@ pub enum ApprovalsError {
 #[derive(Debug, Clone)]
 pub struct Approvals {
     agent_id: String,
+    removed: tokio::sync::watch::Receiver<bool>,
+    lifecycle: std::sync::Arc<super::lifecycle::ApprovalState>,
 }
 
 impl Approvals {
-    pub(crate) fn new(agent_id: &str) -> Self {
+    pub(crate) fn new(
+        agent_id: &str,
+        removed: tokio::sync::watch::Receiver<bool>,
+        lifecycle: std::sync::Arc<super::lifecycle::ApprovalState>,
+    ) -> Self {
         Self {
             agent_id: agent_id.to_string(),
+            removed,
+            lifecycle,
         }
     }
 
     /// The agent's undecided requests, oldest first. Empty when the runtime
-    /// has no approval gate.
+    /// has no approval gate or this agent has been removed. Reusing the id
+    /// does not make a removed agent's handle observe the replacement.
     pub fn pending(&self) -> Result<Vec<PendingApproval>, ApprovalsError> {
+        // Hold the lifecycle read through the gate access. Removal must finish
+        // before the id can be reused, so a concurrent old handle cannot cross
+        // from its lifecycle check into the replacement's approval store.
+        let removed = self.removed.borrow();
+        if *removed {
+            return Ok(Vec::new());
+        }
         let Some(gate) = ApprovalGate::try_global() else {
             return Ok(Vec::new());
         };
@@ -60,6 +76,20 @@ impl Approvals {
         request_id: &str,
         decision: ApprovalDecision,
     ) -> Result<PendingApproval, ApprovalsError> {
+        self.lifecycle
+            .with_live(|| self.decide_live(request_id, decision))
+            .unwrap_or_else(|| Err(ApprovalsError::NotFound(request_id.to_owned())))
+    }
+
+    fn decide_live(
+        &self,
+        request_id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<PendingApproval, ApprovalsError> {
+        let removed = self.removed.borrow();
+        if *removed {
+            return Err(ApprovalsError::NotFound(request_id.to_owned()));
+        }
         let gate = ApprovalGate::try_global().ok_or(ApprovalsError::GateNotInstalled)?;
         log::debug!(
             "[embed][approvals] agent={} decide request_id={request_id} decision={}",

@@ -9,9 +9,10 @@ readme = "README.md"
 publish = false
 
 [features]
+langfuse = ["openhuman-core/langfuse"]
 # `channels` is in core's default set already; enabling it here too compiles
 # the `Runtime::channels` facade in a default build.
-default = ["openhuman-core/default", "channels"]
+default = ["openhuman-core/default", "channels", "modules"]
 http-server = ["openhuman-core/http-server"]
 inference = ["openhuman-core/inference"]
 documents = ["openhuman-core/documents"]
@@ -24,14 +25,17 @@ web3 = ["openhuman-core/web3"]
 storage-sqlite = ["openhuman-core/storage-sqlite"]
 storage-mongodb = ["openhuman-core/storage-mongodb"]
 storage-file = ["openhuman-core/storage-file"]
-runtime-node = ["openhuman-core/runtime-node"]
 media = ["openhuman-core/media"]
 flows = ["openhuman-core/flows"]
 skills = ["openhuman-core/skills"]
 mcp = ["openhuman-core/mcp"]
 # Also carries `process::sentry`, the shared Sentry options + before_send chain.
 crash-reporting = ["dep:sentry", "openhuman-core/crash-reporting"]
-channels = ["openhuman-core/channels"]
+# The in-process SaaS profile facade (`ProfileRuntime`). Headless: it does not
+# pull in tinychannels or axum. Relaying a platform message into a profile
+# (`ProfileHandle::relay_inbound`) is a channel transport and needs `channels`.
+profiles = []
+channels = ["profiles", "openhuman-core/channels"]
 whatsapp-web = ["openhuman-core/whatsapp-web"]
 file-logging = ["openhuman-core/file-logging"]
 scheduler-gate = ["openhuman-core/scheduler-gate"]
@@ -41,12 +45,15 @@ scheduler-gate = ["openhuman-core/scheduler-gate"]
 e2e-test-support = ["openhuman-core/e2e-test-support"]
 
 [dependencies]
+futures-core = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
 async-trait = "0.1"
 openhuman-core = { path = "../openhuman-core", package = "openhuman", default-features = false }
 anyhow = "1"
 # `JobSchedule::At` converts to and from the core's `chrono` instants.
 chrono = "0.4"
 log = "0.4"
+jsonschema = { version = "0.58", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `process::sentry` (crash-reporting): the client options and before_send
@@ -64,6 +71,7 @@ tinymcp-bus = { path = "../../vendor/tinymcp/crates/tinymcp-bus" }
 # The session store port (`SessionStoreProvider`) a host implements to keep
 # conversations in its own database, and the in-memory provider; same path as
 # the core's so one copy resolves.
+tinyagents-harness = { path = "../../vendor/tinyagents/crates/tinyagents-harness", default-features = false }
 tinyagents-session = { path = "../../vendor/tinyagents/crates/tinyagents-session" }
 # The wire request/response types `complete` converts to; same path as the
 # core's so one copy resolves.
@@ -82,6 +90,10 @@ async-trait = "0.1"
 tinymemory-api = { path = "../../vendor/tinymemory/crates/tinymemory-api", features = ["conformance"] }
 dirs = "6"
 env_logger = "0.11"
+# The profile tests and example implement a stub `BackendTransport`, whose
+# `http_client` hands out a `reqwest::Client`. Same features as the core's, so
+# the dev graph adds no reqwest feature (see the unification note below).
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls", "stream", "http2", "multipart", "socks"] }
 wiremock = "0.6"
 # Feature unification with openhuman-cli's dev-dependencies. Cargo builds the
 # core once per distinct feature set of its dependencies, and the tests of
@@ -92,3 +104,56 @@ wiremock = "0.6"
 sentry = { version = "0.47.0", default-features = false, features = ["test"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[example]]
+name = "mcp"
+required-features = ["mcp"]
+
+[[example]]
+name = "skills"
+required-features = ["skills"]
+
+[[example]]
+name = "telegram"
+required-features = ["channels"]
+
+[[example]]
+name = "storage"
+required-features = ["storage-sqlite"]
+
+# SaaS profiles need `profiles`; these two also relay platform messages, which
+# needs `channels`.
+[[test]]
+name = "saas_profiles"
+required-features = ["channels"]
+
+# Host capability regression exercises the authenticated profile facade.
+[[test]]
+name = "profile_host_capabilities"
+required-features = ["channels"]
+
+# Due agent jobs of hosted profiles run once, as their own profile.
+[[test]]
+name = "profile_direct_providers"
+required-features = ["profiles"]
+
+[[test]]
+name = "profile_system_prompt"
+required-features = ["profiles"]
+
+[[test]]
+name = "profile_cron_sweep"
+required-features = ["profiles"]
+
+# Operator-admitted cron and time tools, the iteration cap, no backend credential.
+[[test]]
+name = "profile_operator_tools"
+required-features = ["channels"]
+
+[[example]]
+name = "profiles"
+required-features = ["profiles"]

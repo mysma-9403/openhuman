@@ -38,6 +38,7 @@ import {
   type ChatThreadTodosChangedEvent,
   type ChatToolCallEvent,
   type ChatToolResultEvent,
+  type CostSource,
   type ProactiveMessageEvent,
   segmentText,
   subscribeChatEvents,
@@ -51,9 +52,12 @@ import {
   clearInferenceStatusForThread,
   clearParallelRequest,
   clearPendingApprovalForThread,
+  clearPendingApprovalIfRequest,
   clearPendingPlanReviewForThread,
   clearProcessingForThread,
   clearStreamingAssistantForThread,
+  clearTurnApprovalForThread,
+  dropDetachedApprovalsForThread,
   endInferenceTurn,
   fetchAndHydrateCompletedTurnState,
   fetchAndHydrateTurnState,
@@ -363,14 +367,16 @@ function chatTurnUsagePayload(event: ChatDoneEvent): {
   inputTokens: number;
   outputTokens: number;
   cachedTokens?: number;
-  costUsd?: number;
+  costUsd?: number | null;
+  costSource?: CostSource;
   contextWindow?: number;
+  contextTokens?: number;
   threadId?: string;
   subAgents?: Array<{
     agentId: string;
     inputTokens: number;
     outputTokens: number;
-    costUsd: number;
+    costUsd: number | null;
   }>;
 } {
   const u = event.usage;
@@ -380,7 +386,9 @@ function chatTurnUsagePayload(event: ChatDoneEvent): {
       outputTokens: u.output_tokens,
       cachedTokens: u.cached_input_tokens,
       costUsd: u.cost_usd,
+      costSource: u.cost_source,
       contextWindow: u.context_window,
+      contextTokens: u.context_tokens,
       threadId: event.thread_id,
       subAgents: (u.subagents ?? []).map(s => ({
         agentId: s.agent_id,
@@ -404,6 +412,12 @@ function chatTurnUsagePayload(event: ChatDoneEvent): {
 
 const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
   const dispatch = useAppDispatch();
+  const snapshotPollingRef = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    snapshotPollingRef.current = controller;
+    return () => controller.abort();
+  }, []);
   // Latest translator for the long-lived socket handlers below: a failed turn's
   // copy is rendered in the locale active when the error arrives.
   const { t } = useT();
@@ -612,6 +626,10 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
 
   useEffect(() => {
     if (socketStatus !== 'connected') return;
+    // A terminal snapshot must survive a socket subscription refresh, but
+    // cannot outlive the provider that owns its store projection.
+    const snapshotPolling = snapshotPollingRef.current;
+    if (!snapshotPolling) return;
 
     // When a turn ends, any follow-ups the user queued behind it are about to be
     // dispatched by the backend as fresh turns. Nothing else persists their
@@ -707,6 +725,7 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
     };
 
     const finishChatDoneTurn = async (event: ChatDoneEvent, path: string) => {
+      if (snapshotPolling.signal.aborted) return;
       // One store update: freeze the turn's trail, end the tail, reveal the
       // persisted reply in the tail's slot. See `turnSettled`.
       rtLog('turn_settled', { thread: event.thread_id, request: event.request_id, path });
@@ -727,6 +746,7 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
       // Persist queued follow-ups (in order, after this turn's assistant reply)
       // and only then clear the queue + lifecycle.
       await flushQueuedFollowups(event.thread_id);
+      if (snapshotPolling.signal.aborted) return;
       dispatch(endInferenceTurn({ threadId: event.thread_id }));
       dispatch(clearThreadInferenceActive(event.thread_id));
       // Snapshot polling can outlive this completed turn. Capture the rows it
@@ -744,8 +764,14 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
       // ending the live lifecycle) matters: `hydrateRuntimeFromSnapshot`
       // intentionally refuses to overwrite an actively streaming turn.
       const completedSnapshot = await dispatch(
-        fetchAndHydrateCompletedTurnState(event.thread_id)
-      ).unwrap();
+        fetchAndHydrateCompletedTurnState(event.thread_id, { signal: snapshotPolling.signal })
+      )
+        .unwrap()
+        .catch(error => {
+          if (snapshotPolling.signal.aborted) return null;
+          throw error;
+        });
+      if (snapshotPolling.signal.aborted) return;
       if (!completedSnapshot) {
         dispatch(
           cancelUnresolvedTurnTimeline({ threadId: event.thread_id, rowIds: unresolvedRowIds })
@@ -1030,14 +1056,16 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
                 inputTokens: childInput ?? 0,
                 outputTokens: childOutput ?? 0,
                 cachedTokens: event.subagent?.cached_input_tokens ?? 0,
-                costUsd: event.subagent?.cost_usd ?? 0,
+                // `null` (cost not known) is kept so the thread shows no
+                // price; an absent field means "nothing to add".
+                costUsd: event.subagent?.cost_usd === undefined ? 0 : event.subagent.cost_usd,
                 subAgentSpendOnly: true,
                 subAgents: [
                   {
                     agentId: event.tool_name ?? 'subagent',
                     inputTokens: childInput ?? 0,
                     outputTokens: childOutput ?? 0,
-                    costUsd: event.subagent?.cost_usd ?? 0,
+                    costUsd: event.subagent?.cost_usd === undefined ? 0 : event.subagent.cost_usd,
                   },
                 ],
               })
@@ -1435,6 +1463,7 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
                 toolkit,
                 toolCallId: event.tool_call_id,
                 expiresAt: event.expires_at,
+                ...(event.detached === true ? { detached: true } : {}),
               },
             })
           );
@@ -1455,10 +1484,29 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
           // would race the optimistic clear and, worse, drop a card whose
           // decision the USER on this client is mid-click on when the event
           // for a DIFFERENT thread's request arrives.
-          if (
-            !event.thread_id ||
-            (event.resolution !== 'expired' && event.resolution !== 'cancelled')
-          ) {
+          if (!event.thread_id) return;
+          // A detached card (an async sub-agent's) has no turn end of its own
+          // to clear it, so any resolution of exactly that request — a decision
+          // made on another client or by a typed reply, an expiry, a cancel —
+          // removes it here. Matching on `request_id` keeps a different
+          // thread's or a newer request's card.
+          const runtime = store.getState().chatRuntime;
+          const held = runtime.pendingApprovalByThread[event.thread_id];
+          // A detached request can also be waiting in the thread's queue
+          // behind the shown card; its resolution drops it from there.
+          const queued = (runtime.queuedApprovalsByThread?.[event.thread_id] ?? []).some(
+            entry => entry.requestId === event.request_id
+          );
+          if ((held?.detached && held.requestId === event.request_id) || queued) {
+            dispatch(
+              clearPendingApprovalIfRequest({
+                threadId: event.thread_id,
+                requestId: event.request_id,
+              })
+            );
+            return;
+          }
+          if (event.resolution !== 'expired' && event.resolution !== 'cancelled') {
             return;
           }
           dispatch(
@@ -1683,8 +1731,9 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
           const completeSegmentDelivery = hasCompleteSegmentDelivery(event, segmentDelivery);
 
           dispatch(recordChatTurnUsage(chatTurnUsagePayload(event)));
-          // A parked gate cannot outlive its turn, so those go now.
-          dispatch(clearPendingApprovalForThread({ threadId: event.thread_id }));
+          // A parked gate cannot outlive its turn, so those go now — except a
+          // detached one (an async sub-agent's), which is still waiting.
+          dispatch(clearTurnApprovalForThread({ threadId: event.thread_id }));
           dispatch(clearPendingPlanReviewForThread({ threadId: event.thread_id }));
           // Nothing the turn RENDERED is cleared here. The streaming buffer, the
           // status line and the running rows used to be torn down first, before
@@ -1887,7 +1936,7 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
           if (!olderTurn) {
             dispatch(clearInferenceStatusForThread({ threadId: event.thread_id }));
             dispatch(clearStreamingAssistantForThread({ threadId: event.thread_id }));
-            dispatch(clearPendingApprovalForThread({ threadId: event.thread_id }));
+            dispatch(clearTurnApprovalForThread({ threadId: event.thread_id }));
             dispatch(clearPendingPlanReviewForThread({ threadId: event.thread_id }));
 
             const existing = currentState.chatRuntime.toolTimelineByThread[event.thread_id] ?? [];
@@ -1983,14 +2032,31 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
     const lifecycles = state.chatRuntime.inferenceTurnLifecycleByThread;
     const threadIds = Object.keys(lifecycles);
     const activeThreadIds = Object.keys(state.thread.activeThreadIds);
-    if (threadIds.length === 0 && activeThreadIds.length === 0) return;
+    // Threads holding a detached approval (an async sub-agent's), shown or
+    // queued. Its parent turn may long be over, so it is in neither list
+    // above, but a drop (always the case when the core restarts) can lose the
+    // park or its `approval_decided`. Forget the cards and rejoin the thread
+    // on reconnect: the core replays exactly the parks it still holds.
+    const detachedThreadIds = Object.entries(state.chatRuntime.pendingApprovalByThread)
+      .filter(([, approval]) => approval?.detached)
+      .map(([threadId]) => threadId)
+      .concat(Object.keys(state.chatRuntime.queuedApprovalsByThread ?? {}));
+    if (threadIds.length === 0 && activeThreadIds.length === 0 && detachedThreadIds.length === 0)
+      return;
     // Remember what was in flight BEFORE the markers are cleared below. The
     // reconnect handler in `socketService` re-subscribes from
     // `activeThreadIds`, which this effect is about to empty — so without this
     // snapshot the new socket rejoins only the selected thread's room, and a
     // turn finishing on any other thread announces itself to a `client_id`
     // that no longer exists (#6034).
-    interruptedThreadsRef.current = new Set([...threadIds, ...activeThreadIds]);
+    interruptedThreadsRef.current = new Set([
+      ...threadIds,
+      ...activeThreadIds,
+      ...detachedThreadIds,
+    ]);
+    for (const threadId of new Set(detachedThreadIds)) {
+      dispatch(dropDetachedApprovalsForThread({ threadId }));
+    }
     // Abandon any in-flight tool-chain latency windows: a disconnect tears down
     // these turns without an onDone/onError, so without this the next tool call
     // on a reused thread would attribute stale elapsed/tool counts (#4288).
@@ -1999,6 +2065,7 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
       socket: socketStatus,
       inFlight: threadIds.length,
       active: activeThreadIds.length,
+      detached: detachedThreadIds.length,
     });
     for (const threadId of threadIds) {
       dispatch(clearInferenceStatusForThread({ threadId }));

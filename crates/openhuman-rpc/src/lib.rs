@@ -27,24 +27,42 @@
 //!   persistence-free.
 //! - [`host`]: the shared host boot, one entry per host shape
 //!   ([`host::cli`], [`host::desktop`], [`host::tui`]).
-//! - [`tinyhumans`] (and through it `tinyhumans::embed`): the curated library
-//!   facade hosts configure a runtime with. [`embed`] is the same crate as
-//!   `tinyhumans::embed`, re-exported here so a host (app, CLI, TUI) that
-//!   depends on this crate alone names it in one step.
+//! - [`tinyhumans`] and [`embed`]: curated lists of the TinyHumans-layer and
+//!   embed items the hosts (app, CLI, TUI) use, so a host that depends on
+//!   this crate alone names them in one step. Neither is the layer below
+//!   re-exported wholesale.
 //!
 //! Hosts depend on `openhuman-rpc` and nothing else from this repository
 //! (`scripts/ci/check-crate-chain.mjs` enforces it). What they reach is the
 //! curated surface above; the doc-hidden `__host` list stays internal to the
 //! layers.
 
-pub use openhuman_tinyhumans as tinyhumans;
-/// The embed facade (`openhuman_embed`): runtime builder, process helpers,
-/// config/artifact/chat-surface facades. Same crate as `tinyhumans::embed`.
-pub use openhuman_tinyhumans::embed;
+/// The TinyHumans layer items hosts use: the login/session owner, the
+/// session link constants and the product identity. A curated list, not the
+/// crate.
+pub mod tinyhumans {
+    pub use openhuman_tinyhumans::{
+        identity, link, product_identity, CachedUser, ClientHeaders, CoreLink, SessionError,
+        SessionEvent, SessionManager, SessionState,
+    };
+}
+
+/// The embed items hosts use: the process lifecycle helpers and the
+/// config/artifact/chat-surface/modules facades, plus the few process-level
+/// facts. A curated list, not the crate; embed's `__host` is not on it.
+pub mod embed {
+    pub use openhuman_tinyhumans::embed::modules;
+    pub use openhuman_tinyhumans::embed::{
+        artifacts, chat_surface, config, process, schema_for_rpc_method, secret_storage,
+        CoreRuntime, PickListenPortError, RuntimeBuilder, RuntimeInfo, ServiceSet,
+        HTTP_SERVER_COMPILED_IN, VOICE_COMPILED_IN,
+    };
+}
 
 /// Core internals for this crate's own modules, through embed's doc-hidden
-/// `__host` list. Crate-private: never re-exported on a public path.
-pub(crate) use openhuman_tinyhumans::embed::__host as core_host;
+/// `__host` list. A private binding: child modules reach it as
+/// `crate::core_host`, and it is not part of this crate's API.
+use openhuman_tinyhumans::__host as core_host;
 
 #[cfg(feature = "http-client")]
 mod client;
@@ -53,11 +71,22 @@ mod envelope;
 pub mod host;
 #[cfg(feature = "server")]
 pub mod http_host;
+#[cfg(feature = "os-keyring")]
+pub mod keyring;
 mod origin;
 #[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "session-store")]
 pub mod session_store;
+
+/// Serializes tests that touch the process-global storage backend slot.
+///
+/// `session_store` tests install a backend for a moment; any test that
+/// stores a credential meanwhile would route it to storage secrets (which
+/// need a master key CI does not have). Both take this lock.
+#[cfg(test)]
+pub(crate) static STORAGE_SLOT_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 pub use crate::core_host::core::unwrap_rpc;
 #[cfg(feature = "http-client")]

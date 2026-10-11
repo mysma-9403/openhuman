@@ -127,28 +127,28 @@ async fn run() -> anyhow::Result<()> {
     )
     .model("gpt-5");
 
-    let reviewer = runtime.agent(
-        AgentSpec::new("reviewer")
-            .system_prompt("You review changes and never edit files.")
+    let analyst = runtime.agent(
+        AgentSpec::new("analyst")
+            .system_prompt("You summarize documents and never edit files.")
             .provider(provider.clone())
             .access(Access::readonly())
-            .action_dir("/srv/checkouts/pr-42"),
+            .action_dir("/srv/documents"),
     )?;
 
-    let fixer = runtime.agent(
-        AgentSpec::new("fixer")
-            .system_prompt("You act on review findings inside your working directory.")
+    let writer = runtime.agent(
+        AgentSpec::new("writer")
+            .system_prompt("You compose explanations inside your working directory.")
             .provider(provider)
             .access(Access::full())
-            .action_dir("/srv/checkouts/pr-42"),
+            .action_dir("/srv/documents"),
     )?;
 
-    let review = reviewer.run("Summarise the risks in this change.").await?;
-    let fix = fixer
-        .turn(format!("Address these findings:\n{}", review.reply))
+    let analysis = analyst.run("Summarise this document.").await?;
+    let draft = writer
+        .turn(format!("Explain these points:\n{}", analysis.reply))
         .send()
         .await?;
-    println!("{}", fix.reply);
+    println!("{}", draft.reply);
     Ok(())
 }
 ```
@@ -175,15 +175,15 @@ let spec = AgentSpec::new("triage")
 
 A server declared on one agent is invisible to the others. Skill bundles are copied into `<workspace>/agents/<id>/skills/`, and the operator's `~/.openhuman/skills` stays hidden unless you call `.include_user_skills(true)`. Narrowing which tools an MCP server exposes with `.allow_tools` or `.deny_tools` matters for large servers, because every exposed tool costs prompt budget.
 
-The [`two_agents` example](https://github.com/tinyhumansai/openhuman/blob/main/crates/openhuman-embed/examples/two_agents.rs) runs a reviewer and a fixer end to end.
+The [`two_agents` example](https://github.com/tinyhumansai/openhuman/blob/main/crates/openhuman-embed/examples/two_agents.rs) runs a analyst and a writer end to end.
 
 ## Step 5: multi-turn sessions and streaming
 
 `agent.turn(message)` returns a builder. Each outcome carries a `session_id`; pass it back with `.session(..)` to continue the conversation. Without it, a new session is started.
 
 ```rust
-let first = fixer.run("Run the tests.").await?;
-let again = fixer
+let first = writer.run("Run the tests.").await?;
+let again = writer
     .turn("Now fix the failures.")
     .session(&first.session_id)
     .send()
@@ -201,7 +201,7 @@ let printer = tokio::spawn(async move {
         eprintln!("[progress] {progress:?}");
     }
 });
-let outcome = fixer.turn("go").on_progress(tx).send().await?;
+let outcome = writer.turn("go").on_progress(tx).send().await?;
 let _ = tokio::time::timeout(std::time::Duration::from_secs(30), printer).await;
 ```
 

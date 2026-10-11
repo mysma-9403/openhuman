@@ -211,6 +211,15 @@ impl MemoryEngine for RecordingEngine {
         self.inner.forget(target).await
     }
 
+    async fn forget_within(
+        &self,
+        ids: Vec<tinymemory_api::ItemId>,
+        reach: tinymemory_api::Reach,
+    ) -> tinymemory_api::Result<tinymemory_api::ForgetReport> {
+        self.calls.lock().unwrap().push("forget_within");
+        self.inner.forget_within(ids, reach).await
+    }
+
     async fn list(&self, req: ListRequest) -> tinymemory_api::Result<tinymemory_api::ListPage> {
         self.inner.list(req).await
     }

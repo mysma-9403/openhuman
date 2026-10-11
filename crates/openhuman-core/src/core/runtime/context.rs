@@ -107,6 +107,9 @@ pub struct CoreContext {
     /// ([`crate::agent::session_store`]) hands out to work under this
     /// context. `None` for booted contexts, which use the shared default.
     session_agent: Option<String>,
+    /// The tenant (SaaS profile) this context serves. `None` for booted
+    /// contexts and every single-user agent. See [`crate::core::runtime::tenant`].
+    profile: Option<String>,
     /// What the agent this context was derived for owns.
     agent: agent_parts::AgentParts,
 }
@@ -172,7 +175,10 @@ impl CoreContext {
         // 2. Load the master encryption key before any config/credential op that
         //    needs to decrypt secrets. No-op if already called (e.g. from
         //    run_core_from_args for the CLI).
-        crate::security::keyring::init_master_key().map_err(anyhow::Error::msg)?;
+        if let Some(config) = &preloaded_config {
+            crate::security::secret_storage::init_workspace(&config.workspace_dir);
+        }
+        crate::security::secret_storage::init_master_key().map_err(anyhow::Error::msg)?;
 
         // 4. Seed the per-process RPC bearer. `Fixed` seeds the in-memory value
         //    directly (never touches the env); `EnvOrFile` reads
@@ -265,6 +271,7 @@ impl CoreContext {
             backend_transport,
             turn_origin: None,
             session_agent: None,
+            profile: None,
             agent: Default::default(),
         });
         let _ = DEFAULT_CONTEXT.set(ctx.clone());
@@ -382,6 +389,7 @@ impl CoreContext {
             backend_transport: self.backend_transport.clone(),
             turn_origin: self.turn_origin.clone(),
             session_agent: overlay.session_agent.or_else(|| self.session_agent.clone()),
+            profile: overlay.profile.or_else(|| self.profile.clone()),
             agent,
         })
     }
@@ -505,14 +513,12 @@ impl CoreContext {
     /// spawned task. Calling this before `tokio::spawn` is essential: reading
     /// `current()` inside the child would already have fallen back to the
     /// process default.
+    ///
+    /// In SaaS only the caller's own task scope is carried (never the
+    /// operator's default context), together with its memory identity — the
+    /// same rule as [`spawn_scoped`](crate::core::runtime::spawn_scoped).
     pub fn propagate<F: Future>(fut: F) -> impl Future<Output = F::Output> {
-        let ctx = Self::current();
-        async move {
-            match ctx {
-                Some(ctx) => Self::scope(ctx, fut).await,
-                None => fut.await,
-            }
-        }
+        super::spawn::carry(fut)
     }
 
     /// Test-only constructor: build a context with an explicit
@@ -537,6 +543,7 @@ impl CoreContext {
             backend_transport: None,
             turn_origin: None,
             session_agent: None,
+            profile: None,
             agent: Default::default(),
         })
     }
@@ -568,6 +575,7 @@ impl CoreContext {
             backend_transport: None,
             turn_origin: None,
             session_agent: None,
+            profile: None,
             agent: Default::default(),
         })
     }
@@ -616,7 +624,7 @@ impl StoreInitPlan {
 pub async fn init_stores(cfg: &crate::config::Config, domains: crate::core::runtime::DomainSet) {
     let plan = StoreInitPlan::for_domains(domains);
 
-    let keyring_dir = crate::security::keyring::store::workspace_dir_for_file_backend();
+    let keyring_dir = crate::security::secret_storage::store::workspace_dir_for_file_backend();
     // Keyring path log + credentials Sentry bind (below) are unguarded — they
     // are core infra every DomainSet needs. Each workspace-bound store init is
     // gated on its owning DomainGroup so an excluded domain's store stays
@@ -626,7 +634,7 @@ pub async fn init_stores(cfg: &crate::config::Config, domains: crate::core::runt
         cfg.config_path.display(),
         cfg.workspace_dir.display(),
         keyring_dir.display(),
-        crate::security::keyring::backend_name(),
+        crate::security::secret_storage::backend_name(),
         domains,
     );
     if plan.memory {

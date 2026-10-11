@@ -143,7 +143,7 @@ impl SessionDriver<OpenHumanRunContext> for OpenHumanSessionDriver {
         let mut messages: Vec<TranscriptMessage> = request
             .history
             .iter()
-            .filter_map(crate::agent::message_convert::message_to_native_chat_message)
+            .filter_map(tinyagents_runtime::transcript::message_to_native_transcript)
             .collect();
         if crate::agent::multimodal::has_image_placeholders(&messages) {
             messages = crate::agent::multimodal::rehydrate_image_placeholders(&messages);
@@ -174,7 +174,12 @@ impl SessionDriver<OpenHumanRunContext> for OpenHumanSessionDriver {
             .iter()
             .map(|spec| spec.name.clone())
             .collect();
-        ensure_snapshot_tools_are_executable(&visible_tool_names, &tools, &synthesized_tools)?;
+        ensure_snapshot_tools_are_executable(
+            &visible_tool_names,
+            &tools,
+            &synthesized_tools,
+            &request.run_context.data.recorded_tool_names,
+        )?;
         // The harness must speak the dialect this session's prompt was
         // composed for: a text dialect strips schemas off the wire and needs
         // the positional registry to recover P-Format / code-style calls.
@@ -213,7 +218,6 @@ impl SessionDriver<OpenHumanRunContext> for OpenHumanSessionDriver {
                     &snapshot,
                     &sidecar,
                     started.elapsed(),
-                    &self.model_name,
                 ));
             }
         };
@@ -387,18 +391,45 @@ impl SessionDriver<OpenHumanRunContext> for OpenHumanSessionDriver {
                 + repair_usage
                     .map(|usage| usage.cached_input_tokens)
                     .unwrap_or_default();
-            observed.cost_usd = outcome.charged_amount_usd
-                + close
-                    .as_ref()
-                    .map(|close| close.usage.charged_amount_usd)
-                    .unwrap_or_default()
-                + repair_usage
-                    .map(|usage| usage.charged_amount_usd)
-                    .unwrap_or_default();
+            let mut cost = outcome.cost;
+            if let Some(close) = close.as_ref() {
+                cost.merge(close.usage.cost);
+            }
+            if let Some(repair) = repair_usage {
+                cost.merge(repair.cost);
+            }
+            observed.cost = cost;
+            let loop_last_call = snapshot
+                .lock()
+                .ok()
+                .map(|guard| (guard.last_call_input_tokens, guard.last_call_output_tokens));
+            (
+                observed.last_call_input_tokens,
+                observed.last_call_output_tokens,
+            ) = final_call_tokens(
+                loop_last_call,
+                close.as_ref().map(|close| &close.usage),
+                repair_usage,
+            );
             observed.duration = Some(started.elapsed());
+            observed.driver_finished_at = Some(std::time::Instant::now());
             observed.tool_outcomes = outcome.tool_outcomes.clone();
             observed.hit_cap = outcome.hit_cap;
             observed.wrap_up_injected = outcome.wrap_up_injected;
+            // How the harness stopped the turn, if it did. The wind-down
+            // middleware marked the sidecar during the run.
+            observed.stop = crate::agent::turn_stop::TurnStop::classify(
+                outcome.breaker_halt.as_deref(),
+                observed.wind_down,
+                outcome.hit_cap,
+            );
+            if let Some(stop) = &observed.stop {
+                tracing::debug!(
+                    model = %self.model_name,
+                    "[session-driver] turn stopped early; recording on the sidecar {}",
+                    stop.status_message()
+                );
+            }
             observed.resolved_route = outcome.resolved_route.clone();
         }
         // The turn compacted its context: persist the compacted history, so the
@@ -418,6 +449,26 @@ impl SessionDriver<OpenHumanRunContext> for OpenHumanSessionDriver {
             outcome: None,
         })
     }
+}
+
+/// Input and output tokens of the turn's final model call.
+///
+/// The grounded close and the required-output repair both run after the
+/// harness loop, in that order, so the newest of them that reached the
+/// provider made the final call; without either, the loop's last answered
+/// call did.
+fn final_call_tokens(
+    loop_last_call: Option<(u64, u64)>,
+    close: Option<&grounded_close::RepairUsage>,
+    repair: Option<&grounded_close::RepairUsage>,
+) -> (u64, u64) {
+    [repair, close]
+        .into_iter()
+        .flatten()
+        .find(|usage| usage.last_call_input_tokens > 0 || usage.last_call_output_tokens > 0)
+        .map(|usage| (usage.last_call_input_tokens, usage.last_call_output_tokens))
+        .or(loop_last_call)
+        .unwrap_or_default()
 }
 
 fn system_prefix_len(history: &[Message]) -> usize {
@@ -456,14 +507,15 @@ fn driver_failure(error: impl std::fmt::Display) -> DriverFailure {
     }
 }
 
-/// Refuse a provider declaration that has no executable request-scoped source.
-/// Sources may contain additional durable tools because the runtime snapshot is
-/// the final provider-visible allowlist, but every declared name must resolve
-/// here before the graph begins.
+/// Refuse fresh declarations without a request-scoped executable source.
+/// Historical declarations may outlive their executors. The harness handles
+/// calls to those missing tools as recoverable errors; history never supplies
+/// an executor or bypasses the current tool policy.
 fn ensure_snapshot_tools_are_executable(
     visible_tool_names: &HashSet<String>,
     tools: &Arc<Vec<Box<dyn tinytools::Tool>>>,
     synthesized_tools: &Arc<Vec<Box<dyn tinytools::Tool>>>,
+    recorded_tool_names: &HashSet<String>,
 ) -> Result<(), DriverFailure> {
     let executable_tool_names = tools
         .iter()
@@ -472,6 +524,7 @@ fn ensure_snapshot_tools_are_executable(
         .collect::<HashSet<_>>();
     let missing = visible_tool_names
         .difference(&executable_tool_names)
+        .filter(|name| !recorded_tool_names.contains(*name))
         .cloned()
         .collect::<Vec<_>>();
     if missing.is_empty() {
@@ -491,7 +544,6 @@ fn driver_error_with_snapshot(
         std::sync::Mutex<crate::agent::tinyagents::host::run_context::SessionTurnSidecar>,
     >,
     elapsed: std::time::Duration,
-    fallback_model: &str,
 ) -> DriverFailure {
     // Classify from the typed harness error when the chain carries one, rather
     // than matching on its rendered text.
@@ -526,24 +578,11 @@ fn driver_error_with_snapshot(
         observed.input_tokens = guard.input_tokens;
         observed.output_tokens = guard.output_tokens;
         observed.cached_input_tokens = guard.cached_input_tokens;
-        observed.cost_usd = if guard.charged_amount_usd > 0.0 {
-            guard.charged_amount_usd
-        } else {
-            let pricing_model = guard
-                .resolved_route
-                .as_ref()
-                .map(|route| route.route.as_str())
-                .filter(|route| !route.trim().is_empty())
-                .unwrap_or(fallback_model);
-            crate::agent::cost::estimate_call_cost_usd(
-                pricing_model,
-                &crate::inference::provider::BilledUsage::from_counts(
-                    guard.input_tokens,
-                    guard.output_tokens,
-                )
-                .with_cached_input_tokens(guard.cached_input_tokens),
-            )
-        };
+        observed.last_call_input_tokens = guard.last_call_input_tokens;
+        observed.last_call_output_tokens = guard.last_call_output_tokens;
+        // Each answered call was priced as it arrived (reported charge, else
+        // catalog estimate, else unknown); nothing is re-estimated here.
+        observed.cost = guard.cost;
         observed.duration = Some(elapsed);
         observed.tool_outcomes = guard.tool_outcomes.clone();
         observed.resolved_route = guard.resolved_route.clone();

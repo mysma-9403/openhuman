@@ -15,6 +15,12 @@ fn migration_flag() -> &'static AtomicBool {
     &MIGRATED
 }
 
+thread_local! {
+    /// Fields a `decrypt_config_secrets` pass on this thread could not open
+    /// (and cleared). The pass is synchronous, so a thread-local is exact.
+    static DECRYPT_FAILURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Decrypt one optional secret in place.
 ///
 /// When the stored value uses the legacy, insecure `enc:` (XOR) format this
@@ -25,12 +31,12 @@ fn migration_flag() -> &'static AtomicBool {
 /// from persisting indefinitely (see audit C8). Reading existing `enc:` values
 /// still succeeds throughout the migration.
 fn decrypt_optional_secret(
-    store: &crate::security::keyring::SecretStore,
+    store: &crate::security::secret_storage::SecretStore,
     value: &mut Option<String>,
     field_name: &str,
 ) -> Result<()> {
     if let Some(raw) = value.clone() {
-        if crate::security::keyring::SecretStore::is_encrypted(&raw) {
+        if crate::security::secret_storage::SecretStore::is_encrypted(&raw) {
             // Legacy `enc:` values are migrated to `enc2:` on read so they are
             // rewritten on the next config save instead of lingering forever.
             match store.decrypt_and_migrate(&raw) {
@@ -57,6 +63,7 @@ fn decrypt_optional_secret(
                         field_name,
                         &e.to_string(),
                     );
+                    DECRYPT_FAILURES.with(|failures| failures.set(failures.get() + 1));
                     *value = None;
                 }
             }
@@ -65,13 +72,34 @@ fn decrypt_optional_secret(
     Ok(())
 }
 
+/// [`decrypt_config_secrets`] for a config about to be written somewhere
+/// other nodes read (the shared config document): every process-key field must
+/// open. The load path clears a field it cannot decrypt so the app stays
+/// usable; saving that cleared value over the shared document would turn a
+/// transient keychain failure into lost credentials, so this fails instead.
+pub(super) fn decrypt_config_secrets_strict(
+    config: &mut Config,
+    openhuman_dir: &Path,
+) -> Result<()> {
+    DECRYPT_FAILURES.with(|failures| failures.set(0));
+    decrypt_config_secrets(config, openhuman_dir)?;
+    let failed = DECRYPT_FAILURES.with(|failures| failures.replace(0));
+    if failed > 0 {
+        anyhow::bail!(
+            "{failed} config secret(s) are sealed under this node's key and could not be opened; \
+             not saving them to the shared config document"
+        );
+    }
+    Ok(())
+}
+
 fn encrypt_optional_secret(
-    store: &crate::security::keyring::SecretStore,
+    store: &crate::security::secret_storage::SecretStore,
     value: &mut Option<String>,
     field_name: &str,
 ) -> Result<()> {
     if let Some(raw) = value.clone() {
-        if !crate::security::keyring::SecretStore::is_encrypted(&raw) {
+        if !crate::security::secret_storage::SecretStore::is_encrypted(&raw) {
             *value = Some(
                 store
                     .encrypt(&raw)
@@ -98,7 +126,7 @@ pub(super) fn decrypt_config_secrets(config: &mut Config, openhuman_dir: &Path) 
     }
     // Reset the per-pass migration flag before decrypting any field.
     migration_flag().store(false, Ordering::Relaxed);
-    let store = crate::security::keyring::SecretStore::new(openhuman_dir, true);
+    let store = crate::security::secret_storage::SecretStore::new(openhuman_dir, true);
 
     decrypt_optional_secret(&store, &mut config.api_key, "api_key")?;
     // A MongoDB URL carries the database password.
@@ -222,7 +250,7 @@ pub(super) fn encrypt_config_secrets(config: &mut Config) -> Result<()> {
         .config_path
         .parent()
         .context("Config path must have a parent directory")?;
-    let store = crate::security::keyring::SecretStore::new(parent_dir, true);
+    let store = crate::security::secret_storage::SecretStore::new(parent_dir, true);
 
     encrypt_optional_secret(&store, &mut config.api_key, "api_key")?;
     // A MongoDB URL carries the database password.

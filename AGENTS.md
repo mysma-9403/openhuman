@@ -16,6 +16,7 @@ Architecture: [overview](gitbooks/developing/architecture.md),
 | `crates/openhuman-app/` | Thin desktop host; excluded from the root workspace, build with `--manifest-path crates/openhuman-app/Cargo.toml`. Depends on `openhuman-rpc` only and boots its in-process core with `openhuman_rpc::host::desktop` |
 | `crates/openhuman-core/` | Package `openhuman`: business domains under `src/<domain>/`, the controller contract, dispatch and auth under `src/core/` |
 | `crates/openhuman-core/src/<domain>/` | Flat business-domain modules (agent, memory, tools, security, channels, ...) |
+| `crates/openhuman-core/src/storage/` | The process's storage backend on the `tinystoragedrivers` ports: URL resolution (`OPENHUMAN_STORAGE_URL` / `[storage] url`), the install slot, agent scopes (`local` for the operator), and the base the domain stores build on. Features `storage-sqlite`, `storage-file`, `storage-mongodb`; see `gitbooks/developing/architecture/storage.md` |
 | `crates/openhuman-core/src/core/` | CLI, controller contract (`Outcome`, schemas) and in-process dispatch, controller registry, event bus, runtime composition; no business logic and no JSON-RPC server |
 | `crates/openhuman-cli/` | The `openhuman-core` binary (`src/main.rs`, `openhuman_rpc::host::cli`), the ops bins (`src/bin/`: `openhuman-fleet`, `test-mcp-stub`), and every root `tests/*.rs` / `examples/*.rs` target. Normal dependency: `openhuman-rpc` only; the tests reach core, embed and tinyhumans through `[dev-dependencies]`. The benchmark bins live in the openhuman-benchmarks repository |
 | `crates/openhuman-embed/` | Library facade over the core (depends on core only): `Runtime`/`RuntimeBuilder` with host presets, `embed::process` (tokio runtime, logging, dotenv, master key, Sentry options), and the curated facades hosts use (`config`, `artifacts`, `chat_surface`, `modules`, `identity`). Its doc-hidden `__host` list is for tinyhumans and rpc only |
@@ -386,12 +387,11 @@ Additional rules:
   router and handlers, auth middleware, Socket.IO, `/dev/connect`, the
   listener bind (`openhuman_rpc::server::serve`) and the `run_server*` entry
   points. `openhuman_rpc::host::cli` gives the core this crate's server as
-  the `run`/`serve` launcher (the older `install_cli_server()` +
-  `run_core_from_args` pair does the same for embedders that predate it).
+  the `run`/`serve` launcher.
   Domain-owned HTTP handlers the router mounts (`inference::http`, the
   dictation WebSocket) stay in their domains behind core's `http-server`
   feature. The `http_host` static-directory file server lives here too
-  (`openhuman_rpc::http_host`); `install_cli_server()` and
+  (`openhuman_rpc::http_host`); `host::cli`, `host::desktop` and
   `build_core_http_router()` register its `http_host.*` controllers as a core
   extension, so a host without this crate has no `http_host` surface.
 - The hosts boot through `openhuman_rpc::host`: `host::cli(args)` is the
@@ -404,6 +404,12 @@ Additional rules:
   runtime it owns) drop before it spawns the next.
 
 ## Tool, harness, and runtime boundaries
+
+Embed public API documentation: [Embedding](gitbooks/developing/embed/README.md),
+[concepts](gitbooks/developing/embed/concepts/README.md), and the source-generated
+[builder setters](gitbooks/developing/embed/builder-setters.md). Snippets come from
+compiled examples; run `pnpm docs:generate` and `pnpm docs:check` after changing them.
+
 
 `tinyagents` owns tool-call dialects, parsing, catalog rendering, transcript
 replay, session identity, and the agent loop. `tinytools` owns the shared
@@ -487,7 +493,9 @@ seed history by hand, or pick a transcript by recency.
   count. The host never shrinks a thread's tools because a cache went cold:
   `session_host/recorded_tools.rs` rebuilds recorded Composio actions as
   deferred executors, and the prelude fetches integrations on the first turn
-  of every session instance, not only on a brand-new thread.
+  of every session instance, not only on a brand-new thread. Explicit embed
+  `Turn::tools` overrides and host-only belts are authoritative instead: they
+  do not restore revoked tools from an earlier transcript.
 - **Pre-identity conversations are adopted once**, on first resume, from the
   timestamped stems they were written to (`adopt_legacy_session_transcripts`).
   No legacy file is modified.
@@ -512,6 +520,8 @@ builds after changing a gate. Use `scripts/assert-shed.sh` or
 `scripts/dep-sim.py` before claiming a dependency reduction.
 
 ## Loadable modules and bus contracts
+
+Hosts must interface with loadable components through their minimal `*-bus` contracts. Never import, re-export, link, or call their implementation libraries directly, including through wrapper crates or indirect dependencies. Execute component behavior through the compiled TinyBus module. If the required types or operations are missing, extend the contract and implementation in the owning repository and raise a PR against its canonical upstream first; then consume the released module and update OpenHuman’s gitlink and adapter. Do not introduce a host-side implementation workaround.
 
 ### Submodule ownership
 
@@ -548,12 +558,10 @@ Direct rendered submodules under `vendor/`:
 | `tinyjuice` | Agent tool-output compression and recovery of omitted content. |
 | `tinymcp` | The TinyMCP module implementation and its bus contract. Put MCP module behavior and contract changes here; OpenHuman owns configuration, lifecycle, and host integration. |
 | `tinymemory` | Engine-neutral memory contracts, operations, and providers. Its nested TinyCortex submodule owns the TinyCortex memory engine. |
-| `tinyruntime` | Runtime discovery/installation and bounded pools of warm language interpreter processes, exposed as a TinyBus module. |
 | `tinysearch` | Web-search module, provider dispatch, tool declarations, and execution behind its TinyBus contract. |
 | `tinyskills` | Host-independent skill/workflow bundle parsing, discovery, scope resolution, resource inventory, and safe reads. OpenHuman owns trust and execution policy. |
 | `tinyvoice` | Host-agnostic voice primitives such as audio framing, VAD, wake-word gating, routing, and STT hallucination detection. |
 | `tinywallet` | Multi-chain wallet: `tinywallet-crypto` (address, asset, chain, `rpc::Transport`, tx codec), `tinywallet-x402` (x402 wire, payment, spending ledger, `x402_request` tool), `tinywallet-web3` (wallet engine, per-chain build/sign/broadcast flows, swap/bridge/dapp quotes, agent tools) behind host seams (`WalletSigner`, `PaymentSigner`, `WalletAccounts`, `RpcEndpoints`, `QuoteScope`, `Web3Backend`, `ProxyPolicy`), and the loadable `tinywallet-module` that derives keys and signs. OpenHuman keeps keyring, consent, credentials, config, controllers and the seam impls under `web3/`. |
-| `motosan-ai-oauth` | Provider-agnostic PKCE OAuth login and token-refresh primitives. |
 
 Some rendered submodules are shared dependencies nested inside those projects,
 not separate OpenHuman feature implementations. Make changes to them in their
@@ -583,7 +591,6 @@ method constants, request and response types, and its contract version.
 | `tinydocs-bus` | `documents` |
 | `tinyvoice-bus` | `voice` |
 | `tinyjuice-bus` | inference kernel |
-| `tinyruntime-bus` | runtime clients |
 | `tinywallet-bus` | `web3` (contract; the chain primitives are in `tinywallet-crypto`) |
 | `tinymcp-bus` | `mcp` |
 | `tinychannels-bus` | channel vocabulary |
@@ -594,7 +601,8 @@ Rules:
 - Never redeclare a contract type in OpenHuman.
 - Call members through contract constants, not string literals.
 - Contract crates stay synchronous and free of I/O and runtime dependencies.
-- Shared wire behavior belongs in the contract. Runtime, config, and security
+- Shared wire vocabulary belongs in the contract. Component algorithms execute
+  in the compiled module. Runtime, config, and security
   policy stay in the host.
 - Test the handwritten registry metadata against each contract's bus name and
   object path.

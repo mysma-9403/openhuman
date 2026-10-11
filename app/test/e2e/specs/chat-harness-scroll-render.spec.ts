@@ -6,7 +6,7 @@
  *
  *   1. Scroll: the assistant-ui thread viewport
  *      (`[data-slot="aui_thread-viewport"]`, `components/assistant-ui/thread.tsx`)
- *      follows the bottom while the reader is at it (`useFollowBottom`).
+ *      follows the bottom through the native assistant-ui viewport.
  *      After several messages, the container's `scrollTop` must sit
  *      within a small margin of `scrollHeight - clientHeight`.
  *      When the user manually scrolls UP, the auto-stick releases
@@ -169,10 +169,37 @@ describe('Chat harness — scroll + markdown render', () => {
       timeout: 40_000,
       timeoutMsg: 'bold canary never landed',
     });
-    await browser.waitUntil(async () => await textExists(CANARY_CODE), {
-      timeout: 20_000,
-      timeoutMsg: 'code canary never landed',
-    });
+    try {
+      await browser.waitUntil(async () => await textExists(CANARY_CODE), {
+        timeout: 20_000,
+        timeoutMsg: 'code canary never landed',
+      });
+    } catch (error) {
+      console.log(
+        '[indented-code-state]',
+        await browser.execute(canary => {
+          const state = (
+            window as unknown as {
+              __OPENHUMAN_STORE__?: {
+                getState: () => {
+                  thread?: { messages?: { content: string }[] };
+                  chatRuntime?: { streamingAssistantByThread?: Record<string, unknown> };
+                };
+              };
+            }
+          ).__OPENHUMAN_STORE__?.getState();
+          return {
+            storedCanary:
+              state?.thread?.messages?.some(message => message.content.includes(canary)) ?? false,
+            streamingCanary: JSON.stringify(
+              state?.chatRuntime?.streamingAssistantByThread ?? {}
+            ).includes(canary),
+            codeText: document.querySelector('pre code')?.textContent ?? null,
+          };
+        }, CANARY_CODE)
+      );
+      throw error;
+    }
 
     // ── 2. Markdown renders to the expected DOM tags ───────────────
     let tags = { hasBold: false, hasCode: false, hasLink: false };

@@ -869,30 +869,6 @@ pub fn spawn_web_channel_bridge(io: SocketIo) {
                 break;
             };
             match event {
-                crate::core_host::core::events::DomainEvent::HarnessInitProgress {
-                    step_id,
-                    state,
-                    message,
-                    percent,
-                } => {
-                    let payload = serde_json::json!({
-                        "step_id": step_id,
-                        "state": state,
-                        "message": message,
-                        "percent": percent,
-                    });
-                    let _ = io_memory_sync.emit("init:progress", &payload);
-                }
-                crate::core_host::core::events::DomainEvent::HarnessInitCompleted {
-                    overall,
-                    failed_required,
-                } => {
-                    let payload = serde_json::json!({
-                        "overall": overall,
-                        "failed_required": failed_required,
-                    });
-                    let _ = io_memory_sync.emit("init:completed", &payload);
-                }
                 // Live per-step progress of an in-flight flow run (issue G2).
                 // Best-effort: the durable `flow_runs` row is the source of
                 // truth and the Workflows UI keeps a 2s poller as fallback, so
@@ -1243,38 +1219,42 @@ fn event_alias(name: &str) -> Option<String> {
 /// safe to repeat: the client keys the card by `request_id` and a decided
 /// request is no longer parked, so a socket that already has the card just
 /// re-renders the same one.
+///
+/// Every park on the thread is replayed, oldest first: several async
+/// sub-agents can each be waiting on the same parent thread, and replaying
+/// only the newest left the others unanswerable until they expired.
 fn replay_parked_approval(socket: &SocketRef, thread_id: &str) {
     let Some(gate) = crate::core_host::security::approval::ApprovalGate::try_global() else {
         return;
     };
-    let Some(row) = gate.parked_request_for_thread(thread_id) else {
-        return;
-    };
     let client_id = socket.id.to_string();
-    let expires_at = row.expires_at.map(|t| t.to_rfc3339());
-    let mut event = crate::core_host::web_chat::approval_request_event(
-        &row.request_id,
-        &row.tool_name,
-        &row.action_summary,
-        &row.args_redacted,
-        thread_id,
-        &client_id,
-        row.tool_call_id.as_deref(),
-        expires_at.as_deref(),
-    );
-    // Replay is a fresh emit to a newly-joined socket, not a resend of the
-    // original event, so stamp `ts` with "now" (same clock as
-    // `publish_web_channel_event`) rather than leaving it unset.
-    event.ts = Some(crate::core_host::web_chat::unix_epoch_ms());
-    let Ok(payload) = serde_json::to_value(&event) else {
-        return;
-    };
-    log::info!(
-        "[socketio] replaying parked approval_request to joining socket client_id={client_id} thread_id={thread_id} request_id={} tool={}",
-        row.request_id,
-        row.tool_name
-    );
-    emit_with_aliases(socket, "approval_request", &payload);
+    for row in gate.parked_requests_for_thread(thread_id) {
+        let expires_at = row.expires_at.map(|t| t.to_rfc3339());
+        let mut event = crate::core_host::web_chat::approval_request_event(
+            &row.request_id,
+            &row.tool_name,
+            &row.action_summary,
+            &row.args_redacted,
+            thread_id,
+            &client_id,
+            row.tool_call_id.as_deref(),
+            expires_at.as_deref(),
+            gate.request_is_detached(&row.request_id),
+        );
+        // Replay is a fresh emit to a newly-joined socket, not a resend of the
+        // original event, so stamp `ts` with "now" (same clock as
+        // `publish_web_channel_event`) rather than leaving it unset.
+        event.ts = Some(crate::core_host::web_chat::unix_epoch_ms());
+        let Ok(payload) = serde_json::to_value(&event) else {
+            continue;
+        };
+        log::info!(
+            "[socketio] replaying parked approval_request to joining socket client_id={client_id} thread_id={thread_id} request_id={} tool={}",
+            row.request_id,
+            row.tool_name
+        );
+        emit_with_aliases(socket, "approval_request", &payload);
+    }
 }
 
 /// Re-send the plan review parked on `thread_id`, if any, to the socket that

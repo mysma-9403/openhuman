@@ -30,6 +30,7 @@
 //! `crate::agent`, which re-exports them from this module.
 //! The child files are an implementation detail.
 
+#[cfg(feature = "flows")]
 pub(crate) use builder::provider_role_for_definition;
 pub use builder::{HostOnlyToolPolicy, HostTools, HostTurnTools, TurnContext};
 
@@ -48,6 +49,7 @@ mod recorded_tools;
 mod runtime;
 mod runtime_session;
 mod session_api;
+pub(crate) mod stop_summary;
 #[cfg(test)]
 mod tool_progress;
 mod turn;

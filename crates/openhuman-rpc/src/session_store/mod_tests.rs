@@ -49,8 +49,9 @@ fn recovery_interrupts_turns_left_in_flight() {
     );
 }
 
-/// The provider and storage slots are process-wide; these tests take turns.
-static SLOTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// The provider and storage slots are process-wide; these tests take turns
+/// with each other and with any test that stores a credential.
+use crate::STORAGE_SLOT_TEST_LOCK as SLOTS;
 
 /// Puts the process-global storage backend back as a test found it.
 fn restore_backend(previous: Option<Arc<dyn crate::core_host::storage::StorageBackend>>) {
@@ -98,6 +99,108 @@ async fn a_storage_url_installs_the_driver_backed_store() {
 
     restore_backend(previous_backend);
     crate::core_host::agent::session_store::restore(previous);
+}
+
+/// A storage URL installs the driver-backed store, and two agents on the one
+/// backend keep their turn states apart. Run once per driver the build has.
+async fn driver_backed_store_keeps_agents_apart(url: String, driver: &str) {
+    let _turn = SLOTS.lock().await;
+    let previous = crate::core_host::agent::session_store::installed();
+    let previous_backend = crate::core_host::storage::installed();
+    install_for_url(Some(url)).await.unwrap();
+
+    assert_eq!(
+        crate::core_host::storage::installed().map(|b| b.driver()),
+        Some(driver)
+    );
+    let provider = crate::core_host::agent::session_store::installed().unwrap();
+    let alice = provider.for_agent("alice");
+    alice
+        .turn_states
+        .put(&TurnState::started("t", "r", 8, "2026-01-01T00:00:00Z"))
+        .unwrap();
+    assert!(alice.turn_states.get("t").unwrap().is_some());
+    assert!(provider
+        .for_agent("bob")
+        .turn_states
+        .get("t")
+        .unwrap()
+        .is_none());
+
+    restore_backend(previous_backend);
+    crate::core_host::agent::session_store::restore(previous);
+}
+
+#[cfg(feature = "storage-sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sqlite_backend_keeps_agents_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", dir.path().join("sessions").display());
+    driver_backed_store_keeps_agents_apart(url, "sqlite").await;
+}
+
+#[cfg(feature = "storage-file")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_file_backend_keeps_agents_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("file:{}", dir.path().join("files").display());
+    driver_backed_store_keeps_agents_apart(url, "file").await;
+}
+
+/// Whether every seed host of a MongoDB URL is exactly the local machine
+/// (`localhost`, `127.0.0.1` or `::1`); a prefix match would accept
+/// `127.0.0.1.example.com`. Same rule as the root suites' helper
+/// (`tests/support/storage_drivers.rs`).
+#[cfg(feature = "storage-mongodb")]
+fn is_loopback_mongo_url(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    let hosts = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    !hosts.is_empty()
+        && !url.starts_with("mongodb+srv://")
+        && hosts.split(',').all(|host| {
+            let name = if let Some(v6) = host.strip_prefix('[') {
+                v6.split(']').next().unwrap_or_default()
+            } else {
+                host.rsplit_once(':').map_or(host, |(name, _)| name)
+            };
+            matches!(name, "localhost" | "127.0.0.1" | "::1")
+        })
+}
+
+/// Runs against `TSD_MONGO_URL` (a throwaway local replica set, as the
+/// `Storage (MongoDB)` workflow starts) in a database of its own; skipped
+/// when it is unset or names a host other than this machine.
+#[cfg(feature = "storage-mongodb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mongodb_backend_keeps_agents_apart() {
+    let Some(base) = std::env::var("TSD_MONGO_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+    else {
+        eprintln!("skipped mongodb: TSD_MONGO_URL is not set");
+        return;
+    };
+    if !is_loopback_mongo_url(&base) {
+        eprintln!("skipped mongodb: TSD_MONGO_URL must name a local server");
+        return;
+    }
+    let (head, query) = match base.split_once('?') {
+        Some((head, query)) => (head, format!("?{query}")),
+        None => (base.as_str(), String::new()),
+    };
+    let authority_end = head[head.find("://").map_or(0, |at| at + 3)..]
+        .find('/')
+        .map_or(head.len(), |at| head.find("://").map_or(0, |i| i + 3) + at);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let url = format!(
+        "{}/oh_rpc_{nanos:x}_{}{query}",
+        &head[..authority_end],
+        std::process::id()
+    );
+    driver_backed_store_keeps_agents_apart(url, "mongodb").await;
 }
 
 #[tokio::test]

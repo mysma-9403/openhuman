@@ -56,15 +56,6 @@ fn tool_group_classifies_gate_and_harness_families() {
         );
     }
     assert_eq!(tool_group("media_generate_image"), DomainGroup::Media);
-    // Voice audio_* tools have no voice_/tts_/stt_ prefix — must be classified
-    // explicitly, not fall through to Platform (#4808 review).
-    assert_eq!(tool_group("audio_generate_podcast"), DomainGroup::Voice);
-    assert_eq!(tool_group("audio_email_podcast"), DomainGroup::Voice);
-    assert_eq!(
-        tool_group("audio_generate_and_email_podcast"),
-        DomainGroup::Voice
-    );
-
     // Harness-mapped families → kept under harness().
     assert_eq!(tool_group("memory"), DomainGroup::Memory);
     assert_eq!(tool_group("goal_get"), DomainGroup::Threads);
@@ -128,7 +119,6 @@ fn tool_group_gate_families_dropped_under_harness_not_full() {
     assert!(!harness.allows(tool_group("run_workflow")));
     assert!(!harness.allows(tool_group("shell")));
     // The previously-misclassified gate-family tools now drop under harness.
-    assert!(!harness.allows(tool_group("audio_generate_podcast")));
 }
 
 #[test]
@@ -165,7 +155,7 @@ fn no_gate_family_tool_silently_defaults_to_platform() {
 #[cfg(not(feature = "flows"))]
 fn default_tools_omits_flows_tools_when_feature_off() {
     let security = Arc::new(SecurityPolicy::default());
-    let tools = default_tools(security);
+    let tools = crate::tools::ops::default_tools(security);
     let names = tool_names(&tools);
 
     for absent in [
@@ -331,23 +321,5 @@ async fn full_domain_set_keeps_platform_tools() {
     let names = CoreContext::scope(ctx, async { tool_names(&expansion_tools_for(&tmp)) }).await;
     for name in ["shell", "file_read", "file_write", "todo"] {
         assert!(names.iter().any(|n| n == name), "missing `{name}`");
-    }
-}
-
-/// `node_exec` / `npm_exec` are absent when the managed Node runtime is
-/// compiled out — absent, not present-and-erroring, so the model is never shown
-/// a tool it cannot use.
-#[test]
-#[cfg(not(feature = "runtime-node"))]
-fn default_tools_omits_node_tools_when_runtime_node_off() {
-    let tmp = TempDir::new().unwrap();
-    let cfg = integration_test_config(&tmp, "http://127.0.0.1:1");
-    let tools = integration_tools_for_config(&tmp, &cfg);
-    let names = tool_names(&tools);
-    for absent in ["node_exec", "npm_exec"] {
-        assert!(
-            !names.iter().any(|n| n == absent),
-            "`{absent}` must not be registered with runtime-node compiled out"
-        );
     }
 }

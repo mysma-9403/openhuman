@@ -15,6 +15,8 @@ use std::sync::Arc;
 /// context it derives from.
 #[derive(Debug, Clone)]
 pub struct ContextOverlay {
+    /// Host adapters local to this agent; absent inherits the parent.
+    pub host_overrides: Option<Arc<crate::agent::host_overrides::HostOverrides>>,
     /// The config every handler dispatched under the derived context reads
     /// through `config::ops::load_config_with_timeout()`. Keep `config_path`
     /// equal to the parent's: credentials, auth profiles and the keyring file
@@ -32,6 +34,11 @@ pub struct ContextOverlay {
     /// journal, goals and todos to. `None` keeps the parent's. Setting it
     /// gives the derived context state slots of its own.
     pub session_agent: Option<String>,
+    /// The tenant (SaaS profile) the derived context serves. `None` keeps the
+    /// parent's. Setting it gives the derived context state slots of its own
+    /// and keys every tenant-scoped table on it
+    /// ([`tenant`](crate::core::runtime::tenant)).
+    pub profile: Option<String>,
     /// The agent's own security policy: autonomy tier, auto-approve list,
     /// action budget. `None` keeps the parent's.
     pub agent_policy: Option<Arc<crate::security::SecurityPolicy>>,
@@ -49,15 +56,26 @@ impl ContextOverlay {
         tool_groups: crate::tools::toolpacks::ToolGroups,
     ) -> Self {
         Self {
+            host_overrides: None,
             config,
             domains,
             tool_groups,
             user_skill_roots: true,
             session_agent: None,
+            profile: None,
             agent_policy: None,
             approvals_disabled: false,
             definitions: None,
         }
+    }
+
+    /// Bind agent-local hooks, native inference and session storage.
+    pub fn host_overrides(
+        mut self,
+        overrides: Arc<crate::agent::host_overrides::HostOverrides>,
+    ) -> Self {
+        self.host_overrides = Some(overrides);
+        self
     }
 
     /// Hide the operator's `~/.openhuman/skills` / `~/.agents/skills` from
@@ -70,6 +88,12 @@ impl ContextOverlay {
     /// Scope a host session store to `agent_id` under the derived context.
     pub fn session_agent(mut self, agent_id: impl Into<String>) -> Self {
         self.session_agent = Some(agent_id.into());
+        self
+    }
+
+    /// Make the derived context serve tenant (profile) `profile_id`.
+    pub fn profile(mut self, profile_id: impl Into<String>) -> Self {
+        self.profile = Some(profile_id.into());
         self
     }
 

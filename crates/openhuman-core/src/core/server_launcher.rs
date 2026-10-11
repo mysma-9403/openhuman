@@ -2,7 +2,7 @@
 //!
 //! The JSON-RPC server lives in `openhuman-rpc`, which sits above this crate,
 //! so the CLI cannot call it directly. A host binary installs a launcher once
-//! at startup (`openhuman_rpc::server::install_cli_server()`) before it hands
+//! at startup (through `openhuman_rpc::host::cli`) before it hands
 //! its arguments to [`run_core_from_args`](crate::run_core_from_args).
 //! Without one, `run` / `serve` fail with an error that says so instead of
 //! starting a core nothing can reach.

@@ -6,6 +6,11 @@
 //! tokens as **input** to the LLM the result is being compressed for. Cost uses
 //! the per-model input price from [`crate::agent::cost`].
 //!
+//! Deliberately local, not on the storage port: the aggregate is one
+//! process-global counter (not per user) that is cheap to lose, so a per-agent
+//! scoped document would not mean what the number means. Allowlisted in
+//! `scripts/ci/check-storage-bypass.mjs`.
+//!
 //! Aggregates are kept process-global and snapshotted to
 //! `workspace_dir/state/tokenjuice_savings.json` so the dashboard survives
 //! restarts. The configured default model and snapshot path are installed via
@@ -144,10 +149,12 @@ pub fn record(
 
 /// Cost (USD) of sending `tokens_saved` as input to `model`, using the per-model
 /// input price. Tool results enter the next turn's context as input tokens, so
-/// the input price is the relevant rate.
+/// the input price is the relevant rate. `0.0` for a model the catalog does
+/// not price: the saving is then counted in tokens only, not guessed in USD.
 fn cost_saved_usd(model: &str, tokens_saved: u64) -> f64 {
-    let pricing = crate::agent::cost::lookup_pricing(model);
-    (tokens_saved as f64) / 1_000_000.0 * pricing.input_per_mtok_usd
+    crate::agent::cost::lookup_pricing(model).map_or(0.0, |pricing| {
+        (tokens_saved as f64) * pricing.input_per_token.unwrap_or(0.0)
+    })
 }
 
 fn persist(st: &State) {

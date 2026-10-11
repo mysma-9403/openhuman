@@ -143,7 +143,7 @@ irm https://raw.githubusercontent.com/tinyhumansai/openhuman/main/scripts/instal
 
 <h3>مصمم للمطورين</h3>
 
-<p><a href="https://tinyhumans.gitbook.io/openhuman/developing/quickstart">البدء السريع مع Rust</a> · <a href="https://tinyhumans.gitbook.io/openhuman/developing/embedding">دليل التضمين</a> · <a href="../crates/openhuman-embed/examples">أمثلة</a></p>
+<p><a href="https://tinyhumans.gitbook.io/openhuman/developing/quickstart">البدء السريع مع Rust</a> · <a href="../gitbooks/developing/embed/README.md">دليل التضمين</a> · <a href="../crates/openhuman-embed/examples">أمثلة</a></p>
 
 <p>استخدمه كمكتبة Rust: استدعِ وكيلاً كأي دالة أخرى، أو شغّل أسطولاً كاملاً من خادم صغير واحد.</p>
 
@@ -210,7 +210,7 @@ irm https://raw.githubusercontent.com/tinyhumansai/openhuman/main/scripts/instal
 
 <p><a href="https://tinyhumans.gitbook.io/openhuman/developing/loadable-modules">كيف تعمل الإضافات</a></p>
 
-<p>كل ميزة، مثل البحث أو المستندات أو الصوت، تتصل بناقل Rust واحد، وهي فكرة مستعارة من <a href="https://www.freedesktop.org/wiki/Software/dbus/">ناقل نظام Linux</a>. لا تُحمَّل الميزة إلا عند الحاجة، وإذا تعطلت إحداها تواصل البقية عملها.</p>
+<p>كل ميزة، مثل البحث أو المستندات أو الصوت، تتصل بناقل Rust واحد، وهي فكرة مستعارة من <a href="https://packages.debian.org/stable/dbus">ناقل نظام Linux</a>. لا تُحمَّل الميزة إلا عند الحاجة، وإذا تعطلت إحداها تواصل البقية عملها.</p>
 
 </td>
 
@@ -342,7 +342,7 @@ println!("{}", reply.reply);
 
 <div dir="rtl" lang="ar">
 
-بعد ذلك: [البدء السريع مع Rust](https://tinyhumans.gitbook.io/openhuman/developing/quickstart)، و[دليل التضمين](https://tinyhumans.gitbook.io/openhuman/developing/embedding)، و[مستندات المطورين](https://tinyhumans.gitbook.io/openhuman/developing).
+بعد ذلك: [البدء السريع مع Rust](https://tinyhumans.gitbook.io/openhuman/developing/quickstart)، و[دليل التضمين](../gitbooks/developing/embed/README.md)، و[مستندات المطورين](https://tinyhumans.gitbook.io/openhuman/developing).
 
 ---
 

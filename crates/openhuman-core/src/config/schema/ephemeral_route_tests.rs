@@ -15,6 +15,7 @@ fn route() -> EphemeralRoute {
     EphemeralRoute {
         endpoint: "http://127.0.0.1:41234/openai".to_string(),
         api_key: "mdl-token".to_string(),
+        headers: Vec::new(),
     }
 }
 
@@ -27,6 +28,7 @@ fn from_params_needs_both_halves() {
         Some(EphemeralRoute {
             endpoint: "http://x/openai".into(),
             api_key: "k".into(),
+            headers: Vec::new(),
         })
     );
     // An endpoint with no credential and a credential with no endpoint are both
@@ -55,6 +57,7 @@ fn from_params_treats_blank_as_absent_and_trims() {
         Some(EphemeralRoute {
             endpoint: "http://x/openai".into(),
             api_key: "k".into(),
+            headers: Vec::new(),
         })
     );
 }
@@ -155,6 +158,7 @@ fn apply_twice_leaves_one_entry() {
         EphemeralRoute {
             endpoint: "http://127.0.0.1:9999/openai".into(),
             api_key: "mdl-other".into(),
+            headers: Vec::new(),
         },
     );
     let entries: Vec<_> = config
@@ -176,4 +180,16 @@ fn the_route_cannot_be_serialized_into_a_config_file() {
     let encoded = toml::to_string(&config).expect("config serializes");
     assert!(!encoded.contains("mdl-token"));
     assert!(!encoded.contains("ephemeral_route"));
+}
+
+#[test]
+fn debug_never_discloses_route_bearer_or_header_values() {
+    let route = EphemeralRoute {
+        endpoint: "https://fixture.example/v1".into(),
+        api_key: "u2-unique-route-secret".into(),
+        headers: vec![("x-private".into(), "u2-unique-header-secret".into())],
+    };
+    let debug = format!("{route:?}");
+    assert!(!debug.contains("u2-unique-route-secret"));
+    assert!(!debug.contains("u2-unique-header-secret"));
 }

@@ -239,7 +239,11 @@ pub fn for_config(config: &Config) -> anyhow::Result<Arc<McpHost>> {
 /// When the agent has no host yet, or [`for_config`] fails.
 pub fn lookup(config: &Config) -> anyhow::Result<Arc<McpHost>> {
     let key = host_key(config);
-    if key != config.workspace_dir {
+    // A SaaS profile's default agent keeps its host at its own workspace root
+    // (no agent id), and a read must not create one there either.
+    let tenant_owned = key != config.workspace_dir
+        || crate::core::runtime::current_tenant().map_or(true, |t| t.profile.is_some());
+    if tenant_owned {
         let open = HOSTS.get().and_then(|hosts| {
             hosts
                 .lock()
@@ -323,22 +327,43 @@ pub fn take_agent_host(workspace_dir: &Path, agent_id: &str) -> Option<Arc<McpHo
 }
 
 /// Where the host for `config` keeps its stores: the workspace, or the
-/// agent's own directory beneath it when an agent context is current.
+/// agent's own directory beneath it when an agent context is current. A SaaS
+/// profile's workspace is its own, so its default agent's host sits at the
+/// workspace root and never meets another profile's.
 fn host_key(config: &Config) -> PathBuf {
     crate::core::runtime::agent_scope_dir(config)
 }
 
-/// The current agent's host, when a turn runs under an agent context.
+/// The current tenant's host, when a turn runs under an embedded agent's or
+/// a SaaS profile's context.
 ///
-/// `None` outside an agent context; `Some(None)` when the agent's host cannot
-/// be opened, which must not fall back to another agent's or the default one.
+/// `None` outside both (the desktop's own sessions); `Some(None)` when the
+/// tenant's host cannot be opened, or a SaaS task has no tenant scope, which
+/// must not fall back to another tenant's or the default one.
 fn current_agent_host() -> Option<Option<Arc<McpHost>>> {
-    let agent = crate::core::runtime::agent_scope::current_agent_id()?;
-    let opened = crate::core::runtime::CoreContext::with_current_embedder_config(lookup)?;
+    let tenant = match crate::core::runtime::current_tenant() {
+        Ok(tenant) if !tenant.is_scoped() => return None,
+        Ok(tenant) => tenant,
+        Err(no_tenant) => {
+            tracing::debug!("[mcp] {no_tenant}; no host");
+            return Some(None);
+        }
+    };
+    let Some(opened) = crate::core::runtime::CoreContext::with_current_embedder_config(lookup)
+    else {
+        // A scoped tenant always carries its own config; without one there is
+        // no host it may use.
+        return tenant.profile.is_some().then_some(None);
+    };
     Some(match opened {
         Ok(host) => Some(host),
         Err(error) => {
-            tracing::debug!(agent = %agent, ?error, "[mcp] agent host unavailable");
+            tracing::debug!(
+                agent = tenant.agent.as_deref().unwrap_or(""),
+                profile_scoped = tenant.profile.is_some(),
+                ?error,
+                "[mcp] tenant host unavailable"
+            );
             None
         }
     })

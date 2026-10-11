@@ -56,7 +56,7 @@ async fn cancelled_scope_restores_the_callers_tool_limit() {
 
 #[tokio::test]
 async fn scoped_stop_hooks_are_visible_to_run_contexts() {
-    let hook: Arc<dyn StopHook> = Arc::new(BudgetStopHook::new(1.0));
+    let hook: Arc<dyn StopHook<crate::agent::cost::TurnCost>> = Arc::new(BudgetStopHook::new(1.0));
     assert!(current_stop_hooks().is_empty());
     with_stop_hooks(vec![Arc::clone(&hook)], async {
         let active = current_stop_hooks();
@@ -77,7 +77,10 @@ async fn scoped_stop_hooks_are_visible_to_run_contexts() {
 async fn budget_stop_hook_fails_closed_and_stops_at_cap() {
     let hook = BudgetStopHook::new(1.0);
     let cost = TurnCost {
-        charged_usd: 1.0,
+        cost: crate::agent::cost::CostTally {
+            known_usd: 1.0,
+            source: crate::agent::cost::CostSource::Charged,
+        },
         ..TurnCost::default()
     };
     let state = TurnState {

@@ -46,6 +46,35 @@ pub fn run_from_cli_args(args: &[String]) -> Result<()> {
     run_from_cli_args_with(args, None)
 }
 
+/// Whether the parsed invocation only asks the CLI to print help.
+///
+/// Hosts use this before startup work that may access user credentials so
+/// `--help` remains available on a machine whose keyring is unavailable.
+pub(crate) fn is_help_only(args: &[String]) -> bool {
+    let Ok(launch) = parse_launch_options(args) else {
+        return false;
+    };
+    let Some(command) = launch.args.first() else {
+        return true;
+    };
+    if is_help(command) {
+        return true;
+    }
+    let tail = &launch.args[1..];
+    match command.as_str() {
+        "call" | "agent" => tail.is_empty() || tail.iter().any(|arg| is_help(arg)),
+        "mcp" | "mcp-server" | "run" | "serve" | "sentry-test" => {
+            tail.iter().any(|arg| is_help(arg))
+        }
+        _namespace => {
+            matches!(
+                tail,
+                [function, ..] if is_help(function)
+            ) || matches!(tail, [_, slot, ..] if is_help(slot))
+        }
+    }
+}
+
 /// [`run_from_cli_args`] with a host-supplied boot description for `run` /
 /// `serve`; see [`crate::run_core_from_args_with`].
 pub fn run_from_cli_args_with(

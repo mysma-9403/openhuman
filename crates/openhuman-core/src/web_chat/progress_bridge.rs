@@ -159,56 +159,11 @@ pub fn unix_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Upper bound on the sub-agent tool output forwarded to the drawer over
-/// Socket.IO. The `SubagentToolCallCompleted` event carries the *pre-handoff*
-/// tool result (the result-handoff path that stashes large toolkit payloads
-/// behind a short placeholder runs later, in `SubagentToolSource`), so a raw
-/// multi-MB integration result would otherwise ship in full to the socket /
-/// Redux / DOM. Cap it here on a UTF-8 boundary with a truncation marker so the
-/// drawer payload stays bounded while still showing what the tool returned.
-const MAX_WIRE_SUBAGENT_OUTPUT: usize = 256 * 1024;
-
-/// Bytes reserved within the cap for the truncation marker so the *final*
-/// payload (content + marker) never exceeds [`MAX_WIRE_SUBAGENT_OUTPUT`].
-/// Generous upper bound for `…[truncated <N> bytes of tool output]` at any
-/// plausible `N` (the "…" is 3 UTF-8 bytes).
-const TRUNCATION_MARKER_BUDGET: usize = 80;
-
-/// Truncate `output` so the returned string stays within
-/// [`MAX_WIRE_SUBAGENT_OUTPUT`] bytes, slicing on a char boundary and
-/// appending a marker (which is itself counted against the cap) when content
-/// was dropped. Returns the input unchanged when it's already within the cap.
-fn cap_wire_output(output: String) -> String {
-    if output.len() <= MAX_WIRE_SUBAGENT_OUTPUT {
-        return output;
-    }
-    let mut end = MAX_WIRE_SUBAGENT_OUTPUT.saturating_sub(TRUNCATION_MARKER_BUDGET);
-    while end > 0 && !output.is_char_boundary(end) {
-        end -= 1;
-    }
-    let omitted = output.len() - end;
-    format!(
-        "{}\n…[truncated {omitted} bytes of tool output]",
-        &output[..end]
-    )
-}
-
-/// Cap a tool call's forwarded `args`/input payload the same way
-/// [`cap_wire_output`] caps tool output: a captured argument (e.g. a large
-/// inline file body) must never ship megabytes over the socket. Truncation
-/// only ever produces a marker string; it never re-nests as JSON, since the
-/// wire consumer only needs to know the payload was too big to show in full.
-fn cap_wire_args(args: Option<serde_json::Value>) -> Option<serde_json::Value> {
-    let value = args?;
-    if value.is_null() {
-        return None;
-    }
-    let rendered = value.to_string();
-    if rendered.len() <= MAX_WIRE_SUBAGENT_OUTPUT {
-        return Some(value);
-    }
-    Some(serde_json::Value::String(cap_wire_output(rendered)))
-}
+#[path = "progress_bridge_wire_caps.rs"]
+mod wire_caps;
+#[cfg(test)]
+use wire_caps::MAX_WIRE_SUBAGENT_OUTPUT;
+use wire_caps::{cap_wire_args, cap_wire_output};
 
 pub(super) fn ledger_upsert_agent_run(
     config: &crate::config::Config,
@@ -1084,7 +1039,7 @@ pub(crate) fn spawn_progress_bridge(
                         },
                     );
                 }
-                AgentProgress::TurnCompleted { iterations } => {
+                AgentProgress::TurnCompleted { iterations, .. } => {
                     parent_completed = true;
                     timing.done(iterations, MIN_INTERIM_NARRATION_CHARS, &request_id);
                     if let Ok(mut guard) = timing_snapshot_for_task.lock() {
@@ -1185,8 +1140,13 @@ pub(crate) fn spawn_progress_bridge(
                                     input_tokens,
                                     output_tokens,
                                     cached_input_tokens,
-                                    cost_usd: total_usd,
+                                    // A live rollup of the known spend so far;
+                                    // the turn's final figure (or `null`)
+                                    // arrives on `chat_done`.
+                                    cost_usd: Some(total_usd),
+                                    cost_source: crate::agent::cost::CostSource::Charged,
                                     context_window: 0,
+                                    context_tokens: 0,
                                     subagents: Vec::new(),
                                 }),
                                 ..Default::default()
@@ -1211,7 +1171,7 @@ pub(crate) fn spawn_progress_bridge(
                     // stay on the cumulative TurnCostUpdated rollup.
                     log::debug!(
                         "[web_channel][bridge] model_call_completed model={model} iter={iteration} \
-                         in={input_tokens} out={output_tokens} cost_usd={cost_usd:.6} request_id={request_id}"
+                         in={input_tokens} out={output_tokens} cost_usd={cost_usd:?} request_id={request_id}"
                     );
                 }
             }

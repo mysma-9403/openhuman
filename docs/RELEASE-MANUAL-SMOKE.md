@@ -32,6 +32,15 @@ Applies to every release, all platforms.
 - [ ] **A failed chat turn does not offer an invalid regenerate action** — Trigger a provider failure in a test profile and inspect its error card. Expected: the diagnostic text remains visible, with no Retry or Refresh button on that failed message. A completed assistant reply still offers Refresh (#6613).
 - [ ] **A failed turn leaves its thread usable** — In a test profile, get one successful reply, trigger a streamed provider failure on the next turn, then send another message in the same thread. Expected: the error card appears, the composer re-enables, the next reply streams normally, and the agent still has the first turn's context. If a queued follow-up starts as the failed turn ends, its stream and composer state stay active.
 
+### Memory latency and queued writes (coverage 8.1 / 8.2)
+
+Use a disposable staging account/workspace and synthetic facts. Keep inference reachable while delaying or blocking only the memory endpoint.
+
+- [ ] **Automatic memory does not stall a chat or compaction** — Start a fresh conversation while memory reads take at least 60 seconds, then send another turn and trigger transcript compaction in a long test thread. Expected: inference and compaction proceed while memory refresh remains pending; an unavailable or expired pack is omitted. After restoring memory, a later turn can use the completed scoped pack. A different thread or account must not receive that context.
+- [ ] **Learn and forget acknowledge local queueing** — Ask the agent to learn a unique synthetic fact while memory writes are delayed, then forget its returned item ID. Expected: each tool result says queued without waiting for remote acceptance; the agent continues the requested work and does not claim the fact was saved or removed remotely. Quit after queue acknowledgement, relaunch and restore memory. Expected: retry processes learn before forget and the forgotten fact does not reappear. Repeat with memory explicitly disabled: new writes are refused and earlier pending writes remain unsent until re-enabled.
+- [ ] **Explicit recall/fetch stay bounded** — With memory reads blocked, ask the agent to use recall or fetch. Expected: a call stops waiting after at most 15 seconds, repeated optional memory calls share a 30-second/8-attempt budget while that run record remains tracked, and the agent continues without memory. Idle records can be evicted under heavy run churn. A new chat turn receives a fresh budget; inference/provider latency is measured separately.
+- [ ] **Erase all retires earlier queued learnings** — Queue a synthetic learning during a memory outage, then restore access and use Erase all with confirmation. Expected: the current mutation settles before erasure, older pending learnings are discarded, and none are replayed after restart. Queue a new learning after erasure and repeat Erase all in the same app process; it must also be removed. Verify another staging account's queued facts remain isolated.
+
 ### Refreshed application UI
 
 - [ ] **Settings, Connections, theme, and workflow surfaces remain usable** — On desktop, navigate between Settings sections and Connections tabs, switch between light/dark and at least one named theme family, export and re-import a custom theme, then open a workflow canvas and its run history. Expected: each route renders its own content without stale panels or horizontal overflow; imported themes can be selected and theme selection and run details survive a reload where persistence is expected.
@@ -59,6 +68,10 @@ Applies to every release, all platforms.
 ### Public installer script
 
 - [ ] **`scripts/install.sh` downloads the latest asset on a proxy/VPN network** — From a clean checkout, run `bash scripts/install.sh --dry-run --verbose`, then run the public `curl -fsSL https://raw.githubusercontent.com/tinyhumansai/openhuman/main/scripts/install.sh | bash` flow on one macOS or Linux host. Expected: release metadata resolves, the asset downloads successfully, and transient GitHub/CDN HTTP/2 failures retry over HTTP/1.1 instead of surfacing `curl: (16) Error in the HTTP2 framing layer`.
+
+### Archived conversations
+
+- [ ] **An older conversation remains usable after tool retirement (4.4.7)** — In a staging profile, reopen a conversation saved before one of its tools was retired and send a follow-up. Expected: prior tool results remain visible, the turn can finish, and any attempted retired call returns an unavailable-tool result without executing the old tool. Check that an explicit current tool override or permission restriction still applies.
 
 ### Terminal agent cockpit
 
@@ -96,6 +109,11 @@ Applies to every release, all platforms.
 - [ ] **Headless supervisor update stages without self-exit** — On a Linux service deployment with `[update] restart_strategy = "supervisor"` and `rpc_mutations_enabled = false`, stage a new core binary through the documented operator flow. Expected: the running process stays up until the supervisor restart, the staged binary is present on disk, and `systemctl restart openhuman` (or equivalent) picks up the new version.
 
 ### Cross-platform
+
+- [ ] **Existing desktop secrets survive the keyring host migration (16.1.28)** — Upgrade a signed build with an existing profile containing a saved provider key and encrypted config secret. Expected: both remain usable after restart without re-entry, the `openhuman` / `app:master_key` entry remains unchanged, and no new corruption quarantine appears. Repeat on macOS, Windows and Linux with their native credential store available. Deny or lock keychain access and confirm the consent flow appears without replacing the existing master key. Restore access, restart, and confirm the secrets decrypt again. Do not export keys or capture secret values in the smoke evidence.
+
+- [ ] **Embed capability report and storage configuration** — Run `openhuman-core embed info --json` from a headless install. Expected: versioned JSON lists compiled features and effective defaults without credentials, prompts, endpoint URLs or workspace paths. Run the Embed `storage` recipe with `storage-sqlite`: it writes, reads and deletes an item in its configured SQLite backend. For a release that includes `storage-mongodb`, repeat against an operator-provided test database using the recipe's explicit live settings; confirm the configured backend is reported as MongoDB without exposing its URL.
+- [ ] **Embed agents remain independent during streaming** — Run the offline `runtime_events`, `custom_provider` and `approvals` recipes. Expected: per-agent model routes and hooks stay isolated, events identify the acting agent without user content, and dropping an approval subscription cancels its pending callback. Run the stream cancellation integration test: dropping or externally cancelling a stream releases its model even while the receiver remains unread.
 
 - [ ] **Chat model picker selects the provider as well as the model (#6938)** — In an isolated test profile, switch the same thread from managed to Ollama, then to a configured BYOK provider, and back to a managed catalog model (including a `:free` variant). Verify the actual request endpoint and model match each selection, configured background routes stay unchanged, and reopening the app restores the selected provider/model. Selecting a workload hint must retain its configured route.
 

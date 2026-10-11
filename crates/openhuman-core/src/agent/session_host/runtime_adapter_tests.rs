@@ -112,8 +112,13 @@ fn codec_attaches_only_this_agents_own_sidecar_usage_to_atomic_append() {
         sidecar.input_tokens = 13;
         sidecar.output_tokens = 8;
         sidecar.cached_input_tokens = 3;
-        sidecar.cost_usd = 0.004;
+        sidecar.cost = crate::agent::cost::CostTally {
+            known_usd: 0.004,
+            source: crate::agent::cost::CostSource::Charged,
+        };
         sidecar.context_window = 128_000;
+        sidecar.last_call_input_tokens = 9;
+        sidecar.last_call_output_tokens = 2;
         sidecar
             .tool_outcomes
             .push(crate::agent::tinyagents::ToolCallOutcome {
@@ -133,6 +138,7 @@ fn codec_attaches_only_this_agents_own_sidecar_usage_to_atomic_append() {
             output_tokens: 2,
             cached_input_tokens: 1,
             charged_amount_usd: 0.001,
+            cost_source: crate::agent::cost::CostSource::Charged,
         },
     });
     // `OpenHumanRunContext` is `Clone` and its child ledger is an `Arc`, so this
@@ -164,6 +170,12 @@ fn codec_attaches_only_this_agents_own_sidecar_usage_to_atomic_append() {
         "the parent's own cache reads, NOT 4"
     );
     assert_eq!(usage.usage.context_window, 128_000);
+    // The final call's size is persisted beside the summed spend, so a thread
+    // reopened later can still fill the context gauge correctly.
+    assert_eq!(
+        (usage.usage.last_call_input, usage.usage.last_call_output),
+        (9, 2)
+    );
     assert!(
         (usage.usage.cost_usd - 0.004).abs() < f64::EPSILON,
         "the parent's own cost, NOT 0.005"
@@ -191,8 +203,13 @@ fn last_turn_usage_reports_the_same_holistic_totals_as_transcript_billing() {
         input_tokens: 13,
         output_tokens: 8,
         cached_input_tokens: 3,
-        cost_usd: 0.004,
+        cost: crate::agent::cost::CostTally {
+            known_usd: 0.004,
+            source: crate::agent::cost::CostSource::Charged,
+        },
         context_window: 128_000,
+        last_call_input_tokens: 9,
+        last_call_output_tokens: 2,
         ..Default::default()
     };
     sidecar
@@ -205,6 +222,7 @@ fn last_turn_usage_reports_the_same_holistic_totals_as_transcript_billing() {
                 output_tokens: 2,
                 cached_input_tokens: 1,
                 charged_amount_usd: 0.001,
+                cost_source: crate::agent::cost::CostSource::Charged,
             },
         });
 
@@ -212,8 +230,11 @@ fn last_turn_usage_reports_the_same_holistic_totals_as_transcript_billing() {
     assert_eq!(usage.input_tokens, 18);
     assert_eq!(usage.output_tokens, 10);
     assert_eq!(usage.cached_input_tokens, 4);
-    assert!((usage.cost_usd - 0.005).abs() < f64::EPSILON);
+    assert!((usage.cost_usd.expect("all calls charged") - 0.005).abs() < f64::EPSILON);
     assert_eq!(usage.context_window, 128_000);
+    // The gauge numerator is the root's final call alone: neither the turn's
+    // summed spend nor the child's tokens, which ran in their own window.
+    assert_eq!(usage.context_tokens, 11);
     assert_eq!(usage.subagents.len(), 1, "detail breakdown is retained");
 }
 

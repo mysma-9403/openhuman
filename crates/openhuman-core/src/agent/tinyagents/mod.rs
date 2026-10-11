@@ -21,6 +21,7 @@
 
 mod compaction_carry;
 pub mod config;
+mod deadline_wind_down;
 pub mod discovery;
 mod embeddings;
 mod harness_assembly;
@@ -48,6 +49,8 @@ pub mod run_mode;
 // embedder may be unable to do (OpenCompany withholds spawn tools under
 // multi-tenancy), so "bring your own summarizer" is the case this seam exists
 // for rather than an exotic one.
+pub mod budget;
+mod budget_charge;
 pub mod payload_summarizer;
 mod policy_denial;
 pub(crate) mod reaper;
@@ -61,6 +64,7 @@ pub mod todos;
 pub(crate) mod tools;
 mod topology;
 mod turn_models;
+pub mod turn_observer;
 mod turn_outcome;
 mod turn_policy;
 mod turn_run_error;
@@ -72,7 +76,7 @@ mod verify_before_finish;
 
 pub(crate) use crate::agent::message_convert::chat_message_to_message;
 #[cfg(feature = "flows")]
-pub(crate) use crate::agent::message_convert::{reasoning_from_content, ta_call_to_oh_call};
+pub(crate) use crate::agent::message_convert::ta_call_to_oh_call;
 
 pub(crate) use compaction_carry::{last_user_message, CompactionCarry};
 #[allow(unused_imports)] // Wired into the recall/retrieval facade in workstream 09.2.
@@ -89,8 +93,11 @@ pub(crate) use turn_outcome::{
     HaltSummarySlot, TinyagentsTurnOutcome, ToolCallOutcome, ToolOutcomeSink,
 };
 #[cfg(test)]
-pub(crate) use turn_policy::is_subagent_spawn_or_delegate_tool;
-pub(crate) use turn_policy::{agent_turn_wall_clock_ms, ToolPolicyEnforcement};
+pub(crate) use turn_policy::{agent_turn_wall_clock_ms, is_subagent_spawn_or_delegate_tool};
+pub(crate) use turn_policy::{
+    agent_turn_wall_clock_ms_for, chat_provider_is_local, local_web_turn_backstop_secs,
+    ToolPolicyEnforcement,
+};
 pub(crate) use turn_runner::{run_root_turn_via_hosted_agent, run_turn_via_tinyagents_shared};
 
 // Test-only glue so `tinyagents_tests.rs`'s `use super::*;` sees the

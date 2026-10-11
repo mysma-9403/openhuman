@@ -4,14 +4,14 @@
 //! This is `docs/specs/plan-agents.md` Phase 4 for the most policy-sensitive
 //! seam in the set. The tinyagents runtime holds *no* authority: it asks, and
 //! obeys. Everything it would otherwise have to guess at lives on this side —
-//! the autonomy tier, the command classifier, the per-channel tool policy, the
+//! the autonomy tier, policy over TinyBox's command facts, the per-channel tool policy, the
 //! human-in-the-loop approval park, and the prompt-injection screen.
 //!
 //! # Domains adapted
 //!
 //! - [`crate::security::policy`] — [`SecurityPolicy`], its
-//!   [`SecurityPolicy::classify_command`] / [`SecurityPolicy::check_gated_command`]
-//!   /  [`SecurityPolicy::gate_decision`] triad, and [`AutonomyLevel`].
+//!   [`SecurityPolicy::check_gated_command_analysis`] / [`SecurityPolicy::gate_decision`]
+//!   decisions, and [`AutonomyLevel`].
 //! - [`crate::approval`] — the process-global [`ApprovalGate`],
 //!   [`GateOutcome`], and the `summarize_action` / `redact_args` pair that keep
 //!   raw arguments out of the approval card.
@@ -79,6 +79,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use tinyagents_harness::error::Result as TaResult;
 use tinyagents_harness::host::security_gate::{
     ContentOrigin, GateDecision, ScreenOutcome, SecurityGate, ToolCallRequest,
@@ -96,10 +97,31 @@ use tinytools::{PermissionLevel, Tool};
 /// The tool name whose arguments carry a shell command string.
 ///
 /// Command classification is not a generic capability: only `shell` has a
-/// `command` argument for [`SecurityPolicy::classify_command`] to read. Every
-/// other tool is classified by its declared permission level and
+/// `command` argument for TinyBox to analyze. Every other tool is classified by its declared permission level and
 /// `external_effect_with_args`, which is what the rest of the harness does too.
 const SHELL_TOOL: &str = "shell";
+
+#[derive(Deserialize)]
+struct PreparedShellAuthorization {
+    tool_name: String,
+    request_arguments: serde_json::Value,
+    effective_arguments: serde_json::Value,
+    tool_facts: serde_json::Value,
+}
+
+fn shell_analysis_for_call(
+    call: &ToolCallRequest,
+    context: Option<&serde_json::Value>,
+) -> Option<(serde_json::Value, serde_json::Value)> {
+    let prepared: PreparedShellAuthorization = serde_json::from_value(context?.clone()).ok()?;
+    if prepared.tool_name != SHELL_TOOL || prepared.request_arguments != call.arguments {
+        return None;
+    }
+    Some((
+        prepared.effective_arguments,
+        prepared.tool_facts.get("analysis")?.clone(),
+    ))
+}
 
 /// The channel tool-policy's verdict for one tool, as three explicit outcomes.
 ///
@@ -265,17 +287,18 @@ impl OpenHumanSecurityGate {
     /// Classifies a `shell` call and maps OpenHuman's three-way policy verdict
     /// onto this trait's.
     ///
-    /// Mirrors `ShellTool::external_effect_with_args` exactly: the deterministic
-    /// [`SecurityPolicy::classify_command`] floor, raised (never lowered) by the
-    /// model's self-declared `category`. [`SecurityPolicy::check_gated_command`]
-    /// runs first because it also enforces the hidden-execution guard
-    /// (`$(…)`, backticks, background `&`) that classification alone misses.
+    /// Applies host policy to TinyBox's generic command facts, then raises (never
+    /// lowers) the result with the model's self-declared `category`.
+    #[cfg(feature = "modules")]
     fn shell_decision(
         policy: &SecurityPolicy,
         args: &serde_json::Value,
+        analysis: &serde_json::Value,
     ) -> std::result::Result<PolicyGateDecision, String> {
-        let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-        let mut class: CommandClass = policy.check_gated_command(command)?;
+        let analysis: crate::modules::tinybox::contract::CommandAnalysis =
+            serde_json::from_value(analysis.clone())
+                .map_err(|_| "TinyBox command analysis is invalid".to_owned())?;
+        let mut class: CommandClass = policy.check_gated_command_analysis(&analysis)?;
         if let Some(declared) = args
             .get("category")
             .and_then(|v| v.as_str())
@@ -375,61 +398,11 @@ impl OpenHumanSecurityGate {
         }
         decision_for_outcome(&call.tool_name, outcome)
     }
-}
-
-/// Maps how the approval flow settled to what the runtime is told.
-///
-/// A refusal is a `Deny` whose text names no human and no timeout — every
-/// refusal reads the same — and rules out other routes explicitly, because
-/// `shell` never prompts while autonomy is disabled (`[autonomy] enabled =
-/// false`, the default) and was used to redo a refused call.
-///
-/// The text carries no `[policy-denied]` marker on purpose. The marker
-/// classifies as a policy failure with a zero recovery budget
-/// (`middleware::repeated_failure`), which pauses the turn before the model can
-/// answer. The model must get this turn to tell the user the action was not
-/// done, as it did with the harness's unmarked fallback text.
-fn decision_for_outcome(tool_name: &str, outcome: GateOutcome) -> GateDecision {
-    match outcome {
-        GateOutcome::Allow => GateDecision::Prompted { approved: true },
-        GateOutcome::Deny { reason } => {
-            tracing::warn!(
-                target: "tinyagents",
-                tool = %tool_name,
-                reason = %reason,
-                "[tinyagents::host::security] approval flow declined the tool call"
-            );
-            GateDecision::deny(
-                "This action was refused and must not be performed this turn — do not retry this \
-                 call and do not achieve the same result another way (shell, CLI, another tool). \
-                 Tell the user it was not done.",
-            )
-        }
-    }
-}
-
-#[async_trait]
-impl SecurityGate for OpenHumanSecurityGate {
-    /// Answers in five stages, each of which can only narrow the answer:
-    ///
-    /// 1. the channel tool policy (`agent_tool_policy`),
-    /// 2. tool resolution — an unregistered name is denied,
-    /// 3. `shell` command classification, which supersedes stage 4 for that one
-    ///    tool because it is strictly finer-grained,
-    /// 4. the autonomy tier for acting tools (`can_act`) plus the non-mutating
-    ///    rate-limit read, and
-    /// 5. the approval park for anything the tier prompts on.
-    ///
-    /// **A human approval never short-circuits the remaining stages.** Approving
-    /// at stage 1 settles the *channel* restriction and nothing else; the call
-    /// still has to survive tool resolution, the shell classifier, and the
-    /// autonomy tier. Returning straight after the park would have let a
-    /// channel that merely asks for confirmation authorize a `shell` command the
-    /// tier blocks, or an acting tool under `readonly` — turning the channel's
-    /// second-strictest setting into an override of the user's own autonomy
-    /// choice. A refusal at any stage is still terminal, and `channel_approved`
-    /// is carried forward so a later prompting stage does not ask twice.
-    async fn authorize_tool(&self, call: &ToolCallRequest) -> TaResult<GateDecision> {
+    async fn authorize_tool_with_facts(
+        &self,
+        call: &ToolCallRequest,
+        authorization_context: Option<&serde_json::Value>,
+    ) -> TaResult<GateDecision> {
         // A nested call (made by a running tool, not the model) can never be
         // parked for a human, and the stages below prompt. Fail closed rather
         // than prompt or guess which stages would have: nested calls are off
@@ -545,6 +518,29 @@ impl SecurityGate for OpenHumanSecurityGate {
             )));
         };
 
+        // A scheduled prompt is data, not an open-ended approval for later
+        // actions. Keep cron agent turns within a read-only tool capability.
+        // This check precedes the shell shortcut and all approval settings,
+        // including installations where the approval gate is disabled.
+        if matches!(
+            crate::agent::turn_origin::current(),
+            Some(
+                crate::agent::turn_origin::AgentTurnOrigin::TrustedAutomation {
+                    source: crate::agent::turn_origin::TrustedAutomationSource::Cron,
+                    ..
+                }
+            )
+        ) && (call.tool_name == SHELL_TOOL
+            || tool.permission_level_with_args(&call.arguments) > PermissionLevel::ReadOnly
+            || tool.external_effect_with_args(&call.arguments))
+        {
+            return Ok(GateDecision::deny(format!(
+                "{} Scheduled agent turns may use read-only tools only; '{}' needs a live user action.",
+                crate::security::POLICY_DENIED_MARKER,
+                call.tool_name
+            )));
+        }
+
         // 3. `shell` is the one tool whose arguments carry a classifiable
         //    command, and `gate_decision` already encodes the autonomy tier —
         //    at a finer grain than the tool's coarse `Execute` permission
@@ -552,44 +548,63 @@ impl SecurityGate for OpenHumanSecurityGate {
         //    which OpenHuman's own `ShellTool` permits. So shell answers here
         //    and returns.
         if call.tool_name == SHELL_TOOL {
-            match Self::shell_decision(&policy, &call.arguments) {
-                Err(raw_reason) => {
-                    tracing::warn!(
-                        target: "tinyagents",
-                        tool = %call.tool_name,
-                        "[tinyagents::host::security] shell command blocked by security policy"
-                    );
-                    return Ok(GateDecision::deny(
-                        PolicyDenial::SecurityPolicyBlocked {
-                            tool: &call.tool_name,
-                            raw_reason: &raw_reason,
-                        }
-                        .render(),
-                    ));
-                }
-                Ok(PolicyGateDecision::Block) => {
-                    // `check_gated_command` already rejects the read-only Block
-                    // case; this arm catches a Block produced by the model's
-                    // escalate-only `category` hint.
-                    let raw = format!(
-                        "{} Security policy: this command's category is not permitted in the \
-                         current access tier.",
+            #[cfg(feature = "modules")]
+            {
+                let Some((effective_arguments, analysis)) =
+                    shell_analysis_for_call(call, authorization_context)
+                else {
+                    return Ok(GateDecision::deny(format!(
+                        "{} Shell authorization facts are unavailable or do not match this call.",
                         crate::security::POLICY_BLOCKED_MARKER
-                    );
-                    return Ok(GateDecision::deny(
-                        PolicyDenial::SecurityPolicyBlocked {
-                            tool: &call.tool_name,
-                            raw_reason: &raw,
-                        }
-                        .render(),
-                    ));
+                    )));
+                };
+                match Self::shell_decision(&policy, &effective_arguments, &analysis) {
+                    Err(raw_reason) => {
+                        tracing::warn!(
+                            target: "tinyagents",
+                            tool = %call.tool_name,
+                            "[tinyagents::host::security] shell command blocked by security policy"
+                        );
+                        return Ok(GateDecision::deny(
+                            PolicyDenial::SecurityPolicyBlocked {
+                                tool: &call.tool_name,
+                                raw_reason: &raw_reason,
+                            }
+                            .render(),
+                        ));
+                    }
+                    Ok(PolicyGateDecision::Block) => {
+                        // `check_gated_command_analysis` already rejects the read-only Block
+                        // case; this arm catches a Block produced by the model's
+                        // escalate-only `category` hint.
+                        let raw = format!(
+                            "{} Security policy: this command's category is not permitted in the \
+                         current access tier.",
+                            crate::security::POLICY_BLOCKED_MARKER
+                        );
+                        return Ok(GateDecision::deny(
+                            PolicyDenial::SecurityPolicyBlocked {
+                                tool: &call.tool_name,
+                                raw_reason: &raw,
+                            }
+                            .render(),
+                        ));
+                    }
+                    Ok(PolicyGateDecision::Prompt) => {
+                        return Ok(self.park_once(call, channel_approved).await);
+                    }
+                    Ok(PolicyGateDecision::Allow) => {
+                        return Ok(self.settled(channel_approved));
+                    }
                 }
-                Ok(PolicyGateDecision::Prompt) => {
-                    return Ok(self.park_once(call, channel_approved).await);
-                }
-                Ok(PolicyGateDecision::Allow) => {
-                    return Ok(self.settled(channel_approved));
-                }
+            }
+            #[cfg(not(feature = "modules"))]
+            {
+                let _ = authorization_context;
+                return Ok(GateDecision::deny(format!(
+                    "{} Shell command analysis is unavailable in this build.",
+                    crate::security::POLICY_BLOCKED_MARKER
+                )));
             }
         }
 
@@ -647,6 +662,44 @@ impl SecurityGate for OpenHumanSecurityGate {
             "[tinyagents::host::security] allowed"
         );
         Ok(self.settled(channel_approved))
+    }
+}
+
+#[path = "security_gate_approval.rs"]
+mod approval;
+use approval::decision_for_outcome;
+
+#[async_trait]
+impl SecurityGate for OpenHumanSecurityGate {
+    /// Answers in five stages, each of which can only narrow the answer:
+    ///
+    /// 1. the channel tool policy (`agent_tool_policy`),
+    /// 2. tool resolution — an unregistered name is denied,
+    /// 3. `shell` command classification, which supersedes stage 4 for that one
+    ///    tool because it is strictly finer-grained,
+    /// 4. the autonomy tier for acting tools (`can_act`) plus the non-mutating
+    ///    rate-limit read, and
+    /// 5. the approval park for anything the tier prompts on.
+    ///
+    /// **A human approval never short-circuits the remaining stages.** Approving
+    /// at stage 1 settles the *channel* restriction and nothing else; the call
+    /// still has to survive tool resolution, the shell classifier, and the
+    /// autonomy tier. Returning straight after the park would have let a
+    /// channel that merely asks for confirmation authorize a `shell` command the
+    /// tier blocks, or an acting tool under `readonly` — turning the channel's
+    /// second-strictest setting into an override of the user's own autonomy
+    /// choice. A refusal at any stage is still terminal, and `channel_approved`
+    /// is carried forward so a later prompting stage does not ask twice.
+    async fn authorize_tool(&self, call: &ToolCallRequest) -> TaResult<GateDecision> {
+        self.authorize_tool_with_facts(call, None).await
+    }
+
+    async fn authorize_tool_with_context(
+        &self,
+        call: &ToolCallRequest,
+        context: Option<&serde_json::Value>,
+    ) -> TaResult<GateDecision> {
+        self.authorize_tool_with_facts(call, context).await
     }
 
     /// Runs OpenHuman's prompt-injection detector over `text`.

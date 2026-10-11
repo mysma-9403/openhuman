@@ -42,7 +42,7 @@
 //!   URL doesn't look like the OpenHuman backend.
 
 use crate::config::schema::cloud_providers::{
-    generate_provider_id, AuthStyle, CloudProviderCreds, CloudProviderType,
+    builtin_cloud_provider, generate_provider_id, AuthStyle, CloudProviderCreds,
 };
 use crate::config::Config;
 
@@ -93,7 +93,12 @@ pub(super) fn seed_cloud_providers(config: &mut Config, stats: &mut MigrationSta
         .api_url
         .clone()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| CloudProviderType::Openhuman.default_endpoint().to_string());
+        .unwrap_or_else(|| {
+            builtin_cloud_provider("openhuman")
+                .expect("managed builtin")
+                .endpoint
+                .to_string()
+        });
     let oh_default_model = config
         .default_model
         .clone()
@@ -106,7 +111,6 @@ pub(super) fn seed_cloud_providers(config: &mut Config, stats: &mut MigrationSta
         endpoint: oh_endpoint,
         auth_style: AuthStyle::OpenhumanJwt,
         default_model: Some(oh_default_model),
-        ..Default::default()
     });
     stats.cloud_providers_seeded += 1;
 
@@ -134,7 +138,6 @@ pub(super) fn seed_cloud_providers(config: &mut Config, stats: &mut MigrationSta
                 endpoint: trimmed.to_string(),
                 auth_style: AuthStyle::Bearer,
                 default_model,
-                ..Default::default()
             });
             stats.cloud_providers_seeded += 1;
             log::info!(
@@ -183,7 +186,7 @@ fn set_primary_cloud(config: &mut Config, stats: &mut MigrationStats) {
     let oh = config
         .cloud_providers
         .iter()
-        .find(|e| e.slug == "openhuman" || e.legacy_type.as_deref() == Some("openhuman"));
+        .find(|e| e.slug == "openhuman");
     if let Some(entry) = oh {
         config.primary_cloud = Some(entry.id.clone());
         stats.primary_cloud_set = true;

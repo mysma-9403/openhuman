@@ -19,6 +19,9 @@ use tinytools_agent::dialect::{
     CodeDialect, NativeDialect, PFormatDialect, ToolDialect, XmlDialect,
 };
 
+#[path = "factory_workflows.rs"]
+mod workflows;
+
 impl OpenHumanSessionHost {
     /// Returns whether `agent_id` resolves to a runnable definition for this
     /// configuration. This is deliberately the same resolution path used by
@@ -75,12 +78,12 @@ impl OpenHumanSessionHost {
     /// The welcome agent uses this entry point when routed from the
     /// Tauri web channel (see `channels::provider::web::build_session_agent`).
     pub fn from_config_for_agent(config: &Config, agent_id: &str) -> Result<Self> {
-        // Look up the target definition up front so we can fail fast
-        // with a clear error instead of building half an agent and then
-        // discovering the id is unknown. See `resolve_target_definition`
-        // for the full resolution order (harness registry, then the
-        // config-backed custom agent registry, then the orchestrator's
-        // legacy pre-startup fallback).
+        // A hosted profile never receives the ordinary config-derived belt.
+        // Its operator-selected factory carries registration and permission
+        // boundaries into the same session builder, under this profile scope.
+        if crate::profiles::capabilities::ProfileCapabilities::current().is_some() {
+            return Self::from_config_for_agent_session(config, agent_id, None);
+        }
         let target_def = resolve_target_definition(config, agent_id)?;
 
         log::info!(
@@ -386,7 +389,7 @@ impl OpenHumanSessionHost {
             None => SystemPromptBuilder::with_defaults(),
         };
         let post_turn_hooks: Vec<Arc<dyn crate::agent::hooks::PostTurnHook>> =
-            crate::agent::hooks::embedder_post_turn_hooks();
+            crate::agent::hooks::turn_post_turn_hooks();
 
         // Best-effort prewarm from the shared Composio cache. This avoids
         // building the session with a knowingly stale `&[]` integration view
@@ -796,14 +799,7 @@ impl OpenHumanSessionHost {
             .workspace_dir(config.workspace_dir.clone())
             .action_dir(config.action_dir.clone())
             .workspace_descriptor(workspace_descriptor)
-            .workflows(if host_only {
-                Vec::new()
-            } else {
-                let mut catalogue = crate::skills::load_workflow_metadata(&config.workspace_dir);
-                #[cfg(feature = "flows")]
-                catalogue.extend(crate::flows::catalogue::flow_entries(config));
-                catalogue
-            })
+            .workflows(workflows::session_workflows(config, host_only))
             .post_turn_hooks(post_turn_hooks)
             .agent_definition_name(agent_id.to_string())
             .omit_memory_context(effective_omit_memory_context)
@@ -876,7 +872,7 @@ impl OpenHumanSessionHost {
 /// Any other id that resolves nowhere is a hard error, exactly as before this
 /// function existed — only the *search order* changed, not the failure
 /// contract for a genuinely-unknown id.
-fn resolve_target_definition(
+pub(super) fn resolve_target_definition(
     config: &Config,
     agent_id: &str,
 ) -> Result<Option<crate::agent::harness::definition::AgentDefinition>> {

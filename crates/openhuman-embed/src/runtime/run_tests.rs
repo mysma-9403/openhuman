@@ -69,3 +69,19 @@ fn split_for_cli_keeps_the_session_store_for_a_stateless_workspace() {
         "and still on the builder, so `build()` accepts the stateless workspace"
     );
 }
+
+#[tokio::test]
+async fn split_for_cli_keeps_the_storage_seam_on_both_sides() {
+    let backend = openhuman_core::storage::open("memory").await.unwrap();
+    let (rest, globals) = configured()
+        .storage(StorageSource::Backend(backend))
+        .split_for_cli();
+    assert!(matches!(
+        globals.seams.storage,
+        Some(StorageSource::Backend(_))
+    ));
+    assert!(matches!(
+        rest.seams.storage,
+        Some(StorageSource::Backend(_))
+    ));
+}

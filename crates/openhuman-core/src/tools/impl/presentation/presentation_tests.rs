@@ -39,10 +39,18 @@ fn test_security(workspace: &Path) -> Arc<SecurityPolicy> {
 
 /// Build a tool whose security policy is rooted at `workspace`.
 fn make_tool(workspace: &Path) -> PresentationTool {
-    PresentationTool::new(
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.to_path_buf();
+    config.modules.enabled = false;
+    make_tool_with_config(workspace, config)
+}
+
+fn make_tool_with_config(workspace: &Path, config: crate::config::Config) -> PresentationTool {
+    PresentationTool::with_config(
         workspace.to_path_buf(),
         workspace.join("Files"),
         test_security(workspace),
+        config,
     )
 }
 
@@ -150,15 +158,22 @@ async fn execute_rejects_too_many_slides() {
 }
 
 #[tokio::test]
-#[ignore = "needs a built tinydocs module (OPENHUMAN_MODULE_PATH) and its own process: \
-the module bus belongs to the runtime that creates it, so run this test alone"]
 async fn execute_happy_path_returns_artifact_metadata() {
+    if crate::util::module_test_process::run(
+        module_path!(),
+        "execute_happy_path_returns_artifact_metadata",
+    ) {
+        return;
+    }
     // End-to-end: drives the real ppt-rs engine and the artifact
     // pipeline. Asserts the tool's success contract — `slide_count`
     // excludes the synthetic title slide, the artifact is finalised
     // on disk, and the markdown reply quotes the path + size.
     let ws = workspace();
-    let tool = make_tool(ws.path());
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = ws.path().to_path_buf();
+    config.modules.allow_download = false;
+    let tool = make_tool_with_config(ws.path(), config);
     let result = tool
         .execute(minimal_input_json())
         .await
@@ -232,14 +247,19 @@ fn pptx_entry_names(artifact_path: &str) -> Vec<String> {
 }
 
 #[tokio::test]
-#[ignore = "needs a built tinydocs module (OPENHUMAN_MODULE_PATH) and its own process: \
-the module bus belongs to the runtime that creates it, so run this test alone"]
 async fn execute_embeds_file_image_into_deck() {
+    if crate::util::module_test_process::run(module_path!(), "execute_embeds_file_image_into_deck")
+    {
+        return;
+    }
     let ws = workspace();
     let img_path = ws.path().join("chart.png");
     std::fs::write(&img_path, png_1x1()).expect("write png");
 
-    let tool = make_tool(ws.path());
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = ws.path().to_path_buf();
+    config.modules.allow_download = false;
+    let tool = make_tool_with_config(ws.path(), config);
     let args = json!({
         "title": "Deck with image",
         "slides": [{
@@ -273,6 +293,14 @@ async fn execute_embeds_file_image_into_deck() {
 
 #[tokio::test]
 async fn execute_skips_unsupported_mime_image_with_warning() {
+    struct UnsupportedImage;
+    #[async_trait]
+    impl ImageInspector for UnsupportedImage {
+        async fn inspect(&self, bytes: &[u8]) -> Result<tinydocs_bus::ImageFacts, String> {
+            assert_eq!(bytes, b"i am plain text, not an image");
+            Err("unsupported image type (only PNG and JPEG are embeddable)".into())
+        }
+    }
     let ws = workspace();
     let txt_path = ws.path().join("notanimage.txt");
     std::fs::write(&txt_path, b"i am plain text, not an image").expect("write txt");
@@ -287,7 +315,9 @@ async fn execute_skips_unsupported_mime_image_with_warning() {
         }]
     });
     let input: GeneratePresentationInput = serde_json::from_value(args).expect("args parse");
-    let (resolved, warnings) = tool.resolve_images(&input).await;
+    let (resolved, warnings) = tool
+        .resolve_images_with_inspector(&input, &UnsupportedImage)
+        .await;
     // Partial success: the deck still renders, the bad image is reported.
     assert!(
         resolved.iter().all(Vec::is_empty),
@@ -295,10 +325,41 @@ async fn execute_skips_unsupported_mime_image_with_warning() {
     );
     assert_eq!(warnings.len(), 1, "exactly one image warning expected");
     assert!(
-        warnings[0].contains("unsupported image type"),
-        "warning should name the MIME problem: {:?}",
+        !warnings[0].is_empty(),
+        "the image rejection should be explained: {:?}",
         warnings[0]
     );
+}
+
+#[tokio::test]
+async fn image_inspection_does_not_fall_back_when_modules_are_disabled() {
+    let ws = workspace();
+    let img_path = ws.path().join("chart.png");
+    std::fs::write(&img_path, png_1x1()).expect("write png");
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = ws.path().to_path_buf();
+    config.modules.enabled = false;
+    let tool = PresentationTool::with_config(
+        ws.path().to_path_buf(),
+        ws.path().join("Files"),
+        test_security(ws.path()),
+        config,
+    );
+    let input: GeneratePresentationInput = serde_json::from_value(json!({
+        "title": "No host image parser",
+        "slides": [{
+            "title": "Chart",
+            "bullets": ["See below"],
+            "images": [{ "source": { "type": "file", "path": img_path.to_string_lossy() } }]
+        }]
+    }))
+    .expect("parse presentation input");
+    validate_input(&input).expect("valid presentation input");
+
+    let (resolved, warnings) = tool.resolve_images(&input).await;
+    assert!(resolved.iter().all(Vec::is_empty));
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("disabled"), "{warnings:?}");
 }
 
 #[tokio::test]

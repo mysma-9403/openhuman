@@ -115,6 +115,45 @@ describe('ChatRuntimeProvider — dedupe, proactive resolution, mid-turn invaria
   });
 
   describe('dedupe', () => {
+    it('stops completed-turn snapshot polling when the provider unmounts', async () => {
+      vi.useFakeTimers();
+      let listeners: chatService.ChatEventListeners = {};
+      vi.mocked(chatService.subscribeChatEvents).mockImplementation(value => {
+        listeners = value;
+        return () => {};
+      });
+      store.dispatch(setStatusForUser({ userId: '__pending__', status: 'connected' }));
+      const view = render(
+        <Provider store={store}>
+          <ChatRuntimeProvider>
+            <div />
+          </ChatRuntimeProvider>
+        </Provider>
+      );
+      try {
+        await act(async () => {
+          listeners.onDone?.({
+            thread_id: 'unmounted-snapshot',
+            request_id: 'unmounted-request',
+            full_response: 'Delivered reply',
+            rounds_used: 1,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+          });
+        });
+        expect(threadApi.getTurnState).toHaveBeenCalledWith('unmounted-snapshot');
+        view.unmount();
+        const callsBeforeUnmount = vi.mocked(threadApi.getTurnState).mock.calls.length;
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(2_000);
+        });
+        expect(threadApi.getTurnState).toHaveBeenCalledTimes(callsBeforeUnmount);
+      } finally {
+        view.unmount();
+        vi.useRealTimers();
+      }
+    });
+
     it('finds pending spawn and async delegation tool rows', () => {
       const entries = [
         { id: 'ignored', name: 'search', round: 0, status: 'running' },
@@ -3030,5 +3069,138 @@ describe('ChatRuntimeProvider — skill tool-chain latency (#4273 AC3)', () => {
     expect(warnSpy.mock.calls.some(args => String(args[0]).includes('[skill-latency]'))).toBe(
       false
     );
+  });
+});
+
+// Regression: an async sub-agent's approval card (`detached`) was routed to the
+// parent thread and then wiped by the parent turn's `chat_done`, though its
+// gate was still parked — every async `image_agent` approval expired unseen.
+describe('ChatRuntimeProvider — detached sub-agent approvals', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetRuntimeState();
+    vi.mocked(threadApi.appendMessage).mockImplementation(async (_tid, msg) => msg);
+    vi.mocked(threadApi.getThreads).mockResolvedValue({ threads: [], count: 0 });
+    vi.mocked(threadApi.getTurnState).mockResolvedValue(null);
+    vi.mocked(threadApi.listRuns).mockResolvedValue([]);
+  });
+
+  const done = (threadId: string) => ({
+    thread_id: threadId,
+    request_id: 'parent-turn',
+    full_response: 'I asked the image agent to make it.',
+    rounds_used: 1,
+    total_input_tokens: 0,
+    total_output_tokens: 0,
+    segment_total: 0,
+  });
+
+  it('keeps a detached card across the parent turn end and clears it on its decision', () => {
+    const listeners = renderProvider();
+    act(() => {
+      listeners.onApprovalRequest?.({
+        thread_id: 't-sub',
+        request_id: 'appr-sub',
+        tool_name: 'media_generate_image',
+        message: 'Run `media_generate_image` — a red fox',
+        detached: true,
+      });
+    });
+    act(() => {
+      listeners.onDone?.(done('t-sub'));
+    });
+    expect(store.getState().chatRuntime.pendingApprovalByThread['t-sub']?.requestId).toBe(
+      'appr-sub'
+    );
+
+    act(() => {
+      listeners.onApprovalDecided?.({
+        thread_id: 't-sub',
+        request_id: 'appr-sub',
+        message: 'approve_once',
+      });
+    });
+    expect(store.getState().chatRuntime.pendingApprovalByThread['t-sub']).toBeUndefined();
+  });
+
+  it('keeps a second detached card on the thread answerable instead of replacing the first', () => {
+    const listeners = renderProvider();
+    act(() => {
+      listeners.onApprovalRequest?.({
+        thread_id: 't-sub',
+        request_id: 'appr-a',
+        tool_name: 'media_generate_image',
+        message: 'Run `media_generate_image`',
+        detached: true,
+      });
+      listeners.onApprovalRequest?.({
+        thread_id: 't-sub',
+        request_id: 'appr-b',
+        tool_name: 'media_generate_video',
+        message: 'Run `media_generate_video`',
+        detached: true,
+      });
+    });
+    const runtime = () => store.getState().chatRuntime;
+    expect(runtime().pendingApprovalByThread['t-sub']?.requestId).toBe('appr-a');
+
+    // The first is answered elsewhere; the second takes its place.
+    act(() => {
+      listeners.onApprovalDecided?.({
+        thread_id: 't-sub',
+        request_id: 'appr-a',
+        message: 'approve_once',
+      });
+    });
+    expect(runtime().pendingApprovalByThread['t-sub']?.requestId).toBe('appr-b');
+    act(() => {
+      listeners.onApprovalDecided?.({ thread_id: 't-sub', request_id: 'appr-b', message: 'deny' });
+    });
+    expect(runtime().pendingApprovalByThread['t-sub']).toBeUndefined();
+  });
+
+  it('drops a detached card on a socket drop and rejoins its thread for the core replay', async () => {
+    const listeners = renderProvider();
+    act(() => {
+      listeners.onApprovalRequest?.({
+        thread_id: 't-sub',
+        request_id: 'appr-sub',
+        tool_name: 'media_generate_image',
+        message: 'Run `media_generate_image`',
+        detached: true,
+      });
+    });
+    // The parent turn is long settled: nothing is in flight on the thread.
+    act(() => {
+      listeners.onDone?.(done('t-sub'));
+    });
+    vi.mocked(socketService.subscribeThread).mockClear();
+
+    // The core restarts: its waiter and route for `appr-sub` are gone.
+    act(() => {
+      store.dispatch(setStatusForUser({ userId: '__pending__', status: 'disconnected' }));
+    });
+    expect(store.getState().chatRuntime.pendingApprovalByThread['t-sub']).toBeUndefined();
+    act(() => {
+      store.dispatch(setStatusForUser({ userId: '__pending__', status: 'connected' }));
+    });
+    // The rejoin is what makes the core replay any park it still holds.
+    await waitFor(() => expect(socketService.subscribeThread).toHaveBeenCalledWith('t-sub'));
+  });
+
+  it('still clears an in-turn card when its turn ends', () => {
+    const listeners = renderProvider();
+    act(() => {
+      listeners.onApprovalRequest?.({
+        thread_id: 't-main',
+        request_id: 'appr-main',
+        tool_name: 'shell',
+        message: 'Run `shell` — ls',
+      });
+    });
+    act(() => {
+      listeners.onDone?.(done('t-main'));
+    });
+    expect(store.getState().chatRuntime.pendingApprovalByThread['t-main']).toBeUndefined();
   });
 });

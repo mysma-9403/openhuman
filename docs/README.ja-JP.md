@@ -117,7 +117,7 @@ macOS と Linux のスクリプトが何を行うかを事前に確認するに�
 
 <h3>開発者のために</h3>
 
-<p><a href="https://tinyhumans.gitbook.io/openhuman/developing/quickstart">Rust クイックスタート</a> · <a href="https://tinyhumans.gitbook.io/openhuman/developing/embedding">組み込みガイド</a> · <a href="../crates/openhuman-embed/examples">サンプル</a></p>
+<p><a href="https://tinyhumans.gitbook.io/openhuman/developing/quickstart">Rust クイックスタート</a> · <a href="../gitbooks/developing/embed/README.md">組み込みガイド</a> · <a href="../crates/openhuman-embed/examples">サンプル</a></p>
 
 <p>Rust ライブラリとして使えます。エージェントを普通の関数のように呼び出すことも、小さなサーバー1台でエージェント群をまるごと動かすこともできます。</p>
 
@@ -176,7 +176,7 @@ OpenHuman は、最もコストのかかる部分を見直しました。AI が�
 
 <p><a href="https://tinyhumans.gitbook.io/openhuman/developing/loadable-modules">プラグインのしくみ</a></p>
 
-<p>検索、ドキュメント、音声などの機能はすべて、1本の Rust バスにつながります。これは <a href="https://www.freedesktop.org/wiki/Software/dbus/">Linux のシステムバス</a>から借りた考え方です。機能は必要なときだけ読み込まれ、1つが止まっても他は動き続けます。</p>
+<p>検索、ドキュメント、音声などの機能はすべて、1本の Rust バスにつながります。これは <a href="https://packages.debian.org/stable/dbus">Linux のシステムバス</a>から借りた考え方です。機能は必要なときだけ読み込まれ、1つが止まっても他は動き続けます。</p>
 
 </td>
 
@@ -288,7 +288,7 @@ let reply = agent.run("Summarize what you can see in this directory.").await?;
 println!("{}", reply.reply);
 ```
 
-次は、[Rust クイックスタート](https://tinyhumans.gitbook.io/openhuman/developing/quickstart)、[組み込みガイド](https://tinyhumans.gitbook.io/openhuman/developing/embedding)、[開発者向けドキュメント](https://tinyhumans.gitbook.io/openhuman/developing)をご覧ください。
+次は、[Rust クイックスタート](https://tinyhumans.gitbook.io/openhuman/developing/quickstart)、[組み込みガイド](../gitbooks/developing/embed/README.md)、[開発者向けドキュメント](https://tinyhumans.gitbook.io/openhuman/developing)をご覧ください。
 
 ---
 

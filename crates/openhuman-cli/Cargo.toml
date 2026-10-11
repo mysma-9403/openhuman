@@ -75,6 +75,11 @@ required-features = ["http-server", "bin-tools"]
 # otherwise gate-free target — required-features is the blunt instrument, and
 # it costs the whole target when the gate is off.
 [[test]]
+name = "tinysearch_module_e2e"
+path = "../../tests/tinysearch_module_e2e.rs"
+required-features = ["modules"]
+
+[[test]]
 # Reproduction of the removed spend cap: needs its own process because the
 # global CostTracker is a `OnceCell`, so a shared `--lib` process makes the
 # spend state order-dependent.
@@ -115,6 +120,16 @@ path = "../../tests/storage_secrets_e2e.rs"
 # process-wide slot.
 name = "storage_scope_e2e"
 path = "../../tests/storage_scope_e2e.rs"
+
+[[test]]
+# Its own binary: two agents on one backend keep cron jobs and flows apart.
+name = "storage_agent_scopes_e2e"
+path = "../../tests/storage_agent_scopes_e2e.rs"
+
+[[test]]
+# Its own binary: the delegation graph's checkpointer on every driver.
+name = "storage_delegation_e2e"
+path = "../../tests/storage_delegation_e2e.rs"
 
 [[test]]
 name = "embedded_server_shutdown_e2e"
@@ -162,8 +177,7 @@ required-features = ["voice"]
 name = "raw_coverage_all"
 path = "../../tests/raw_coverage_all.rs"
 # The merged raw-coverage target spans ~76 former files, so it reaches the
-# widest surface of any single target: `lettre` (pulled in through the voice
-# gate's `tinychannels/email`) and the local inference download service.
+# widest surface of any single target: voice and the local inference download service.
 required-features = ["voice", "inference"]
 
 # ~20 former `tests/*.rs` targets folded into one binary (one link of the
@@ -188,8 +202,23 @@ name = "cli_sigpipe"
 path = "../../tests/cli_sigpipe.rs"
 
 [[test]]
+name = "cli_storage_url_e2e"
+path = "../../tests/cli_storage_url_e2e.rs"
+
+[[test]]
+# Boots `openhuman-core serve` on a workspace with legacy approval rows.
+name = "storage_default_import_e2e"
+path = "../../tests/storage_default_import_e2e.rs"
+# Without the SQLite driver the stores keep the legacy tables.
+required-features = ["storage-sqlite"]
+
+[[test]]
 name = "saas_mode_e2e"
 path = "../../tests/saas_mode_e2e.rs"
+
+[[test]]
+name = "saas_profile_isolation_e2e"
+path = "../../tests/saas_profile_isolation_e2e.rs"
 
 [[test]]
 name = "composio_list_tools_stack_overflow_regression"
@@ -206,6 +235,18 @@ path = "../../tests/windows_sandbox_env_e2e.rs"
 [[test]]
 name = "inference_provider_e2e"
 path = "../../tests/inference_provider_e2e.rs"
+
+[[test]]
+name = "keyring_headless_e2e"
+path = "../../tests/keyring_headless_e2e.rs"
+
+[[test]]
+# Its own binary: it installs the process's global tracing subscriber to prove
+# no log line carries a pinned search key, and drives the process-wide
+# TinySearch module.
+name = "search_pinned_keys_e2e"
+path = "../../tests/search_pinned_keys_e2e.rs"
+required-features = ["modules"]
 
 [[test]]
 name = "keyring_secretstore_e2e"
@@ -248,13 +289,7 @@ path = "../../tests/observability_wallet_expected_e2e.rs"
 name = "skills_mcp_registry_live"
 path = "../../tests/skills_mcp_registry_live.rs"
 
-[[example]]
-name = "embed_headless"
-path = "../../examples/embed_headless.rs"
 
-[[example]]
-name = "embed_kernel"
-path = "../../examples/embed_kernel.rs"
 
 [dependencies]
 # The only openhuman crate the binary depends on. Every gate below forwards to
@@ -287,7 +322,11 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 tinyinference-llm = { path = "../../vendor/tinyagents/vendor/tinyinference/crates/tinyinference-llm" }
+# The document-port contract for failure injection in cron storage regressions.
+tinystoragedrivers-core = { path = "../../vendor/tinyagents/vendor/tinystoragedrivers/crates/tinystoragedrivers-core" }
 tinytools = { path = "../../vendor/tinyagents/vendor/tinytools/crates/tinytools" }
+# The completion log a detached sub-agent leaves, for the SaaS delivery-recovery e2e.
+tinyagents-tasks = { path = "../../vendor/tinyagents/crates/tinyagents-tasks" }
 toml = "1.0"
 tracing = "0.1"
 # The TinyComputer contract, for the live computer-use e2e (`computer_bali_live_e2e`).
@@ -299,13 +338,14 @@ base64 = "0.22"
 flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
-lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 parking_lot = "0.12"
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 sha2 = "0.10"
 tar = "0.4"
+tinyagents-graph = { path = "../../vendor/tinyagents/crates/tinyagents-graph", features = ["sqlite", "storage-drivers"] }
 tinyagents-harness = { path = "../../vendor/tinyagents/crates/tinyagents-harness", features = ["sqlite", "multimodal"] }
 tinyagents-session = { path = "../../vendor/tinyagents/crates/tinyagents-session" }
+tinysearch-bus = { path = "../../vendor/tinysearch/crates/tinysearch-bus" }
 tinybus = { path = "../../vendor/tinybus/crates/tinybus", default-features = false, features = ["macros", "uds"] }
 tinychannels = { version = "0.1", features = ["relay-websocket"] }
 tinyinference-core = { path = "../../vendor/tinyagents/vendor/tinyinference/crates/tinyinference-core" }
@@ -325,11 +365,14 @@ urlencoding = "2.1"
 wiremock = "0.6"
 
 [features]
+langfuse = ["openhuman-rpc/langfuse"]
+os-keyring = ["openhuman-rpc/os-keyring"]
 # The contributor set: the core's `[features] default` gates (listed, because
 # `openhuman-rpc`'s own default carries only its server and client) plus the
 # Jev ranker. The product lanes pass `--features
 # "$(scripts/ci/product-features.sh)"`; every product gate name resolves here.
 default = [
+    "os-keyring",
     "media",
     "skills",
     "flows",
@@ -341,6 +384,7 @@ default = [
     "modules",
     "jev",
     "tinymemes",
+    "storage-sqlite",
 ]
 # Every gate forwards to `openhuman-rpc` alone (chain: rpc -> tinyhumans ->
 # embed -> core); `scripts/ci/check-feature-forwarding.mjs` checks the link.
@@ -358,7 +402,6 @@ web3 = ["openhuman-rpc/web3"]
 storage-sqlite = ["openhuman-rpc/storage-sqlite"]
 storage-mongodb = ["openhuman-rpc/storage-mongodb"]
 storage-file = ["openhuman-rpc/storage-file"]
-runtime-node = ["openhuman-rpc/runtime-node"]
 media = ["openhuman-rpc/media"]
 flows = ["openhuman-rpc/flows"]
 skills = ["openhuman-rpc/skills"]
@@ -376,3 +419,7 @@ bin-tools = ["dep:clap"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
+
+[[test]]
+name = "embeddings_opt_out"
+path = "../../tests/embeddings_opt_out.rs"

@@ -24,7 +24,7 @@ use openhuman_core::agent::session_store::SessionStoreProvider;
 use openhuman_core::backend::BackendTransport;
 use openhuman_core::core::server_launcher::HostBoot;
 
-use super::seams::HostSeams;
+use super::seams::{HostSeams, StorageSource};
 use super::{RuntimeBuilder, RuntimeError};
 
 /// The pieces of a builder that are installed process-wide before the CLI
@@ -80,10 +80,15 @@ impl RuntimeBuilder {
                  credentials stay with the operator's install"
             );
         }
-        let (builder, globals) = self.split_for_cli();
-        globals
+        let (mut builder, globals) = self.split_for_cli();
+        let storage = globals
             .install()
             .map_err(|error| anyhow::Error::new(RuntimeError::Invalid(error)))?;
+        // The server's runtime installs the same, already opened backend
+        // rather than opening the URL a second time.
+        if let Some(backend) = storage {
+            builder.seams.storage = Some(StorageSource::Backend(backend));
+        }
 
         let summary = builder.summary();
         log::debug!(
@@ -112,11 +117,17 @@ impl RuntimeBuilder {
                  each subcommand installs the policy its config describes"
             );
         }
+        // The storage seam stays on the builder as well: like the session
+        // store, the server's runtime binds it.
+        let storage = self.seams.storage.clone();
+        let mut seams = std::mem::take(&mut self.seams);
+        seams.storage = storage.clone();
+        self.seams.storage = storage;
         let globals = CliGlobals {
             transport: self.backend_transport.clone(),
             memory_engine: self.memory_engine.clone(),
             session_store: self.session_store.clone(),
-            seams: std::mem::take(&mut self.seams),
+            seams,
         };
         (self, globals)
     }
@@ -131,7 +142,11 @@ impl RuntimeBuilder {
 }
 
 impl CliGlobals {
-    fn install(self) -> Result<(), String> {
+    /// Install every global; returns the storage backend, when one was
+    /// configured, now opened.
+    fn install(
+        mut self,
+    ) -> Result<Option<Arc<dyn openhuman_core::storage::StorageBackend>>, String> {
         if let Some(transport) = self.transport {
             openhuman_core::backend::install_backend_transport(transport);
             log::debug!("[embed][cli] backend transport installed (process global)");
@@ -143,9 +158,14 @@ impl CliGlobals {
             let _previous = openhuman_core::agent::session_store::install(provider);
             log::debug!("[embed][cli] session store installed (process lifetime)");
         }
+        self.seams.open_storage_blocking()?;
+        let storage = match &self.seams.storage {
+            Some(StorageSource::Backend(backend)) => Some(Arc::clone(backend)),
+            _ => None,
+        };
         let seams = self.seams.install()?;
         seams.persist();
-        Ok(())
+        Ok(storage)
     }
 }
 

@@ -197,12 +197,12 @@ fn model_call_completed_emits_generation_span_with_usage_cost_and_pricing() {
             },
             1_010,
         ),
-        (model_call("agentic-v1", 0, 0), 1_500),
+        (model_call("claude-sonnet-4-6", 0, 0), 1_500),
     ]);
     c.finish(2_000);
     let spans = c.spans();
 
-    let generation = find(spans, "llm.agentic-v1");
+    let generation = find(spans, "llm.claude-sonnet-4-6");
     assert_eq!(generation.kind, SpanKind::Generation);
     // Parented under the live iteration; starts at the iteration start
     // (ModelStarted) and ends when the usage record was observed.
@@ -219,7 +219,7 @@ fn model_call_completed_emits_generation_span_with_usage_cost_and_pricing() {
     // Provider-labeled model: `{provider_id}.{model}`.
     assert_eq!(
         a["gen_ai.request.model"],
-        serde_json::json!("managed.agentic-v1")
+        serde_json::json!("managed.claude-sonnet-4-6")
     );
     assert_eq!(a["gen_ai.usage.input_tokens"], serde_json::json!(1_000));
     assert_eq!(a["gen_ai.usage.output_tokens"], serde_json::json!(200));
@@ -234,12 +234,18 @@ fn model_call_completed_emits_generation_span_with_usage_cost_and_pricing() {
     // Pricing basis is auditable.
     assert_eq!(
         a["gen_ai.pricing.input_per_mtok_usd"],
-        serde_json::json!(0.0886)
+        serde_json::json!(3.0)
     );
     assert!(a.contains_key("gen_ai.pricing.output_per_mtok_usd"));
-    // Zero reasoning / cache-write tokens are omitted on the generation.
+    // Zero reasoning tokens are omitted; cache writes always flow (even 0)
+    // so every route reports the same usage dimensions.
     assert!(!a.contains_key("gen_ai.usage.reasoning_tokens"));
-    assert!(!a.contains_key("gen_ai.usage.cache_creation_tokens"));
+    assert_eq!(
+        a["gen_ai.usage.cache_creation_tokens"],
+        serde_json::json!(0)
+    );
+    assert_eq!(a["gen_ai.usage.total_tokens"], serde_json::json!(1_200));
+    assert_eq!(a["gen_ai.cost.source"], serde_json::json!("priced"));
 }
 
 #[test]
@@ -258,7 +264,7 @@ fn custom_model_generation_is_stamped_custom_provenance() {
         cached_input_tokens: 0,
         cache_creation_tokens: 0,
         reasoning_tokens: 0,
-        cost_usd: 0.0001,
+        cost_usd: Some(0.0001),
     };
     let mut c = collect(&[(AgentProgress::TurnStarted, 0), (event, 10)]);
     c.finish(20);
@@ -628,6 +634,7 @@ fn subagent_span_records_prompt_and_final_output_when_capture_on() {
                 worktree_path: None,
                 changed_files: vec![],
                 dirty_status: None,
+                stop: None,
             },
             105,
         ),

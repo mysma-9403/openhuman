@@ -226,6 +226,7 @@ fn client_options_wire_the_chain_and_the_transport() {
         release_tag("1.0.0", None),
         "test".into(),
     ));
+    assert_eq!(options.traces_sample_rate, 0.1);
     assert!(options.dsn.is_none(), "an unparsable DSN sends nothing");
     assert_eq!(options.release.as_deref(), Some("openhuman@1.0.0"));
     assert_eq!(options.environment.as_deref(), Some("test"));
@@ -233,4 +234,42 @@ fn client_options_wire_the_chain_and_the_transport() {
     assert!(options.transport.is_some());
     let before_send = options.before_send.expect("chain installed");
     assert!(before_send(event("Failed to request http://localhost:1/x: e", &[])).is_none());
+}
+
+#[test]
+fn environment_prefers_app_env_lowercased() {
+    assert_eq!(resolve_environment(Some(" Staging ".into())), "staging");
+}
+
+#[test]
+fn environment_falls_back_on_blank_or_missing() {
+    let expected = if cfg!(debug_assertions) {
+        "development"
+    } else {
+        "production"
+    };
+    assert_eq!(resolve_environment(None), expected);
+    assert_eq!(resolve_environment(Some("   ".into())), expected);
+}
+
+#[test]
+fn core_dsn_precedence_is_runtime_then_baked_and_skips_blanks() {
+    let some = |v: &str| Some(v.to_string());
+    assert_eq!(
+        select_core_dsn(some("rc"), some("rl"), Some("bc"), Some("bl")).as_deref(),
+        Some("rc")
+    );
+    assert_eq!(
+        select_core_dsn(some("  "), some("rl"), Some("bc"), Some("bl")).as_deref(),
+        Some("rl")
+    );
+    assert_eq!(
+        select_core_dsn(None, None, Some(" bc "), Some("bl")).as_deref(),
+        Some("bc")
+    );
+    assert_eq!(
+        select_core_dsn(None, None, Some(""), Some("bl")).as_deref(),
+        Some("bl")
+    );
+    assert_eq!(select_core_dsn(None, None, None, Some("  ")), None);
 }

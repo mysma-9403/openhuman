@@ -11,7 +11,13 @@ use std::path::{Path, PathBuf};
 
 pub use openhuman_core::core::runtime::{AGENT_WORKER_STACK_BYTES, MAX_BLOCKING_THREADS};
 
+/// Scoped ownership for host commands outside an agent turn. After dropping
+/// the scoped future, await `wait()` before acknowledging cancellation.
+pub use openhuman_core::tools::timeout::ProcessCleanup as CommandCleanup;
+
+/// Sentry options and event scrubbing shared by desktop and terminal hosts.
 #[cfg(feature = "crash-reporting")]
+#[cfg_attr(docsrs, doc(cfg(feature = "crash-reporting")))]
 #[path = "process_sentry.rs"]
 pub mod sentry;
 
@@ -90,10 +96,10 @@ pub fn apply_startup_restart_delay_from_env() {
     openhuman_core::platform::service::apply_startup_restart_delay_from_env();
 }
 
-/// Load the master encryption key before anything decrypts a secret. A
-/// no-op once loaded; the core's boot calls it too.
+/// Load the master key when encrypted-file storage is selected. The default
+/// in-memory backend needs no key. Core boot also calls this helper.
 pub fn init_master_key() -> anyhow::Result<()> {
-    openhuman_core::security::keyring::init_master_key().map_err(|error| {
+    openhuman_core::security::secret_storage::init_master_key().map_err(|error| {
         log::warn!("[embed][process] master key init failed");
         anyhow::Error::msg(error)
     })
@@ -102,3 +108,24 @@ pub fn init_master_key() -> anyhow::Result<()> {
 #[cfg(test)]
 #[path = "process_tests.rs"]
 mod tests;
+
+/// Run a host command with stdin and a deadline, owning its process group.
+/// Normal completion, timeout, and cancellation all reap the command. When
+/// called inside a cancellable turn, its cleanup is also tracked by that turn.
+/// Explicit command environment settings are preserved over `Turn::tool_env`.
+pub async fn command_output(
+    command: &mut tokio::process::Command,
+    input: Vec<u8>,
+    deadline: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    let cleanup = openhuman_core::tools::timeout::ProcessCleanup::default();
+    let result = cleanup
+        .scope(tokio::time::timeout(
+            deadline,
+            openhuman_core::tools::timeout::output_with_input(command, Some(input)),
+        ))
+        .await;
+    cleanup.wait().await;
+    result
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "host command timed out"))?
+}

@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use tinymemory_api::{
     BeliefsRequest, ConsolidateReceipt, ConsolidateRequest, EngineDescriptor, EngineHealth,
     EraseReport, EraseRequest, ExplorePage, ExploreRequest, ExportPage, FetchPage, FetchRequest,
-    ForgetReport, ForgetTarget, GetRequest, Hit, ListPage, ListRequest, MemoryEngine, RecallAnswer,
-    RecallRequest, Result, StoreItem, StoreReceipt, WaitFor, WriteOptions,
+    ForgetReport, ForgetTarget, GetRequest, Hit, ItemId, ListPage, ListRequest, MemoryEngine,
+    Reach, RecallAnswer, RecallRequest, Result, StoreItem, StoreReceipt, WaitFor, WriteOptions,
 };
 
 use super::error::MemoryError;
@@ -163,6 +163,18 @@ impl MemoryEngine for ScrubbingEngine {
         self.timed("forget", self.inner.forget(target), |report| {
             report.forgotten
         })
+        .await
+    }
+
+    // Forwarded, not left to the default: the default reads back through
+    // this wrapper's `get` and then calls `forget(ForgetTarget::Ids)`, which
+    // on the inner engine sweeps the whole tree for the ids.
+    async fn forget_within(&self, ids: Vec<ItemId>, reach: Reach) -> Result<ForgetReport> {
+        self.timed(
+            "forget_within",
+            self.inner.forget_within(ids, reach),
+            |report| report.forgotten,
+        )
         .await
     }
 

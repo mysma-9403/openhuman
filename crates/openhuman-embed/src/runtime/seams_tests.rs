@@ -39,6 +39,53 @@ impl PostTurnHook for NamedPostTurn {
 
 struct NamedToolHook(&'static str);
 
+#[test]
+fn live_replacement_and_removal_update_builder_hooks_and_restore_predecessors() {
+    let name = "seams-live-builder-hook";
+    let original: Arc<dyn PostTurnHook> = Arc::new(NamedPostTurn(name));
+    replace_embedder_post_turn_hook(name, Some(original.clone()));
+    let mut seams = HostSeams {
+        post_turn_hooks: vec![Arc::new(NamedPostTurn(name))],
+        ..Default::default()
+    }
+    .install()
+    .unwrap();
+    seams.post_turn_hook(
+        name,
+        Some(Arc::new(NamedPostTurn("different-diagnostic-name"))),
+    );
+    assert_eq!(post_turn_marker(name), Some(1));
+    assert_eq!(post_turn_marker("different-diagnostic-name"), None);
+    seams.post_turn_hook(name, None);
+    assert!(Arc::ptr_eq(
+        &embedder_post_turn_hooks()
+            .into_iter()
+            .find(|hook| hook.name() == name)
+            .unwrap(),
+        &original
+    ));
+    seams.tool_hook(
+        "seams-live-tool",
+        Some(Arc::new(NamedToolHook("different-tool-name"))),
+    );
+    assert!(embedder_tool_hooks()
+        .iter()
+        .any(|hook| hook.name() == "seams-live-tool"));
+    seams.tool_hook("seams-live-tool", None);
+    assert!(!embedder_tool_hooks()
+        .iter()
+        .any(|hook| hook.name() == "seams-live-tool"));
+    drop(seams);
+    assert!(Arc::ptr_eq(
+        &embedder_post_turn_hooks()
+            .into_iter()
+            .find(|hook| hook.name() == name)
+            .unwrap(),
+        &original
+    ));
+    replace_embedder_post_turn_hook(name, None);
+}
+
 #[async_trait::async_trait]
 impl ToolHook for NamedToolHook {
     fn name(&self) -> &str {
@@ -248,4 +295,74 @@ fn builder_options_collect_into_the_seams() {
     assert_eq!(builder.seams.tool_hooks.len(), 1);
     assert!(builder.seams.live_policy.is_some());
     assert!(builder.seams.server_launcher.is_none());
+}
+
+static STORAGE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+async fn memory_backend() -> Arc<dyn openhuman_core::storage::StorageBackend> {
+    openhuman_core::storage::open("memory")
+        .await
+        .expect("memory backend")
+}
+
+#[tokio::test]
+async fn a_storage_url_is_opened_installed_and_the_previous_backend_restored() {
+    let _lock = STORAGE_LOCK.lock().await;
+    let previous = memory_backend().await;
+    openhuman_core::storage::install(Arc::clone(&previous));
+
+    let mut seams = HostSeams {
+        storage: Some(StorageSource::from("memory")),
+        ..HostSeams::default()
+    };
+    seams.open_storage().await.expect("open");
+    let installed = seams.install().expect("install");
+    let ours = openhuman_core::storage::installed().expect("ours installed");
+    assert!(!Arc::ptr_eq(&ours, &previous), "the seam installed its own");
+
+    drop(installed);
+    let now = openhuman_core::storage::installed().expect("previous restored");
+    assert!(Arc::ptr_eq(&now, &previous));
+    openhuman_core::storage::clear();
+}
+
+#[tokio::test]
+async fn a_backend_with_no_predecessor_is_cleared_and_a_replaced_one_left_alone() {
+    let _lock = STORAGE_LOCK.lock().await;
+    openhuman_core::storage::clear();
+
+    let backend = memory_backend().await;
+    let installed = HostSeams {
+        storage: Some(StorageSource::Backend(Arc::clone(&backend))),
+        ..HostSeams::default()
+    }
+    .install()
+    .expect("install");
+    assert!(openhuman_core::storage::installed().is_some());
+    drop(installed);
+    assert!(openhuman_core::storage::installed().is_none());
+
+    let installed = HostSeams {
+        storage: Some(StorageSource::Backend(backend)),
+        ..HostSeams::default()
+    }
+    .install()
+    .expect("install");
+    let later = memory_backend().await;
+    openhuman_core::storage::install(Arc::clone(&later));
+    drop(installed);
+    let now = openhuman_core::storage::installed().expect("later kept");
+    assert!(Arc::ptr_eq(&now, &later));
+    openhuman_core::storage::clear();
+}
+
+#[tokio::test]
+async fn an_unopenable_storage_url_fails_the_open() {
+    let mut seams = HostSeams {
+        storage: Some(StorageSource::from("nonsense://nowhere")),
+        ..HostSeams::default()
+    };
+    let error = seams.open_storage().await.expect_err("bad url");
+    assert!(error.contains("storage backend"), "{error}");
 }

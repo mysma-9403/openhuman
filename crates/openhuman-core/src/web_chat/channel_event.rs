@@ -18,6 +18,11 @@ pub struct WebChannelEvent {
     /// owner's stream in SaaS mode and is not part of the wire payload.
     #[serde(skip)]
     pub agent: Option<String>,
+    /// The tenant (SaaS profile) whose work produced this event, stamped at
+    /// publish time. Never serialized: the `/events` stream of a SaaS user
+    /// carries only events of that user's profile.
+    #[serde(skip)]
+    pub profile: Option<String>,
     /// The event name (e.g., `chat_message`, `tool_call`).
     pub event: String,
     /// Unique identifier for the Socket.IO client.
@@ -228,6 +233,12 @@ pub struct WebChannelEvent {
     /// requeue), when applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// `Some(true)` on an `approval_request` whose park can outlive the chat
+    /// turn it is shown on (an async-delegated sub-agent). The client keeps
+    /// such a card across that turn's `chat_done` and clears it on
+    /// `approval_decided` instead. Absent for an ordinary in-turn park.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detached: Option<bool>,
 }
 
 impl WebChannelEvent {
@@ -236,6 +247,27 @@ impl WebChannelEvent {
     /// agent scope) is dropped rather than guessed at.
     pub fn belongs_to(&self, agent: &str) -> bool {
         self.agent.as_deref() == Some(agent)
+    }
+
+    /// Whether a SaaS profile's stream may carry this event: only one stamped
+    /// with that profile. An unstamped event is dropped rather than guessed at.
+    pub fn belongs_to_profile(&self, profile: &str) -> bool {
+        self.profile.as_deref() == Some(profile)
+    }
+
+    /// Stamp the tenant whose work produced this event where the publisher
+    /// left it unset. A SaaS task with no scope (`None`) stamps nothing, so
+    /// the event reaches no user's stream.
+    pub fn stamp_tenant(&mut self, tenant: Option<crate::core::runtime::Tenant>) {
+        let Some(tenant) = tenant else {
+            return;
+        };
+        if self.agent.is_none() {
+            self.agent = tenant.agent;
+        }
+        if self.profile.is_none() {
+            self.profile = tenant.profile;
+        }
     }
 }
 
@@ -313,8 +345,20 @@ pub struct TurnUsagePayload {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
-    pub cost_usd: f64,
+    /// The turn's cost, or `null` when it is not known (some call had no
+    /// reported charge and no catalogued price). The UI shows no price then.
+    pub cost_usd: Option<f64>,
+    /// `charged` (every call billed by the provider), `estimated` (some call
+    /// priced from list rates) or `unknown`.
+    #[serde(default)]
+    pub cost_source: crate::agent::cost::CostSource,
     pub context_window: u64,
+    /// Tokens the parent's context held after the turn's final model call: the
+    /// context gauge's numerator. Unlike the totals above it is one request,
+    /// not a sum, and excludes sub-agents. `0` when the core did not record it;
+    /// the UI then falls back to its older estimate.
+    #[serde(default)]
+    pub context_tokens: u64,
     /// Per-sub-agent spend, omitted from the wire when no sub-agents ran.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subagents: Vec<SubagentUsagePayload>,
@@ -328,7 +372,8 @@ pub struct SubagentUsagePayload {
     pub agent_id: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cost_usd: f64,
+    /// `null` when the child's cost is not known.
+    pub cost_usd: Option<f64>,
 }
 
 /// Per-event subagent progress detail attached to `WebChannelEvent`.

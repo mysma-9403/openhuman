@@ -3,9 +3,7 @@
 //!
 //! Its own test binary because it installs a backend into the process-wide
 //! storage slot, which would reroute every other suite's stores in a shared
-//! process. One test, so nothing in this binary races the slot either.
-
-use std::sync::Arc;
+//! process. Each driver runs as its own test case (see `support/storage_drivers.rs`), and the cases take turns on the slot.
 
 use openhuman_core::config::Config;
 use openhuman_core::cron::{self, Schedule};
@@ -13,14 +11,19 @@ use openhuman_core::flows;
 use openhuman_core::flows::tinyflows::state::FlowState;
 use serde_json::json;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_configured_backend_holds_cron_flows_and_flow_state() {
+#[macro_use]
+#[path = "support/storage_drivers.rs"]
+mod storage_drivers;
+
+use storage_drivers::Case;
+
+async fn a_configured_backend_holds_cron_flows_and_flow_state(case: Case) {
     let workspace = tempfile::tempdir().unwrap();
     let config = Config {
         workspace_dir: workspace.path().to_path_buf(),
         ..Config::default()
     };
-    openhuman_core::storage::install(Arc::new(openhuman_core::storage::MemoryStorage::new()));
+    case.install();
 
     // Cron: the store functions run on blocking threads, as the scheduler does.
     let cron_config = config.clone();
@@ -87,7 +90,7 @@ async fn a_configured_backend_holds_cron_flows_and_flow_state() {
             retries: Some(0),
             single_flight: true,
         };
-        policy::set_policy(&policy_config, "job-1", wanted.clone()).unwrap();
+        policy::set_policy(&policy_config, "job-1", wanted).unwrap();
         assert_eq!(policy::get_policy(&policy_config, "job-1").unwrap(), wanted);
         policy::clear_policy(&policy_config, "job-1").unwrap();
         assert_eq!(
@@ -125,3 +128,5 @@ async fn a_configured_backend_holds_cron_flows_and_flow_state() {
     openhuman_core::agent::orchestration::open_delegation_checkpointer(&config).unwrap();
     assert!(workspace.path().join("graph_checkpoints.db").exists());
 }
+
+driver_cases!(async a_configured_backend_holds_cron_flows_and_flow_state);
