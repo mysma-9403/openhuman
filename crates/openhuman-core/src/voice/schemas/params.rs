@@ -167,21 +167,3 @@ impl std::fmt::Debug for VoiceTestProviderParams {
             .finish()
     }
 }
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum OverlaySttState {
-    RecordingStarted,
-    TranscriptionDone,
-    Cancelled,
-    Error,
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct OverlaySttNotifyParams {
-    /// Voice state transition.
-    pub(super) state: OverlaySttState,
-    /// Transcribed text (required when state is "transcription_done").
-    #[serde(default)]
-    pub(super) text: Option<String>,
-}

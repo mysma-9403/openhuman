@@ -22,21 +22,6 @@
 //! path the event is published at, so the broker can filter by domain and never
 //! wake a process for events it did not ask for.
 
-/// Voice-domain events.
-#[non_exhaustive]
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub enum VoiceEvent {
-    /// A PTT session committed a transcript to a thread. Carries only
-    /// length/timing — never the raw text, per the PII-safe logging rule.
-    PttTranscriptCommitted {
-        thread_id: String,
-        session_id: u64,
-        text_len: usize,
-        held_ms: u64,
-        finalized_by_watchdog: bool,
-    },
-}
-
 /// A tool call made while answering a committed turn: name and id only.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConversationToolCall {
@@ -1270,10 +1255,6 @@ pub enum DomainEvent {
         tenant: Option<crate::core::runtime::Tenant>,
     },
 
-    // ── Voice ────────────────────────────────────────────────────────────
-    /// A voice domain event (PTT, transcription lifecycle, etc.).
-    Voice(VoiceEvent),
-
     // ── Task sources ─────────────────────────────────────────────────────
     /// A task source completed a fetch pass.
     TaskSourceFetched {
@@ -1456,8 +1437,6 @@ impl DomainEvent {
             | Self::ThreadTodosChanged { .. }
             | Self::ThreadRunModeChanged { .. } => "agent",
 
-            Self::Voice(_) => "voice",
-
             Self::ApprovalRequested { .. }
             | Self::ApprovalDecided { .. }
             | Self::ApprovalGateOverrideIgnored { .. }
@@ -1599,7 +1578,6 @@ impl DomainEvent {
             Self::ThreadGoalCleared { .. } => "ThreadGoalCleared",
             Self::ThreadTodosChanged { .. } => "ThreadTodosChanged",
             Self::ThreadRunModeChanged { .. } => "ThreadRunModeChanged",
-            Self::Voice(_) => "Voice",
         }
     }
 

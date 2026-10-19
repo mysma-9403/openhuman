@@ -123,7 +123,7 @@ async fn a_public_file_share_uses_the_public_url_and_makes_no_link() {
         1,
     );
     version.file = Some(FileRef {
-        path: file.display().to_string(),
+        key: file.display().to_string(),
         size_bytes: 9,
         media_type: Some("image/png".into()),
     });
@@ -354,7 +354,7 @@ async fn a_file_in_a_protected_location_is_never_uploaded() {
         1,
     );
     version.file = Some(FileRef {
-        path: key.display().to_string(),
+        key: key.display().to_string(),
         size_bytes: 7,
         media_type: None,
     });

@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use tinyinference_llm::model::{ModelRequest, ModelResponse};
 
+type SeenModelRequests = Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>;
+
 struct FakeModel;
 
 #[async_trait]
@@ -21,7 +23,7 @@ impl ChatModel<()> for FakeModel {
     }
 }
 
-fn fake_entry(seen: Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>) -> ChatModelEntry {
+fn fake_entry(seen: SeenModelRequests) -> ChatModelEntry {
     ChatModelEntry {
         build: Arc::new(move |request| {
             seen.lock().unwrap().push((

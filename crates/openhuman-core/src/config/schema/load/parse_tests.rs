@@ -163,3 +163,57 @@ default_model = "claude-sonnet-4"
     );
     assert_eq!(std::fs::read_to_string(config_path).unwrap(), once);
 }
+
+#[tokio::test]
+async fn legacy_dictation_and_voice_settings_load_and_save_only_the_stt_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(
+        &config_path,
+        r#"
+[dictation]
+enabled = true
+hotkey = "ctrl+shift+d"
+activation_mode = "toggle"
+llm_refinement = false
+streaming = false
+streaming_interval_ms = 700
+
+[voice_server]
+auto_start = true
+hotkey = "ctrl+shift+v"
+activation_mode = "tap"
+stt_engine = "elevenlabs"
+skip_cleanup = true
+min_duration_secs = 0.8
+silence_threshold = 0.02
+custom_dictionary = ["OpenHuman"]
+"#,
+    )
+    .unwrap();
+
+    let config = Config::load_from_config_path(&config_path, &workspace)
+        .await
+        .unwrap();
+    assert_eq!(
+        config.voice_server.stt_engine,
+        crate::config::schema::SttEngine::Elevenlabs
+    );
+    config.save().await.unwrap();
+
+    let saved: toml::Value =
+        toml::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+    let voice_server = saved["voice_server"].as_table().unwrap();
+    assert_eq!(
+        voice_server.len(),
+        1,
+        "only the active engine setting should remain"
+    );
+    assert_eq!(voice_server["stt_engine"].as_str(), Some("elevenlabs"));
+    assert!(
+        saved.get("dictation").is_none(),
+        "retired dictation data must be dropped on save"
+    );
+}

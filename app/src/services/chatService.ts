@@ -1646,21 +1646,6 @@ interface ChatSendParams {
    */
   locale?: string | null;
   /**
-   * When `true`, the core will synthesize the agent reply via TTS and
-   * stream audio back (push-to-talk reply flow).
-   */
-  speakReply?: boolean;
-  /**
-   * Originating input source — e.g. `'ptt'` for push-to-talk, `'keyboard'`
-   * for typed input. Forwarded to the core for analytics / routing.
-   */
-  source?: string;
-  /**
-   * PTT session ID — ties the chat turn to a specific push-to-talk recording
-   * session so the core can correlate audio and text events.
-   */
-  sessionId?: number;
-  /**
    * Queue mode for concurrent messages. When a turn is already in
    * flight: `steer` injects at the next iteration boundary, `followup`
    * queues for after the turn, `collect` adds as context. `interrupt`
@@ -1701,9 +1686,6 @@ export async function chatSend(params: ChatSendParams): Promise<string | undefin
       message: params.message,
       model_override: params.model ?? undefined,
       locale: params.locale ?? undefined,
-      speak_reply: params.speakReply ?? undefined,
-      source: params.source ?? undefined,
-      session_id: params.sessionId ?? undefined,
       queue_mode: params.queueMode ?? undefined,
       reasoning_effort: params.reasoningEffort ?? undefined,
     },

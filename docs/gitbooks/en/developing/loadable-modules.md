@@ -42,7 +42,7 @@ in [the module-boundary inventory](../../../module-boundary-inventory.md).
 | `tinydocs` | Document extraction and `.docx` / `.pptx` synthesis |
 | `tinywallet` | Key derivation and transaction signing |
 | `tinyjuice` | Tool-output compression and recovery |
-| `tinyvoice` | Audio framing, VAD, wake-word gating, hallucination detection |
+| `tinyvoice` | Audio framing, VAD, and transcript hallucination detection |
 | `tinymcp` | The MCP client and registry |
 | `tinyconnectors` | OAuth connector actions and triggers |
 | `tinybox` | Sandbox/resource lifecycle, bounded and supervised execution, jail and Docker operations, shell execution, file transfer and port forwarding |

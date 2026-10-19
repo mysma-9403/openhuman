@@ -92,6 +92,6 @@ All three are available over JSON-RPC as `openhuman.devices_create_pairing`, `op
 ## See also
 
 - [Privacy and security](privacy-and-security.md): how OpenHuman handles your data and keys.
-- [Voice](native-tools/voice.md): push-to-talk and dictation, the main use for a phone companion.
+- [Voice](native-tools/voice.md): use the iOS hold-to-talk control, dictation, or a live voice session from the phone companion.
 - [Architecture](../developing/architecture.md): where the iOS client sits relative to the core.
 - [OS keyring and secret storage](os-keyring-and-secret-storage.md): where the core's X25519 private key is kept.

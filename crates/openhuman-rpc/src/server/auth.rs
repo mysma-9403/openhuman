@@ -10,9 +10,6 @@
 //! - `GET /dev/connect`   — dev-only core handoff; see `server::dev_connect`
 //! - `GET /events`        — SSE stream; browser `EventSource` cannot set
 //!   headers, so the handler enforces a bind-token / bearer credential itself
-//! - `GET /ws/dictation`  — WebSocket upgrade; browser WS API cannot set
-//!   headers, so the handler enforces the bearer (header or `?token=`) +
-//!   origin itself before the upgrade (C4 / issue #1924)
 //! - `OPTIONS *`          — CORS preflight (handled by outer CORS middleware)
 //!
 //! Endpoints that accept the bearer either via header **or** `?token=…` query
@@ -44,10 +41,7 @@ use crate::core_host::security::credentials::AuthService;
 /// clients (browser `EventSource`, browser `WebSocket`) cannot set
 /// `Authorization` headers via standard APIs. `/events` is not unauthenticated
 /// — it is exempt from the *middleware* header check but enforces its own
-/// bind-token credential inside the handler. `/ws/dictation` is NOT public: it
-/// is bearer-gated by this middleware via [`QUERY_TOKEN_PATHS`] (header or
-/// `?token=`) so an unauthenticated upgrade is rejected with 401 before the
-/// WebSocket handshake; the handler adds an origin check on top (finding C4).
+/// bind-token credential inside the handler.
 const PUBLIC_PATHS: &[&str] = &[
     "/",
     "/health",
@@ -97,7 +91,7 @@ fn is_public_path(path: &str) -> bool {
 /// Add new entries here only for SSE / WebSocket routes whose clients cannot
 /// send headers and that carry per-user data. The follow-up approvals stream
 /// (#1339) is the next planned addition.
-const QUERY_TOKEN_PATHS: &[&str] = &["/events/webhooks", "/ws/dictation", "/ws/live-voice"];
+const QUERY_TOKEN_PATHS: &[&str] = &["/events/webhooks", "/ws/live-voice"];
 
 /// Axum middleware: enforce `Authorization: Bearer <token>` on all protected
 /// endpoints.

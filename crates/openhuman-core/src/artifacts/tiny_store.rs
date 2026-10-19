@@ -139,7 +139,8 @@ impl LegacyUiBridge {
                         == Some(ext.clone())
                 });
                 if let Some(owned) = owned {
-                    let source = Path::new(&file.path);
+                    let source_buf = stored_file_path(&self.workspace_dir, file);
+                    let source = source_buf.as_path();
                     let size = if same_file(owned, source) {
                         tokio::fs::metadata(source).await?.len()
                     } else {
@@ -170,10 +171,10 @@ impl LegacyUiBridge {
         .await
         .map_err(anyhow::Error::msg)?;
         let size = if record.holds_file() {
-            let source = latest
-                .file
-                .as_ref()
-                .map_or_else(|| PathBuf::from(&latest.body), |f| PathBuf::from(&f.path));
+            let source = latest.file.as_ref().map_or_else(
+                || PathBuf::from(&latest.body),
+                |f| stored_file_path(&self.workspace_dir, f),
+            );
             if same_file(&source, &dest) {
                 tokio::fs::metadata(&dest).await?.len()
             } else {
@@ -315,6 +316,13 @@ pub fn version_files_dir(workspace_dir: &Path) -> PathBuf {
         .join("artifacts")
         .join(VERSIONED_SUBDIR)
         .join("files")
+}
+
+/// Where a version's stored file lives on disk: its storage key under
+/// [`version_files_dir`]. A key that is an absolute path (a record written
+/// before files were kept behind a store) names that path itself.
+pub fn stored_file_path(workspace_dir: &Path, file: &tiny_artifacts::FileRef) -> PathBuf {
+    version_files_dir(workspace_dir).join(&file.key)
 }
 
 /// Build the artifact tools bound to this workspace's service: the crate's

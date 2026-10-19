@@ -41,6 +41,10 @@ pub(crate) const CHROME_PATH_HINT: &str = "Chrome could not be started from the 
 
 /// How TinyComputer says no Chrome was found: agent-browser's own words
 /// before TinyComputer 0.11, and the module's since.
+/// Where Chrome puts a tab whose navigation failed
+/// (`chrome-error://chromewebdata/`).
+const CHROME_ERROR_SCHEME: &str = "chrome-error:";
+
 const CHROME_MISSING: &[&str] = &["chrome not found", "no chrome or chromium was found"];
 
 /// How TinyComputer says the browser binary it was given would not start, or
@@ -394,7 +398,42 @@ impl BrowserClient {
         if raw.eq_ignore_ascii_case("about:blank") {
             return Ok(());
         }
-        self.check_url(raw)
+        // A navigation that failed (DNS, a refused or reset connection, a
+        // certificate) leaves Chrome on its own error page. Refusing it as
+        // a policy breach hid the failure: an agent read "only HTTPS URLs"
+        // and kept clicking. Say the page did not load.
+        if raw
+            .get(..CHROME_ERROR_SCHEME.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(CHROME_ERROR_SCHEME))
+        {
+            return Err(BrowserCallError::Bus {
+                name: "PageLoadFailed".into(),
+                message: "the page failed to load (Chrome showed its error page); \
+                          the site or the network refused it"
+                    .into(),
+            });
+        }
+        // Name the scheme the page is on, never the rest of its address: a
+        // log then says what it was without keeping what was in it.
+        self.check_url(raw).map_err(|error| match error {
+            BrowserCallError::Policy(reason) if reason == "only HTTPS URLs are allowed" => {
+                let scheme = raw.split_once(':').map_or("", |(scheme, _)| scheme);
+                let scheme = if !scheme.is_empty()
+                    && scheme.len() <= 32
+                    && scheme
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+                {
+                    format!("{}:", scheme.to_ascii_lowercase())
+                } else {
+                    "an unknown scheme".into()
+                };
+                BrowserCallError::Policy(format!(
+                    "only HTTPS URLs are allowed (the page is on {scheme})"
+                ))
+            }
+            other => other,
+        })
     }
 
     /// Whether the allowed websites are "Allow all" (`*`): the browser may

@@ -311,6 +311,9 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
 /// Moves a job's next run to `at`, which no production path can do directly
 /// (a patch reschedules from the schedule, not to a given instant). Writes the
 /// instant the store keeps (`next_run_ms`), so the due-job query sees it.
+/// Legacy TinyFlows rows also carry `next_run` and `next_run_ns`; keep those
+/// representations in sync when present so the module's claim decoder sees
+/// the same deadline as the due-job query.
 #[cfg(test)]
 pub(crate) fn force_next_run_for_test(
     config: &Config,
@@ -322,15 +325,25 @@ pub(crate) fn force_next_run_for_test(
     let docs = std::sync::Arc::clone(opened.scoped()?.documents());
     let job_id = job_id.to_string();
     crate::storage::block_on_anyhow(async move {
-        let stored = docs
-            .get("cron.jobs", &job_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("no job {job_id}"))?;
-        let mut doc = stored.doc;
-        doc["next_run_ms"] = serde_json::json!(at.timestamp_millis());
-        docs.put("cron.jobs", &job_id, doc, Precondition::None)
-            .await?;
-        Ok(())
+        for collection in ["cron.jobs", "cron_jobs"] {
+            if let Some(stored) = docs.get(collection, &job_id).await? {
+                let mut doc = stored.doc;
+                doc["next_run_ms"] = serde_json::json!(at.timestamp_millis());
+                if doc.get("next_run").is_some() {
+                    doc["next_run"] = serde_json::json!(at.to_rfc3339());
+                }
+                if doc.get("next_run_ns").is_some() {
+                    let next_run_ns = at
+                        .timestamp_nanos_opt()
+                        .ok_or_else(|| anyhow::anyhow!("next run is outside nanosecond range"))?;
+                    doc["next_run_ns"] = serde_json::json!(next_run_ns);
+                }
+                docs.put(collection, &job_id, doc, Precondition::None)
+                    .await?;
+                return Ok(());
+            }
+        }
+        Err(anyhow::anyhow!("no job {job_id}"))
     })
 }
 

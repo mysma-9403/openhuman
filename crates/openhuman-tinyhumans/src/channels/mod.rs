@@ -27,6 +27,7 @@ use tinychannels_bus::{ChannelBackendRequest, ChannelBackendResult};
 use crate::install::InstallOptions;
 
 /// The id the callback registers under.
+#[cfg(feature = "channels")]
 pub const CALLBACK_ID: &str = "tinyhumans";
 
 /// Serves one callback request.

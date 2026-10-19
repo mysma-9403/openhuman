@@ -18,9 +18,7 @@ fn fresh_workspace_config() -> (tempfile::TempDir, Config) {
     let workspace = tempfile::tempdir().expect("temporary MCP workspace");
     let artifact = std::env::var_os(MODULE_ARTIFACT_ENV)
         .map(std::path::PathBuf::from)
-        .or_else(|| {
-            openhuman_core::modules::local_artifact("tinymcp").map(std::path::PathBuf::from)
-        })
+        .or_else(|| openhuman_core::modules::local_artifact("tinymcp"))
         .expect("the MCP test runner supplies the verified TinyMCP artifact")
         .canonicalize()
         .expect("TinyMCP artifact exists");

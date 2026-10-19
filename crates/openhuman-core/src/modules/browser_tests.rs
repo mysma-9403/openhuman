@@ -258,6 +258,50 @@ fn blank_session_page_is_reportable_but_not_an_explicit_navigation_target() {
     assert!(client.check_url("about:blank").is_err());
 }
 
+/// A navigation that fails leaves Chrome on its own error page. That is a
+/// page that did not load, not a site the policy refused, and saying so is
+/// what lets an agent tell a dead link from a blocked one.
+#[test]
+fn chrome_error_page_reads_as_a_failed_load_not_a_policy_refusal() {
+    let client = BrowserClient::new(Arc::new(Config::default()));
+    let error = client
+        .check_returned_url("chrome-error://chromewebdata/")
+        .expect_err("an error page is not a page to read");
+    assert!(
+        matches!(&error, BrowserCallError::Bus { name, .. } if name == "PageLoadFailed"),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("failed to load"), "{error}");
+}
+
+/// Any other page off HTTPS is still refused, and the refusal names the
+/// scheme it saw (never the rest of the address), so a log says what it was.
+#[test]
+fn a_returned_page_off_https_is_refused_naming_its_scheme() {
+    let client = BrowserClient::new(Arc::new(Config::default()));
+    for (url, scheme) in [
+        ("data:text/html,<p>secret</p>", "data:"),
+        ("http://example.com/?token=abc", "http:"),
+        ("blob:https://example.com/1234", "blob:"),
+    ] {
+        let error = client.check_returned_url(url).expect_err(url);
+        let text = error.to_string();
+        assert!(
+            matches!(error, BrowserCallError::Policy(_)),
+            "{url}: {text}"
+        );
+        assert!(
+            text.contains("only HTTPS URLs are allowed"),
+            "{url}: {text}"
+        );
+        assert!(text.contains(scheme), "{url}: {text}");
+        assert!(
+            !text.contains("secret") && !text.contains("token"),
+            "{url}: {text}"
+        );
+    }
+}
+
 /// Drives real URLs through `check_url` (parsing, host extraction, policy),
 /// so the non-global block is proven on the path the browser tool uses, not
 /// only on the helper.

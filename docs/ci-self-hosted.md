@@ -198,7 +198,8 @@ CI_AREA_DOCS=true node scripts/ci/self-hosted/lanes.mjs --profile hosted --lanes
 Publish and smoke-test the image first. Roll the pinned rootfs into idle slots
 without interrupting active jobs, then change `guest-image.txt`. Check the metadata
 inside a new guest rather than trusting only the supervisor configuration. The
-current image contains Rust 1.96.1, mold 2.40.4, Tinymold 0.3.0 and nextest 0.9.148.
+current image ships Rust 1.99.1 (the host's `RUST_TOOLCHAINS` also installs the
+pinned 1.96.1), bubblewrap 0.13.1, mold 2.40.4, Tinymold 0.3.0 and nextest 0.9.148.
 
 Private workflow routing runs from the trusted base branch. A PR run can therefore
 exercise the previous workflow; green pre-merge CI alone does not prove a workflow

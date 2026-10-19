@@ -30,7 +30,7 @@ The second group has mostly one tab per engine family. Each works the same way: 
 | --- | --- |
 | LLM | Model providers: the managed route, your own keys for 26 built-in providers, and local servers (Ollama, LM Studio, MLX, any OpenAI-compatible endpoint). See [Model routing](model-routing/README.md). |
 | Composio | Your own connector-platform key, if you prefer it to the managed route. |
-| Voice agents | Speech-to-text and text-to-speech providers, routing per workload, and the dictation hotkey. |
+| Voice agents | Speech-to-text and text-to-speech providers, routed per workload. |
 | Embeddings | The embedding provider behind memory and tool search. |
 | Search | Web search providers. Two have a managed route. The rest need your own key. See [Web search](native-tools/web-search.md). |
 | Usage | What you have spent, by day and by model, plus the background activity log. See [Billing, cost and usage](billing-and-usage.md). |

@@ -2,7 +2,8 @@ use super::*;
 
 #[test]
 fn disabled_export_does_not_create_a_trace_context() {
-    let config = crate::config::Config::default();
+    let mut config = crate::config::Config::default();
+    config.observability.share_usage_data = false;
     let context = trace_context(
         &config,
         &ChatRequestMetadata::default(),

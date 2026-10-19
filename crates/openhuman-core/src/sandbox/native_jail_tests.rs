@@ -264,7 +264,7 @@ fn openhumans_own_credential_files_are_denied_when_present() {
     let denied = credential_denials(
         crate::security::credentials::credential_files(&config),
         root.path(),
-        &[scratch.clone()],
+        std::slice::from_ref(&scratch),
     )
     .unwrap();
 

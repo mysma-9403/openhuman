@@ -298,7 +298,9 @@ pub mod artifact_publisher {
     };
     // tinyhumans file-storage publisher: the protected-path guard it re-checks
     // before upload, and the store its tests save artifacts into.
-    pub use openhuman_core::artifacts::tiny_store::{refused_path, versioned_store};
+    pub use openhuman_core::artifacts::tiny_store::{
+        refused_path, version_files_dir, versioned_store,
+    };
 }
 
 /// Egress disclosure, for hosted calls that leave the machine.
@@ -414,9 +416,6 @@ pub mod desktop {
     pub mod notifications {
         pub use openhuman_core::desktop::notifications::subscribe_core_notifications;
     }
-    pub mod overlay {
-        pub use openhuman_core::desktop::overlay::subscribe_attention_events;
-    }
 }
 
 pub mod mcp {
@@ -471,15 +470,8 @@ pub mod profiles {
 }
 
 pub mod voice {
-    pub mod dictation_listener {
-        pub use openhuman_core::voice::dictation_listener::{
-            subscribe_dictation_events, subscribe_transcription_results,
-        };
-    }
-    // The core carries the live-voice and dictation sockets only with voice and
-    // the HTTP server compiled in. Where its features differ from embed's (a
-    // workspace build unifies them separately), rpc still names these paths, so
-    // embed supplies a socket-dropping stand-in rather than a missing item.
+    // Where feature unification differs between embed and core, rpc still names
+    // the live-voice path; embed supplies a socket-dropping stand-in.
     pub mod live {
         pub mod ws {
             #[cfg(all(feature = "voice", feature = "http-server"))]
@@ -487,12 +479,6 @@ pub mod voice {
             #[cfg(not(all(feature = "voice", feature = "http-server")))]
             pub async fn handle_live_voice_ws<S, X, C>(_socket: S, _ctx: X, _config: C) {}
         }
-    }
-    pub mod streaming {
-        #[cfg(all(feature = "voice", feature = "http-server"))]
-        pub use openhuman_core::voice::streaming::handle_dictation_ws;
-        #[cfg(not(all(feature = "voice", feature = "http-server")))]
-        pub async fn handle_dictation_ws<S, C>(_socket: S, _config: C) {}
     }
 }
 

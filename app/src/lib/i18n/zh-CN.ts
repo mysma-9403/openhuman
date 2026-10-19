@@ -625,7 +625,6 @@ const messages: TranslationMap = {
   'devOptions.toolPolicyDiagnosticsDesc': '工具清单、策略态势、MCP 允许列表和近期拦截',
   'devOptions.toolPolicyDiagnostics.loading': '加载中…',
   'devOptions.toolPolicyDiagnostics.unavailable': '诊断不可用',
-  'voice.pushToTalk': '按住说话',
   'misc.somethingWentWrong': '出现了一些问题',
   'misc.beta': '测试版',
   'misc.betaFeedback': '发送反馈',
@@ -1105,13 +1104,9 @@ const messages: TranslationMap = {
   'mnemonic.createANewWallet': '创建新钱包',
   'mnemonic.importWallet': '导入钱包',
   'team.deleting': '正在删除...',
-  'voice.tapToToggle': '点击切换',
   'voice.settingsSaved': '语音设置已保存。',
   'voice.failedToLoadSettings': '无法加载语音设置',
   'voice.failedToSaveSettings': '无法保存语音设置',
-  'voice.debug.alwaysOn': '常驻聆听',
-  'voice.debug.alwaysOnDesc':
-    '保持麦克风开启，无需快捷键即可自动将你说的话发送给智能体。屏幕锁定时暂停。',
   'voice.providers.saved': '语音提供商已保存。',
   'voice.providers.failedToSave': '无法保存语音提供商',
   'voice.mode.start': '开始语音聊天',
@@ -1175,25 +1170,6 @@ const messages: TranslationMap = {
   'voice.routing.elevenlabsVoiceIdAria': 'ElevenLabs 声音 ID（自定义）',
   'voice.routing.elevenlabsVoiceDesc':
     '选择精选声音，或粘贴来自 ElevenLabs 控制台的自定义声音 ID。',
-  'pttSettings.title': '按住说话',
-  'pttSettings.description':
-    '在其他应用中时，按住按键即可与 OpenHuman 对话。松开按键发送录音；若已开启「朗读回复」，OpenHuman 会用语音读出回复。',
-  'pttSettings.shortcutLabel': '快捷键',
-  'pttSettings.shortcutPlaceholder': '按下一个键（例如 F13）',
-  'pttSettings.shortcutUnsetHint': '按住说话已关闭：请选择一个快捷键来启用。',
-  'pttSettings.speakRepliesLabel': '朗读智能体的回复',
-  'pttSettings.showOverlayLabel': '按住时显示悬浮层',
-  'pttSettings.errorConflictsWithDictation': '该快捷键已被听写功能占用。请选择其他按键。',
-  'pttSettings.errorModifierOnly':
-    '请选择一个常规按键（例如 F13）：仅由修饰键组成的快捷键无法用于按住说话。',
-  'pttSettings.errorEmpty': '请选择要绑定的按键。',
-  'pttSettings.errorAccessibility':
-    '此快捷键需要 macOS 的辅助功能权限。请打开系统设置 → 隐私与安全 → 辅助功能，并启用 OpenHuman。',
-  'pttSettings.errorShortcutInUse': '该快捷键已被其他应用占用。请选择其他快捷键。',
-  'pttSettings.errorUnsupportedWayland':
-    'Wayland 会话尚不支持 OpenHuman 的全局快捷键：请切换到 X11 会话，或使用应用内的听写开关。',
-  'pttOverlay.listening': '正在聆听…',
-  'pttOverlay.idle': '空闲',
   'composio.triageTitle': '集成触发器',
   'composio.triageDesc':
     '启用时，每个传入的 Composio 触发器都会经过 AI 分类步骤，对事件进行分类并可能启动自动化操作：每个触发器使用一个本地 LLM 轮次。如果你更喜欢手动审查，可以全局或按集成禁用。如果环境变量',
@@ -2229,10 +2205,6 @@ const messages: TranslationMap = {
   'oauth.button.connecting': '连接中...',
   'oauth.button.loopbackTimeout': '登录超时：浏览器未完成 OAuth 跳转。请重试。',
   'openhuman.team_list_teams': '团队列表',
-  'overlay.ariaAttention': '注意消息',
-  'overlay.ariaOrb': 'OpenHuman 浮层',
-  'overlay.ariaVoiceActive': '语音输入已激活',
-  'overlay.orbTitle': '拖动以移动 · 双击重置位置',
   'pages.settings.account.migration': '导入',
   'pages.settings.account.migrationDesc':
     '将 OpenClaw（即将支持 Hermes）的记忆和笔记迁移到此工作区。',
@@ -3062,26 +3034,6 @@ const messages: TranslationMap = {
   'skills.install.urlLabel': '技能 URL',
   'skills.install.urlPlaceholder': 'https://raw.githubusercontent.com/owner/repo/main/SKILL.md',
   'skills.search.placeholder': '搜索技能...',
-  'skills.setup.voice.activation': '激活方式',
-  'skills.setup.voice.activeDescPrefix': 'Fn',
-  'skills.setup.voice.activeDescSuffix': 'Fn',
-  'skills.setup.voice.activeTitle': '语音智能已激活',
-  'skills.setup.voice.customizeSettings': '自定义设置',
-  'skills.setup.voice.downloadSttBtn': '打开语音设置',
-  'skills.setup.voice.enableDesc': '启用语音输入和输出功能',
-  'skills.setup.voice.hotkey': '热键',
-  'skills.setup.voice.startBtn': '启动中...',
-  'skills.setup.voice.startError': '启动语音服务失败',
-  'skills.setup.voice.starting': '启动中...',
-  'skills.setup.voice.stepEnable': '启动语音服务',
-  'skills.setup.voice.stepSetup': '需要设置语音转文本',
-  'skills.setup.voice.stepSuccess': '准备就绪',
-  'skills.setup.voice.sttNotReady': '语音转文本模型未就绪',
-  'skills.setup.voice.sttNotReadyDesc':
-    '语音智能需要一个可用的语音转文本引擎。请在「设置 › 语音」中选择一个。',
-  'skills.setup.voice.sttReady': '语音转文本模型已就绪',
-  'skills.setup.voice.sttReturnHint': '请在语音设置中配置语音转文本引擎，然后回到这里启动语音。',
-  'skills.setup.voice.title': '语音智能',
   'skills.uninstall.description':
     '这将永久删除技能目录及其所有捆绑资源。智能体将在下一轮停止看到它。',
   'upsell.global.limitMessage': '升级方案或充值配额以继续使用',
@@ -3344,8 +3296,6 @@ const messages: TranslationMap = {
     '检测到 OPENHUMAN_APPROVAL_GATE=0 覆盖，但已忽略：桌面应用始终保持审批门开启。',
 
   // Run queue
-  'notch.ready': '就绪',
-  'notch.listening': '聆听中…',
 
   'orchestration.detail.stop': '停止',
 
@@ -3519,7 +3469,6 @@ const messages: TranslationMap = {
   'voice.routing.testOk': '处理中',
   'voice.routing.testFailed': '失败',
   'voice.routing.unsaved': '有未保存的更改',
-  'pttSettings.clearShortcut': '清除',
   'flows.allRuns.tableTitle': '运行记录',
   'flows.allRuns.columnStatus': '状态',
   'flows.allRuns.columnWorkflow': '工作流',
@@ -3572,7 +3521,7 @@ const messages: TranslationMap = {
   'settings.embeddings.modelCardTitle': '模型尺寸( V)',
   'mcp.rows.searchPlaceholder': '搜索服务器...',
   'mcp.tab.section.clients': '客户',
-  'voice.pageDesc': '演讲引擎,它们是如何被引导的, 并推向说话。',
+  'voice.pageDesc': '语音引擎和提供商路由。',
   'voice.providers.cardDesc': '打开你想使用的引擎. 钥匙留在这个装置上',
   'voice.providers.cap.stt': '对文本的发言',
   'voice.providers.cap.tts': '语音文本',

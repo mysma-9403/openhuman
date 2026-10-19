@@ -116,7 +116,6 @@ impl Default for Config {
             tts_provider: None,
             integrations: IntegrationsConfig::default(),
             update: UpdateConfig::default(),
-            dictation: DictationConfig::default(),
             onboarding_completed: false,
             chat_onboarding_completed: false,
             model_registry: Vec::new(),

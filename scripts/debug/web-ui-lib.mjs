@@ -2,6 +2,88 @@
 // `scripts/__tests__/debug-web-ui.test.mjs` can cover them without booting a
 // browser, a core or Vite.
 import net from "node:net";
+import path from "node:path";
+
+/** Merge child overrides into an inherited environment; null explicitly unsets a key. */
+export function mergeChildEnv(parent, overrides) {
+  const env = { ...parent };
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === null) delete env[key];
+    else env[key] = value;
+  }
+  return env;
+}
+
+/** Isolated environment and working directory for the throwaway core process. */
+export function coreLaunchSpec(
+  parentEnv,
+  { workspace, mockUrl, token, logLevel = parentEnv.RUST_LOG ?? "info" },
+) {
+  return {
+    cwd: workspace,
+    env: {
+      OPENHUMAN_WORKSPACE: workspace,
+      OPENHUMAN_DOTENV_PATH: path.join(workspace, "empty.env"),
+      OPENHUMAN_CORE_TOKEN: token,
+      BACKEND_URL: mockUrl,
+      VITE_BACKEND_URL: mockUrl,
+      OPENHUMAN_COMPOSIO_MODE: "disabled",
+      OPENHUMAN_SANDBOX: "off",
+      OPENHUMAN_BACKEND_API_KEY: null,
+      OPENHUMAN_BACKEND_SESSION_TOKEN: null,
+      OPENHUMAN_STORAGE_URL: null,
+      RUST_LOG: logLevel,
+    },
+  };
+}
+
+/** Pass the isolated launch specification through to the child process launcher. */
+export function startCoreChild(startChild, core, corePort, launchSpec) {
+  return startChild(
+    "core",
+    core,
+    ["serve", "--port", String(corePort)],
+    launchSpec.env,
+    launchSpec.cwd,
+  );
+}
+
+/** Whether a logged core RPC auth state reports an authenticated credential. */
+export function isCoreAuthenticated(authState) {
+  return authState?.result?.isAuthenticated === true;
+}
+
+/** Navigate an authenticated scripted session to chat when Home has no composer. */
+export async function ensureSignedInChat(page, appOrigin) {
+  const composer = page.getByRole("textbox", { name: "Message input" });
+  if (!(await composer.isVisible().catch(() => false))) {
+    await page.goto(`${appOrigin}/#/chat`);
+  }
+  await composer.waitFor({ state: "visible", timeout: 120_000 });
+}
+
+/** Create an authenticated core RPC client with a bounded request lifetime. */
+export function createCoreRpcClient(
+  rpcUrl,
+  token,
+  fetchImpl = fetch,
+  timeoutMs = 10_000,
+) {
+  return async (method, params = {}) => {
+    const res = await fetchImpl(rpcUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const body = await res.json();
+    if (body.error) throw new Error(`${method}: ${body.error.message}`);
+    return body.result;
+  };
+}
 
 export const USAGE = `Usage: pnpm debug web [options]
 
@@ -90,7 +172,7 @@ export function freePort() {
 
 /** `YYYYMMDD-HHMMSS` in local time, for the per-run artifact directory. */
 export function runStamp(date = new Date()) {
-  const pad = n => String(n).padStart(2, "0");
+  const pad = (n) => String(n).padStart(2, "0");
   return (
     `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-` +
     `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
@@ -116,7 +198,7 @@ export async function waitFor(fn, { timeoutMs, intervalMs = 200, what }) {
       // not ready yet
     }
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-    await new Promise(resolve => setTimeout(resolve, intervalMs));
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 }
 

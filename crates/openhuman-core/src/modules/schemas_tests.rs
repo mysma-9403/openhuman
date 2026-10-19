@@ -79,6 +79,7 @@ async fn forgetting_sites_reports_how_many_went() {
     for site in ["shop.test", "books.test"] {
         std::fs::write(sites.join(format!("{site}.json")), b"{}").unwrap();
     }
+    let workspace = config.workspace_dir.clone();
     let ctx = CoreContext::for_test_with_config(DomainSet::full(), config);
 
     let (one, every) = CoreContext::scope(ctx.clone(), async {
@@ -88,16 +89,24 @@ async fn forgetting_sites_reports_how_many_went() {
             Value::String("https://www.shop.test/cart".to_string()),
         );
         let one = super::handle_browser_forget_sites(DispatchCtx::new(ctx.clone()), one).await;
-        (
-            one,
-            super::handle_browser_forget_sites(DispatchCtx::new(ctx.clone()), Map::new()).await,
-        )
+        let every =
+            super::handle_browser_forget_sites(DispatchCtx::new(ctx.clone()), Map::new()).await;
+
+        let reopened = crate::modules::site_memory_host::SiteStore::open(&workspace)
+            .expect("reopen active site store");
+        assert!(reopened.load("shop.test").await.unwrap().hints.is_empty());
+        assert!(reopened.load("books.test").await.unwrap().hints.is_empty());
+        assert_eq!(reopened.forget(None).await.unwrap(), 0);
+
+        (one, every)
     })
     .await;
 
     assert_eq!(one.unwrap()["forgotten"], 1);
     assert_eq!(every.unwrap()["forgotten"], 1);
-    assert!(!sites.join("books.test.json").exists());
+
+    assert!(sites.join("shop.test.json").exists());
+    assert!(sites.join("books.test.json").exists());
 }
 
 #[test]

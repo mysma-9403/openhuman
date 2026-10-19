@@ -1,5 +1,5 @@
-//! Login-gated background services (local AI, voice) started on session
-//! store and stopped on session clear, plus the embedder-host detection
+//! Login-gated background services (local AI) started on session store and
+//! stopped on session clear, plus the embedder-host detection
 //! that gates global (operator-wide) activation side effects.
 
 use crate::config::Config;
@@ -40,34 +40,15 @@ pub(super) fn spawn_integrations_cache_warm(config: &Config) {
     });
 }
 
-/// Start all login-gated background services (local AI and voice). Called both
+/// Start login-gated background services. Called both
 /// from the initial boot path (when an existing
 /// session is detected) and from `set_credential()` when a credential is installed.
 pub async fn start_credential_gated_services(
-    ctx: &crate::core::runtime::DispatchCtx,
+    _ctx: &crate::core::runtime::DispatchCtx,
     config: &Config,
 ) {
-    // These login-gated services are mutually independent — the ONLY ordering
-    // constraint is voice-server → standalone-dictation-listener (they contend
-    // for the single rdev global listener on macOS). Previously each was
-    // `.await`ed in series, so their cold-start costs SUMMED: the local-AI
-    // bootstrap (Ollama/embeddings) + the Windows WASAPI microphone init
-    // (a synchronous readiness handshake in `always_on::spawn_capture_thread`)
-    // stacked into the ~10s stall users hit before hotkeys/commands were usable
-    // — worst on Windows (#3490). Worse,
-    // the hotkey/command registration (steps 2–3) sat
-    // *after* the local-AI bootstrap in the series, so commands could not
-    // register until Ollama finished warming.
-    //
-    // Run them concurrently on independent tasks instead: readiness is bounded
-    // by the slowest single service rather than their sum, and command
-    // registration no longer waits behind local-AI warm-up. Each task logs its
-    // own elapsed time so a future regression can be attributed to one stage; a
-    // panic in one service is logged on join and never aborts the others.
-
     // Unit tests must not launch the real login-gated background services: they
-    // include detached, long-lived continuous audio capture that outlives the
-    // test that spawned it and interleaves with the
+    // include detached listeners that outlive the test that spawned them and interleave with the
     // shared process state (HOME / active_user.toml) of the parallel `cargo
     // test` run. Once startup became concurrent (#3490) that interleaving made
     // the session-isolation tests order-dependent. `cfg!(test)` is compiled out
@@ -123,52 +104,6 @@ pub async fn start_credential_gated_services(
         ));
     }
 
-    // 2+3. Voice hotkey services — the user-facing command registration. The
-    //      embedded voice server owns the single rdev listener; the standalone
-    //      dictation listener only starts when the server is NOT auto-starting,
-    //      so keep these two ordered *relative to each other* (but concurrent
-    //      with everything else).
-    {
-        let config = config.clone();
-        let ctx = ctx.clone();
-        tasks.push((
-            "voice_hotkey",
-            tokio::spawn(async move {
-                let step = std::time::Instant::now();
-                crate::voice::server::start_if_enabled(&ctx, &config).await;
-                if !config.voice_server.auto_start && config.components.voice {
-                    crate::voice::dictation_listener::start_if_enabled(&ctx, &config).await;
-                }
-                log::debug!(
-                    "[services] voice hotkey services registered ({} ms)",
-                    step.elapsed().as_millis()
-                );
-            }),
-        ));
-    }
-
-    // 3b. Always-on listening (Phase 2): continuous mic + VAD → STT → agent.
-    //     Its cold WASAPI init (`always_on::spawn_capture_thread`) is the
-    //     Windows-specific blocker; it now runs the blocking capture-readiness
-    //     handshake on the blocking pool (see `always_on::start_if_enabled`), so
-    //     on its own task it neither stalls an async worker nor the hotkey /
-    //     command registration above.
-    {
-        let config = config.clone();
-        let ctx = ctx.clone();
-        tasks.push((
-            "always_on",
-            tokio::spawn(async move {
-                let step = std::time::Instant::now();
-                crate::voice::always_on::start_if_enabled(&ctx, &config).await;
-                log::debug!(
-                    "[services] always-on listening started ({} ms)",
-                    step.elapsed().as_millis()
-                );
-            }),
-        ));
-    }
-
     let total = tasks.len();
     let mut failed = 0usize;
     for (name, task) in tasks {
@@ -195,12 +130,6 @@ pub async fn stop_credential_gated_services(
     ctx: &crate::core::runtime::DispatchCtx,
     config: &Config,
 ) {
-    // 2. Voice server
-    if let Some(server) = crate::voice::server::try_global_server() {
-        server.stop().await;
-        log::info!("[services] voice server stopped on logout");
-    }
-
     // 4. Local AI — reset state to idle. OpenHuman never owns the local
     //    runtime process (the user runs Ollama / LM Studio / MLX), so there is
     //    nothing to stop; we only clear the cached probe verdict so the
@@ -210,17 +139,6 @@ pub async fn stop_credential_gated_services(
         let runtime = crate::inference::local_runtime_config(config);
         service.reset_to_idle(&runtime);
         log::info!("[services] local AI reset to idle on logout");
-    }
-
-    // 5. Dictation listener — abort the hotkey forwarder task so it doesn't
-    //    accumulate duplicate rdev listeners across logout → login cycles.
-    crate::voice::dictation_listener::stop().await;
-
-    // 6. Disable delivery and release module-owned microphone/output leases.
-    crate::voice::always_on::shutdown().await;
-    #[cfg(feature = "voice")]
-    if let Err(error) = crate::voice::capture_lease::close_all().await {
-        log::warn!("[services] voice capture cleanup pending: {error}");
     }
 
     if let Err(error) = crate::integrations::composio::trigger_history::close_global(ctx).await {

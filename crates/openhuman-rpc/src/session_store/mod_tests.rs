@@ -55,6 +55,11 @@ async fn a_storage_url_installs_the_driver_backed_store() {
 
 /// A storage URL installs the driver-backed store, and two agents on the one
 /// backend keep their turn states apart. Run once per driver the build has.
+#[cfg(any(
+    feature = "storage-sqlite",
+    feature = "storage-file",
+    feature = "storage-mongodb"
+))]
 async fn driver_backed_store_keeps_agents_apart(url: String, driver: &str) {
     let _turn = SLOTS.lock().await;
     let previous = crate::core_host::agent::session_store::installed();

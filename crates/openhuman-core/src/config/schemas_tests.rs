@@ -37,10 +37,6 @@ fn every_registered_key_resolves_to_non_unknown_schema() {
         "reset_local_data",
         "get_onboarding_completed",
         "set_onboarding_completed",
-        "get_dictation_settings",
-        "update_dictation_settings",
-        "get_voice_server_settings",
-        "update_voice_server_settings",
     ];
     for k in keys {
         let s = schemas(k);

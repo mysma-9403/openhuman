@@ -19,10 +19,6 @@ use super::integrations::{
     handle_get_composio_trigger_settings, handle_get_search_settings,
     handle_update_composio_trigger_settings, handle_update_search_settings,
 };
-use super::voice::{
-    handle_get_dictation_settings, handle_get_voice_server_settings,
-    handle_update_dictation_settings, handle_update_voice_server_settings,
-};
 use super::workspace::{
     handle_agent_server_status, handle_get_agent_paths, handle_get_analytics_settings,
     handle_get_dashboard_settings, handle_get_data_paths, handle_get_onboarding_completed,
@@ -58,10 +54,6 @@ pub fn all_controller_schemas() -> Vec<ControllerSchema> {
         schemas("update_agent_paths"),
         schemas("get_onboarding_completed"),
         schemas("set_onboarding_completed"),
-        schemas("get_dictation_settings"),
-        schemas("update_dictation_settings"),
-        schemas("get_voice_server_settings"),
-        schemas("update_voice_server_settings"),
         schemas("update_composio_trigger_settings"),
         schemas("get_composio_trigger_settings"),
         schemas("get_autonomy_settings"),
@@ -178,22 +170,6 @@ pub fn all_registered_controllers() -> Vec<RegisteredController> {
         RegisteredController {
             schema: schemas("set_onboarding_completed"),
             handler: handle_set_onboarding_completed,
-        },
-        RegisteredController {
-            schema: schemas("get_dictation_settings"),
-            handler: handle_get_dictation_settings,
-        },
-        RegisteredController {
-            schema: schemas("update_dictation_settings"),
-            handler: handle_update_dictation_settings,
-        },
-        RegisteredController {
-            schema: schemas("get_voice_server_settings"),
-            handler: handle_get_voice_server_settings,
-        },
-        RegisteredController {
-            schema: schemas("update_voice_server_settings"),
-            handler: handle_update_voice_server_settings,
         },
         RegisteredController {
             schema: schemas("update_composio_trigger_settings"),

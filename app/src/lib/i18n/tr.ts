@@ -633,7 +633,6 @@ const messages: TranslationMap = {
     'Araç envanteri, politika durumu, MCP izin listeleri ve son engellemeler',
   'devOptions.toolPolicyDiagnostics.loading': 'Yükleniyor…',
   'devOptions.toolPolicyDiagnostics.unavailable': 'Tanılama kullanılamıyor',
-  'voice.pushToTalk': 'Bas-konuş',
   'misc.somethingWentWrong': 'Bir sorun oluştu',
   'misc.beta':
     'OpenHuman erken beta aşamasında. Geri bildirim paylaşmaktan veya karşılaştığınız hataları bildirmekten çekinmeyin: her bildirim daha hızlı yayınlamamıza yardımcı olur.',
@@ -1210,13 +1209,9 @@ const messages: TranslationMap = {
   'mnemonic.createANewWallet': 'Yeni cüzdan oluştur',
   'mnemonic.importWallet': 'Cüzdanı içe aktar',
   'team.deleting': 'Siliniyor...',
-  'voice.tapToToggle': 'Açıp kapatmak için dokunun',
   'voice.settingsSaved': 'Ses ayarları kaydedildi.',
   'voice.failedToLoadSettings': 'Ses ayarları yüklenemedi',
   'voice.failedToSaveSettings': 'Ses ayarları kaydedilemedi',
-  'voice.debug.alwaysOn': 'Sürekli dinleme',
-  'voice.debug.alwaysOnDesc':
-    'Mikrofonu açık tutar ve söylediklerinizi kısayol tuşu olmadan otomatik olarak ajana gönderir. Ekran kilitlendiğinde duraklar.',
   'voice.providers.saved': 'Ses sağlayıcıları kaydedildi.',
   'voice.providers.failedToSave': 'Ses sağlayıcıları kaydedilemedi',
   'voice.mode.start': 'Sesli sohbeti başlat',
@@ -1224,7 +1219,7 @@ const messages: TranslationMap = {
   'voice.mode.connecting': 'Bağlanıyor…',
   'voice.mode.listening': 'Dinleniyor',
   'voice.mode.speaking': 'Konuşuyor',
-  'voice.pageDesc': 'Konuşma motorları, nasıl yönlendirildikleri ve bas-konuş.',
+  'voice.pageDesc': 'Konuşma motorları ve sağlayıcı yönlendirmesi.',
   'voice.providers.title': 'Ses sağlayıcıları',
   'voice.providers.cardDesc': 'Kullanmak istediğiniz motorları açın. Anahtarlar bu cihazda kalır.',
   'voice.providers.cap.stt': 'Konuşmadan metne',
@@ -1291,28 +1286,6 @@ const messages: TranslationMap = {
   'voice.routing.elevenlabsVoiceIdAria': 'ElevenLabs ses kimliği (özel)',
   'voice.routing.elevenlabsVoiceDesc':
     'Seçilmiş seslerden birini seçin veya ElevenLabs panelinizden özel bir ses kimliği yapıştırın.',
-  'pttSettings.title': 'Bas-konuş',
-  'pttSettings.clearShortcut': 'Temizle',
-  'pttSettings.description':
-    "Başka bir uygulamadayken OpenHuman ile konuşmak için bir tuşu basılı tutun. Göndermek için tuşu bırakın; 'Ajan yanıtlarını seslendir' açıksa OpenHuman yanıtı sesli okur.",
-  'pttSettings.shortcutLabel': 'Kısayol tuşu',
-  'pttSettings.shortcutPlaceholder': 'Bir tuşa basın (örn. F13)',
-  'pttSettings.shortcutUnsetHint': 'Bas-konuş kapalı: etkinleştirmek için bir kısayol tuşu seçin.',
-  'pttSettings.speakRepliesLabel': 'Ajan yanıtlarını seslendir',
-  'pttSettings.showOverlayLabel': 'Basılı tutarken kaplama penceresini göster',
-  'pttSettings.errorConflictsWithDictation':
-    'Bu kısayol zaten dikte için kullanılıyor. Farklı bir tuş seçin.',
-  'pttSettings.errorModifierOnly':
-    'Normal bir tuş seçin (örn. F13): yalnızca değiştirici tuşlardan oluşan kısayollar bas-konuş için çalışmaz.',
-  'pttSettings.errorEmpty': 'Atamak için bir tuş seçin.',
-  'pttSettings.errorAccessibility':
-    "macOS bu kısayol için Erişilebilirlik izni gerektiriyor. Sistem Ayarları → Gizlilik ve Güvenlik → Erişilebilirlik bölümünü açın ve OpenHuman'ı etkinleştirin.",
-  'pttSettings.errorShortcutInUse':
-    'Bu kısayol başka bir uygulama tarafından kullanılıyor. Farklı bir kısayol seçin.',
-  'pttSettings.errorUnsupportedWayland':
-    "Wayland oturumları OpenHuman'da henüz genel kısayolları desteklemiyor: bir X11 oturumuna geçin veya uygulama içi dikte düğmesini kullanın.",
-  'pttOverlay.listening': 'Dinleniyor…',
-  'pttOverlay.idle': 'Boşta',
   'composio.triageTitle': 'Entegrasyon tetikleyicileri',
   'composio.triageDesc':
     'Etkin olduğunda, gelen her Composio tetikleyicisi olayı sınıflandıran ve otomatik eylemler başlatabilen bir yapay zekâ ön değerlendirme adımından geçer: tetikleyici başına bir yerel LLM turu. Elle incelemeyi tercih ediyorsanız bunu genel olarak veya entegrasyon bazında devre dışı bırakın. Şu ortam değişkeni',
@@ -2481,10 +2454,6 @@ const messages: TranslationMap = {
   'oauth.button.loopbackTimeout':
     'Oturum açma zaman aşımına uğradı: tarayıcı OAuth yönlendirmesini tamamlamadı. Lütfen tekrar deneyin.',
   'openhuman.team_list_teams': 'Ekipleri listele',
-  'overlay.ariaAttention': 'Dikkat mesajı',
-  'overlay.ariaOrb': 'OpenHuman kaplama penceresi',
-  'overlay.ariaVoiceActive': 'Sesli giriş etkin',
-  'overlay.orbTitle': 'Taşımak için sürükleyin · Konumu sıfırlamak için çift tıklayın',
   'pages.settings.account.migration': 'İçe aktar',
   'pages.settings.account.migrationDesc': 'Başka bir yerel asistandan bellek ve notları aktarın',
   'pages.settings.account.privacy': 'Gizlilik',
@@ -3503,28 +3472,6 @@ const messages: TranslationMap = {
   'skills.install.urlLabel': "Yetenek URL'si",
   'skills.install.urlPlaceholder': 'https://raw.githubusercontent.com/owner/repo/main/SKILL.md',
   'skills.search.placeholder': 'Yeteneklerde ara…',
-  'skills.setup.voice.activation': 'Etkinleştirme',
-  'skills.setup.voice.activeDescPrefix': 'Fn',
-  'skills.setup.voice.activeDescSuffix': 'Fn',
-  'skills.setup.voice.activeTitle': 'Ses zekâsı etkin',
-  'skills.setup.voice.customizeSettings': 'Ayarları özelleştir',
-  'skills.setup.voice.downloadSttBtn': 'Ses ayarlarını aç',
-  'skills.setup.voice.enableDesc':
-    'Mikrofonunuzu kullanarak ellerinizi kullanmadan metin dikte edin.',
-  'skills.setup.voice.hotkey': 'Kısayol tuşu',
-  'skills.setup.voice.startBtn': 'Başlatılıyor...',
-  'skills.setup.voice.startError': 'Ses sunucusu başlatılamadı',
-  'skills.setup.voice.starting': 'Başlatılıyor...',
-  'skills.setup.voice.stepEnable': 'Ses sunucusunu başlat',
-  'skills.setup.voice.stepSetup': 'Konuşmadan metne kurulumu gerekli',
-  'skills.setup.voice.stepSuccess': 'Kullanıma hazır',
-  'skills.setup.voice.sttNotReady': 'Konuşmadan metne modeli hazır değil',
-  'skills.setup.voice.sttNotReadyDesc':
-    'Ses zekâsı için çalışan bir konuşmadan metne motoru gerekir. Ayarlar › Ses bölümünden birini seçin.',
-  'skills.setup.voice.sttReady': 'Konuşmadan metne modeli hazır',
-  'skills.setup.voice.sttReturnHint':
-    'Ses ayarlarında bir konuşmadan metne motoru yapılandırın, ardından sesi başlatmak için buraya dönün.',
-  'skills.setup.voice.title': 'Ses zekâsı',
   'skills.uninstall.description':
     'Bu işlem yetenek dizinini ve paketlenmiş tüm kaynaklarını kalıcı olarak siler. Ajan bir sonraki turda onu artık görmez.',
   'upsell.global.limitMessage': 'Devam etmek için planınızı yükseltin veya kredi yükleyin',
@@ -3744,8 +3691,6 @@ const messages: TranslationMap = {
   'security.approvalGateOverrideIgnored.title': 'Geçersiz kılma engellendi',
   'security.approvalGateOverrideIgnored.body':
     'Bir OPENHUMAN_APPROVAL_GATE=0 geçersiz kılması algılandı ancak yok sayıldı: masaüstü uygulaması onay kapısını her zaman açık tutar.',
-  'notch.ready': 'Hazır',
-  'notch.listening': 'Dinleniyor…',
   'codeBlock.copy': 'Kopyala',
   'codeBlock.copied': 'Kopyalandı!',
   'userErrors.dismiss': 'Kapat',

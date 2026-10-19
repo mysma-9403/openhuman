@@ -1319,14 +1319,24 @@ describe('getCoreRpcToken (cloud-mode persistence)', () => {
     expect(headers.Authorization).toBe('Bearer cloud-token-abc');
   });
 
-  test('honours the host-injected notch core token before the cache/store', async () => {
-    // The notch / overlay WKWebViews have no Tauri IPC; the Rust host injects
-    // the bearer as a global, which must win ahead of the resolution cache.
+  test('uses the normal sidecar token even when a legacy notch token global exists', async () => {
     (globalThis as { __OPENHUMAN_NOTCH_CORE_TOKEN__?: string }).__OPENHUMAN_NOTCH_CORE_TOKEN__ =
-      'notch-bearer-xyz';
+      'stale-notch-token';
+    vi.doMock('../../utils/configPersistence', () => ({
+      peekStoredRpcUrl: () => null,
+      getStoredCoreToken: () => null,
+      normalizeRpcUrl: normalizeMockRpcUrl,
+    }));
+    vi.mocked(isTauri).mockReturnValue(true);
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'core_rpc_endpoint') {
+        return { url: 'http://127.0.0.1:7788/rpc', token: 'normal-sidecar-token' };
+      }
+      throw new Error(`unexpected invoke: ${cmd}`);
+    });
     try {
       const { getCoreRpcToken } = await import('../coreRpcClient');
-      await expect(getCoreRpcToken()).resolves.toBe('notch-bearer-xyz');
+      await expect(getCoreRpcToken()).resolves.toBe('normal-sidecar-token');
     } finally {
       delete (globalThis as { __OPENHUMAN_NOTCH_CORE_TOKEN__?: string })
         .__OPENHUMAN_NOTCH_CORE_TOKEN__;

@@ -12,7 +12,7 @@
 //! autonomy, and the publisher only exists when the integration client does
 //! (a backend is configured and the user is signed in).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -39,6 +39,9 @@ pub struct StorageArtifactPublisher {
     /// The turn the backend requests are reported to. A publisher is built
     /// once per tool set, not per call, so it reports outside any chat.
     approval: ApprovalTurnContext,
+    /// The folder a version's storage key is relative to. `None` reads keys
+    /// as the paths they are (records from before versions were kept).
+    version_files: Option<PathBuf>,
 }
 
 impl StorageArtifactPublisher {
@@ -49,7 +52,16 @@ impl StorageArtifactPublisher {
             client,
             security,
             approval: ApprovalTurnContext::default(),
+            version_files: None,
         }
+    }
+
+    /// Resolve a version's file key against `dir`, the folder its copies are
+    /// kept in. An absolute key still names itself.
+    #[must_use]
+    pub fn with_version_files(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.version_files = Some(dir.into());
+        self
     }
 }
 
@@ -63,20 +75,26 @@ pub fn artifact_publisher(config: &Config) -> Option<Arc<dyn ArtifactPublisher>>
         &config.workspace_dir,
         &config.action_dir,
     ));
-    Some(Arc::new(StorageArtifactPublisher::new(client, security)))
+    Some(Arc::new(
+        StorageArtifactPublisher::new(client, security).with_version_files(
+            openhuman_embed::__host::artifact_publisher::version_files_dir(&config.workspace_dir),
+        ),
+    ))
 }
 
 /// The bytes, file name and media type a version uploads as.
 async fn upload_body(
     record: &ArtifactRecord,
     version: &ArtifactVersion,
+    version_files: Option<&Path>,
 ) -> anyhow::Result<(Vec<u8>, String, &'static str)> {
     if record.holds_file() {
         let path = version
             .file
             .as_ref()
-            .map_or(version.body.as_str(), |f| f.path.as_str());
-        let path = Path::new(path);
+            .map_or(version.body.as_str(), |f| f.key.as_str());
+        let joined = version_files.map(|dir| dir.join(path));
+        let path = joined.as_deref().unwrap_or_else(|| Path::new(path));
         // The record was checked when written; check again on what the path
         // resolves to now, so nothing protected leaves the machine.
         let resolved = tokio::fs::canonicalize(path)
@@ -217,7 +235,8 @@ impl ArtifactPublisher for StorageArtifactPublisher {
         if !self.security.can_act() {
             anyhow::bail!("[policy-blocked] Action blocked: autonomy is read-only");
         }
-        let (bytes, filename, mime) = upload_body(record, version).await?;
+        let (bytes, filename, mime) =
+            upload_body(record, version, self.version_files.as_deref()).await?;
         tracing::debug!(
             artifact_id = %record.id,
             version = version.version,

@@ -677,7 +677,6 @@ const messages: TranslationMap = {
     'Alat inventaris, postur kebijakan, allowzes MCP, dan blok terbaru',
   'devOptions.toolPolicyDiagnostics.loading': 'Memuat…',
   'devOptions.toolPolicyDiagnostics.unavailable': 'Diagnostik tidak tersedia',
-  'voice.pushToTalk': 'Tekan untuk Bicara',
   'misc.somethingWentWrong': 'Terjadi kesalahan',
   'misc.beta': 'Beta',
   'misc.betaFeedback': 'Kirim masukan',
@@ -1192,13 +1191,9 @@ const messages: TranslationMap = {
   'mnemonic.createANewWallet': 'Buat Dompet Baru',
   'mnemonic.importWallet': 'Impor Dompet',
   'team.deleting': 'Menghapus...',
-  'voice.tapToToggle': 'Ketuk untuk mengalihkan',
   'voice.settingsSaved': 'Pengaturan suara tersimpan.',
   'voice.failedToLoadSettings': 'Gagal memuat pengaturan suara',
   'voice.failedToSaveSettings': 'Gagal menyimpan pengaturan suara',
-  'voice.debug.alwaysOn': 'Mendengarkan terus-menerus',
-  'voice.debug.alwaysOnDesc':
-    'Biarkan mikrofon tetap aktif dan kirim ucapan Anda ke agen secara otomatis, tanpa pintasan. Berhenti sementara saat layar terkunci.',
   'voice.providers.saved': 'Penyedia suara disimpan.',
   'voice.providers.failedToSave': 'Gagal menyimpan penyedia suara',
   'voice.mode.start': 'Mulai obrolan suara',
@@ -1264,26 +1259,6 @@ const messages: TranslationMap = {
   'voice.routing.elevenlabsVoiceIdAria': 'ID suara ElevenLabs (kustom)',
   'voice.routing.elevenlabsVoiceDesc':
     'Pilih suara yang dikurasi atau tempel ID suara kustom dari dasbor ElevenLabs Anda.',
-  'pttSettings.title': 'Tekan untuk bicara',
-  'pttSettings.description':
-    'Tahan sebuah tombol untuk berbicara dengan OpenHuman saat kamu sedang di aplikasi lain. Lepas tombol untuk mengirim; jika «Bacakan balasan» aktif, OpenHuman akan menyuarakan balasannya.',
-  'pttSettings.shortcutLabel': 'Pintasan',
-  'pttSettings.shortcutPlaceholder': 'Tekan sebuah tombol (mis. F13)',
-  'pttSettings.shortcutUnsetHint': 'Tekan untuk bicara mati: pilih pintasan untuk mengaktifkannya.',
-  'pttSettings.speakRepliesLabel': 'Suarakan balasan agen',
-  'pttSettings.showOverlayLabel': 'Tampilkan lapisan saat tombol ditahan',
-  'pttSettings.errorConflictsWithDictation':
-    'Pintasan ini sudah dipakai oleh dikte. Pilih tombol lain.',
-  'pttSettings.errorModifierOnly':
-    'Pilih tombol biasa (mis. F13): pintasan hanya pengubah tidak berfungsi untuk tekan untuk bicara.',
-  'pttSettings.errorEmpty': 'Pilih tombol untuk diikat.',
-  'pttSettings.errorAccessibility':
-    'macOS memerlukan izin Aksesibilitas untuk pintasan ini. Buka Pengaturan Sistem → Privasi & Keamanan → Aksesibilitas lalu aktifkan OpenHuman.',
-  'pttSettings.errorShortcutInUse': 'Aplikasi lain sudah memakai pintasan ini. Pilih yang lain.',
-  'pttSettings.errorUnsupportedWayland':
-    'Sesi Wayland belum mendukung pintasan global di OpenHuman: beralihlah ke sesi X11 atau gunakan tombol dikte di dalam aplikasi.',
-  'pttOverlay.listening': 'Mendengarkan…',
-  'pttOverlay.idle': 'Siaga',
   'composio.triageTitle': 'Pemicu Integrasi',
   'composio.triageDesc':
     'Saat aktif, setiap pemicu Composio yang masuk menjalani langkah triase AI yang mengklasifikasikan event dan mungkin memulai tindakan otomatis: satu giliran LLM lokal per pemicu. Nonaktifkan secara global atau per integrasi jika Anda lebih suka tinjauan manual. Jika variabel lingkungan',
@@ -2384,10 +2359,6 @@ const messages: TranslationMap = {
   'oauth.button.loopbackTimeout':
     'Masuk habis waktu: browser tidak menyelesaikan pengalihan OAuth. Silakan coba lagi.',
   'openhuman.team_list_teams': 'Daftar tim',
-  'overlay.ariaAttention': 'Pesan perhatian',
-  'overlay.ariaOrb': 'Overlay OpenHuman',
-  'overlay.ariaVoiceActive': 'Input suara aktif',
-  'overlay.orbTitle': 'Seret untuk memindahkan · Klik dua kali untuk mereset posisi',
   'pages.settings.account.migration': 'Impor',
   'pages.settings.account.migrationDesc':
     'Migrasikan memori dan catatan dari OpenClaw (dan, segera, Hermes) ke ruang kerja ini.',
@@ -3274,27 +3245,6 @@ const messages: TranslationMap = {
   'skills.install.urlLabel': 'URL skill',
   'skills.install.urlPlaceholder': 'https://raw.githubusercontent.com/owner/repo/main/SKILL.md',
   'skills.search.placeholder': 'Teks placeholder',
-  'skills.setup.voice.activation': 'Aktivasi',
-  'skills.setup.voice.activeDescPrefix': 'Fn',
-  'skills.setup.voice.activeDescSuffix': 'Fn',
-  'skills.setup.voice.activeTitle': 'Kecerdasan Suara Aktif',
-  'skills.setup.voice.customizeSettings': 'Sesuaikan pengaturan',
-  'skills.setup.voice.downloadSttBtn': 'Buka pengaturan suara',
-  'skills.setup.voice.enableDesc': 'Deskripsi aktifkan',
-  'skills.setup.voice.hotkey': 'Pintasan',
-  'skills.setup.voice.startBtn': 'Memulai...',
-  'skills.setup.voice.startError': 'Gagal memulai server suara',
-  'skills.setup.voice.starting': 'Memulai...',
-  'skills.setup.voice.stepEnable': 'Mulai server suara',
-  'skills.setup.voice.stepSetup': 'Penyiapan speech-to-text diperlukan',
-  'skills.setup.voice.stepSuccess': 'Siap digunakan',
-  'skills.setup.voice.sttNotReady': 'Model speech-to-text belum siap',
-  'skills.setup.voice.sttNotReadyDesc':
-    'Kecerdasan Suara memerlukan mesin ucapan-ke-teks yang berfungsi. Pilih salah satu di Pengaturan › Suara.',
-  'skills.setup.voice.sttReady': 'Model speech-to-text siap',
-  'skills.setup.voice.sttReturnHint':
-    'Konfigurasikan mesin speech-to-text di pengaturan suara, lalu kembali ke sini untuk memulai suara.',
-  'skills.setup.voice.title': 'Kecerdasan Suara',
   'skills.uninstall.description':
     'Ini akan menghapus permanen direktori skill dan semua resource yang dibundel. Agen akan berhenti melihatnya pada giliran berikutnya.',
   'upsell.global.limitMessage': 'Upgrade paket atau isi ulang kredit untuk melanjutkan',
@@ -3567,8 +3517,6 @@ const messages: TranslationMap = {
     'Override OPENHUMAN_APPROVAL_GATE=0 terdeteksi tetapi diabaikan: aplikasi desktop selalu menjaga gerbang persetujuan tetap aktif.',
 
   // Run queue
-  'notch.ready': 'Siap',
-  'notch.listening': 'Mendengar…',
 
   'orchestration.detail.stop': 'Hentikan',
 
@@ -3755,7 +3703,6 @@ const messages: TranslationMap = {
   'voice.routing.testOk': 'Sedang bekerja',
   'voice.routing.testFailed': 'Gagal',
   'voice.routing.unsaved': 'Perubahan belum disimpan',
-  'pttSettings.clearShortcut': 'Bersihkan',
   'flows.allRuns.tableTitle': 'Jalankan',
   'flows.allRuns.columnWorkflow': 'Alur kerja',
   'flows.allRuns.columnStarted': 'Dimulai',
@@ -3807,7 +3754,7 @@ const messages: TranslationMap = {
   'settings.embeddings.modelCardTitle': '& dimensi model',
   'mcp.rows.searchPlaceholder': 'Cari server...',
   'mcp.tab.section.clients': 'Klien',
-  'voice.pageDesc': 'Mesin pidato, bagaimana mereka diarahkan, dan mendorong-to- bicara.',
+  'voice.pageDesc': 'Mesin ucapan dan perutean penyedia.',
   'voice.providers.cardDesc':
     'Nyalakan mesin yang ingin kau gunakan. Kunci tetap pada perangkat ini.',
   'voice.providers.cap.stt': 'Pidato teks',

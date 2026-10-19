@@ -128,7 +128,7 @@ pub(crate) async fn setup_wallet_in(
         .await?
         .value;
     setup(
-        &ctx,
+        ctx,
         WalletSetupParams {
             consent_granted: true,
             source: WalletSetupSource::Imported,

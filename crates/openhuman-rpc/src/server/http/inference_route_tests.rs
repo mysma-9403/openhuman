@@ -43,7 +43,6 @@ fn ensure_test_rpc_auth() -> String {
         .expect("rpc bearer must be installed after ensure_test_rpc_auth")
         .to_string()
 }
-
 /// Build the test router (Socket.IO disabled — no real runtime needed).
 fn test_router() -> axum::Router {
     let _ = ensure_test_rpc_auth();
@@ -133,18 +132,4 @@ async fn test_chat_completions_with_bearer_not_rejected_as_auth_error() {
         StatusCode::FORBIDDEN,
         "403 must not fire when bearer is present"
     );
-}
-
-/// Dictation WebSockets accept the browser query-token transport at the
-/// handler boundary, but still reject a token that is not the process bearer.
-#[tokio::test]
-async fn test_dictation_rejects_invalid_query_token() {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/ws/dictation?token=not-the-core-token")
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = dispatch(req).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

@@ -97,14 +97,12 @@ async fn reactions_and_threads_without_a_callback_answer_the_unavailable_sentine
     let reaction = backend
         .send_reaction(&channels, "telegram", serde_json::json!({"emoji": "+1"}))
         .await
-        .err()
-        .expect("no callback");
+        .expect_err("no callback");
     assert!(reaction.to_string().starts_with(sentinel), "{reaction}");
     let listed = backend
         .list_threads(&channels, "telegram", None)
         .await
-        .err()
-        .expect("no callback");
+        .expect_err("no callback");
     assert!(listed.to_string().starts_with(sentinel), "{listed}");
 }
 

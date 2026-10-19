@@ -10,13 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::body::Body;
-use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::{SinkExt, StreamExt};
 use openhuman_core::config::schema::cloud_providers::{
     AuthStyle as CloudAuthStyle, CloudProviderCreds,
 };
@@ -28,10 +26,8 @@ use openhuman_core::inference::http;
 use openhuman_core::security::credentials::{
     AuthService, APP_SESSION_PROVIDER, DEFAULT_AUTH_PROFILE_NAME,
 };
-use openhuman_core::voice::streaming::handle_dictation_ws;
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 #[derive(Clone, Default)]
 struct MockState {
@@ -170,45 +166,6 @@ async fn http_models_and_chat_use_mocked_ollama_without_real_runtime() {
 }
 
 #[tokio::test]
-async fn dictation_ws_empty_stop_and_audio_cap_do_not_load_whisper() {
-    let _env = env_lock_async().await;
-    let tmp = tempdir().expect("tempdir");
-    let mut config = temp_config(&tmp);
-    config.dictation.streaming = false;
-    config.dictation.llm_refinement = false;
-
-    let ws_url = serve_dictation_ws(config).await;
-
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
-        .await
-        .expect("connect empty dictation ws");
-    ws.send(WsMessage::Text(r#"{"type":"stop"}"#.into()))
-        .await
-        .expect("send stop");
-    let final_msg = ws.next().await.expect("final frame").expect("final ok");
-    let final_json: Value =
-        serde_json::from_str(final_msg.to_text().expect("text frame")).expect("final json");
-    assert_eq!(final_json["type"], "final");
-    assert_eq!(final_json["text"], "");
-    assert_eq!(final_json["raw_text"], "");
-
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
-        .await
-        .expect("connect capped dictation ws");
-    ws.send(WsMessage::Binary(vec![0u8; 9_600_002].into()))
-        .await
-        .expect("send oversized pcm");
-    let error_msg = ws.next().await.expect("error frame").expect("error ok");
-    let error_json: Value =
-        serde_json::from_str(error_msg.to_text().expect("text frame")).expect("error json");
-    assert_eq!(error_json["type"], "error");
-    assert!(error_json["message"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("Recording limit reached"));
-}
-
-#[tokio::test]
 async fn local_service_reports_endpoint_state_from_mocked_ollama_without_spawning() {
     let _env = env_lock_async().await;
     let (base, _state) = serve_mock().await;
@@ -290,28 +247,6 @@ async fn serve_app(app: Router) -> String {
         axum::serve(listener, app).await.expect("serve app");
     });
     format!("http://{addr}")
-}
-
-async fn serve_dictation_ws(config: Config) -> String {
-    let config = Arc::new(config);
-    let app = Router::new().route(
-        "/ws/dictation",
-        get({
-            let config = config.clone();
-            move |ws: WebSocketUpgrade| {
-                let config = config.clone();
-                async move { ws.on_upgrade(move |socket| handle_dictation_ws(socket, config)) }
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ws");
-    let addr = listener.local_addr().expect("ws addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve ws");
-    });
-    format!("ws://{addr}/ws/dictation")
 }
 
 async fn ollama_chat_completions(

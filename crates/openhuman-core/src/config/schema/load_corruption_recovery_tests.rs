@@ -18,7 +18,6 @@ fn env_overlay_empty_lookup_leaves_defaults_intact() {
         cfg.default_temperature,
         cfg.runtime.reasoning_enabled,
         cfg.update.enabled,
-        cfg.dictation.enabled,
     );
     cfg.apply_env_overlay_with(&HashMapEnv::new());
     let after = (
@@ -26,7 +25,6 @@ fn env_overlay_empty_lookup_leaves_defaults_intact() {
         cfg.default_temperature,
         cfg.runtime.reasoning_enabled,
         cfg.update.enabled,
-        cfg.dictation.enabled,
     );
     assert_eq!(before, after);
 }

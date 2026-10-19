@@ -1,6 +1,6 @@
 //! Broadcast bus + DomainEvent subscriber for core notifications.
 //!
-//! Mirrors the pattern used by [`overlay::bus`](crate::desktop::overlay::bus)
+//! Provides a broadcast channel for notification events.
 //! — a single `tokio::sync::broadcast` channel wrapped in a `Lazy` static,
 //! plus a [`EventHandler`] implementation that translates relevant
 //! [`DomainEvent`] variants into [`CoreNotificationEvent`] payloads.

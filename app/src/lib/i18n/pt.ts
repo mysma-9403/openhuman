@@ -680,7 +680,6 @@ const messages: TranslationMap = {
     'Inventário de ferramentas, postura de políticas, listas de permissão MCP e bloqueios recentes',
   'devOptions.toolPolicyDiagnostics.loading': 'Carregando…',
   'devOptions.toolPolicyDiagnostics.unavailable': 'Diagnósticos indisponíveis',
-  'voice.pushToTalk': 'Pressionar para Falar',
   'misc.somethingWentWrong': 'Algo deu errado',
   'misc.beta':
     'O OpenHuman está em beta inicial. Sinta-se à vontade para compartilhar feedback ou reportar bugs que encontrar: cada relato nos ajuda a melhorar mais rápido.',
@@ -1201,13 +1200,9 @@ const messages: TranslationMap = {
   'mnemonic.createANewWallet': 'Criar uma nova carteira',
   'mnemonic.importWallet': 'Importar carteira',
   'team.deleting': 'Excluindo...',
-  'voice.tapToToggle': 'Toque para alternar',
   'voice.settingsSaved': 'Configurações de voz salvas.',
   'voice.failedToLoadSettings': 'Falha ao carregar configurações de voz',
   'voice.failedToSaveSettings': 'Falha ao salvar as configurações de voz',
-  'voice.debug.alwaysOn': 'Escuta contínua',
-  'voice.debug.alwaysOnDesc':
-    'Mantém o microfone aberto e envia o que você diz ao agente automaticamente, sem atalho. Pausa quando a tela está bloqueada.',
   'voice.providers.saved': 'Provedores de voz salvos.',
   'voice.providers.failedToSave': 'Falha ao salvar provedores de voz',
   'voice.mode.start': 'Iniciar chat de voz',
@@ -1273,27 +1268,6 @@ const messages: TranslationMap = {
   'voice.routing.elevenlabsVoiceIdAria': 'ID de voz ElevenLabs (personalizado)',
   'voice.routing.elevenlabsVoiceDesc':
     'Escolha uma voz selecionada ou cole um ID de voz personalizado do seu painel ElevenLabs.',
-  'pttSettings.title': 'Pressionar para falar',
-  'pttSettings.description':
-    'Mantenha uma tecla pressionada para falar com o OpenHuman enquanto está noutro aplicativo. Soltar a tecla envia o áudio; se «Ler respostas em voz alta» estiver ativo, o OpenHuman lê a resposta.',
-  'pttSettings.shortcutLabel': 'Atalho',
-  'pttSettings.shortcutPlaceholder': 'Pressione uma tecla (por exemplo, F13)',
-  'pttSettings.shortcutUnsetHint':
-    'Pressionar para falar está desligado: escolha um atalho para ativar.',
-  'pttSettings.speakRepliesLabel': 'Ler as respostas do agente em voz alta',
-  'pttSettings.showOverlayLabel': 'Mostrar a sobreposição enquanto a tecla está pressionada',
-  'pttSettings.errorConflictsWithDictation':
-    'Este atalho já é usado pelo ditado. Escolha uma tecla diferente.',
-  'pttSettings.errorModifierOnly':
-    'Escolha uma tecla normal (por exemplo, F13): atalhos apenas com modificadores não funcionam para pressionar para falar.',
-  'pttSettings.errorEmpty': 'Escolha uma tecla para vincular.',
-  'pttSettings.errorAccessibility':
-    'O macOS precisa de permissão de Acessibilidade para este atalho. Abra Ajustes do Sistema → Privacidade e Segurança → Acessibilidade e ative o OpenHuman.',
-  'pttSettings.errorShortcutInUse': 'Outro aplicativo já está a usar este atalho. Escolha outro.',
-  'pttSettings.errorUnsupportedWayland':
-    'As sessões Wayland ainda não suportam atalhos globais no OpenHuman: mude para uma sessão X11 ou use o controlo de ditado integrado no aplicativo.',
-  'pttOverlay.listening': 'A escutar…',
-  'pttOverlay.idle': 'Inativo',
   'composio.triageTitle': 'Gatilhos de Integração',
   'composio.triageDesc':
     'Quando ativo, cada gatilho Composio recebido passa por uma etapa de triagem de IA que classifica o evento e pode iniciar ações automatizadas: um turno de LLM local por gatilho. Desative globalmente ou por integração se preferir revisão manual. Se a variável de ambiente',
@@ -2397,10 +2371,6 @@ const messages: TranslationMap = {
   'oauth.button.loopbackTimeout':
     'Login expirou: o navegador não concluiu o redirecionamento OAuth. Por favor, tente novamente.',
   'openhuman.team_list_teams': 'Listar equipes',
-  'overlay.ariaAttention': 'Mensagem de atenção',
-  'overlay.ariaOrb': 'Orb do OpenHuman',
-  'overlay.ariaVoiceActive': 'Entrada de voz ativa',
-  'overlay.orbTitle': 'Arraste para mover · Clique duplo para redefinir posição',
   'pages.settings.account.migration': 'Importar',
   'pages.settings.account.migrationDesc':
     'Migre memória e anotações do OpenClaw (e, em breve, do Hermes) para este espaço de trabalho.',
@@ -3295,27 +3265,6 @@ const messages: TranslationMap = {
   'skills.install.urlLabel': 'URL da skill',
   'skills.install.urlPlaceholder': 'https://raw.githubusercontent.com/owner/repo/main/SKILL.md',
   'skills.search.placeholder': 'Espaço reservado',
-  'skills.setup.voice.activation': 'Ativação',
-  'skills.setup.voice.activeDescPrefix': 'Fn',
-  'skills.setup.voice.activeDescSuffix': 'Fn',
-  'skills.setup.voice.activeTitle': 'Inteligência de Voz está Ativa',
-  'skills.setup.voice.customizeSettings': 'Personalizar configurações',
-  'skills.setup.voice.downloadSttBtn': 'Abrir configurações de voz',
-  'skills.setup.voice.enableDesc': 'Descrição de ativação',
-  'skills.setup.voice.hotkey': 'Tecla de atalho',
-  'skills.setup.voice.startBtn': 'Iniciando...',
-  'skills.setup.voice.startError': 'Falha ao iniciar servidor de voz',
-  'skills.setup.voice.starting': 'Iniciando...',
-  'skills.setup.voice.stepEnable': 'Iniciar servidor de voz',
-  'skills.setup.voice.stepSetup': 'Configuração de fala para texto necessária',
-  'skills.setup.voice.stepSuccess': 'Pronto para usar',
-  'skills.setup.voice.sttNotReady': 'Modelo de fala para texto não está pronto',
-  'skills.setup.voice.sttNotReadyDesc':
-    'A Inteligência de Voz precisa de um motor de fala para texto funcionando. Escolha um em Configurações › Voz.',
-  'skills.setup.voice.sttReady': 'Modelo de fala para texto pronto',
-  'skills.setup.voice.sttReturnHint':
-    'Configure um mecanismo de fala para texto nas configurações de voz e depois volte aqui para iniciar a voz.',
-  'skills.setup.voice.title': 'Inteligência de Voz',
   'skills.uninstall.description':
     'Isso exclui permanentemente o diretório da skill e todos os recursos empacotados. O agente deixará de vê-la no próximo turno.',
   'upsell.global.limitMessage': 'Faça upgrade do seu plano ou adicione créditos para continuar',
@@ -3594,8 +3543,6 @@ const messages: TranslationMap = {
     'Uma substituição OPENHUMAN_APPROVAL_GATE=0 foi detetada mas ignorada: o aplicativo de desktop mantém sempre o portão de aprovação ativado.',
 
   // Run queue
-  'notch.ready': 'Pronto',
-  'notch.listening': 'Ouvindo…',
 
   'orchestration.detail.stop': 'Parar',
 
@@ -3785,7 +3732,6 @@ const messages: TranslationMap = {
   'voice.routing.testOk': 'Trabalhando',
   'voice.routing.testFailed': 'Falhou',
   'voice.routing.unsaved': 'Alterações não salvas',
-  'pttSettings.clearShortcut': 'Limpar',
   'flows.allRuns.tableTitle': 'Execuções',
   'flows.allRuns.columnWorkflow': 'Fluxo de trabalho',
   'flows.allRuns.columnStarted': 'Iniciado',
@@ -3835,7 +3781,7 @@ const messages: TranslationMap = {
   'settings.embeddings.modelCardTitle': 'Modelo & dimensões',
   'mcp.rows.searchPlaceholder': 'Procurar servidores...',
   'mcp.tab.section.clients': 'Clientes',
-  'voice.pageDesc': 'Motores de fala, como eles são encaminhados, e push-to-talk.',
+  'voice.pageDesc': 'Motores de fala e roteamento de provedores.',
   'voice.providers.cardDesc': 'Liga os motores que queres usar. As chaves ficam neste dispositivo.',
   'voice.providers.cap.stt': 'Discurso ao texto',
   'voice.providers.cap.tts': 'Texto ao discurso',

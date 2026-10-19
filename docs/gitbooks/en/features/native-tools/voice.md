@@ -7,17 +7,15 @@ icon: microphone
 
 # Voice
 
-You can talk to OpenHuman instead of typing. Dictation, spoken replies and the live voice agent are part of the core, not a plugin.
+Voice is an optional core capability. The Cargo `voice` feature is off in contributor builds and on in the desktop product; the runtime component is enabled by default. Dictation, spoken replies and the live voice agent use the same core voice domain.
 
 ## Speech-to-text
 
-- **Hotkey.** Push-to-talk and toggle modes.
-- **Audio capture.** Cross-platform mic capture with voice-activity detection.
-- **Streaming transcription.** Words appear as you speak.
+- **Recording.** Start a microphone recording from the composer and stop it to transcribe.
 - **Hallucination filter.** Strips known artifacts such as "Thanks for watching" and phrases invented from silence.
 - **Postprocessing.** Punctuation, capitalization and dictation cleanup.
 
-Dictation can replace the active text input on your desktop, or go straight into a chat with the agent.
+When you stop recording, the transcription is submitted as a message to the current chat. Desktop global voice shortcuts are no longer part of the product.
 
 ## Text-to-speech
 
@@ -29,12 +27,12 @@ Click Tiny, the mascot in the chat composer, and talk. Tiny listens and answers 
 
 Choose how Tiny's voice runs under **Connections → Voice agents**:
 
-| Provider | Setup | Notes |
-| --- | --- | --- |
-| Gemini Live (TinyHumans) | None (default) | One model that hears and speaks. Billed through your TinyHumans balance. |
-| ElevenLabs Agent (TinyHumans) | None | Hosted ElevenLabs voice with OpenHuman as its brain. |
-| Gemini Live (Google API key) | Your Google AI Studio key | Talks to Google directly. |
-| Sarvam AI | Your Sarvam key | Indian languages (Hindi, Tamil, Bengali and more, or automatic detection). Sarvam's speech recognition, chat model and voices work together. |
+| Provider                      | Setup                     | Notes                                                                                                                                        |
+| ----------------------------- | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Gemini Live (TinyHumans)      | None (default)            | One model that hears and speaks. Billed through your TinyHumans balance.                                                                     |
+| ElevenLabs Agent (TinyHumans) | None                      | Hosted ElevenLabs voice with OpenHuman as its brain.                                                                                         |
+| Gemini Live (Google API key)  | Your Google AI Studio key | Talks to Google directly.                                                                                                                    |
+| Sarvam AI                     | Your Sarvam key           | Indian languages (Hindi, Tamil, Bengali and more, or automatic detection). Sarvam's speech recognition, chat model and voices work together. |
 
 Each card has a **Test** button that opens a short session to check the provider. You can also pick the voice, and the language where the provider supports it.
 

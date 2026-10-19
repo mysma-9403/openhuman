@@ -116,7 +116,6 @@ The running container exposes these endpoints:
 | `GET /schema` | None. Read-only schema discovery. |
 | `POST /rpc` | The bearer token. This is the executable surface. |
 | `GET /events` | Exempt from the header check, because a browser `EventSource` cannot set headers, but the handler enforces its own credential. Not an open stream. |
-| `GET /ws/dictation` | The bearer token, as a header or `?token=`, checked before the WebSocket upgrade. |
 | `GET /oauth/mcp/callback` | Exempt from the bearer middleware: an external authorization server posts back here with no bearer. The one-time `state`, minted in `oauth_begin`, is the guard. |
 | `GET /dev/connect` | Exempt from the middleware, guarded in the handler instead: a debug build or an explicit opt-in, a loopback `app` origin and `Host`, and no cross-site navigation. It should not be reachable on a deployed core. |
 | `POST /v1/chat/completions`, `GET /v1/models` | The OpenAI-compatible surface, behind core's `http-server` gate. These accept the core bearer or an external provider key, so they are executable too, not just `/rpc`. |

@@ -8,7 +8,6 @@ mod agent;
 mod inference;
 mod integrations;
 mod registry;
-mod voice;
 mod workspace;
 
 pub use registry::{all_controller_schemas, all_registered_controllers};

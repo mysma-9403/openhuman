@@ -344,36 +344,6 @@ fn env_overlay_analytics_enabled_parses_truthy_falsy() {
 }
 
 #[test]
-fn env_overlay_dictation_activation_mode_only_toggle_or_push() {
-    let mut cfg = Config::default();
-
-    cfg.apply_env_overlay_with(
-        &HashMapEnv::new().with("OPENHUMAN_DICTATION_ACTIVATION_MODE", "toggle"),
-    );
-    assert_eq!(
-        cfg.dictation.activation_mode,
-        crate::config::DictationActivationMode::Toggle
-    );
-
-    cfg.apply_env_overlay_with(
-        &HashMapEnv::new().with("OPENHUMAN_DICTATION_ACTIVATION_MODE", "push"),
-    );
-    assert_eq!(
-        cfg.dictation.activation_mode,
-        crate::config::DictationActivationMode::Push
-    );
-
-    // Unknown — retains previous value (Push).
-    cfg.apply_env_overlay_with(
-        &HashMapEnv::new().with("OPENHUMAN_DICTATION_ACTIVATION_MODE", "wave"),
-    );
-    assert_eq!(
-        cfg.dictation.activation_mode,
-        crate::config::DictationActivationMode::Push
-    );
-}
-
-#[test]
 fn env_overlay_auto_update_interval_parses_u32() {
     let mut cfg = Config::default();
     cfg.apply_env_overlay_with(
