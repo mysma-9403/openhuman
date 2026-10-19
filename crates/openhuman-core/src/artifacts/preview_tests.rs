@@ -13,7 +13,7 @@ fn file_record(path: &Path) -> ArtifactRecord {
         1,
     );
     version.file = Some(FileRef {
-        path: path.display().to_string(),
+        key: path.display().to_string(),
         size_bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
         media_type: None,
     });

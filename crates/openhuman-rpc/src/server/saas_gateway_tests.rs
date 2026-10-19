@@ -7,7 +7,6 @@ fn single_user_surfaces_are_closed() {
         "/v1/chat/completions",
         "/events/domain",
         "/events/webhooks",
-        "/ws/dictation",
         "/socket.io/",
         "/dev/connect",
         "/oauth/mcp/callback",

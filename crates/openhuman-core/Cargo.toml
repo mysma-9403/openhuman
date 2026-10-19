@@ -619,8 +619,7 @@ storage-file = []
 # `--no-default-features --features flows` and never reads this list.
 default = ["media", "skills", "flows", "mcp", "channels", "http-server", "scheduler-gate", "file-logging", "modules", "tinymemes", "storage-sqlite"]
 # The core's domain-owned HTTP surfaces (#5048): the `/v1` OpenAI-compatible
-# router (`inference::http`), the WebSocket dictation handler
-# (`voice::streaming`), the `openhuman text-input run` dev server, and the MCP
+# router (`inference::http`), the `openhuman text-input run` dev server, and the MCP
 # Streamable-HTTP transport (`mcp::server::http`, additionally gated by `mcp`).
 # The JSON-RPC server that mounts them — `/rpc`, auth, CORS, SSE, Socket.IO,
 # the listener — lives in `openhuman-rpc`, whose `server` feature turns this
@@ -708,16 +707,12 @@ modules = [
     "dep:tinystoragedrivers-busproxy",
     "dep:tinybus-module",
 ]
-# Voice domain: STT/TTS providers, the standalone dictation
-# server, and always-on listening.
+# Voice domain: STT/TTS providers, reply speech, and live voice.
 # The desktop product enables voice explicitly; contributor defaults leave it
 # off. WAV framing moved to the `tinyvoice` module, removing the former `hound`
 # dependency. Composes with the runtime `DomainSet::voice` flag (#4796): the
 # feature narrows the compile-time surface, `DomainSet` gates it at runtime.
-# Requires `inference` (the microphone-permission probe), so enabling `voice` turns
-# `inference` on transitively.
-# Device capture and hotkeys are owned by TinyVoice. Native text insertion
-# and permissions execute through the TinyComputer contract.
+# Requires `inference` for hosted speech providers and reply speech.
 voice = [
     "inference",
     # Wake-word gating, command routing and hallucination detection run in the

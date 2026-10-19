@@ -658,7 +658,6 @@ const messages: TranslationMap = {
   'devOptions.toolPolicyDiagnosticsDesc': '도구 인벤토리, 정책 상태, MCP 허용 목록 및 최근 차단',
   'devOptions.toolPolicyDiagnostics.loading': '로딩 중…',
   'devOptions.toolPolicyDiagnostics.unavailable': '진단을 사용할 수 없습니다.',
-  'voice.pushToTalk': '눌러서 말하기',
   'misc.somethingWentWrong': '문제가 발생했습니다',
   'misc.beta':
     'OpenHuman은 초기 베타 버전입니다. 피드백을 공유하거나 발견한 버그를 신고해 주세요: 모든 신고는 더 빠른 출시를 돕습니다.',
@@ -1164,13 +1163,9 @@ const messages: TranslationMap = {
   'mnemonic.createANewWallet': '새 지갑 만들기',
   'mnemonic.importWallet': '지갑 가져오기',
   'team.deleting': '삭제 중...',
-  'voice.tapToToggle': '탭하여 전환',
   'voice.settingsSaved': '음성 설정이 저장되었습니다.',
   'voice.failedToLoadSettings': '음성 설정 로드 실패',
   'voice.failedToSaveSettings': '음성 설정 저장 실패',
-  'voice.debug.alwaysOn': '상시 청취',
-  'voice.debug.alwaysOnDesc':
-    '단축키 없이 마이크를 계속 열어 두고 말한 내용을 자동으로 에이전트에 보냅니다. 화면이 잠기면 일시 중지됩니다.',
   'voice.providers.saved': '음성 제공업체가 저장되었습니다.',
   'voice.providers.failedToSave': '음성 제공자를 저장하지 못했습니다.',
   'voice.mode.start': '음성 채팅 시작',
@@ -1236,28 +1231,6 @@ const messages: TranslationMap = {
   'voice.routing.elevenlabsVoiceIdAria': 'ElevenLabs 음성 ID (커스텀)',
   'voice.routing.elevenlabsVoiceDesc':
     '선별된 음성을 선택하거나 ElevenLabs 대시보드에서 커스텀 음성 ID를 붙여넣으세요.',
-  'pttSettings.title': '눌러서 말하기',
-  'pttSettings.description':
-    "다른 앱을 사용하는 중에도 키를 누르고 있으면 OpenHuman과 대화할 수 있습니다. 키를 놓으면 녹음이 전송되고, '답변 읽어주기'가 켜져 있으면 OpenHuman이 답변을 음성으로 들려줍니다.",
-  'pttSettings.shortcutLabel': '단축키',
-  'pttSettings.shortcutPlaceholder': '키를 누르세요 (예: F13)',
-  'pttSettings.shortcutUnsetHint':
-    '눌러서 말하기가 꺼져 있습니다: 활성화하려면 단축키를 선택하세요.',
-  'pttSettings.speakRepliesLabel': '에이전트 답변 음성으로 읽어주기',
-  'pttSettings.showOverlayLabel': '누르고 있는 동안 오버레이 표시',
-  'pttSettings.errorConflictsWithDictation':
-    '이 단축키는 받아쓰기에 이미 사용 중입니다. 다른 키를 선택하세요.',
-  'pttSettings.errorModifierOnly':
-    '일반 키를 선택하세요(예: F13): 보조 키로만 구성된 단축키는 눌러서 말하기에서 동작하지 않습니다.',
-  'pttSettings.errorEmpty': '바인딩할 키를 선택하세요.',
-  'pttSettings.errorAccessibility':
-    '이 단축키에는 macOS의 손쉬운 사용 권한이 필요합니다. 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용을 열고 OpenHuman을 활성화하세요.',
-  'pttSettings.errorShortcutInUse':
-    '다른 앱이 이미 이 단축키를 사용 중입니다. 다른 단축키를 선택하세요.',
-  'pttSettings.errorUnsupportedWayland':
-    'Wayland 세션은 OpenHuman의 전역 단축키를 아직 지원하지 않습니다: X11 세션으로 전환하거나 앱 내 받아쓰기 토글을 사용하세요.',
-  'pttOverlay.listening': '듣는 중…',
-  'pttOverlay.idle': '대기 중',
   'composio.triageTitle': '통합 트리거',
   'composio.triageDesc':
     '활성화되면 들어오는 각 Composio 트리거가 이벤트를 분류하고 자동 작업을 시작할 수 있는 AI 선별 단계를 거칩니다: 트리거당 로컬 LLM 턴 하나가 사용됩니다. 수동 검토를 선호한다면 전체 또는 통합별로 비활성화하세요. 환경 변수가',
@@ -2343,10 +2316,6 @@ const messages: TranslationMap = {
   'oauth.button.loopbackTimeout':
     '로그인 시간 초과: 브라우저가 OAuth 리디렉션을 완료하지 못했습니다. 다시 시도해 주세요.',
   'openhuman.team_list_teams': '팀 목록 팀',
-  'overlay.ariaAttention': '주의 메시지',
-  'overlay.ariaOrb': 'OpenHuman 오버레이',
-  'overlay.ariaVoiceActive': '음성 입력 활성',
-  'overlay.orbTitle': '드래그하여 이동 · 두 번 클릭하여 위치 초기화',
   'pages.settings.account.migration': '가져오기',
   'pages.settings.account.migrationDesc':
     'OpenClaw(또는 곧 Hermes)의 메모리와 메모를 이 작업 공간으로 마이그레이션합니다.',
@@ -3214,27 +3183,6 @@ const messages: TranslationMap = {
   'skills.install.urlLabel': '스킬 URL',
   'skills.install.urlPlaceholder': 'https://raw.githubusercontent.com/owner/repo/main/SKILL.md',
   'skills.search.placeholder': '플레이스홀더',
-  'skills.setup.voice.activation': '활성화',
-  'skills.setup.voice.activeDescPrefix': 'Fn',
-  'skills.setup.voice.activeDescSuffix': 'Fn',
-  'skills.setup.voice.activeTitle': '음성 인텔리전스가 활성화됨',
-  'skills.setup.voice.customizeSettings': '설정 사용자 지정',
-  'skills.setup.voice.downloadSttBtn': '음성 설정 열기',
-  'skills.setup.voice.enableDesc': '활성화 설명',
-  'skills.setup.voice.hotkey': '핫키',
-  'skills.setup.voice.startBtn': '시작 중...',
-  'skills.setup.voice.startError': '음성 서버를 시작하지 못했습니다',
-  'skills.setup.voice.starting': '시작 중...',
-  'skills.setup.voice.stepEnable': '음성 서버 시작',
-  'skills.setup.voice.stepSetup': '음성 텍스트 변환 설정 필요',
-  'skills.setup.voice.stepSuccess': '사용 준비 완료',
-  'skills.setup.voice.sttNotReady': '음성-텍스트 모델이 준비되지 않음',
-  'skills.setup.voice.sttNotReadyDesc':
-    '음성 인텔리전스에는 작동하는 음성 인식 엔진이 필요합니다. 설정 › 음성에서 하나를 선택하세요.',
-  'skills.setup.voice.sttReady': '음성-텍스트 모델 준비됨',
-  'skills.setup.voice.sttReturnHint':
-    '음성 설정에서 음성 텍스트 변환 엔진을 구성한 다음 여기로 돌아와 음성을 시작하세요.',
-  'skills.setup.voice.title': '음성 인텔리전스',
   'skills.uninstall.description':
     '이 작업은 스킬 디렉터리와 모든 번들 리소스를 영구적으로 삭제합니다. 에이전트는 다음 턴부터 이를 더 이상 볼 수 없습니다.',
   'upsell.global.limitMessage': '계속하려면 플랜을 업그레이드하거나 크레딧을 충전하세요',
@@ -3505,8 +3453,6 @@ const messages: TranslationMap = {
     'OPENHUMAN_APPROVAL_GATE=0 재정의가 감지되었지만 무시되었습니다: 데스크톱 앱은 승인 게이트를 항상 켜둡니다.',
 
   // Run queue
-  'notch.ready': '준비됨',
-  'notch.listening': '듣는 중…',
 
   'orchestration.detail.stop': '중지',
 
@@ -3687,7 +3633,6 @@ const messages: TranslationMap = {
   'voice.routing.testOk': '작업 중',
   'voice.routing.testFailed': '실패',
   'voice.routing.unsaved': '저장되지 않은 변경 사항',
-  'pttSettings.clearShortcut': '지우기',
   'flows.allRuns.tableTitle': '실행',
   'flows.allRuns.columnStatus': '상태',
   'flows.allRuns.columnWorkflow': '워크플로',
@@ -3740,7 +3685,7 @@ const messages: TranslationMap = {
   'settings.embeddings.modelCardTitle': '모형 & 차원',
   'mcp.rows.searchPlaceholder': '서버 검색...',
   'mcp.tab.section.clients': '고객 지원',
-  'voice.pageDesc': '연설 엔진, 그들은 경로를, 및 푸시 - 투 - 토크.',
+  'voice.pageDesc': '음성 엔진 및 제공업체 라우팅.',
   'voice.providers.cardDesc': '사용하려는 엔진을 켜십시오. 이 장치에 열쇠 체재.',
   'voice.providers.cap.stt': '본문 바로가기',
   'voice.providers.cap.tts': '본문 바로가기',

@@ -167,30 +167,6 @@ pub(super) struct OnboardingCompletedSetParams {
 }
 
 #[derive(Debug, Deserialize)]
-pub(super) struct DictationSettingsUpdate {
-    pub(super) enabled: Option<bool>,
-    pub(super) hotkey: Option<String>,
-    pub(super) activation_mode: Option<String>,
-    pub(super) llm_refinement: Option<bool>,
-    pub(super) streaming: Option<bool>,
-    pub(super) streaming_interval_ms: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct VoiceServerSettingsUpdate {
-    pub(super) auto_start: Option<bool>,
-    pub(super) hotkey: Option<String>,
-    pub(super) activation_mode: Option<String>,
-    pub(super) skip_cleanup: Option<bool>,
-    pub(super) min_duration_secs: Option<f32>,
-    pub(super) silence_threshold: Option<f32>,
-    pub(super) custom_dictionary: Option<Vec<String>>,
-    pub(super) always_on_enabled: Option<bool>,
-    pub(super) wake_word: Option<String>,
-    pub(super) stt_engine: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 pub(super) struct ComposioTriggerSettingsUpdate {
     pub(super) triage_disabled: Option<bool>,
     pub(super) triage_disabled_toolkits: Option<Vec<String>>,

@@ -41,6 +41,9 @@ async fn ready_artifact(workspace: &Path, files_dir: &Path) -> String {
     meta.id
 }
 
+// Keep the shared environment lock across the async storage reads so tests
+// that change process-wide backend configuration cannot race this lookup.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn resolve_source_returns_the_file_in_the_files_folder() {
     // Core-process tests can install a process-global storage backend while

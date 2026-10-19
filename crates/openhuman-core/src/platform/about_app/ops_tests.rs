@@ -9,12 +9,11 @@ fn off(name: &str) -> ComponentSet {
 
 #[test]
 fn capability_of_a_disabled_component_shows_disabled() {
-    let cap = super::super::lookup("voice.ptt").expect("voice.ptt");
+    let cap = super::super::lookup("voice.live_agent").expect("live voice capability");
     assert_ne!(cap.status, CapabilityStatus::Disabled);
     let marked = apply_components(cap, &off("voice"));
     assert_eq!(marked.status, CapabilityStatus::Disabled);
     assert_eq!(marked.id, cap.id);
-    // Another component being off leaves it alone.
     assert_eq!(apply_components(cap, &off("wallet")).status, cap.status);
     assert_eq!(
         apply_components(cap, &ComponentSet::all()).status,
@@ -102,11 +101,10 @@ async fn an_explicit_context_decides_which_capabilities_are_disabled() {
     let off = DispatchCtx::new(CoreContext::for_test_with_components(voice_off));
     let on = DispatchCtx::new(CoreContext::for_test_with_components(ComponentSet::all()));
 
-    // The two contexts answer independently, concurrently and across awaits.
     let ask = |ctx: DispatchCtx| async move {
         tokio::task::yield_now().await;
-        lookup_capability(&ctx, "voice.ptt")
-            .expect("voice.ptt")
+        lookup_capability(&ctx, "voice.live_agent")
+            .expect("live voice capability")
             .value
             .status
     };

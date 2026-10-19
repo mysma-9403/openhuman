@@ -59,7 +59,7 @@ pub async fn read_body(config: &Config, id: &str) -> Result<ArtifactBody, String
     .get(id)
     .await
     .map_err(|e| e.to_string())?;
-    let record = match versioned {
+    let mut record = match versioned {
         Some(record) => record,
         // An artifact made before versioning has only its legacy record: show
         // the file that record vouches for.
@@ -68,13 +68,20 @@ pub async fn read_body(config: &Config, id: &str) -> Result<ArtifactBody, String
             if let Some(folder) = record
                 .latest()
                 .and_then(|v| v.file.as_ref())
-                .and_then(|f| Path::new(&f.path).parent())
+                .and_then(|f| Path::new(&f.key).parent())
             {
                 roots.push(folder.to_path_buf());
             }
             record
         }
     };
+    // A version's file is kept under a storage key inside the version files
+    // folder; show it by the path it has on disk. A legacy absolute key stays
+    // as it is, since joining an absolute path replaces the base.
+    let kept = super::tiny_store::version_files_dir(&config.workspace_dir);
+    if let Some(file) = record.versions.last_mut().and_then(|v| v.file.as_mut()) {
+        file.key = kept.join(&file.key).display().to_string();
+    }
     let converter = DocumentConverter::for_config(config);
     Ok(body_of(
         &record,
@@ -108,7 +115,7 @@ async fn legacy_record(
     version.file = Some(tiny_artifacts::FileRef {
         size_bytes: meta.size_bytes,
         media_type: None,
-        path,
+        key: path,
     });
     let mut record = ArtifactRecord::pending(id, meta.title, ArtifactKind::File, at);
     record.versions.push(version);
@@ -188,7 +195,7 @@ pub(crate) async fn body_of(
     }
     let path = latest
         .and_then(|v| v.file.as_ref())
-        .map_or(stored, |f| f.path.clone());
+        .map_or(stored, |f| f.key.clone());
     preview.body = path.clone();
     // Inside the trusted folders, an existing regular file: anything else is
     // shown by its path only.

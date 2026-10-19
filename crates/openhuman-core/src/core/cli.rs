@@ -631,7 +631,6 @@ fn print_general_help(grouped: &BTreeMap<String, Vec<ControllerSchema>>) {
     println!("  openhuman-tui [--thread <id>|--new]       (terminal UI; separate executable)");
     println!("  openhuman skills <subcommand> [options]   (skill development runtime)");
     println!("  openhuman agent <subcommand> [options]    (inspect agent definitions & prompts)");
-    println!("  openhuman voice [--hotkey <combo>] [--mode <tap|push>]  (voice dictation server)");
     println!("  openhuman sentry-test [--message <text>] [--panic]  (verify Sentry wiring)");
     println!("  openhuman <namespace> <function> [--param value ...]\n");
     println!("Global options (place before the command):");

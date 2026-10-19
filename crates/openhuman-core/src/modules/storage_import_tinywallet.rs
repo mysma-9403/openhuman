@@ -23,7 +23,6 @@
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use serde_json::json;
 use tinystoragedrivers::ScopedStorage;
 
 use super::storage_grant_schemas::tinywallet::{MODULE_ID, PAYMENTS_STREAM};
@@ -62,7 +61,6 @@ async fn import_into(
     scoped: &ScopedStorage,
     workspace_dir: &Path,
 ) -> Result<Outcome> {
-    let docs = scoped.documents();
     let marker = support::marker_id("x402", workspace_dir);
     if support::already_imported(scoped, MARKER_COLLECTION, &marker).await? {
         return Ok(Outcome::AlreadyDone);

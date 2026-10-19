@@ -400,40 +400,15 @@ describe('chatService.subscribeChatEvents', () => {
     });
   });
 
-  it('forwards speak_reply, source, session_id when provided', async () => {
-    const socket = createMockSocket();
-    bindMockSocket(socket);
-
-    await chatSend({
-      threadId: 'thread-1',
-      message: 'hello',
-      speakReply: true,
-      source: 'ptt',
-      sessionId: 42,
-    });
-
-    expect(mockCallCoreRpc).toHaveBeenCalledWith(
-      expect.objectContaining({
-        method: 'openhuman.channel_web_chat',
-        params: expect.objectContaining({
-          message: 'hello',
-          speak_reply: true,
-          source: 'ptt',
-          session_id: 42,
-        }),
-      })
-    );
-  });
-
-  it('does not include the new fields when omitted', async () => {
+  it('does not include PTT-only request fields', async () => {
     const socket = createMockSocket();
     bindMockSocket(socket);
 
     await chatSend({ threadId: 'thread-1', message: 'hi' });
     const params = mockCallCoreRpc.mock.calls[0][0].params;
-    expect(params.speak_reply).toBeUndefined();
-    expect(params.source).toBeUndefined();
-    expect(params.session_id).toBeUndefined();
+    expect(params).not.toHaveProperty('speak_reply');
+    expect(params).not.toHaveProperty('source');
+    expect(params).not.toHaveProperty('session_id');
   });
 });
 

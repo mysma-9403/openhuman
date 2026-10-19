@@ -17,7 +17,7 @@ If you want a specific outcome, such as a private assistant, a local model, a br
 
 OpenHuman runs on macOS, Windows and Linux desktops. 4 GB of RAM is recommended. Plan for 16 GB or more if you will ingest very large mailboxes or repos, or run a [local model](../features/model-routing/local-ai.md) on the same machine. For a local model you install the runtime (such as Ollama) and pull the models yourself.
 
-The first time you launch the app, your OS asks for the permissions it needs: Accessibility on macOS, and Input Monitoring for the voice hotkey. You can review them any time under **Settings**.
+The first time you launch the app, your OS asks for the permissions it needs, such as Accessibility on macOS when you use desktop control. You can review them any time under **Settings**.
 
 ## 1. Download and install
 

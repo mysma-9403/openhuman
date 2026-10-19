@@ -6,7 +6,6 @@ use crate::core::{ControllerSchema, FieldSchema, TypeSchema};
 mod agent;
 mod inference;
 mod integrations;
-mod voice;
 mod workspace;
 
 #[cfg(test)]
@@ -17,7 +16,6 @@ pub fn schemas(function: &str) -> ControllerSchema {
     inference::lookup(function)
         .or_else(|| agent::lookup(function))
         .or_else(|| workspace::lookup(function))
-        .or_else(|| voice::lookup(function))
         .or_else(|| integrations::lookup(function))
         .unwrap_or_else(|| ControllerSchema {
             namespace: "config",

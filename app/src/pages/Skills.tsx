@@ -43,12 +43,10 @@ import {
 } from '../components/skills/skillIcons';
 import SkillSearchBar from '../components/skills/SkillSearchBar';
 import SkillsPage from '../components/skills/SkillsPage';
-import VoiceSetupModal from '../components/skills/VoiceSetupModal';
 import { Alert, AlertDescription } from '../components/ui/Alert';
 import Badge, { type BadgeVariant } from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
-import { useVoiceSkillStatus } from '../features/voice/useVoiceSkillStatus';
 import { useChannelDefinitions } from '../hooks/useChannelDefinitions';
 import { useAgentReadyComposioToolkits, useComposioIntegrations } from '../lib/composio/hooks';
 import { canonicalizeComposioToolkitSlug } from '../lib/composio/toolkitSlug';
@@ -671,8 +669,6 @@ export default function Skills() {
   const [composioModalToolkit, setComposioModalToolkit] = useState<ComposioToolkitMeta | null>(
     null
   );
-  const [voiceModalOpen, setVoiceModalOpen] = useState(false);
-  const voiceStatus = useVoiceSkillStatus();
 
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const addToast = useCallback((toast: Omit<ToastNotification, 'id'>) => {
@@ -951,36 +947,6 @@ export default function Skills() {
         <div className="space-y-2">
           {items.map(item => {
             if (item.kind === 'builtin') {
-              /* v8 ignore start -- BUILT_IN_SKILLS list is empty today; the per-id
-               branches below are retained for the hidden voice skill without
-               dragging the diff-coverage gate down while unreachable. */
-              if (item.id === 'voice-stt') {
-                return (
-                  <UnifiedSkillCard
-                    key={item.id}
-                    icon={item.icon}
-                    title={item.name}
-                    description={item.description}
-                    statusLabel={voiceStatus.statusLabel}
-                    statusColor={voiceStatus.statusColor}
-                    ctaLabel={voiceStatus.ctaLabel}
-                    ctaVariant={voiceStatus.ctaVariant}
-                    testId={`skill-row-${item.id}`}
-                    ctaTestId={`skill-install-${item.id}`}
-                    onCtaClick={() => {
-                      if (
-                        voiceStatus.connectionStatus === 'connected' ||
-                        voiceStatus.connectionStatus === 'connecting' ||
-                        voiceStatus.connectionStatus === 'disconnected'
-                      ) {
-                        navigate(item.route!);
-                        return;
-                      }
-                      setVoiceModalOpen(true);
-                    }}
-                  />
-                );
-              }
               return (
                 <UnifiedSkillCard
                   key={item.id}
@@ -993,7 +959,6 @@ export default function Skills() {
                   onCtaClick={() => navigate(item.route!)}
                 />
               );
-              /* v8 ignore stop */
             }
           })}
         </div>
@@ -1426,10 +1391,6 @@ export default function Skills() {
 
       {channelModalDef && (
         <ChannelSetupModal definition={channelModalDef} onClose={() => setChannelModalDef(null)} />
-      )}
-
-      {voiceModalOpen && (
-        <VoiceSetupModal onClose={() => setVoiceModalOpen(false)} skillStatus={voiceStatus} />
       )}
 
       {composioModalToolkit && (

@@ -76,9 +76,9 @@ fn dev_server_is_an_app_origin_only_when_it_is_the_dev_url() {
 }
 
 #[test]
-fn other_webviews_are_left_to_their_own_handlers() {
+fn non_main_webviews_are_left_to_their_own_handlers() {
     assert_eq!(
-        navigation_handoff("ptt-overlay", &url("https://github.com/"), "http", None),
+        navigation_handoff("mascot", &url("https://github.com/"), "http", None),
         None
     );
 }

@@ -63,7 +63,7 @@ The first load of an older config moves these once into `[components]`, and the 
 | `[memory] engine = "none"` | `components.memory = false` (`engine` is kept) |
 | `OPENHUMAN_TINYMEMES` set to an off value | `components.memes = false` |
 | `OPENHUMAN_DISABLE_CHANNEL_LISTENERS=1` | `components.channels = false` at load (env override, kept for one release; `OPENHUMAN_COMPONENT_CHANNELS` wins) |
-| `[dictation] enabled`, `[voice_server] auto_start` and `always_on_enabled` all explicitly `false` | `components.voice = false` (any other mix keeps voice on) |
+| `[dictation] enabled`, `[voice_server] auto_start` and `always_on_enabled` all explicitly `false` | `components.voice = false` (any other mix keeps voice on); these legacy keys are migration inputs only |
 | `[sandbox] enabled = false` (or `[security.sandbox] enabled = false`) | `components.sandbox = false` (`enabled = true` or unset keeps it on; the old key is kept) |
 | `[composio] enabled` | dropped; it was never read |
 
@@ -81,7 +81,7 @@ The module reads its own `TINYMEMES_*` overrides from the process environment, s
 
 ## Voice
 
-`voice = false` removes the `voice` domain family, so `voice.*` answers `COMPONENT_DISABLED:voice`. The embedded voice server, the dictation hotkey listener and always-on listening do not start whatever `[dictation] enabled`, `[voice_server] auto_start` and `always_on_enabled` say, and `tinyvoice` is never downloaded, attested or loaded. `about_app` and `modules.list` report voice as disabled. The Cargo `voice` feature is unchanged.
+`voice = false` removes the `voice` domain family, so `voice.*` answers `COMPONENT_DISABLED:voice`, and `tinyvoice` is never downloaded, attested or loaded. The former config controllers for dictation and voice-server settings have been retired; their legacy keys remain migration inputs only and no longer control voice startup. `voice_server.stt_engine` remains as the fallback engine when no explicit STT provider is selected. `about_app` and `modules.list` report voice as disabled. The Cargo `voice` feature is unchanged.
 
 ## Sandbox
 

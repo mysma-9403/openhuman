@@ -17,7 +17,6 @@ import AppUpdatePrompt from './components/AppUpdatePrompt';
 import BootCheckGate from './components/BootCheckGate/BootCheckGate';
 import CommandProvider from './components/commands/CommandProvider';
 import ServiceBlockingGate from './components/daemon/ServiceBlockingGate';
-import DictationHotkeyManager from './components/DictationHotkeyManager';
 import ErrorFallbackScreen from './components/ErrorFallbackScreen';
 import KeyringConsentOverlay from './components/keyring/KeyringConsentOverlay';
 import AppSidebar from './components/layout/shell/AppSidebar';
@@ -30,12 +29,10 @@ import WindowsWindowControls, {
 import NoticeCenter from './components/notices/NoticeCenter';
 import OpenhumanLinkModal from './components/OpenhumanLinkModal';
 import PersistRehydrationScreen from './components/PersistRehydrationScreen';
-import PttHotkeyManager from './components/PttHotkeyManager';
 import SecurityBanner from './components/SecurityBanner';
 import { Toaster } from './components/ui/Toast';
 import AppWalkthrough from './components/walkthrough/AppWalkthrough';
 import { useDevSkipOnboarding } from './hooks/useDevSkipOnboarding';
-import { useNotchBootSync } from './hooks/useNotchBootSync';
 import { I18nProvider } from './lib/i18n/I18nContext';
 import {
   startNativeNotificationsService,
@@ -146,8 +143,6 @@ function App() {
                               <AnalyticsPageTracker />
                               <AppShell />
                               <SecurityBanner />
-                              {!onMobile && <DictationHotkeyManager />}
-                              {!onMobile && <PttHotkeyManager />}
                               {!onMobile && <AppUpdatePrompt />}
                               <KeyringConsentOverlay />
                               <AnnouncementGate />
@@ -230,10 +225,6 @@ export function AppShellDesktop() {
     location.pathname,
     navigate,
   ]);
-
-  // Sync the notch indicator to the persisted always-on listening state once
-  // the core is ready (once per boot). Extracted to a hook so it's testable.
-  useNotchBootSync(isBootstrapping);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const navType = useNavigationType();

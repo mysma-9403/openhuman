@@ -192,8 +192,8 @@ pub(super) async fn validate_provider_key(
 ///
 /// The rate is deliberately **16kHz**, not 8kHz: 16 kHz mono is what every STT
 /// engine in the routing table takes without resampling, and it is the rate the
-/// rest of the capture pipeline (`voice::audio_capture`, the dictation
-/// WebSocket) already produces. Generating the "Test STT" clip at a rate an
+/// voice transcription and WebSocket paths already use. Generating the
+/// "Test STT" clip at a rate an
 /// engine might reject would turn a working configuration into a spurious
 /// failure (the shape of issue #3425).
 pub(super) fn generate_silent_wav() -> Vec<u8> {

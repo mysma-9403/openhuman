@@ -284,3 +284,25 @@ fn a_protected_location_is_refused_under_its_macos_canonical_name() {
     assert!(refused_path(Path::new("/private/tmp/notes.md")).is_none());
     assert!(refused_path(Path::new("/Users/me/OpenHuman/notes.md")).is_none());
 }
+
+#[test]
+fn a_stored_file_key_resolves_under_the_version_files_folder_and_an_absolute_one_stays() {
+    let workspace = Path::new("/ws");
+    let kept = tiny_artifacts::FileRef {
+        key: "artifacts/files/a1/v2.pptx".into(),
+        size_bytes: 1,
+        media_type: None,
+    };
+    assert_eq!(
+        stored_file_path(workspace, &kept),
+        version_files_dir(workspace).join("artifacts/files/a1/v2.pptx")
+    );
+    let legacy = tiny_artifacts::FileRef {
+        key: "/elsewhere/old.pptx".into(),
+        ..kept
+    };
+    assert_eq!(
+        stored_file_path(workspace, &legacy),
+        PathBuf::from("/elsewhere/old.pptx")
+    );
+}

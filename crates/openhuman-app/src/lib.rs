@@ -81,7 +81,6 @@ mod remote_ws_relay;
 // the parsing helpers compile (and test) everywhere so `cargo test` on the
 // developer host covers them.
 mod deep_link_registration_check;
-mod dictation_hotkeys;
 mod directory_picker;
 mod external_navigation;
 mod file_logging;
@@ -99,12 +98,8 @@ mod loopback_oauth;
 mod mascot_native_window;
 mod mcp_commands;
 mod native_notifications;
-#[cfg(target_os = "macos")]
-mod notch_window;
 mod process_kill;
 mod process_recovery;
-mod ptt_hotkeys;
-mod ptt_overlay;
 #[cfg(target_os = "windows")]
 mod reset_reboot_schedule;
 mod session;
@@ -122,21 +117,14 @@ use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, RunEvent, WebviewWindow};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri::{AppHandle, Manager, RunEvent};
 use tauri_plugin_notification::NotificationExt;
 
 #[cfg(any(windows, target_os = "linux"))]
 use tauri_plugin_deep_link::DeepLinkExt;
 
 #[cfg(target_os = "macos")]
-use objc2::runtime::{AnyClass, AnyObject};
-#[cfg(target_os = "macos")]
-use objc2::ClassType;
-#[cfg(target_os = "macos")]
-use objc2_app_kit::{
-    NSPanel, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWindowTitleVisibility,
-};
+use objc2_app_kit::{NSWindow, NSWindowTitleVisibility};
 
 // Use Tauri's upstream native WebView runtime on every desktop platform.
 pub(crate) type AppRuntime = tauri::Wry;
@@ -223,16 +211,6 @@ async fn active_rpc_endpoint(desktop: &core_process::CoreProcessHandle) -> (Stri
 }
 
 #[tauri::command]
-fn overlay_parent_rpc_url() -> Option<String> {
-    let url = std::env::var("OPENHUMAN_CORE_RPC_URL").ok()?;
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed.to_string())
-}
-
-#[tauri::command]
 fn process_diagnostics_list_owned() -> Result<Vec<process_recovery::ProcessInfo>, String> {
     match process_recovery::enumerate_openhuman_processes() {
         Ok(processes) => {
@@ -245,112 +223,6 @@ fn process_diagnostics_list_owned() -> Result<Vec<process_recovery::ProcessInfo>
         Err(err) => {
             log::warn!("[startup-recovery] diagnostics process enumeration failed: {err}");
             Err(err)
-        }
-    }
-}
-
-#[allow(dead_code)] // Overlay disabled in tauri.conf.json; helper kept for future re-enable.
-fn pin_overlay_bottom_right(window: &WebviewWindow<AppRuntime>) {
-    let Ok(Some(monitor)) = window.current_monitor() else {
-        log::warn!("[overlay] could not resolve current monitor for positioning");
-        return;
-    };
-    let Ok(size) = window.outer_size() else {
-        log::warn!("[overlay] could not resolve overlay size for positioning");
-        return;
-    };
-
-    let margin = 20i32;
-    let x = monitor.position().x + monitor.size().width as i32 - size.width as i32 - margin;
-    let y = monitor.position().y + monitor.size().height as i32 - size.height as i32 - margin;
-
-    if let Err(err) = window.set_position(PhysicalPosition::new(x, y)) {
-        log::warn!("[overlay] failed to pin overlay bottom-right: {err}");
-    } else {
-        log::info!("[overlay] pinned overlay bottom-right at {},{}", x, y);
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[allow(dead_code)] // Overlay disabled in tauri.conf.json; helper kept for future re-enable.
-fn configure_overlay_window_macos(window: &WebviewWindow<AppRuntime>) {
-    // Standard NSWindow cannot float above fullscreen apps on macOS because
-    // fullscreen apps run in a separate Space. Only NSPanel can do this.
-    //
-    // Tauri/tao hardcodes NSWindow as the window class, so we use
-    // object_setClass() to reclass the existing NSWindow into an NSPanel
-    // at runtime. This avoids creating a new window (which crashes because
-    // Tao's window delegate is tightly coupled to the original NSWindow).
-    //
-    // After reclassing, we set the NonactivatingPanel style mask and
-    // Transient collection behavior — matching the working Swift overlay
-    // helper (accessibility/helper.rs OverlayController) which is confirmed
-    // to float above fullscreen apps on macOS Sonoma.
-    //
-    // Previous attempts that FAILED:
-    // 1. CGShieldingWindowLevel + CanJoinAllSpaces + FullScreenAuxiliary → hidden
-    // 2. Window level i32::MAX-17 + Stationary → hidden
-    // 3. CGS private API CGSSetWindowTags sticky bit → hidden
-    // 4. object_setClass WITHOUT NonactivatingPanel style mask → hidden
-    // 5. Create new NSPanel + reparent webview → CRASH (Tao delegate panic)
-    //
-    // See: https://github.com/tauri-apps/tauri/issues/11488
-
-    match window.ns_window() {
-        Ok(ns_window_raw) => unsafe {
-            let ns_window = ns_window_raw as *mut AnyObject;
-
-            // ── Reclass NSWindow → NSPanel ──────────────────────────
-            let panel_class: *const AnyClass = NSPanel::class();
-            objc2::ffi::object_setClass(ns_window, panel_class);
-            log::info!("[overlay] reclassed NSWindow → NSPanel via object_setClass");
-
-            // Cast to NSPanel for method calls
-            let panel: &NSPanel = &*(ns_window as *const NSPanel);
-
-            // ── Style mask: add NonactivatingPanel ──────────────────
-            // This is the KEY piece the Swift helper uses. Without it,
-            // the panel doesn't behave as a proper non-activating panel
-            // and won't float above fullscreen Spaces.
-            let current_style = panel.styleMask();
-            panel.setStyleMask(current_style | NSWindowStyleMask::NonactivatingPanel);
-
-            // ── Collection behavior ─────────────────────────────────
-            // The Swift helper uses .canJoinAllSpaces + .transient
-            // (NOT .stationary or .fullScreenAuxiliary alone).
-            // Transient means the panel follows the active Space and
-            // appears above fullscreen apps.
-            panel.setCollectionBehavior(
-                NSWindowCollectionBehavior::CanJoinAllSpaces
-                    | NSWindowCollectionBehavior::Transient
-                    | NSWindowCollectionBehavior::FullScreenAuxiliary
-                    | NSWindowCollectionBehavior::IgnoresCycle,
-            );
-
-            // ── Window level: status bar tier ───────────────────────
-            // NSStatusWindowLevel = 25. The Swift helper uses .statusBar
-            // which is the same value.
-            panel.setLevel(25);
-
-            // ── Panel-specific properties ───────────────────────────
-            panel.setFloatingPanel(true);
-            panel.setHidesOnDeactivate(false);
-            panel.setBecomesKeyOnlyIfNeeded(true);
-            panel.setWorksWhenModal(true);
-
-            // Make sure it's ordered front
-            panel.orderFrontRegardless();
-
-            log::info!(
-                "[overlay] NSPanel configured — level=25, \
-                 NonactivatingPanel+canJoinAllSpaces+transient, \
-                 floatingPanel={}, hidesOnDeactivate={}",
-                panel.isFloatingPanel(),
-                panel.hidesOnDeactivate(),
-            );
-        },
-        Err(err) => {
-            log::warn!("[overlay] failed to access native NSWindow handle: {err}");
         }
     }
 }
@@ -922,310 +794,6 @@ async fn install_app_update(
     app.restart();
 }
 
-/// Register (or re-register) the global dictation toggle hotkey.
-/// Emits `dictation://toggle` to all webviews when the shortcut is pressed.
-#[tauri::command]
-async fn register_dictation_hotkey(
-    app: AppHandle<AppRuntime>,
-    shortcut: String,
-) -> Result<(), String> {
-    log::info!("[dictation] register_dictation_hotkey: shortcut={shortcut}");
-
-    let old_shortcuts = {
-        let state = app.state::<dictation_hotkeys::DictationHotkeyState>();
-        let guard = state.0.lock().unwrap();
-        guard.clone()
-    };
-
-    let expanded_shortcuts = dictation_hotkeys::expand_dictation_shortcuts(&shortcut);
-    if expanded_shortcuts.is_empty() {
-        return Err("Shortcut cannot be empty".to_string());
-    }
-    log::info!(
-        "[dictation] expanded shortcuts: {}",
-        expanded_shortcuts.join(", ")
-    );
-
-    // Reject overlap with the currently-registered PTT hotkey.
-    let ptt_current = {
-        let state = app.state::<ptt_hotkeys::PttHotkeyState>();
-        let guard = state.shortcut.lock().unwrap();
-        guard.clone()
-    };
-    if let Some(conflict) = ptt_hotkeys::first_conflict_with(&expanded_shortcuts, &ptt_current) {
-        return Err(format!(
-            "dictation shortcut '{conflict}' conflicts with the push-to-talk hotkey"
-        ));
-    }
-
-    let register_shortcut = |shortcut_variant: &str| -> Result<(), String> {
-        let app_clone = app.clone();
-        app.global_shortcut()
-            .on_shortcut(shortcut_variant, move |_app, _sc, event| {
-                if event.state == ShortcutState::Pressed {
-                    log::debug!("[dictation] hotkey pressed — emitting dictation://toggle");
-                    if let Err(e) = app_clone.emit("dictation://toggle", ()) {
-                        log::warn!("[dictation] emit failed: {e}");
-                    }
-                }
-            })
-            .map_err(|e| format!("Failed to register shortcut '{shortcut_variant}': {e}"))
-    };
-
-    let mut unregistered_old: Vec<String> = Vec::new();
-    for old in &old_shortcuts {
-        log::debug!("[dictation] unregistering previous shortcut: {old}");
-        if let Err(e) = app.global_shortcut().unregister(old.as_str()) {
-            for restored in &unregistered_old {
-                if let Err(restore_err) = register_shortcut(restored.as_str()) {
-                    log::warn!(
-                        "[dictation] rollback failed while restoring old shortcut '{restored}': {restore_err}"
-                    );
-                }
-            }
-            return Err(format!(
-                "Failed to unregister previous shortcut '{old}': {e}"
-            ));
-        }
-        unregistered_old.push(old.clone());
-    }
-
-    let mut newly_registered: Vec<String> = Vec::new();
-    for shortcut_variant in &expanded_shortcuts {
-        if let Err(err) = register_shortcut(shortcut_variant.as_str()) {
-            log::error!("[dictation] failed to register shortcut '{shortcut_variant}': {err}");
-            for registered in &newly_registered {
-                if let Err(unregister_err) = app.global_shortcut().unregister(registered.as_str()) {
-                    log::warn!(
-                        "[dictation] rollback failed while unregistering '{registered}': {unregister_err}"
-                    );
-                }
-            }
-            for old in &old_shortcuts {
-                if let Err(restore_err) = register_shortcut(old.as_str()) {
-                    log::warn!(
-                        "[dictation] rollback failed while restoring old shortcut '{old}': {restore_err}"
-                    );
-                }
-            }
-            return Err(err);
-        }
-        newly_registered.push(shortcut_variant.clone());
-    }
-
-    // Persist all newly registered shortcuts.
-    {
-        let state = app.state::<dictation_hotkeys::DictationHotkeyState>();
-        let mut guard = state.0.lock().unwrap();
-        *guard = expanded_shortcuts.clone();
-    }
-
-    log::info!(
-        "[dictation] shortcuts registered: {}",
-        expanded_shortcuts.join(", ")
-    );
-    Ok(())
-}
-
-/// Unregister the global dictation hotkey (if any).
-#[tauri::command]
-async fn unregister_dictation_hotkey(app: AppHandle<AppRuntime>) -> Result<(), String> {
-    log::info!("[dictation] unregister_dictation_hotkey: called");
-    let state = app.state::<dictation_hotkeys::DictationHotkeyState>();
-    let mut guard = state.0.lock().unwrap();
-    if guard.is_empty() {
-        log::debug!("[dictation] no shortcut registered — nothing to unregister");
-    } else {
-        let old_shortcuts = guard.clone();
-        guard.clear();
-        for old in old_shortcuts {
-            log::debug!("[dictation] unregistering shortcut: {old}");
-            app.global_shortcut()
-                .unregister(old.as_str())
-                .map_err(|e| {
-                    log::warn!("[dictation] failed to unregister '{old}': {e}");
-                    format!("Failed to unregister shortcut '{old}': {e}")
-                })?;
-            log::info!("[dictation] shortcut unregistered: {old}");
-        }
-    }
-    Ok(())
-}
-
-/// Register (or re-register) the global push-to-talk hotkey. Emits
-/// `ptt://start { session_id }` on press and `ptt://stop { session_id }`
-/// on release.
-#[tauri::command]
-async fn register_ptt_hotkey(app: AppHandle<AppRuntime>, shortcut: String) -> Result<(), String> {
-    log::info!("[ptt] register_ptt_hotkey: shortcut={shortcut}");
-
-    let expanded = ptt_hotkeys::expand_ptt_shortcuts(&shortcut).map_err(|e| e.to_string())?;
-
-    // Reject overlap with the currently-registered dictation hotkey.
-    let dictation_current = {
-        let state = app.state::<dictation_hotkeys::DictationHotkeyState>();
-        let guard = state.0.lock().unwrap();
-        guard.clone()
-    };
-    if let Some(conflict) = ptt_hotkeys::first_conflict_with(&expanded, &dictation_current) {
-        return Err(ptt_hotkeys::PttError::ConflictsWithDictation(conflict).to_string());
-    }
-
-    let old_shortcuts = {
-        let state = app.state::<ptt_hotkeys::PttHotkeyState>();
-        let guard = state.shortcut.lock().unwrap();
-        guard.clone()
-    };
-
-    // Lazy-instantiate the overlay window so it's ready before the first press.
-    if let Err(e) = ptt_overlay::ensure_window(&app) {
-        log::warn!("[ptt] overlay window create failed (continuing): {e}");
-    }
-
-    let register_shortcut = |variant: &str| -> Result<(), String> {
-        let app_pressed = app.clone();
-        let app_released = app.clone();
-        let variant_owned = variant.to_string();
-        app.global_shortcut()
-            .on_shortcut(variant, move |app_inner, _sc, event| {
-                let state = app_inner.state::<ptt_hotkeys::PttHotkeyState>();
-                match event.state {
-                    ShortcutState::Pressed => {
-                        // Drop OS key-repeat events; only the first Pressed of a hold opens a session.
-                        if state
-                            .is_held
-                            .compare_exchange(
-                                false,
-                                true,
-                                std::sync::atomic::Ordering::AcqRel,
-                                std::sync::atomic::Ordering::Acquire,
-                            )
-                            .is_err()
-                        {
-                            log::trace!(
-                                "[ptt] press dropped (already held) shortcut={variant_owned}"
-                            );
-                            return;
-                        }
-                        let session_id = state
-                            .session_counter
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            + 1;
-                        log::debug!(
-                            "[ptt] pressed shortcut={variant_owned} session_id={session_id}"
-                        );
-                        if let Err(e) = app_pressed.emit(
-                            "ptt://start",
-                            serde_json::json!({
-                                "session_id": session_id,
-                            }),
-                        ) {
-                            log::warn!("[ptt] emit start failed: {e}");
-                        }
-                    }
-                    ShortcutState::Released => {
-                        if !state
-                            .is_held
-                            .swap(false, std::sync::atomic::Ordering::AcqRel)
-                        {
-                            // No corresponding Pressed in our state — stale event, drop.
-                            log::trace!(
-                                "[ptt] release dropped (not held) shortcut={variant_owned}"
-                            );
-                            return;
-                        }
-                        let session_id = state
-                            .session_counter
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        log::debug!(
-                            "[ptt] released shortcut={variant_owned} session_id={session_id}"
-                        );
-                        if let Err(e) = app_released.emit(
-                            "ptt://stop",
-                            serde_json::json!({
-                                "session_id": session_id,
-                            }),
-                        ) {
-                            log::warn!("[ptt] emit stop failed: {e}");
-                        }
-                    }
-                }
-            })
-            .map_err(|e| format!("Failed to register ptt shortcut '{variant}': {e}"))
-    };
-
-    // Unregister previous PTT variants.
-    let mut unregistered: Vec<String> = Vec::new();
-    for old in &old_shortcuts {
-        if let Err(e) = app.global_shortcut().unregister(old.as_str()) {
-            // Rollback already-unregistered ones.
-            for r in &unregistered {
-                if let Err(re) = register_shortcut(r) {
-                    log::warn!("[ptt] rollback failed for '{r}': {re}");
-                }
-            }
-            return Err(format!(
-                "Failed to unregister previous ptt shortcut '{old}': {e}"
-            ));
-        }
-        unregistered.push(old.clone());
-    }
-
-    // Register the new variants. Rollback on first failure.
-    let mut newly_registered: Vec<String> = Vec::new();
-    for v in &expanded {
-        if let Err(e) = register_shortcut(v) {
-            for r in &newly_registered {
-                if let Err(re) = app.global_shortcut().unregister(r.as_str()) {
-                    log::warn!("[ptt] rollback failed for '{r}': {re}");
-                }
-            }
-            for old in &old_shortcuts {
-                if let Err(re) = register_shortcut(old) {
-                    log::warn!("[ptt] rollback failed for '{old}': {re}");
-                }
-            }
-            return Err(e);
-        }
-        newly_registered.push(v.clone());
-    }
-
-    {
-        let state = app.state::<ptt_hotkeys::PttHotkeyState>();
-        let mut guard = state.shortcut.lock().unwrap();
-        *guard = expanded.clone();
-    }
-
-    log::info!("[ptt] registered: {}", expanded.join(", "));
-    Ok(())
-}
-
-/// Unregister the global PTT hotkey (if any).
-#[tauri::command]
-async fn unregister_ptt_hotkey(app: AppHandle<AppRuntime>) -> Result<(), String> {
-    log::info!("[ptt] unregister_ptt_hotkey: called");
-    let state = app.state::<ptt_hotkeys::PttHotkeyState>();
-    let old = {
-        let guard = state.shortcut.lock().unwrap();
-        guard.clone()
-    };
-    let mut still_registered: Vec<String> = Vec::new();
-    for s in &old {
-        if let Err(e) = app.global_shortcut().unregister(s.as_str()) {
-            log::warn!("[ptt] unregister '{s}' failed: {e}");
-            still_registered.push(s.clone());
-        }
-    }
-    // Only retain variants that genuinely failed to unregister; the rest are gone.
-    {
-        let mut guard = state.shortcut.lock().unwrap();
-        *guard = still_registered;
-    }
-    // Destroy the overlay window so resources are released.
-    ptt_overlay::destroy_window(&app);
-    Ok(())
-}
-
 fn is_daemon_mode() -> bool {
     std::env::args().any(|arg| arg == "daemon" || arg == "--daemon")
 }
@@ -1314,13 +882,6 @@ fn set_titlebar_for_sidebar(app: AppHandle<AppRuntime>, collapsed: bool) -> Resu
     }
 }
 
-/// Tauri command: bring the main window to front from any webview (e.g. overlay orb click).
-#[tauri::command]
-fn activate_main_window(app: AppHandle<AppRuntime>) -> Result<(), String> {
-    log::debug!("[window] activate_main_window called from overlay");
-    show_main_window(&app)
-}
-
 /// Show the floating mascot. macOS: native NSPanel + WKWebView (so the
 /// window is actually transparent — vendored tauri-cef can't render
 /// transparent windowed-mode browsers). Loads the Vite dev URL in
@@ -1365,61 +926,6 @@ fn mascot_native_window_is_open() -> bool {
 #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
 fn mascot_native_window_is_open() -> bool {
     false
-}
-
-/// Dispatch a notch-panel mutation onto the app main thread.
-///
-/// The notch is a native NSPanel + WKWebView; AppKit requires it to be built
-/// and torn down on the main thread (and its `thread_local` storage lives
-/// there). Tauri runs these IPC command handlers on a worker thread, so we hop
-/// to the main thread via `run_on_main_thread`. Fire-and-forget: notch
-/// visibility is cosmetic (the frontend swallows errors), so we log the result
-/// on the main thread rather than blocking the command to propagate it back.
-#[cfg(target_os = "macos")]
-fn dispatch_notch_on_main(
-    app: AppHandle<AppRuntime>,
-    op: impl FnOnce(&AppHandle<AppRuntime>) + Send + 'static,
-) -> Result<(), String> {
-    app.clone()
-        .run_on_main_thread(move || op(&app))
-        .map_err(|e| format!("run_on_main_thread dispatch failed: {e}"))
-}
-
-/// Show the notch activity indicator. macOS only — transparent NSPanel + WKWebView
-/// anchored to the top-centre of the primary screen. Displays live voice and
-/// agent status (listening, thinking, executing) in a pill that emerges from
-/// the physical notch on supported MacBook Pros.
-#[tauri::command]
-fn notch_window_show(app: AppHandle<AppRuntime>) -> Result<(), String> {
-    log::info!("[notch-window] show requested");
-    #[cfg(target_os = "macos")]
-    {
-        dispatch_notch_on_main(app, |app| {
-            if let Err(e) = notch_window::show(app) {
-                log::warn!("[notch-window] show failed: {e}");
-            }
-        })
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = app;
-        Ok(()) // No-op on non-macOS
-    }
-}
-
-/// Hide the notch activity indicator.
-#[tauri::command]
-fn notch_window_hide(app: AppHandle<AppRuntime>) -> Result<(), String> {
-    log::info!("[notch-window] hide requested");
-    #[cfg(target_os = "macos")]
-    {
-        dispatch_notch_on_main(app, |_app| notch_window::hide())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = app;
-        Ok(())
-    }
 }
 
 /// Hide or show the OS top-level main-window frame on Windows by enumerating
@@ -2883,16 +2389,11 @@ pub fn run() {
         .register_asynchronous_uri_scheme_protocol(widget_scheme::SCHEME, widget_scheme::handle)
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         // Auto-updater for the Tauri shell. Endpoint and minisign pubkey live
         // in `tauri.conf.json` under `plugins.updater`. Releases are signed at
         // build time with `TAURI_SIGNING_PRIVATE_KEY` (+ `_PASSWORD`); see
         // docs/gitbooks/en/overview/auto-update.md for the full pipeline.
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .manage(dictation_hotkeys::DictationHotkeyState(
-            std::sync::Mutex::new(Vec::new()),
-        ))
-        .manage(ptt_hotkeys::PttHotkeyState::new())
         .manage(PendingAppUpdateState::default());
     let builder = builder.manage(std::sync::Arc::new(imessage_scanner::ScannerRegistry::new()));
     builder
@@ -3222,36 +2723,6 @@ pub fn run() {
                 }
             }
 
-            // Overlay window is currently disabled in `tauri.conf.json` (the
-            // `overlay` entry under `app.windows` was removed), so we skip
-            // the macOS NSPanel reclass + bottom-right pin + initial show
-            // here. The helpers (`configure_overlay_window_macos`,
-            // `pin_overlay_bottom_right`) and the React entry point
-            // (`src/overlay/OverlayApp.tsx`) are kept intact so the overlay
-            // can be re-enabled by restoring the config entry and the two
-            // setup blocks below.
-            //
-            //   #[cfg(target_os = "macos")]
-            //   if let Some(window) = app.get_webview_window("overlay") {
-            //       configure_overlay_window_macos(&window);
-            //   }
-            //   if let Some(window) = app.get_webview_window("overlay") {
-            //       pin_overlay_bottom_right(&window);
-            //       let _ = window.show();
-            //   }
-
-            // Notch activity indicator: transparent pill at the top-centre of
-            // the primary screen. Shows live voice / agent state. macOS only
-            // (physical notch or menu-bar HUD on older hardware).
-            //
-            // It is NOT auto-shown here: the notch is the always-on listening
-            // HUD, so its visibility is owned by the frontend, which calls
-            // `notch_window_show` / `notch_window_hide` (via `syncNotchVisibility`)
-            // to mirror `voice_server.always_on_enabled` — once on boot and
-            // whenever the Settings toggle flips. Showing it unconditionally
-            // here would flash the pill on every launch even with always-on
-            // listening disabled (the default).
-
             // Tray icon setup moved to RunEvent::Ready (see below) — GTK is only
             // initialized after the event loop starts, so we must delay tray creation
             // until the Ready event fires. Creating the tray here would panic on
@@ -3298,7 +2769,6 @@ pub fn run() {
             // cannot fetch directly (cleartext mixed content). See #3865.
             core_rpc::relay_http_rpc,
             remote_ws_relay::relay_remote_socket,
-            overlay_parent_rpc_url,
             process_diagnostics_list_owned,
             // Artifact export — cross-platform. Previously macOS/Linux-gated,
             // but the `directories` + `tokio::fs::copy` flow compiles on Windows
@@ -3330,20 +2800,12 @@ pub fn run() {
             session::commands::auth_logout,
             session::commands::auth_state,
             session::commands::auth_current_user,
-            register_dictation_hotkey,
-            unregister_dictation_hotkey,
-            register_ptt_hotkey,
-            unregister_ptt_hotkey,
-            ptt_overlay::show_ptt_overlay,
             native_notifications::notification_permission_state,
             native_notifications::notification_permission_request,
-            activate_main_window,
             set_titlebar_for_sidebar,
             native_notifications::show_native_notification,
             mascot_window_show,
             mascot_window_hide,
-            notch_window_show,
-            notch_window_hide,
             file_logging::reveal_logs_folder,
             file_logging::logs_folder_path,
             workspace_paths::open_workspace_path,

@@ -82,10 +82,14 @@ async fn byte_policy_projects_a_parent_readable_artifact_before_the_result_cap()
     );
     assert_ne!(outcome.output, original);
     assert!(outcome.artifact_paths.contains(&"authored.txt".to_owned()));
+    let output_prefix = format!("{}/", tinyagents_harness::artifacts::OUTPUTS_DIR);
     let stored_path = outcome
         .artifact_paths
         .iter()
-        .find(|path| path.starts_with("outputs/"))
+        .find(|path| {
+            path.strip_prefix(&output_prefix)
+                .is_some_and(|name| !name.is_empty())
+        })
         .expect("host projection records its artifact path");
     let parent_copy = parent_action_dir.join(stored_path);
     assert!(

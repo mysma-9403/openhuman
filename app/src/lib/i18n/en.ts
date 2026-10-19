@@ -735,7 +735,6 @@ const en: TranslationMap = {
   'devOptions.toolPolicyDiagnostics.unavailable': 'Diagnostics unavailable',
 
   // Voice / Dictation
-  'voice.pushToTalk': 'Push to Talk',
 
   // Misc
   'misc.somethingWentWrong': 'Something went wrong',
@@ -1334,13 +1333,9 @@ const en: TranslationMap = {
   'team.deleting': 'Deleting...',
 
   // Voice
-  'voice.tapToToggle': 'Tap to toggle',
   'voice.settingsSaved': 'Voice settings saved.',
   'voice.failedToLoadSettings': 'Failed to load voice settings',
   'voice.failedToSaveSettings': 'Failed to save voice settings',
-  'voice.debug.alwaysOn': 'Always-on listening',
-  'voice.debug.alwaysOnDesc':
-    'Keep the microphone open and send what you say to the agent automatically, no hotkey. Pauses when the screen is locked.',
   'voice.providers.saved': 'Voice providers saved.',
   'voice.providers.failedToSave': 'Failed to save voice providers',
   'voice.mode.start': 'Start voice chat',
@@ -1348,7 +1343,7 @@ const en: TranslationMap = {
   'voice.mode.connecting': 'Connecting…',
   'voice.mode.listening': 'Listening',
   'voice.mode.speaking': 'Speaking',
-  'voice.pageDesc': 'Speech engines, how they are routed, and push-to-talk.',
+  'voice.pageDesc': 'Speech engines and provider routing.',
   'voice.providers.title': 'Voice Providers',
   'voice.providers.cardDesc': 'Turn on the engines you want to use. Keys stay on this device.',
   'voice.providers.cap.stt': 'Speech to text',
@@ -1424,27 +1419,6 @@ const en: TranslationMap = {
   // External voice providers
 
   // Push-to-talk (PTT)
-  'pttSettings.title': 'Push-to-talk',
-  'pttSettings.clearShortcut': 'Clear',
-  'pttSettings.description':
-    "Hold a key to talk to OpenHuman while you're in another app. Release the key to send; OpenHuman speaks the reply if 'Speak agent replies' is on.",
-  'pttSettings.shortcutLabel': 'Hotkey',
-  'pttSettings.shortcutPlaceholder': 'Press a key (e.g. F13)',
-  'pttSettings.shortcutUnsetHint': 'Push-to-talk is off: pick a hotkey to enable.',
-  'pttSettings.speakRepliesLabel': 'Speak agent replies',
-  'pttSettings.showOverlayLabel': 'Show overlay while held',
-  'pttSettings.errorConflictsWithDictation':
-    'This shortcut is already used by dictation. Pick a different key.',
-  'pttSettings.errorModifierOnly':
-    "Pick a regular key (e.g. F13): modifier-only shortcuts don't work for push-to-talk.",
-  'pttSettings.errorEmpty': 'Pick a key to bind.',
-  'pttSettings.errorAccessibility':
-    'macOS needs Accessibility permission for this shortcut. Open System Settings → Privacy & Security → Accessibility and enable OpenHuman.',
-  'pttSettings.errorShortcutInUse': 'Another app already uses this shortcut. Pick a different one.',
-  'pttSettings.errorUnsupportedWayland':
-    "Wayland sessions don't support global shortcuts in OpenHuman yet: switch to an X11 session or use the in-app dictation toggle.",
-  'pttOverlay.listening': 'Listening…',
-  'pttOverlay.idle': 'Idle',
 
   // Autocomplete
 
@@ -2779,10 +2753,6 @@ const en: TranslationMap = {
   'oauth.button.loopbackTimeout':
     'Sign-in timed out: the browser did not complete the OAuth redirect. Please try again.',
   'openhuman.team_list_teams': 'Team list teams',
-  'overlay.ariaAttention': 'Attention message',
-  'overlay.ariaOrb': 'OpenHuman overlay',
-  'overlay.ariaVoiceActive': 'Voice input active',
-  'overlay.orbTitle': 'Drag to move · Double-click to reset position',
   'pages.settings.account.migration': 'Import',
   'pages.settings.account.migrationDesc':
     'Bring memory and notes over from another local assistant',
@@ -3793,27 +3763,6 @@ const en: TranslationMap = {
   'skills.install.urlLabel': 'Skill URL',
   'skills.install.urlPlaceholder': 'https://raw.githubusercontent.com/owner/repo/main/SKILL.md',
   'skills.search.placeholder': 'Search skills…',
-  'skills.setup.voice.activation': 'Activation',
-  'skills.setup.voice.activeDescPrefix': 'Fn',
-  'skills.setup.voice.activeDescSuffix': 'Fn',
-  'skills.setup.voice.activeTitle': 'Voice Intelligence is Active',
-  'skills.setup.voice.customizeSettings': 'Customize settings',
-  'skills.setup.voice.downloadSttBtn': 'Open voice settings',
-  'skills.setup.voice.enableDesc': 'Dictate text hands-free using your microphone.',
-  'skills.setup.voice.hotkey': 'Hotkey',
-  'skills.setup.voice.startBtn': 'Starting...',
-  'skills.setup.voice.startError': 'Failed to start voice server',
-  'skills.setup.voice.starting': 'Starting...',
-  'skills.setup.voice.stepEnable': 'Start voice server',
-  'skills.setup.voice.stepSetup': 'Speech-to-text setup required',
-  'skills.setup.voice.stepSuccess': 'Ready to go',
-  'skills.setup.voice.sttNotReady': 'Speech-to-text model not ready',
-  'skills.setup.voice.sttNotReadyDesc':
-    'Voice Intelligence needs a working speech-to-text engine. Pick one under Settings › Voice.',
-  'skills.setup.voice.sttReady': 'Speech-to-text model ready',
-  'skills.setup.voice.sttReturnHint':
-    'Configure a speech-to-text engine in Voice settings, then come back here to start voice.',
-  'skills.setup.voice.title': 'Voice Intelligence',
   'skills.uninstall.description':
     'This permanently deletes the skill directory and all its bundled resources. The agent will stop seeing it at the next turn.',
   'upsell.global.limitMessage': 'Upgrade your plan or top up credits to continue',
@@ -4093,8 +4042,6 @@ const en: TranslationMap = {
     'An OPENHUMAN_APPROVAL_GATE=0 override was detected but ignored: the desktop app always keeps the approval gate on.',
 
   // Run queue
-  'notch.ready': 'Ready',
-  'notch.listening': 'Listening…',
 
   // Code block chrome
   'codeBlock.copy': 'Copy',

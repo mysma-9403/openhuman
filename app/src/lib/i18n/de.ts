@@ -689,7 +689,6 @@ const messages: TranslationMap = {
     'Werkzeuginventar, Richtlinienstatus, MCP-Zulassungslisten und aktuelle Sperren',
   'devOptions.toolPolicyDiagnostics.loading': 'Laden…',
   'devOptions.toolPolicyDiagnostics.unavailable': 'Diagnose nicht verfügbar',
-  'voice.pushToTalk': 'Push-to-Talk',
   'misc.somethingWentWrong': 'Etwas ist schief gelaufen',
   'misc.beta':
     'OpenHuman befindet sich in der frühen Betaphase. Teile uns gerne dein Feedback mit oder melde Fehler, auf die du stößt – jede Meldung hilft uns, schneller zu liefern.',
@@ -1215,13 +1214,9 @@ const messages: TranslationMap = {
   'mnemonic.createANewWallet': 'Ein neues Wallet erstellen',
   'mnemonic.importWallet': 'Wallet importieren',
   'team.deleting': 'Löschen...',
-  'voice.tapToToggle': 'Zum Umschalten tippen',
   'voice.settingsSaved': 'Spracheinstellungen gespeichert.',
   'voice.failedToLoadSettings': 'Spracheinstellungen konnten nicht geladen werden',
   'voice.failedToSaveSettings': 'Spracheinstellungen konnten nicht gespeichert werden.',
-  'voice.debug.alwaysOn': 'Dauerhaftes Zuhören',
-  'voice.debug.alwaysOnDesc':
-    'Hält das Mikrofon offen und sendet das Gesagte automatisch an den Agenten, ohne Tastenkürzel. Pausiert, wenn der Bildschirm gesperrt ist.',
   'voice.providers.saved': 'Sprachanbieter gespeichert.',
   'voice.providers.failedToSave': 'Sprachanbieter konnten nicht gespeichert werden.',
   'voice.mode.start': 'Sprachchat starten',
@@ -1287,28 +1282,6 @@ const messages: TranslationMap = {
   'voice.routing.elevenlabsVoiceIdAria': 'ElevenLabs-Stimmen-ID (benutzerdefiniert)',
   'voice.routing.elevenlabsVoiceDesc':
     'Wähle eine kuratierte Stimme oder füge eine benutzerdefinierte Stimmen-ID aus deinem ElevenLabs-Dashboard ein.',
-  'pttSettings.title': 'Push-to-Talk',
-  'pttSettings.description':
-    'Halte eine Taste gedrückt, um mit OpenHuman zu sprechen, während du eine andere App nutzt. Loslassen sendet die Aufnahme; wenn „Antworten vorlesen" aktiviert ist, antwortet OpenHuman per Sprachausgabe.',
-  'pttSettings.shortcutLabel': 'Tastenkürzel',
-  'pttSettings.shortcutPlaceholder': 'Taste drücken (z. B. F13)',
-  'pttSettings.shortcutUnsetHint':
-    'Push-to-Talk ist aus: wähle ein Tastenkürzel, um es zu aktivieren.',
-  'pttSettings.speakRepliesLabel': 'Antworten des Agenten vorlesen',
-  'pttSettings.showOverlayLabel': 'Overlay während des Haltens anzeigen',
-  'pttSettings.errorConflictsWithDictation':
-    'Dieses Tastenkürzel wird bereits für die Diktierfunktion verwendet. Wähle eine andere Taste.',
-  'pttSettings.errorModifierOnly':
-    'Wähle eine normale Taste (z. B. F13): reine Modifikator-Kürzel funktionieren bei Push-to-Talk nicht.',
-  'pttSettings.errorEmpty': 'Wähle eine Taste zum Binden.',
-  'pttSettings.errorAccessibility':
-    'macOS benötigt für dieses Tastenkürzel die Bedienungshilfen-Berechtigung. Öffne Systemeinstellungen → Datenschutz & Sicherheit → Bedienungshilfen und aktiviere OpenHuman.',
-  'pttSettings.errorShortcutInUse':
-    'Eine andere App verwendet dieses Tastenkürzel bereits. Wähle ein anderes.',
-  'pttSettings.errorUnsupportedWayland':
-    'Wayland-Sitzungen unterstützen globale Tastenkürzel in OpenHuman noch nicht: wechsle zu einer X11-Sitzung oder nutze den In-App-Diktierschalter.',
-  'pttOverlay.listening': 'Höre zu…',
-  'pttOverlay.idle': 'Bereit',
   'composio.triageTitle': 'Integrationsauslöser',
   'composio.triageDesc':
     'Wenn er aktiv ist, durchläuft jeder eingehende Composio-Auslöser einen KI-Triage-Schritt, der das Ereignis klassifiziert und möglicherweise automatisierte Aktionen auslöst – eine lokale LLM-Runde pro Auslöser. Deaktiviere die Option global oder pro Integration, wenn du eine manuelle Überprüfung bevorzugst. Wenn die Umgebungsvariable',
@@ -2435,10 +2408,6 @@ const messages: TranslationMap = {
   'oauth.button.loopbackTimeout':
     'Anmeldung abgelaufen: der Browser hat die OAuth-Weiterleitung nicht abgeschlossen. Bitte versuche es erneut.',
   'openhuman.team_list_teams': 'Teamlisten-Teams',
-  'overlay.ariaAttention': 'Achtung-Nachricht',
-  'overlay.ariaOrb': 'OpenHuman-Overlay',
-  'overlay.ariaVoiceActive': 'Spracheingabe aktiv',
-  'overlay.orbTitle': 'Zum Verschieben ziehen · Doppelklicken, um die Position zurückzusetzen',
   'pages.settings.account.migration': 'Importieren',
   'pages.settings.account.migrationDesc':
     'Migriere Speicher und Notizen von OpenClaw (oder bald Hermes) in diesen Arbeitsbereich.',
@@ -3342,27 +3311,6 @@ const messages: TranslationMap = {
   'skills.install.urlLabel': 'Fähigkeit URL',
   'skills.install.urlPlaceholder': 'https://raw.githubusercontent.com/owner/repo/main/SKILL.md',
   'skills.search.placeholder': 'Platzhalter',
-  'skills.setup.voice.activation': 'Aktivierung',
-  'skills.setup.voice.activeDescPrefix': 'Fn',
-  'skills.setup.voice.activeDescSuffix': 'Fn',
-  'skills.setup.voice.activeTitle': 'Sprachintelligenz ist aktiv',
-  'skills.setup.voice.customizeSettings': 'Passe die Einstellungen an',
-  'skills.setup.voice.downloadSttBtn': 'Spracheinstellungen öffnen',
-  'skills.setup.voice.enableDesc': 'Diktiere Text freihändig über dein Mikrofon.',
-  'skills.setup.voice.hotkey': 'Hotkey',
-  'skills.setup.voice.startBtn': 'Starten...',
-  'skills.setup.voice.startError': 'Der Sprachserver konnte nicht gestartet werden',
-  'skills.setup.voice.starting': 'Startet...',
-  'skills.setup.voice.stepEnable': 'Sprachserver starten',
-  'skills.setup.voice.stepSetup': 'Einrichtung der Spracherkennung erforderlich',
-  'skills.setup.voice.stepSuccess': 'Bereit zu gehen',
-  'skills.setup.voice.sttNotReady': 'Speech-to-Text-Modell nicht bereit',
-  'skills.setup.voice.sttNotReadyDesc':
-    'Voice Intelligence braucht eine funktionierende Spracherkennung. Wähle eine unter Einstellungen › Sprache.',
-  'skills.setup.voice.sttReady': 'Bereit für das Speech-to-Text-Modell',
-  'skills.setup.voice.sttReturnHint':
-    'Richte in den Spracheinstellungen eine Spracherkennung ein und kehre dann hierher zurück, um die Sprachfunktion zu starten.',
-  'skills.setup.voice.title': 'Sprachintelligenz',
   'skills.uninstall.description':
     'Dadurch werden das Skill-Verzeichnis und alle darin enthaltenen Ressourcen dauerhaft gelöscht. Der Agent wird es in der nächsten Runde nicht mehr sehen.',
   'upsell.global.limitMessage': 'Aktualisiere deinen Plan oder lade Guthaben auf, um fortzufahren',
@@ -3650,8 +3598,6 @@ const messages: TranslationMap = {
     'Ein OPENHUMAN_APPROVAL_GATE=0-Override wurde erkannt, aber ignoriert: Die Desktop-App lässt das Genehmigungstor immer eingeschaltet.',
 
   // Run queue
-  'notch.ready': 'Bereit',
-  'notch.listening': 'Höre zu…',
 
   'orchestration.detail.stop': 'Stoppen',
 
@@ -3844,7 +3790,6 @@ const messages: TranslationMap = {
   'voice.routing.testOk': 'Arbeitet',
   'voice.routing.testFailed': 'Fehlgeschlagen',
   'voice.routing.unsaved': 'Ungespeicherte Änderungen',
-  'pttSettings.clearShortcut': 'Leeren',
   'flows.allRuns.tableTitle': 'Läufe',
   'flows.allRuns.columnStarted': 'Gestartet',
   'flows.allRuns.columnDuration': 'Dauer',
@@ -3895,7 +3840,7 @@ const messages: TranslationMap = {
   'settings.embeddings.modelCardTitle': 'Modell und Abmessungen',
   'mcp.rows.searchPlaceholder': 'Suchserver...',
   'mcp.tab.section.clients': 'Kunden',
-  'voice.pageDesc': 'Sprachmaschinen, wie sie geroutet werden, und Push-to-Talk.',
+  'voice.pageDesc': 'Sprachmodule und Anbieterrouting.',
   'voice.providers.cardDesc':
     'Schalten Sie die Motoren ein, die Sie verwenden möchten. Die Schlüssel bleiben auf diesem Gerät.',
   'voice.providers.cap.stt': 'Rede zum Text',

@@ -288,15 +288,7 @@ fn extension_namespace_description(namespace: &str) -> Option<&'static str> {
 /// Returns a reference to the global CLI adapter registry.
 fn cli_adapters() -> &'static [RegisteredCliAdapter] {
     CLI_ADAPTERS.get_or_init(|| {
-        // The `voice` namespace stays registered regardless of the `voice`
-        // feature: with the feature off, `voice::cli::run_standalone_subcommand`
-        // resolves to the facade stub, which returns a "voice disabled" error so
-        // `openhuman voice` fails gracefully instead of the subcommand vanishing.
         vec![
-            RegisteredCliAdapter {
-                namespace: "voice",
-                handler: crate::voice::cli::run_standalone_subcommand,
-            },
             // Bare `openhuman subsystems` prints the slot table; `openhuman
             // subsystems status` still routes through the generic namespace
             // dispatcher and prints JSON.

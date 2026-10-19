@@ -133,13 +133,11 @@ pub use search::{
     search_settings_json, SearchProviderPatch, SearchSettingsPatch,
 };
 pub use ui::{
-    apply_analytics_settings, apply_browser_settings, apply_user_timezone, get_dictation_settings,
-    get_onboarding_completed, get_voice_server_settings, load_and_apply_analytics_settings,
-    load_and_apply_browser_settings, load_and_apply_dictation_settings,
-    load_and_apply_user_timezone, load_and_apply_voice_server_settings, set_onboarding_completed,
-    user_timezone_json, workspace_onboarding_flag_exists, workspace_onboarding_flag_resolve,
+    apply_analytics_settings, apply_browser_settings, apply_user_timezone,
+    get_onboarding_completed, load_and_apply_analytics_settings, load_and_apply_browser_settings,
+    load_and_apply_user_timezone, set_onboarding_completed, user_timezone_json,
+    workspace_onboarding_flag_exists, workspace_onboarding_flag_resolve,
     workspace_onboarding_flag_set, AnalyticsSettingsPatch, BrowserSettingsPatch,
-    DictationSettingsPatch, VoiceServerSettingsPatch,
 };
 
 #[cfg(test)]

@@ -4,11 +4,10 @@ use crate::core::all::RegisteredController;
 use crate::core::{ControllerSchema, FieldSchema, TypeSchema};
 
 use super::handlers::{
-    handle_overlay_stt_notify, handle_voice_list_models, handle_voice_reply_synthesize,
-    handle_voice_server_start, handle_voice_server_status, handle_voice_server_stop,
-    handle_voice_set_providers, handle_voice_status, handle_voice_stt_dispatch,
-    handle_voice_test_provider, handle_voice_transcribe, handle_voice_transcribe_bytes,
-    handle_voice_tts, handle_voice_tts_dispatch, handle_voice_update_provider_settings,
+    handle_voice_list_models, handle_voice_reply_synthesize, handle_voice_set_providers,
+    handle_voice_status, handle_voice_stt_dispatch, handle_voice_test_provider,
+    handle_voice_transcribe, handle_voice_transcribe_bytes, handle_voice_tts,
+    handle_voice_tts_dispatch, handle_voice_update_provider_settings,
 };
 use super::helpers::{json_output, optional_bool, optional_string, required_string};
 
@@ -25,10 +24,6 @@ pub fn all_voice_controller_schemas() -> Vec<ControllerSchema> {
         voice_schemas("voice_update_provider_settings"),
         voice_schemas("voice_list_models"),
         voice_schemas("voice_test_provider"),
-        voice_schemas("voice_server_start"),
-        voice_schemas("voice_server_stop"),
-        voice_schemas("voice_server_status"),
-        voice_schemas("overlay_stt_notify"),
     ]
     .into_iter()
     .chain(crate::voice::live::live_controller_schemas())
@@ -80,22 +75,6 @@ pub fn all_voice_registered_controllers() -> Vec<RegisteredController> {
         RegisteredController {
             schema: voice_schemas("voice_test_provider"),
             handler: handle_voice_test_provider,
-        },
-        RegisteredController {
-            schema: voice_schemas("voice_server_start"),
-            handler: handle_voice_server_start,
-        },
-        RegisteredController {
-            schema: voice_schemas("voice_server_stop"),
-            handler: handle_voice_server_stop,
-        },
-        RegisteredController {
-            schema: voice_schemas("voice_server_status"),
-            handler: handle_voice_server_status,
-        },
-        RegisteredController {
-            schema: voice_schemas("overlay_stt_notify"),
-            handler: handle_overlay_stt_notify,
         },
     ]
     .into_iter()
@@ -332,52 +311,6 @@ pub fn voice_schemas(function: &str) -> ControllerSchema {
                 "result",
                 "{ ok: bool, detail: string, latency_ms?: number }",
             )],
-        },
-        "voice_server_start" => ControllerSchema {
-            namespace: "voice",
-            function: "server_start",
-            description:
-                "Start the voice dictation server (hotkey → record → transcribe → insert text).",
-            inputs: vec![
-                optional_string("hotkey", "Hotkey combination (default: Fn)."),
-                optional_string(
-                    "activation_mode",
-                    "Activation mode: tap or push (default: push).",
-                ),
-                optional_bool("skip_cleanup", "Skip LLM post-processing."),
-            ],
-            outputs: vec![json_output("status", "Voice server status after start.")],
-        },
-        "voice_server_stop" => ControllerSchema {
-            namespace: "voice",
-            function: "server_stop",
-            description: "Stop the voice dictation server.",
-            inputs: vec![],
-            outputs: vec![json_output("status", "Voice server status after stop.")],
-        },
-        "voice_server_status" => ControllerSchema {
-            namespace: "voice",
-            function: "server_status",
-            description: "Get the current voice dictation server status.",
-            inputs: vec![],
-            outputs: vec![json_output("status", "Current voice server status.")],
-        },
-        "overlay_stt_notify" => ControllerSchema {
-            namespace: "voice",
-            function: "overlay_stt_notify",
-            description:
-                "Notify the overlay of a voice/STT state change from the chat prompt button.",
-            inputs: vec![
-                required_string(
-                    "state",
-                    "State transition: recording_started, transcription_done, cancelled, error.",
-                ),
-                optional_string(
-                    "text",
-                    "Transcribed text (when state is transcription_done).",
-                ),
-            ],
-            outputs: vec![json_output("result", "Notification acknowledgement.")],
         },
         _ => ControllerSchema {
             namespace: "voice",

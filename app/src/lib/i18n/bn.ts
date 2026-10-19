@@ -662,7 +662,6 @@ const messages: TranslationMap = {
   'devOptions.toolPolicyDiagnosticsDesc': 'টুল- মেকআপ, নীতি পোস্ট, xqxqxs, এবং সম্প্রতি ব্যবহৃত',
   'devOptions.toolPolicyDiagnostics.loading': 'লোড করা হচ্ছে...',
   'devOptions.toolPolicyDiagnostics.unavailable': 'ডায়াগনস্টিক উপলব্ধ নয়',
-  'voice.pushToTalk': 'পুশ টু টক',
   'misc.somethingWentWrong': 'কিছু একটা ভুল হয়েছে',
   'misc.beta':
     'OpenHuman এখন আর্লি বেটায় আছে। যেকোনো মতামত বা বাগ রিপোর্ট করুন: প্রতিটি রিপোর্ট আমাদের দ্রুত এগিয়ে যেতে সাহায্য করে।',
@@ -1174,13 +1173,9 @@ const messages: TranslationMap = {
   'mnemonic.createANewWallet': 'একটি নতুন ওয়ালেট তৈরি করুন',
   'mnemonic.importWallet': 'ওয়ালেট ইম্পোর্ট করুন',
   'team.deleting': 'মুছে ফেলা হচ্ছে...',
-  'voice.tapToToggle': 'টগল করতে ট্যাপ করুন',
   'voice.settingsSaved': 'ভয়েস সেটিংস সংরক্ষিত।',
   'voice.failedToLoadSettings': 'ভয়েস সেটিংস লোড করতে ব্যর্থ হয়েছে',
   'voice.failedToSaveSettings': 'ভয়েস সেটিংস সংরক্ষণ করতে ব্যর্থ হয়েছে',
-  'voice.debug.alwaysOn': 'সবসময় শোনা',
-  'voice.debug.alwaysOnDesc':
-    'মাইক্রোফোন খোলা রাখুন এবং আপনি যা বলেন তা হটকি ছাড়াই স্বয়ংক্রিয়ভাবে এজেন্টের কাছে পাঠান। স্ক্রিন লক হলে থেমে যায়।',
   'voice.providers.saved': 'ভয়েস প্রদানকারী সংরক্ষিত।',
   'voice.providers.failedToSave': 'ভয়েস প্রদানকারী সংরক্ষণ করতে ব্যর্থ',
   'voice.mode.start': 'ভয়েস চ্যাট শুরু করুন',
@@ -1246,28 +1241,6 @@ const messages: TranslationMap = {
   'voice.routing.elevenlabsVoiceIdAria': 'ElevenLabs ভয়েস ID (কাস্টম)',
   'voice.routing.elevenlabsVoiceDesc':
     'একটি কিউরেটেড ভয়েস বেছে নিন বা আপনার ElevenLabs ড্যাশবোর্ড থেকে একটি কাস্টম ভয়েস ID পেস্ট করুন।',
-  'pttSettings.title': 'চাপ দিয়ে কথা বলুন',
-  'pttSettings.description':
-    'অন্য একটি অ্যাপে থাকার সময় OpenHuman-এর সাথে কথা বলতে একটি কী চেপে ধরে রাখুন। কী ছেড়ে দিলে রেকর্ডিং পাঠানো হয়; «উত্তর পড়ে শোনাও» চালু থাকলে OpenHuman উত্তরটি জোরে পড়ে শোনায়।',
-  'pttSettings.shortcutLabel': 'হটকি',
-  'pttSettings.shortcutPlaceholder': 'একটি কী চাপুন (যেমন F13)',
-  'pttSettings.shortcutUnsetHint':
-    'চাপ দিয়ে কথা বলুন বন্ধ আছে: চালু করতে একটি হটকি নির্বাচন করুন।',
-  'pttSettings.speakRepliesLabel': 'এজেন্টের উত্তর জোরে পড়ুন',
-  'pttSettings.showOverlayLabel': 'চেপে ধরা অবস্থায় ওভারলে দেখান',
-  'pttSettings.errorConflictsWithDictation':
-    'এই শর্টকাটটি ইতিমধ্যে ডিকটেশনের জন্য ব্যবহৃত হচ্ছে। অন্য একটি কী বেছে নিন।',
-  'pttSettings.errorModifierOnly':
-    'একটি সাধারণ কী বেছে নিন (যেমন F13): শুধু মডিফায়ার নিয়ে গঠিত শর্টকাট চাপ দিয়ে কথা বলুনের জন্য কাজ করে না।',
-  'pttSettings.errorEmpty': 'বাঁধার জন্য একটি কী বেছে নিন।',
-  'pttSettings.errorAccessibility':
-    'এই শর্টকাটের জন্য macOS-এর অ্যাক্সেসিবিলিটি অনুমতি দরকার। System Settings → Privacy & Security → Accessibility খুলুন এবং OpenHuman চালু করুন।',
-  'pttSettings.errorShortcutInUse':
-    'অন্য একটি অ্যাপ ইতিমধ্যে এই শর্টকাট ব্যবহার করছে। ভিন্ন একটি বেছে নিন।',
-  'pttSettings.errorUnsupportedWayland':
-    'Wayland সেশন এখনও OpenHuman-এ গ্লোবাল শর্টকাট সমর্থন করে না: একটি X11 সেশনে চলে যান অথবা অ্যাপের ভেতরের ডিকটেশন টগল ব্যবহার করুন।',
-  'pttOverlay.listening': 'শুনছে…',
-  'pttOverlay.idle': 'অপেক্ষায়',
   'composio.triageTitle': 'ইন্টিগ্রেশন ট্রিগার',
   'composio.triageDesc':
     'সক্রিয় থাকলে, প্রতিটি আসন্ত Composio ট্রিগার একটি AI ট্রিয়াজ ধাপের মধ্য দিয়ে যায় যা ইভেন্ট শ্রেণীবদ্ধ করে এবং স্বয়ংক্রিয় কাজ শুরু করতে পারে: প্রতিটি ট্রিগারে একটি লোকাল LLM টার্ন। বৈশ্বিকভাবে বা নির্দিষ্ট ইন্টিগ্রেশনে নিষ্ক্রিয় করুন যদি আপনি ম্যানুয়াল রিভিউ পছন্দ করেন। যদি পরিবেশ ভ্যারিয়েবল',
@@ -2365,10 +2338,6 @@ const messages: TranslationMap = {
   'oauth.button.loopbackTimeout':
     'সাইন-ইন টাইম আউট হয়েছে: ব্রাউজার OAuth পুনর্নির্দেশনা সম্পন্ন করেনি। অনুগ্রহ করে আবার চেষ্টা করুন।',
   'openhuman.team_list_teams': 'টিম তালিকা',
-  'overlay.ariaAttention': 'মনোযোগের বার্তা',
-  'overlay.ariaOrb': 'OpenHuman ওভারলে',
-  'overlay.ariaVoiceActive': 'ভয়েস ইনপুট সক্রিয়',
-  'overlay.orbTitle': 'সরাতে টেনে আনুন · পজিশন রিসেট করতে ডাবল-ক্লিক করুন',
   'pages.settings.account.migration': 'আমদানি',
   'pages.settings.account.migrationDesc':
     'OpenClaw (এবং শীঘ্রই Hermes) থেকে মেমরি ও নোট এই ওয়ার্কস্পেসে স্থানান্তর করুন।',
@@ -3245,27 +3214,6 @@ const messages: TranslationMap = {
   'skills.install.urlLabel': 'স্কিল URL',
   'skills.install.urlPlaceholder': 'https://raw.githubusercontent.com/owner/repo/main/SKILL.md',
   'skills.search.placeholder': 'প্লেসহোল্ডার',
-  'skills.setup.voice.activation': 'অ্যাক্টিভেশন',
-  'skills.setup.voice.activeDescPrefix': 'Fn',
-  'skills.setup.voice.activeDescSuffix': 'Fn',
-  'skills.setup.voice.activeTitle': 'ভয়েস ইন্টেলিজেন্স সক্রিয়',
-  'skills.setup.voice.customizeSettings': 'সেটিংস কাস্টমাইজ করুন',
-  'skills.setup.voice.downloadSttBtn': 'ভয়েস সেটিংস খুলুন',
-  'skills.setup.voice.enableDesc': 'সক্রিয় বিবরণ',
-  'skills.setup.voice.hotkey': 'হটকি',
-  'skills.setup.voice.startBtn': 'শুরু হচ্ছে...',
-  'skills.setup.voice.startError': 'ভয়েস সার্ভার শুরু করতে ব্যর্থ',
-  'skills.setup.voice.starting': 'শুরু হচ্ছে...',
-  'skills.setup.voice.stepEnable': 'ভয়েস সার্ভার শুরু করুন',
-  'skills.setup.voice.stepSetup': 'স্পিচ-টু-টেক্সট সেটআপ প্রয়োজন',
-  'skills.setup.voice.stepSuccess': 'যেতে প্রস্তুত',
-  'skills.setup.voice.sttNotReady': 'স্পিচ-টু-টেক্সট মডেল প্রস্তুত নয়',
-  'skills.setup.voice.sttNotReadyDesc':
-    'ভয়েস ইন্টেলিজেন্সের জন্য একটি সচল স্পিচ-টু-টেক্সট ইঞ্জিন দরকার। সেটিংস › ভয়েস থেকে একটি বেছে নিন।',
-  'skills.setup.voice.sttReady': 'স্পিচ-টু-টেক্সট মডেল প্রস্তুত',
-  'skills.setup.voice.sttReturnHint':
-    'ভয়েস সেটিংসে একটি স্পিচ-টু-টেক্সট ইঞ্জিন কনফিগার করুন, তারপর ভয়েস শুরু করতে এখানে ফিরে আসুন।',
-  'skills.setup.voice.title': 'ভয়েস ইন্টেলিজেন্স',
   'skills.uninstall.description':
     'এটি স্থায়ীভাবে স্কিল ডিরেক্টরি এবং এর সমস্ত বান্ডল রিসোর্স মুছে ফেলে। এজেন্ট পরবর্তী টার্নে এটি দেখা বন্ধ করবে।',
   'upsell.global.limitMessage': 'চালিয়ে যেতে আপনার প্ল্যান আপগ্রেড করুন বা ক্রেডিট টপ আপ করুন',
@@ -3540,8 +3488,6 @@ const messages: TranslationMap = {
     'একটি OPENHUMAN_APPROVAL_GATE=0 ওভাররাইড সনাক্ত করা হয়েছিল কিন্তু উপেক্ষা করা হয়েছে: ডেস্কটপ অ্যাপ সর্বদা অনুমোদন গেট চালু রাখে।',
 
   // Run queue
-  'notch.ready': 'প্রস্তুত',
-  'notch.listening': 'শুনছি…',
 
   'orchestration.detail.stop': 'থামান',
 
@@ -3726,7 +3672,6 @@ const messages: TranslationMap = {
   'voice.routing.testOk': 'কাজ চলছে',
   'voice.routing.testFailed': 'ব্যর্থ',
   'voice.routing.unsaved': 'অসংরক্ষিত পরিবর্তন',
-  'pttSettings.clearShortcut': 'পরিষ্কার',
   'flows.allRuns.tableTitle': 'রান',
   'flows.allRuns.columnStatus': 'স্ট্যাটাস',
   'flows.allRuns.columnWorkflow': 'ওয়ার্কফ্লো',
@@ -3779,7 +3724,7 @@ const messages: TranslationMap = {
   'settings.embeddings.modelCardTitle': 'মডেল ও মাত্রা',
   'mcp.rows.searchPlaceholder': 'অনুসন্ধানের সার্ভার...',
   'mcp.tab.section.clients': 'ক্লায়েন্ট',
-  'voice.pageDesc': 'ভাষণ ইঞ্জিন, কিভাবে তাদের পরাজিত করা হয়, এবং উলকি.',
+  'voice.pageDesc': 'স্পিচ ইঞ্জিন ও প্রদানকারী রাউটিং।',
   'voice.providers.cardDesc': 'ইঞ্জিন চালু করুন. এই ডিভাইসের মধ্যে কি-টি রাখো।',
   'voice.providers.cap.stt': 'লেখার মধ্যে শব্দ',
   'voice.providers.cap.tts': 'প্রদর্শিত টেক্সট',

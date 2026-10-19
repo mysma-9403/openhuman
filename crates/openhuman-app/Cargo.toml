@@ -108,7 +108,6 @@ tauri = { version = "2.11", default-features = false, features = [
     "webview-data-url",
 ] }
 tauri-plugin-deep-link = "2.0.0"
-tauri-plugin-global-shortcut = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"
 # Prevents a second launch from racing into CEF init and hitting the

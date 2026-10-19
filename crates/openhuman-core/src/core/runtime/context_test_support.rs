@@ -34,6 +34,19 @@ impl CoreContext {
         })
     }
 
+    /// Test-only constructor with context-local hook registrations.
+    pub(crate) fn for_test_with_extensions(
+        domains: crate::core::runtime::DomainSet,
+        workspace_dir: Option<std::path::PathBuf>,
+        extensions: crate::core::slots::Extensions,
+    ) -> Arc<CoreContext> {
+        let mut ctx = Arc::try_unwrap(Self::for_test(domains, workspace_dir))
+            .ok()
+            .unwrap();
+        ctx.extensions = extensions;
+        Arc::new(ctx)
+    }
+
     /// Test-only: given `[components]` switches.
     pub(crate) fn for_test_with_components(c: crate::core::runtime::ComponentSet) -> Arc<Self> {
         let mut ctx = Arc::try_unwrap(Self::for_test(

@@ -653,7 +653,6 @@ const messages: TranslationMap = {
     'قوائم جرد المواد، ووضع السياسات، والقوائم المسموح بها بx0xx، والوحدات الأخيرة',
   'devOptions.toolPolicyDiagnostics.loading': 'التعبئة...',
   'devOptions.toolPolicyDiagnostics.unavailable': 'التشخيص غير متاح',
-  'voice.pushToTalk': 'اضغط للتحدث',
   'misc.somethingWentWrong': 'حدث خطأ ما',
   'misc.beta':
     'OpenHuman في مرحلة تجريبية مبكرة. لا تتردد في مشاركة ملاحظاتك أو الإبلاغ عن أي أخطاء تواجهها: كل تقرير يساعدنا على الإنجاز بشكل أسرع.',
@@ -1157,13 +1156,9 @@ const messages: TranslationMap = {
   'mnemonic.createANewWallet': 'إنشاء محفظة جديدة',
   'mnemonic.importWallet': 'استيراد محفظة',
   'team.deleting': 'جارٍ الحذف...',
-  'voice.tapToToggle': 'انقر للتبديل',
   'voice.settingsSaved': 'تم حفظ إعدادات الصوت.',
   'voice.failedToLoadSettings': 'فشل تحميل إعدادات الصوت',
   'voice.failedToSaveSettings': 'فشل في حفظ إعدادات الصوت',
-  'voice.debug.alwaysOn': 'الاستماع الدائم',
-  'voice.debug.alwaysOnDesc':
-    'أبقِ الميكروفون مفتوحًا وأرسل ما تقوله إلى الوكيل تلقائيًا دون مفتاح اختصار. يتوقف مؤقتًا عند قفل الشاشة.',
   'voice.providers.saved': 'تم حفظ موفري الصوت.',
   'voice.providers.failedToSave': 'فشل في حفظ موفري الصوت',
   'voice.mode.start': 'بدء المحادثة الصوتية',
@@ -1228,26 +1223,6 @@ const messages: TranslationMap = {
   'voice.routing.elevenlabsVoiceIdAria': 'معرف صوت ElevenLabs (مخصص)',
   'voice.routing.elevenlabsVoiceDesc':
     'اختر صوتاً منتقىً أو الصق معرف صوت مخصص من لوحة تحكم ElevenLabs.',
-  'pttSettings.title': 'اضغط للتحدث',
-  'pttSettings.description':
-    'اضغط مفتاحًا باستمرار للتحدث إلى OpenHuman أثناء وجودك في تطبيق آخر. تحرير المفتاح يُرسل التسجيل؛ إذا كان «قراءة الردود» مفعَّلًا، ينطق OpenHuman الرد بصوت عالٍ.',
-  'pttSettings.shortcutLabel': 'اختصار المفتاح',
-  'pttSettings.shortcutPlaceholder': 'اضغط مفتاحًا (مثل F13)',
-  'pttSettings.shortcutUnsetHint': 'اضغط للتحدث متوقف: اختر اختصارًا لتفعيله.',
-  'pttSettings.speakRepliesLabel': 'نطق ردود الوكيل',
-  'pttSettings.showOverlayLabel': 'إظهار التراكب أثناء الضغط',
-  'pttSettings.errorConflictsWithDictation':
-    'هذا الاختصار مُستخدم بالفعل لخاصية الإملاء. اختر مفتاحًا مختلفًا.',
-  'pttSettings.errorModifierOnly':
-    'اختر مفتاحًا عاديًا (مثل F13): الاختصارات المكونة من مفاتيح تعديل فقط لا تعمل مع اضغط للتحدث.',
-  'pttSettings.errorEmpty': 'اختر مفتاحًا للربط.',
-  'pttSettings.errorAccessibility':
-    'يحتاج macOS إلى إذن إمكانية الوصول لهذا الاختصار. افتح إعدادات النظام ← الخصوصية والأمان ← إمكانية الوصول وفعّل OpenHuman.',
-  'pttSettings.errorShortcutInUse': 'يستخدم تطبيق آخر هذا الاختصار بالفعل. اختر اختصارًا مختلفًا.',
-  'pttSettings.errorUnsupportedWayland':
-    'جلسات Wayland لا تدعم بعد الاختصارات العامة في OpenHuman: انتقل إلى جلسة X11 أو استخدم زر الإملاء داخل التطبيق.',
-  'pttOverlay.listening': 'يستمع…',
-  'pttOverlay.idle': 'في الانتظار',
   'composio.triageTitle': 'مشغّلات التكامل',
   'composio.triageDesc':
     'عند التفعيل، يمر كل مشغّل Composio وارد عبر خطوة فرز بالذكاء الاصطناعي تُصنّف الحدث وقد تبدأ إجراءات آلية: دورة LLM محلية واحدة لكل مشغّل. عطّله عالميًا أو لكل تكامل إذا كنت تفضل المراجعة اليدوية. إذا كان متغير البيئة',
@@ -2318,10 +2293,6 @@ const messages: TranslationMap = {
   'oauth.button.loopbackTimeout':
     'انتهت مهلة تسجيل الدخول: لم يكتمل المتصفح إعادة توجيه OAuth. يرجى المحاولة مرة أخرى.',
   'openhuman.team_list_teams': 'قائمة الفرق',
-  'overlay.ariaAttention': 'رسالة انتباه',
-  'overlay.ariaOrb': 'تراكب OpenHuman',
-  'overlay.ariaVoiceActive': 'إدخال الصوت نشط',
-  'overlay.orbTitle': 'اسحب للتحريك · انقر مرتين لإعادة الضبط',
   'pages.settings.account.migration': 'استيراد',
   'pages.settings.account.migrationDesc':
     'انقل الذاكرة والملاحظات من OpenClaw (وقريبًا Hermes) إلى مساحة العمل هذه.',
@@ -3182,27 +3153,6 @@ const messages: TranslationMap = {
   'skills.install.urlLabel': 'رابط المهارة',
   'skills.install.urlPlaceholder': 'https://raw.githubusercontent.com/owner/repo/main/SKILL.md',
   'skills.search.placeholder': 'بحث',
-  'skills.setup.voice.activation': 'التفعيل',
-  'skills.setup.voice.activeDescPrefix': 'Fn',
-  'skills.setup.voice.activeDescSuffix': 'Fn',
-  'skills.setup.voice.activeTitle': 'ذكاء الصوت نشط',
-  'skills.setup.voice.customizeSettings': 'تخصيص الإعدادات',
-  'skills.setup.voice.downloadSttBtn': 'فتح إعدادات الصوت',
-  'skills.setup.voice.enableDesc': 'وصف التفعيل',
-  'skills.setup.voice.hotkey': 'المفتاح الساخن',
-  'skills.setup.voice.startBtn': 'جارٍ البدء...',
-  'skills.setup.voice.startError': 'فشل تشغيل خادم الصوت',
-  'skills.setup.voice.starting': 'جارٍ البدء...',
-  'skills.setup.voice.stepEnable': 'تشغيل خادم الصوت',
-  'skills.setup.voice.stepSetup': 'يلزم إعداد تحويل الكلام إلى نص',
-  'skills.setup.voice.stepSuccess': 'جاهز للانطلاق',
-  'skills.setup.voice.sttNotReady': 'نموذج تحويل الكلام إلى نص غير جاهز',
-  'skills.setup.voice.sttNotReadyDesc':
-    'يحتاج ذكاء الصوت إلى محرك تحويل كلام إلى نص يعمل. اختر واحداً من الإعدادات › الصوت.',
-  'skills.setup.voice.sttReady': 'نموذج تحويل الكلام إلى نص جاهز',
-  'skills.setup.voice.sttReturnHint':
-    'هيّئ محرك تحويل الكلام إلى نص في إعدادات الصوت، ثم عد إلى هنا لبدء الصوت.',
-  'skills.setup.voice.title': 'ذكاء الصوت',
   'skills.uninstall.description':
     'هذا يحذف دليل المهارة نهائيًا وجميع موارده المرفقة. سيتوقف الوكيل عن رؤيتها في الدور التالي.',
   'upsell.global.limitMessage': 'قم بترقية خطتك أو أضف رصيدًا للمتابعة',
@@ -3470,8 +3420,6 @@ const messages: TranslationMap = {
     'تم اكتشاف تجاوز OPENHUMAN_APPROVAL_GATE=0 لكنه تم تجاهله: يحافظ تطبيق سطح المكتب دائمًا على تفعيل بوابة الموافقة.',
 
   // Run queue
-  'notch.ready': 'جاهز',
-  'notch.listening': 'أستمع…',
 
   'orchestration.detail.stop': 'إيقاف',
 
@@ -3654,7 +3602,6 @@ const messages: TranslationMap = {
   'voice.routing.testOk': 'جارٍ العمل',
   'voice.routing.testFailed': 'فشل',
   'voice.routing.unsaved': 'تغييرات غير محفوظة',
-  'pttSettings.clearShortcut': 'مسح',
   'flows.allRuns.tableTitle': 'التشغيلات',
   'flows.allRuns.columnStatus': 'الحالة',
   'flows.allRuns.columnWorkflow': 'سير العمل',
@@ -3706,7 +3653,7 @@ const messages: TranslationMap = {
   'settings.embeddings.modelCardTitle': 'الأبعاد النموذجية',
   'mcp.rows.searchPlaceholder': 'خوادم البحث...',
   'mcp.tab.section.clients': 'العملاء',
-  'voice.pageDesc': 'محركات الكلمات، كيف يتم توجيهها، والدفع إلى الكلام.',
+  'voice.pageDesc': 'محركات الكلام وتوجيه مزوداته.',
   'voice.providers.cardDesc': 'شغل المحركات التي تريد استخدامها المفاتيح تبقى على هذا الجهاز',
   'voice.providers.cap.stt': 'خطاب النص',
   'voice.providers.cap.tts': 'نص الخطاب',

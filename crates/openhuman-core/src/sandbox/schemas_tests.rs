@@ -223,10 +223,11 @@ async fn handle_validate_policy_errors_instead_of_passing_when_tinybox_is_unavai
 
 #[tokio::test]
 async fn every_sandbox_method_answers_component_disabled_when_sandbox_is_off() {
+    type ControllerHandler = fn(DispatchCtx, Map<String, Value>) -> ControllerFuture;
     let mut set = crate::core::runtime::ComponentSet::all();
     set.sandbox = false;
     let ctx = crate::core::runtime::context::CoreContext::for_test_with_components(set);
-    let handlers: [fn(DispatchCtx, Map<String, Value>) -> ControllerFuture; 4] = [
+    let handlers: [ControllerHandler; 4] = [
         handle_status,
         handle_resolve_policy,
         handle_cleanup_orphans,

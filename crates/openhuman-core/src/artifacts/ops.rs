@@ -205,7 +205,7 @@ async fn regenerate_presentation(
 
     // A fresh policy from the live config — cheap, sync, and mirrors how
     // the agent harness builds the same tool (see `tools::ops`).
-    let security = std::sync::Arc::new(SecurityPolicy::for_config(&config));
+    let security = std::sync::Arc::new(SecurityPolicy::for_config(config));
     // The regenerate target is an explicit constructor argument of the tool
     // that produces the artifact: its `create_artifact_regenerating` call
     // reuses this id instead of minting a new one.

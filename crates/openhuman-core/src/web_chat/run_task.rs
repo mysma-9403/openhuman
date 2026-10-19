@@ -322,17 +322,6 @@ pub(crate) async fn run_chat_task(
                 ),
             }
         }
-        if metadata.source.as_deref() == Some("ptt") {
-            if let Some(session_id) = metadata.session_id {
-                crate::voice::publish_ptt_transcript_committed(
-                    thread_id.to_string(),
-                    session_id,
-                    task_result.full_response.chars().count(),
-                    0,
-                    false,
-                );
-            }
-        }
     }
 
     // TinyMemes: remix the final reply (slang + memes) when the flag puts this

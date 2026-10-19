@@ -115,16 +115,49 @@ fn full_tool_catalog_names() -> Vec<String> {
     let browser = cfg.browser.clone();
     let http = cfg.http_request.clone();
 
-    let tools = all_tools(
-        Arc::new(cfg.clone()),
-        &security,
-        AuditLogger::disabled(),
-        &browser,
-        &http,
-        tmp.path(),
-        &HashMap::new(),
-        &cfg,
+    // Media generators belong to the host, so provide the same three tools
+    // through the generic source port the product host uses. Keep the source
+    // in this context's Extensions: a process-global test registration can
+    // leak into concurrently running catalog tests.
+    let extensions = crate::core::slots::Extensions::new();
+    #[cfg(feature = "media")]
+    crate::tools::sources::register_tool_source_in(&extensions, "catalog-test-media", |_| {
+        use std::sync::Arc;
+        use tinyagents_harness::tinyinference_image::MockImageGenerator;
+        use tinyagents_harness::tinyinference_video::{MockVideoGenerator, MockVideoScript};
+
+        crate::media::generation::media_tools_from(
+            crate::media::generation::MediaGenerators::new(
+                Arc::new(MockImageGenerator::new()),
+                Arc::new(MockVideoGenerator::new(MockVideoScript::delivers())),
+            ),
+            std::path::Path::new("."),
+            std::path::Path::new("./workspace"),
+            std::path::Path::new("./Files"),
+            tinyagents_harness::tinyinference_video::WaitPolicy::new(
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_secs(5),
+            ),
+        )
+    });
+    let context = crate::core::runtime::CoreContext::for_test_with_extensions(
+        crate::core::runtime::DomainSet::full(),
+        Some(tmp.path().to_path_buf()),
+        extensions,
     );
+
+    let tools = crate::core::runtime::CoreContext::sync_scope(context, || {
+        all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            AuditLogger::disabled(),
+            &browser,
+            &http,
+            tmp.path(),
+            &HashMap::new(),
+            &cfg,
+        )
+    });
 
     let mut names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
     names.push(tinyagents_harness::tool::discover::TOOL_SEARCH_NAME.to_string());

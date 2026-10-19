@@ -37,7 +37,7 @@ That makes the guarantee independent of prompts, agents, tools or upstream bugs.
 
 One deliberate exemption: backend control-plane round-trips keep flowing. These are sign-in, session, team, billing, and integration connection management and catalog reads. Blocking them breaks the app for no privacy gain. They carry auth tokens, ids and routing metadata, never user content.
 
-Voice is not covered. There is no local speech-to-text engine, so dictation and transcription still leave the device under `local_only`. They go to the hosted OpenHuman STT proxy, or to whichever third-party STT provider you configured. If that matters for your threat model, leave voice off.
+Speech-to-text is not covered by `local_only`. There is no local speech-to-text engine, so dictation and transcription leave the device through the hosted OpenHuman STT proxy or the third-party STT provider you configured. Disable the voice component if your threat model requires all speech processing to stay local.
 
 Privacy mode governs data egress. It is separate from the [autonomy tiers](approval-gate.md) (readonly, supervised, full), which govern what the agent may do. You can run a fully autonomous agent that never sends a byte of inference off-device.
 

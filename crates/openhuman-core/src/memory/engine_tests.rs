@@ -1,6 +1,5 @@
 use super::*;
 use crate::memory::test_fixtures::config_in;
-use crate::security::credentials::api_key::store_api_key;
 
 use crate::security::credentials::{AuthService, APP_SESSION_PROVIDER, DEFAULT_AUTH_PROFILE_NAME};
 

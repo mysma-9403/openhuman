@@ -1,6 +1,6 @@
 [[permission]]
 identifier = "allow-core-process"
-description = "Privileged desktop permissions for core process control, service management, dictation, window/UI, notifications, log access, and workspace integration"
+description = "Privileged desktop permissions for core process control, service management, window/UI, notifications, log access, and workspace integration"
 
 [permission.commands]
 
@@ -64,9 +64,7 @@ allow = [
     # restart-driven flips, causing a false re-flip and restart loop on
     # every login. (#900)
     "get_active_user_id",
-    # The renderer RPC URL handed to a child overlay webview that was spawned
-    # with `OPENHUMAN_CORE_RPC_URL` (falls back to `None` when unset).
-    "overlay_parent_rpc_url",
+
 
     # =========================
     # GATEWAYS
@@ -123,37 +121,13 @@ allow = [
     "auth_current_user",
 
     # =========================
-    # DICTATION
-    # =========================
-    "register_dictation_hotkey",
-    "unregister_dictation_hotkey",
-
-    # =========================
-    # PUSH-TO-TALK (PTT)
-    # =========================
-    # Voice settings panel registers/unregisters the global PTT hotkey and shows
-    # the PTT overlay via these invokes. Without these allow entries the invoke
-    # is rejected with "Command <name> not allowed by ACL" and PTT (plus the
-    # always-on listening flow that depends on hotkey registration) never works.
-    "register_ptt_hotkey",
-    "unregister_ptt_hotkey",
-    "show_ptt_overlay",
-
-    # =========================
     # WINDOW / UI
     # =========================
-    "activate_main_window",
     # RootShellLayout keeps the native titlebar in sync with the sidebar.
     "set_titlebar_for_sidebar",
     # Floating mascot window (native NSPanel on macOS; errors elsewhere).
     "mascot_window_show",
     "mascot_window_hide",
-    # Notch activity indicator (transparent NSPanel pill, macOS). The Voice
-    # settings panel + app boot call these via `syncNotchVisibility` to mirror
-    # always-on listening state. Without these allow entries the invoke is
-    # rejected with "Command not found" and the notch never shows/hides.
-    "notch_window_show",
-    "notch_window_hide",
 
     # =========================
     # NOTIFICATIONS

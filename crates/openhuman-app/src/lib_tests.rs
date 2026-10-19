@@ -64,30 +64,6 @@ fn core_rpc_url_returns_expected_format() {
     }
 }
 
-/// Test overlay_parent_rpc_url handles empty env var
-#[test]
-fn overlay_parent_rpc_url_handles_empty() {
-    let _g = env_lock();
-    let original = std::env::var("OPENHUMAN_CORE_RPC_URL").ok();
-
-    std::env::set_var("OPENHUMAN_CORE_RPC_URL", "");
-    assert!(overlay_parent_rpc_url().is_none());
-
-    std::env::set_var("OPENHUMAN_CORE_RPC_URL", "   ");
-    assert!(overlay_parent_rpc_url().is_none());
-
-    std::env::set_var("OPENHUMAN_CORE_RPC_URL", "http://127.0.0.1:7788/rpc");
-    assert_eq!(
-        overlay_parent_rpc_url(),
-        Some("http://127.0.0.1:7788/rpc".to_string())
-    );
-
-    match original {
-        Some(v) => std::env::set_var("OPENHUMAN_CORE_RPC_URL", v),
-        None => std::env::remove_var("OPENHUMAN_CORE_RPC_URL"),
-    }
-}
-
 // NOTE: `setup_tray_function_signature_compiles` and `app_runtime_type_exists`
 // removed (plan.md §2.1) — one had an empty body, the other's only real
 // assertion was commented out; both were compile-only no-ops.
@@ -1079,6 +1055,26 @@ fn every_allowed_ipc_command_is_registered() {
         stale.is_empty(),
         "allowed in permissions/*.toml but not registered in generate_handler!: {stale:?}"
     );
+}
+
+#[test]
+fn removed_shell_ptt_and_dictation_commands_are_not_registered() {
+    let registered = registered_ipc_commands();
+    let removed = [
+        "register_dictation_hotkey",
+        "unregister_dictation_hotkey",
+        "register_ptt_hotkey",
+        "unregister_ptt_hotkey",
+        "show_ptt_overlay",
+        "activate_main_window",
+        "overlay_parent_rpc_url",
+    ];
+    for command in removed {
+        assert!(
+            !registered.contains(command),
+            "removed command {command} is still registered in generate_handler!"
+        );
+    }
 }
 
 #[test]

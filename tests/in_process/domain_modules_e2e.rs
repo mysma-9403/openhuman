@@ -254,36 +254,6 @@ async fn config_agent_tools_and_threads_mutation_paths_round_trip() {
         Some(false)
     );
 
-    let dictation = rpc(
-        &harness.rpc_base,
-        30_007,
-        "openhuman.config_update_dictation_settings",
-        json!({
-            "enabled": true,
-            "hotkey": "Fn",
-            "activation_mode": "push",
-            "llm_refinement": false,
-            "streaming": true,
-            "streaming_interval_ms": 750
-        }),
-    )
-    .await;
-    ok(&dictation, "update_dictation_settings");
-    let dictation_get = rpc(
-        &harness.rpc_base,
-        30_008,
-        "openhuman.config_get_dictation_settings",
-        json!({}),
-    )
-    .await;
-    assert!(
-        payload(&dictation_get, "get_dictation_settings")
-            .get("streaming_interval_ms")
-            .and_then(Value::as_u64)
-            == Some(750),
-        "dictation settings should return the persisted settings payload: {dictation_get}"
-    );
-
     let search = rpc(
         &harness.rpc_base,
         30_009,

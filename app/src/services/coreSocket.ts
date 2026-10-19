@@ -6,9 +6,8 @@
  * The core handshake validates the per-process bearer token, so every
  * caller has to read it via `getCoreRpcToken()` and pass it through
  * `io(url, { auth: { token } })`. Centralising the factory keeps the
- * handshake shape uniform across the three current call sites
- * (`socketService`, `useDictationHotkey`, `OverlayApp`) and gives each
- * site a single line to call.
+ * handshake shape uniform at the current `socketService` call site and gives
+ * it a single line to call.
  */
 import { io, type ManagerOptions, type Socket, type SocketOptions } from 'socket.io-client';
 

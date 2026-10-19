@@ -103,7 +103,6 @@ impl Clone for Config {
             tts_provider: self.tts_provider.clone(),
             integrations: self.integrations.clone(),
             update: self.update.clone(),
-            dictation: self.dictation.clone(),
             onboarding_completed: self.onboarding_completed,
             chat_onboarding_completed: self.chat_onboarding_completed,
             model_registry: self.model_registry.clone(),

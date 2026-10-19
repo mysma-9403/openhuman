@@ -718,7 +718,6 @@ const messages: TranslationMap = {
   'devOptions.toolPolicyDiagnostics.unavailable': '診断情報は利用できません',
 
   // Voice / Dictation
-  'voice.pushToTalk': 'プッシュトゥトーク',
 
   // Misc
   'misc.somethingWentWrong': '問題が発生しました',
@@ -1326,13 +1325,9 @@ const messages: TranslationMap = {
   'team.deleting': '削除中...',
 
   // Voice
-  'voice.tapToToggle': 'タップで切り替え',
   'voice.settingsSaved': '音声設定を保存しました。',
   'voice.failedToLoadSettings': '音声設定の読み込みに失敗しました',
   'voice.failedToSaveSettings': '音声設定の保存に失敗しました',
-  'voice.debug.alwaysOn': '常時リスニング',
-  'voice.debug.alwaysOnDesc':
-    'マイクを常時開き、ホットキーなしで発話をエージェントに自動送信します。画面ロック中は一時停止します。',
   'voice.providers.saved': '音声プロバイダーを保存しました。',
   'voice.providers.failedToSave': '音声プロバイダーの保存に失敗しました',
   'voice.mode.start': '音声チャットを開始',
@@ -1340,7 +1335,7 @@ const messages: TranslationMap = {
   'voice.mode.connecting': '接続中…',
   'voice.mode.listening': '聞き取り中',
   'voice.mode.speaking': '発話中',
-  'voice.pageDesc': '音声エンジン、ルーティング、プッシュトゥトークの設定。',
+  'voice.pageDesc': '音声エンジンとプロバイダーのルーティング。',
   'voice.providers.title': '音声プロバイダー',
   'voice.providers.cardDesc': '使用するエンジンを有効にします。キーはこのデバイスに保存されます。',
   'voice.providers.cap.stt': '音声からテキストへ',
@@ -1416,29 +1411,6 @@ const messages: TranslationMap = {
   // External voice providers
 
   // Push-to-talk (PTT)
-  'pttSettings.title': 'プッシュトゥトーク',
-  'pttSettings.clearShortcut': 'クリア',
-  'pttSettings.description':
-    '他のアプリを使用している間にOpenHumanと話すには、キーを押しながら話します。キーを離すと送信され、「エージェントの返信を読み上げる」がオンになっている場合、OpenHumanが返信を読み上げます。',
-  'pttSettings.shortcutLabel': 'ホットキー',
-  'pttSettings.shortcutPlaceholder': 'キーを押してください（例：F13）',
-  'pttSettings.shortcutUnsetHint':
-    'プッシュトゥトークは無効です：有効にするにはホットキーを選択してください。',
-  'pttSettings.speakRepliesLabel': 'エージェントの返信を読み上げる',
-  'pttSettings.showOverlayLabel': '押している間オーバーレイを表示',
-  'pttSettings.errorConflictsWithDictation':
-    'このショートカットはすでに音声入力に使用されています。別のキーを選択してください。',
-  'pttSettings.errorModifierOnly':
-    '通常のキー（例: F13）を選択してください。修飾キーのみのショートカットはプッシュトゥトークでは機能しません。',
-  'pttSettings.errorEmpty': '割り当てるキーを選択してください。',
-  'pttSettings.errorAccessibility':
-    'このショートカットにはmacOSのアクセシビリティ権限が必要です。システム設定 → プライバシーとセキュリティ → アクセシビリティを開き、OpenHumanを有効にしてください。',
-  'pttSettings.errorShortcutInUse':
-    '別のアプリがこのショートカットを既に使用しています。別のものを選択してください。',
-  'pttSettings.errorUnsupportedWayland':
-    'Waylandセッションでは、OpenHumanのグローバルショートカットはまだサポートされていません。X11セッションに切り替えるか、アプリ内の音声入力トグルを使用してください。',
-  'pttOverlay.listening': '聞き取り中…',
-  'pttOverlay.idle': '待機中',
 
   // Autocomplete
 
@@ -2792,10 +2764,6 @@ const messages: TranslationMap = {
   'oauth.button.loopbackTimeout':
     'サインインがタイムアウトしました：ブラウザでのOAuthリダイレクトが完了しませんでした。もう一度お試しください。',
   'openhuman.team_list_teams': 'チーム一覧',
-  'overlay.ariaAttention': '注意メッセージ',
-  'overlay.ariaOrb': 'OpenHumanオーバーレイ',
-  'overlay.ariaVoiceActive': '音声入力がアクティブです',
-  'overlay.orbTitle': 'ドラッグで移動 · ダブルクリックで位置をリセット',
   'pages.settings.account.migration': 'インポート',
   'pages.settings.account.migrationDesc':
     '他のローカルアシスタントからメモリーとノートを引き継ぎます',
@@ -3825,27 +3793,6 @@ const messages: TranslationMap = {
   'skills.install.urlLabel': 'スキルURL',
   'skills.install.urlPlaceholder': 'https://raw.githubusercontent.com/owner/repo/main/SKILL.md',
   'skills.search.placeholder': 'スキルを検索…',
-  'skills.setup.voice.activation': 'アクティベーション',
-  'skills.setup.voice.activeDescPrefix': 'Fn',
-  'skills.setup.voice.activeDescSuffix': 'Fn',
-  'skills.setup.voice.activeTitle': 'ボイスインテリジェンスが有効です',
-  'skills.setup.voice.customizeSettings': '設定をカスタマイズ',
-  'skills.setup.voice.downloadSttBtn': '音声設定を開く',
-  'skills.setup.voice.enableDesc': 'マイクを使用してハンズフリーでテキストを入力します。',
-  'skills.setup.voice.hotkey': 'ホットキー',
-  'skills.setup.voice.startBtn': '起動中...',
-  'skills.setup.voice.startError': '音声サーバーの起動に失敗しました',
-  'skills.setup.voice.starting': '起動中...',
-  'skills.setup.voice.stepEnable': '音声サーバーを起動',
-  'skills.setup.voice.stepSetup': '音声認識の設定が必要です',
-  'skills.setup.voice.stepSuccess': '準備完了',
-  'skills.setup.voice.sttNotReady': '音声認識モデルの準備ができていません',
-  'skills.setup.voice.sttNotReadyDesc':
-    'Voice Intelligence は動作する音声認識エンジンが必要です。設定 › 音声 で選択してください。',
-  'skills.setup.voice.sttReady': '音声認識モデルの準備が完了しました',
-  'skills.setup.voice.sttReturnHint':
-    '音声設定で音声認識エンジンを構成し、ここに戻って音声を開始してください。',
-  'skills.setup.voice.title': '音声インテリジェンス',
   'skills.uninstall.description':
     'これにより、スキルディレクトリとそのすべてのバンドルリソースが完全に削除されます。エージェントは次のターンからこれを認識しなくなります。',
   'upsell.global.limitMessage':
@@ -4129,8 +4076,6 @@ const messages: TranslationMap = {
     'OPENHUMAN_APPROVAL_GATE=0 のオーバーライドが検出されましたが無視されました: デスクトップアプリでは承認ゲートが常に有効に保たれます。',
 
   // Run queue
-  'notch.ready': '準備完了',
-  'notch.listening': '聞き取り中…',
 
   // Code block chrome
   'codeBlock.copy': 'コピー',

@@ -36,7 +36,7 @@ media
 # permission checks execute through TinyComputer; `voice` requires this gate.
 inference
 
-# STT/TTS, dictation server, reply speech. Shipped MISSING from v0.58.19 to
+# STT/TTS, reply speech, and live voice. Shipped MISSING from v0.58.19 to
 # v0.61.x (#4901) — the reason this whole guard exists.
 voice
 

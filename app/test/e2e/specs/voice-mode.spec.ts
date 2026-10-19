@@ -305,8 +305,7 @@ describe.skip('Voice mode — Human tab capture & error mapping (#1610)', () => 
   // ---------------------------------------------------------------------------
   // 6.1 — Human tab renders with MicComposer in idle state.
   //
-  // Checks that the Human tab mounts, shows the "Push to Talk" label in the
-  // mascot header, and the MicComposer idle button (aria-label="Start recording"
+  // Checks that the Human tab mounts the MicComposer idle button (aria-label="Start recording"
   // / visible label "Tap and speak") is present.
   // ---------------------------------------------------------------------------
   it('6.1 — Human tab renders with MicComposer in idle state', async () => {
@@ -317,17 +316,6 @@ describe.skip('Voice mode — Human tab capture & error mapping (#1610)', () => 
     await completeOnboardingIfVisible('[HumanTabE2E]');
 
     await navigateToHumanTab();
-
-    // The Human page renders a "Push to Talk" checkbox in the mascot header.
-    const hasPushToTalk = await textExists('Push to Talk');
-    if (!hasPushToTalk) {
-      const tree = await dumpAccessibilityTree();
-      console.log(
-        '[HumanTabE2E:6.1] Push-to-Talk not found. Accessibility tree:\n',
-        tree.slice(0, 4_000)
-      );
-    }
-    expect(hasPushToTalk).toBe(true);
 
     // The MicComposer is embedded via the sidebar Conversations with
     // composer="mic-cloud". The idle button label is "Tap and speak".

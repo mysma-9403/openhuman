@@ -11,7 +11,7 @@
 //! asks the navigation delegate before it asks for a new window).
 //!
 //! Only `main` is covered. It is the one webview whose content is the app UI
-//! and that can render arbitrary links; the PTT overlay renders none, and the
+//! and that can render arbitrary links; the child windows render none, and the
 //! shell creates no webviews that are meant to browse remote sites.
 
 use tauri::{plugin::TauriPlugin, Manager, Runtime};

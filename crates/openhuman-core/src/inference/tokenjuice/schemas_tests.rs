@@ -176,10 +176,11 @@ fn compress_declares_explicit_as_an_enum_of_the_accepted_kinds() {
 
 #[tokio::test]
 async fn every_tokenjuice_method_answers_component_disabled_when_juice_is_off() {
+    type ControllerHandler = fn(DispatchCtx, Map<String, Value>) -> ControllerFuture;
     let mut set = crate::core::runtime::ComponentSet::all();
     set.juice = false;
     let ctx = crate::core::runtime::context::CoreContext::for_test_with_components(set);
-    let handlers: [fn(DispatchCtx, Map<String, Value>) -> ControllerFuture; 8] = [
+    let handlers: [ControllerHandler; 8] = [
         handle_detect,
         handle_compress,
         handle_cache_stats,
