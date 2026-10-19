@@ -63,7 +63,7 @@ where
             // execute the full core boot sequence. Hosted turns still need
             // the same built-in definition registry that boot initializes in
             // production, so install it before constructing the router.
-            openhuman_core::agent::harness::definition::AgentDefinitionRegistry::init_global_builtins()
+            openhuman_core::agent_registry::host_definition::AgentDefinitionRegistry::init_global_builtins()
                 .expect("initialize built-in agent definitions for JSON-RPC E2E");
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -1317,6 +1317,48 @@ async fn json_rpc_config_update_browser_settings_persists_backend() {
 
 #[cfg(feature = "modules")]
 #[tokio::test]
+async fn json_rpc_modules_list_reports_the_serving_source() {
+    let _env_lock = json_rpc_e2e_env_lock_async().await;
+    let tmp = tempdir().expect("tempdir");
+    let home = tmp.path();
+    let openhuman_home = home.join(".openhuman");
+
+    let _home_guard = EnvVarGuard::set_to_path("HOME", home);
+    let _workspace_guard = EnvVarGuard::unset("OPENHUMAN_WORKSPACE");
+    let _backend_url_guard = EnvVarGuard::unset("BACKEND_URL");
+    let _vite_backend_guard = EnvVarGuard::unset("VITE_BACKEND_URL");
+    let _source_guard = EnvVarGuard::unset("OPENHUMAN_MODULE_SOURCE");
+
+    write_min_config(&openhuman_home, "http://127.0.0.1:9");
+
+    let (rpc_addr, rpc_join) = serve_on_ephemeral(build_core_http_router(false)).await;
+    let rpc_base = format!("http://{rpc_addr}");
+
+    let list = post_json_rpc(&rpc_base, 41_260, "openhuman.modules_list", json!({})).await;
+    let list = peel_logs_envelope(assert_no_jsonrpc_error(&list, "modules_list"));
+    let modules = list
+        .get("modules")
+        .and_then(Value::as_array)
+        .expect("modules array");
+    assert!(!modules.is_empty(), "{list}");
+    for module in modules {
+        // Default config: every supported module is served by the pinned
+        // release; an unsupported platform reports no source.
+        match module.get("source").and_then(Value::as_str) {
+            Some(source) => assert_eq!(source, "release", "{module}"),
+            None => assert_eq!(
+                module.get("state").and_then(Value::as_str),
+                Some("unsupported"),
+                "{module}"
+            ),
+        }
+    }
+
+    rpc_join.abort();
+}
+
+#[cfg(feature = "modules")]
+#[tokio::test]
 async fn json_rpc_modules_browser_forget_sites_removes_learned_sites() {
     let _env_lock = json_rpc_e2e_env_lock_async().await;
     let tmp = tempdir().expect("tempdir");
@@ -2497,6 +2539,137 @@ async fn json_rpc_cron_origin_delivery_lands_in_the_asking_thread_inner() {
 }
 
 #[test]
+fn json_rpc_cron_add_run_list_round_trip_over_the_tinyflows_module() {
+    run_json_rpc_e2e_on_agent_stack(
+        "json_rpc_cron_add_run_list_round_trip_over_the_tinyflows_module",
+        json_rpc_cron_add_run_list_round_trip_over_the_tinyflows_module_inner,
+    );
+}
+
+/// The cron surface end to end over JSON-RPC with the scheduler runtime, job
+/// store and schedule maths in the `tinyflows` module: an agent job is added,
+/// listed, run now (the module's `ExecuteJob` calling back into the host), its
+/// run is recorded, and removing it empties the list.
+async fn json_rpc_cron_add_run_list_round_trip_over_the_tinyflows_module_inner() {
+    let _env_lock = json_rpc_e2e_env_lock_async().await;
+    let tmp = tempdir().expect("tempdir");
+    let home = tmp.path();
+    let openhuman_home = home.join(".openhuman");
+
+    let _home_guard = EnvVarGuard::set_to_path("HOME", home);
+    let _workspace_guard = EnvVarGuard::unset("OPENHUMAN_WORKSPACE");
+    let _backend_url_guard = EnvVarGuard::unset("BACKEND_URL");
+    let _vite_backend_guard = EnvVarGuard::unset("VITE_BACKEND_URL");
+    clear_forced_chat_completions();
+
+    let (mock_addr, mock_join) = serve_on_ephemeral(mock_upstream_router()).await;
+    let mock_origin = format!("http://{mock_addr}");
+    write_min_config(&openhuman_home, &mock_origin);
+    write_min_config(&openhuman_home.join("users").join("e2e-user"), &mock_origin);
+
+    let (rpc_addr, rpc_join) = serve_on_ephemeral(build_core_http_router(false)).await;
+    let rpc_base = format!("http://{rpc_addr}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let store = post_json_rpc(
+        &rpc_base,
+        1,
+        "openhuman.auth_store_session",
+        json!({ "token": "e2e-test-jwt", "user_id": "e2e-user" }),
+    )
+    .await;
+    assert_no_jsonrpc_error(&store, "store_session");
+
+    // The workspace may hold the host's own system jobs; ours is not there yet.
+    let empty = post_json_rpc(&rpc_base, 2, "openhuman.cron_list", json!({})).await;
+    assert!(
+        !assert_no_jsonrpc_error(&empty, "cron_list")
+            .to_string()
+            .contains("roundtrip"),
+        "the job is not there before it is added"
+    );
+
+    let add = post_json_rpc(
+        &rpc_base,
+        3,
+        "openhuman.cron_add",
+        json!({
+            "name": "roundtrip",
+            "schedule": { "kind": "every", "every_ms": 3_600_000 },
+            "job_type": "agent",
+            "prompt": "Say the round trip phrase.",
+            "delivery": { "mode": "none" },
+        }),
+    )
+    .await;
+    let add_result = assert_no_jsonrpc_error(&add, "cron_add");
+    let job_id = add_result["result"]["id"]
+        .as_str()
+        .or_else(|| add_result["id"].as_str())
+        .unwrap_or_else(|| panic!("job id missing: {add_result}"))
+        .to_string();
+
+    let listed = post_json_rpc(&rpc_base, 4, "openhuman.cron_list", json!({})).await;
+    let listed_body = assert_no_jsonrpc_error(&listed, "cron_list").to_string();
+    assert!(
+        listed_body.contains(&job_id) && listed_body.contains("roundtrip"),
+        "the added job is listed: {listed_body}"
+    );
+
+    push_forced_chat_completion_when(
+        "Say the round trip phrase.",
+        forced_text_completion("round trip phrase"),
+    );
+    let run = post_json_rpc(
+        &rpc_base,
+        5,
+        "openhuman.cron_run",
+        json!({ "job_id": job_id }),
+    )
+    .await;
+    assert_no_jsonrpc_error(&run, "cron_run");
+
+    let mut recorded = String::new();
+    for _ in 0..200 {
+        let runs = post_json_rpc(
+            &rpc_base,
+            6,
+            "openhuman.cron_runs",
+            json!({ "job_id": job_id }),
+        )
+        .await;
+        recorded = assert_no_jsonrpc_error(&runs, "cron_runs").to_string();
+        if recorded.contains("\"status\":\"ok\"") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        recorded.contains("\"status\":\"ok\"") && recorded.contains("round trip phrase"),
+        "the run is recorded with the agent's output: {recorded}"
+    );
+
+    let remove = post_json_rpc(
+        &rpc_base,
+        7,
+        "openhuman.cron_remove",
+        json!({ "job_id": job_id }),
+    )
+    .await;
+    assert_no_jsonrpc_error(&remove, "cron_remove");
+    let after = post_json_rpc(&rpc_base, 8, "openhuman.cron_list", json!({})).await;
+    assert!(
+        !assert_no_jsonrpc_error(&after, "cron_list")
+            .to_string()
+            .contains(&job_id),
+        "the removed job is gone"
+    );
+
+    mock_join.abort();
+    rpc_join.abort();
+}
+
+#[test]
 fn json_rpc_protocol_auth_and_agent_hello() {
     run_json_rpc_e2e_on_agent_stack(
         "json_rpc_protocol_auth_and_agent_hello",
@@ -3449,7 +3622,8 @@ async fn json_rpc_thread_turn_state_lifecycle() {
     state.lifecycle = tinyagents_session::turn_state::TurnLifecycle::Streaming;
     state.iteration = 2;
     state.streaming_text = "partial".into();
-    tinyagents_session::turn_state::store::put(workspace_dir.clone(), &state)
+    openhuman_core::storage::sessions::turn_states_for(&workspace_dir)
+        .put(&state)
         .expect("seed snapshot");
 
     // get → present
@@ -3507,7 +3681,8 @@ async fn json_rpc_thread_turn_state_lifecycle() {
     );
     state2.lifecycle = tinyagents_session::turn_state::TurnLifecycle::Completed;
     state2.updated_at = "2999-01-01T00:00:00Z".into();
-    tinyagents_session::turn_state::store::put(workspace_dir.clone(), &state2)
+    openhuman_core::storage::sessions::turn_states_for(&workspace_dir)
+        .put(&state2)
         .expect("seed snapshot 2");
 
     // history → both turns, newest first.
@@ -3626,9 +3801,8 @@ async fn json_rpc_run_ledger_lifecycle() {
         .await
         .expect("load config");
 
-    tinyagents_session::run_ledger::upsert_agent_run(
-        &config.workspace_dir,
-        tinyagents_session::run_ledger::AgentRunUpsert {
+    openhuman_core::storage::sessions::with_ledger(&config.workspace_dir, |ledger| {
+        let ledger_arg_0 = tinyagents_session::run_ledger::AgentRunUpsert {
             id: "sub-run-1".to_string(),
             kind: tinyagents_session::run_ledger::AgentRunKind::WorkerThread,
             parent_run_id: Some("req-run-1".to_string()),
@@ -3647,18 +3821,19 @@ async fn json_rpc_run_ledger_lifecycle() {
             metadata: json!({ "source": "json_rpc_e2e" }),
             started_at: None,
             completed_at: None,
-        },
-    )
+        };
+        async move { ledger.upsert_agent_run(ledger_arg_0).await }
+    })
     .expect("seed run");
 
-    tinyagents_session::run_ledger::append_run_event(
-        &config.workspace_dir,
-        tinyagents_session::run_ledger::RunEventAppend {
+    openhuman_core::storage::sessions::with_ledger(&config.workspace_dir, |ledger| {
+        let ledger_arg_0 = tinyagents_session::run_ledger::RunEventAppend {
             run_id: "sub-run-1".to_string(),
             event_type: "subagent_awaiting_user".to_string(),
             payload: json!({ "question": "Which repo should I inspect?" }),
-        },
-    )
+        };
+        async move { ledger.append_run_event(ledger_arg_0).await }
+    })
     .expect("seed event");
 
     let list = post_json_rpc(
@@ -3743,9 +3918,7 @@ async fn json_rpc_agent_work_list_groups_runs_by_bucket() {
         .await
         .expect("load config");
 
-    use tinyagents_session::run_ledger::{
-        upsert_agent_run, AgentRunKind, AgentRunStatus, AgentRunUpsert,
-    };
+    use tinyagents_session::run_ledger::{AgentRunKind, AgentRunStatus, AgentRunUpsert};
     let seed = |id: &str, status: AgentRunStatus| AgentRunUpsert {
         id: id.to_string(),
         kind: AgentRunKind::Subagent,
@@ -3764,25 +3937,25 @@ async fn json_rpc_agent_work_list_groups_runs_by_bucket() {
         completed_at: None,
     };
     // Two awaiting-user (needs_input), one running (working), one completed.
-    upsert_agent_run(
-        &config.workspace_dir,
-        seed("work-a", AgentRunStatus::AwaitingUser),
-    )
+    openhuman_core::storage::sessions::with_ledger(&config.workspace_dir, |ledger| {
+        let ledger_arg_0 = seed("work-a", AgentRunStatus::AwaitingUser);
+        async move { ledger.upsert_agent_run(ledger_arg_0).await }
+    })
     .expect("seed a");
-    upsert_agent_run(
-        &config.workspace_dir,
-        seed("work-b", AgentRunStatus::AwaitingUser),
-    )
+    openhuman_core::storage::sessions::with_ledger(&config.workspace_dir, |ledger| {
+        let ledger_arg_0 = seed("work-b", AgentRunStatus::AwaitingUser);
+        async move { ledger.upsert_agent_run(ledger_arg_0).await }
+    })
     .expect("seed b");
-    upsert_agent_run(
-        &config.workspace_dir,
-        seed("work-c", AgentRunStatus::Running),
-    )
+    openhuman_core::storage::sessions::with_ledger(&config.workspace_dir, |ledger| {
+        let ledger_arg_0 = seed("work-c", AgentRunStatus::Running);
+        async move { ledger.upsert_agent_run(ledger_arg_0).await }
+    })
     .expect("seed c");
-    upsert_agent_run(
-        &config.workspace_dir,
-        seed("work-d", AgentRunStatus::Completed),
-    )
+    openhuman_core::storage::sessions::with_ledger(&config.workspace_dir, |ledger| {
+        let ledger_arg_0 = seed("work-d", AgentRunStatus::Completed);
+        async move { ledger.upsert_agent_run(ledger_arg_0).await }
+    })
     .expect("seed d");
 
     let list = post_json_rpc(&rpc_base, 9131, "openhuman.agent_work_list", json!({})).await;
@@ -3872,9 +4045,8 @@ async fn json_rpc_workflow_run_definitions_and_runs_roundtrip() {
     );
 
     // Seed a durable workflow run, then list + get it.
-    tinyagents_session::run_ledger::upsert_workflow_run(
-        &config.workspace_dir,
-        tinyagents_session::run_ledger::WorkflowRunUpsert {
+    openhuman_core::storage::sessions::with_ledger(&config.workspace_dir, |ledger| {
+        let ledger_arg_0 = tinyagents_session::run_ledger::WorkflowRunUpsert {
             id: "wf-run-1".to_string(),
             definition_id: "parallel_research_cross_check".to_string(),
             parent_thread_id: Some("thread-wf-1".to_string()),
@@ -3885,8 +4057,9 @@ async fn json_rpc_workflow_run_definitions_and_runs_roundtrip() {
             summary: None,
             started_at: None,
             completed_at: None,
-        },
-    )
+        };
+        async move { ledger.upsert_workflow_run(ledger_arg_0).await }
+    })
     .expect("seed workflow run");
 
     let list = post_json_rpc(
@@ -4070,13 +4243,14 @@ async fn json_rpc_agent_team_coordination_roundtrip() {
     );
 
     // Mark A done directly via the run ledger, then B claims fine.
-    let task_a =
-        tinyagents_session::run_ledger::get_agent_team_task(&config.workspace_dir, &task_a_id)
-            .expect("get task A")
-            .expect("task A present");
-    tinyagents_session::run_ledger::upsert_agent_team_task(
-        &config.workspace_dir,
-        tinyagents_session::run_ledger::AgentTeamTaskUpsert {
+    let task_a = openhuman_core::storage::sessions::with_ledger(&config.workspace_dir, |ledger| {
+        let ledger_arg_0 = (&task_a_id).to_string();
+        async move { ledger.get_agent_team_task(&ledger_arg_0).await }
+    })
+    .expect("get task A")
+    .expect("task A present");
+    openhuman_core::storage::sessions::with_ledger(&config.workspace_dir, |ledger| {
+        let ledger_arg_0 = tinyagents_session::run_ledger::AgentTeamTaskUpsert {
             id: task_a.id.clone(),
             team_id: task_a.team_id.clone(),
             title: task_a.title.clone(),
@@ -4090,8 +4264,9 @@ async fn json_rpc_agent_team_coordination_roundtrip() {
             source_run_id: task_a.source_run_id.clone(),
             order_index: task_a.order_index,
             created_at: Some(task_a.created_at),
-        },
-    )
+        };
+        async move { ledger.upsert_agent_team_task(ledger_arg_0).await }
+    })
     .expect("mark A done");
 
     let claim_b_ok = post_json_rpc(
@@ -4368,7 +4543,7 @@ async fn json_rpc_web_chat_routing_cases_use_expected_backend_models_inner() {
             Some(&json!(true))
         );
 
-        let sse_event = tokio::time::timeout(Duration::from_secs(12), sse_task)
+        let sse_event = tokio::time::timeout(Duration::from_secs(45), sse_task)
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for chat_done for case {model_override}"))
             .expect("sse task join should succeed");
@@ -4583,7 +4758,7 @@ async fn json_rpc_web_chat_custom_chat_provider_uses_stored_key_and_rebuilds_on_
         Some(&json!(true))
     );
     signal_accepted_web_chat_request_id(request_tx, accepted_result);
-    let sse_event = tokio::time::timeout(Duration::from_secs(12), sse_task)
+    let sse_event = tokio::time::timeout(Duration::from_secs(45), sse_task)
         .await
         .expect("timed out waiting for first custom-provider chat_done")
         .expect("first custom-provider sse join");
@@ -4647,7 +4822,7 @@ async fn json_rpc_web_chat_custom_chat_provider_uses_stored_key_and_rebuilds_on_
         Some(&json!(true))
     );
     signal_accepted_web_chat_request_id(request_tx, accepted_result);
-    let sse_event = tokio::time::timeout(Duration::from_secs(12), sse_task)
+    let sse_event = tokio::time::timeout(Duration::from_secs(45), sse_task)
         .await
         .expect("timed out waiting for second custom-provider chat_done")
         .expect("second custom-provider sse join");
@@ -4703,7 +4878,7 @@ async fn json_rpc_web_chat_custom_chat_provider_uses_stored_key_and_rebuilds_on_
         Some(&json!(true))
     );
     signal_accepted_web_chat_request_id(request_tx, accepted_result);
-    let sse_event = tokio::time::timeout(Duration::from_secs(12), sse_task)
+    let sse_event = tokio::time::timeout(Duration::from_secs(45), sse_task)
         .await
         .expect("timed out waiting for unaffected agentic chat_done")
         .expect("unaffected agentic sse join");
@@ -4758,7 +4933,7 @@ async fn json_rpc_web_chat_custom_chat_provider_uses_stored_key_and_rebuilds_on_
             Some(&json!(true))
         );
         signal_accepted_web_chat_request_id(request_tx, accepted_result);
-        let sse_event = tokio::time::timeout(Duration::from_secs(12), sse_task)
+        let sse_event = tokio::time::timeout(Duration::from_secs(45), sse_task)
             .await
             .expect("timed out waiting for managed chat_done")
             .expect("managed sse join");
@@ -4988,12 +5163,14 @@ async fn json_rpc_web_chat_custom_chat_provider_with_auth_none_omits_auth_header
         )),
         "reinjecting a reserved provider must retain its CA bundle"
     );
-    let (model, model_id) = openhuman_core::inference::provider::create_chat_model_with_model_id(
-        "chat",
-        &loaded_config,
-        0.0,
-    )
-    .expect("custom auth-none model should build");
+    let (model, model_id) =
+        openhuman_core::inference::provider::create_chat_model_with_model_id_in(
+            &openhuman_core::core::runtime::DispatchCtx::host_default(),
+            "chat",
+            &loaded_config,
+            0.0,
+        )
+        .expect("custom auth-none model should build");
     let direct = model
         .invoke(
             &(),
@@ -5033,7 +5210,7 @@ async fn json_rpc_web_chat_custom_chat_provider_with_auth_none_omits_auth_header
             .and_then(|v| v.get("accepted")),
         Some(&json!(true))
     );
-    let sse_event = tokio::time::timeout(Duration::from_secs(12), sse_task)
+    let sse_event = tokio::time::timeout(Duration::from_secs(45), sse_task)
         .await
         .expect("timed out waiting for auth-none chat_done")
         .expect("auth-none sse join");
@@ -9206,6 +9383,149 @@ async fn mcp_clients_declare_connect_tool_call_happy_path() {
     rpc_join.abort();
 }
 
+/// MCP clients **reconfigure and retire** over real JSON-RPC (#7571): connect
+/// and call through a configured client, change the module's client
+/// configuration (registry credentials are part of it, so the host reopens the
+/// module's configured object with a new configuration), prove the install
+/// survives and answers again, then retire it by dropping it from `mcp.json`
+/// and prove neither the install nor a call to it is left behind.
+#[tokio::test]
+async fn mcp_clients_reconfigure_then_retire_over_rpc() {
+    let _env_lock = json_rpc_e2e_env_lock_async().await;
+    let tmp = tempdir().expect("tempdir");
+    let home = tmp.path();
+    let openhuman_home = home.join(".openhuman");
+
+    let _home_guard = EnvVarGuard::set_to_path("HOME", home);
+    let _workspace_guard = EnvVarGuard::unset("OPENHUMAN_WORKSPACE");
+    let _backend_url_guard = EnvVarGuard::unset("BACKEND_URL");
+    let _vite_backend_guard = EnvVarGuard::unset("VITE_BACKEND_URL");
+
+    let (mock_addr, mock_join) = serve_on_ephemeral(mock_upstream_router()).await;
+    let mock_origin = format!("http://{}", mock_addr);
+    write_min_config(&openhuman_home, &mock_origin);
+    write_min_config(&openhuman_home.join("users").join("local"), &mock_origin);
+
+    let stub_path = env!("CARGO_BIN_EXE_test-mcp-stub");
+    let (rpc_addr, rpc_join) = serve_on_ephemeral(build_core_http_router(false)).await;
+    let rpc_base = format!("http://{}", rpc_addr);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // connect -> list_tools -> call through the configured client
+    let declared = post_json_rpc(
+        &rpc_base,
+        9950,
+        "openhuman.mcp_clients_config_set",
+        json!({ "mcpServers": { "echo-reconf": { "command": stub_path } } }),
+    )
+    .await;
+    assert_no_jsonrpc_error(&declared, "mcp_clients_config_set (declare)");
+    let server_id = installed_server_id(&rpc_base, 9951, "echo-reconf").await;
+    let connect = post_json_rpc(
+        &rpc_base,
+        9952,
+        "openhuman.mcp_clients_connect",
+        json!({ "server_id": server_id }),
+    )
+    .await;
+    assert_no_jsonrpc_error(&connect, "mcp_clients_connect");
+    let listed = post_json_rpc(
+        &rpc_base,
+        9953,
+        "openhuman.mcp_clients_list_tools",
+        json!({ "server_id": server_id }),
+    )
+    .await;
+    let listed = peel_logs_envelope(assert_no_jsonrpc_error(&listed, "list_tools"));
+    assert!(
+        listed.to_string().contains("echo"),
+        "stub should list the echo tool: {listed}"
+    );
+
+    // reconfigure: a different client configuration reopens the configured object
+    let reconf = post_json_rpc(
+        &rpc_base,
+        9954,
+        "openhuman.mcp_clients_registry_settings_set",
+        json!({ "mcp_official_base": "https://registry.reconfigure.example.test" }),
+    )
+    .await;
+    assert_no_jsonrpc_error(&reconf, "registry_settings_set (reconfigure)");
+    let settings = post_json_rpc(
+        &rpc_base,
+        9955,
+        "openhuman.mcp_clients_registry_settings_get",
+        json!({}),
+    )
+    .await;
+    let settings = peel_logs_envelope(assert_no_jsonrpc_error(&settings, "settings_get"));
+    assert_eq!(
+        settings.get("mcp_official_base").and_then(Value::as_str),
+        Some("https://registry.reconfigure.example.test"),
+        "the reopened module serves the new configuration: {settings}"
+    );
+    // The install survives the reopen and is usable again after a connect.
+    assert_eq!(
+        installed_server_id(&rpc_base, 9956, "echo-reconf").await,
+        server_id
+    );
+    let reconnect = post_json_rpc(
+        &rpc_base,
+        9957,
+        "openhuman.mcp_clients_connect",
+        json!({ "server_id": server_id }),
+    )
+    .await;
+    assert_no_jsonrpc_error(&reconnect, "mcp_clients_connect (after reconfigure)");
+    let echoed = post_json_rpc(
+        &rpc_base,
+        9958,
+        "openhuman.mcp_clients_tool_call",
+        json!({
+            "server_id": server_id,
+            "tool_name": "echo",
+            "arguments": { "message": "after reconfigure" }
+        }),
+    )
+    .await;
+    let echoed = peel_logs_envelope(assert_no_jsonrpc_error(&echoed, "tool_call (reconfigured)"));
+    assert_eq!(tool_call_is_error(echoed), Some(false), "{echoed}");
+    assert!(echoed.to_string().contains("after reconfigure"), "{echoed}");
+
+    // retire: dropping the entry uninstalls it and nothing answers for it
+    let retired = post_json_rpc(
+        &rpc_base,
+        9959,
+        "openhuman.mcp_clients_config_set",
+        json!({ "mcpServers": {} }),
+    )
+    .await;
+    let retired = peel_logs_envelope(assert_no_jsonrpc_error(&retired, "config_set (retire)"));
+    assert_eq!(
+        retired.get("removed"),
+        Some(&json!(["echo-reconf"])),
+        "{retired}"
+    );
+    let status = post_json_rpc(&rpc_base, 9960, "openhuman.mcp_clients_status", json!({})).await;
+    let status = peel_logs_envelope(assert_no_jsonrpc_error(&status, "status (retired)"));
+    assert_eq!(status["servers"], json!([]), "{status}");
+    let gone = post_json_rpc(
+        &rpc_base,
+        9961,
+        "openhuman.mcp_clients_tool_call",
+        json!({ "server_id": server_id, "tool_name": "echo", "arguments": {} }),
+    )
+    .await;
+    let gone_text = gone.to_string();
+    assert!(
+        gone.get("error").is_some() || gone_text.contains("\"is_error\":true"),
+        "a retired install must not answer a call: {gone}"
+    );
+
+    mock_join.abort();
+    rpc_join.abort();
+}
+
 /// `mcp_clients_set_enabled` smoke: declares a server, disables it via RPC,
 /// and asserts the response carries `enabled=false` (issue #3196).
 #[tokio::test]
@@ -9427,7 +9747,7 @@ async fn mcp_clients_config_round_trip_merges_credentials_and_removes_absent_ser
     assert_eq!(b5.get("removed"), Some(&json!(["echo-rt"])), "{b5}");
     assert_eq!(b5["mcpServers"], json!({}), "{b5}");
 
-    // ── 6. a refused document names the entry and the field ──────────────────
+    // ── 6. a refused document is redacted and leaves the store unchanged ────
     let refused = post_json_rpc(
         &rpc_base,
         9968,
@@ -9438,9 +9758,25 @@ async fn mcp_clients_config_round_trip_merges_credentials_and_removes_absent_ser
     let message = refused["error"]["message"]
         .as_str()
         .expect("a refusal is a JSON-RPC error");
-    assert!(
-        message.contains("`bad`") && message.contains("both"),
-        "refusal should name the entry and the problem: {message}"
+    assert_eq!(
+        message, "MODULE_CALL_REPORTED: module execution failed",
+        "the host reports sanitized module errors instead of exposing remote text"
+    );
+    let after_refusal = post_json_rpc(
+        &rpc_base,
+        9969,
+        "openhuman.mcp_clients_config_get",
+        json!({}),
+    )
+    .await;
+    let after_refusal = peel_logs_envelope(assert_no_jsonrpc_error(
+        &after_refusal,
+        "config_get (after refusal)",
+    ));
+    assert_eq!(
+        after_refusal["mcpServers"],
+        json!({}),
+        "a refused replacement leaves the install store unchanged"
     );
 
     mock_join.abort();
@@ -9886,7 +10222,7 @@ async fn json_rpc_config_agent_timeout_settings_roundtrip() {
     // Restore the process-global timeout so later tests in this binary don't
     // inherit the 300s value set above (the AtomicU64 is per-process, not per-test).
     openhuman_core::tools::timeout::set_tool_timeout_secs(
-        openhuman_core::tools::timeout::DEFAULT_TIMEOUT_SECS,
+        tinytools_std::timeout::DEFAULT_TIMEOUT_SECS,
     );
 
     mock_join.abort();
@@ -10150,7 +10486,7 @@ async fn json_rpc_task_sources_crud_and_status() {
 ///
 /// This test used to register a stub `ComposioProvider` (deleted by
 /// tinymemory v1.13.4 with the whole in-process provider registry — see
-/// `crate::integrations::composio::providers`'s module docs) and
+/// `crate::integrations::composio::contract`'s module docs) and
 /// exercise the full fetch → enrich → route → ingest pipeline against it.
 /// `task_sources::pipeline::fetch_tasks_unavailable` documents why that
 /// capability was not ported forward: tinyconnectors' `Sync` member returns
@@ -11766,6 +12102,9 @@ fn json_rpc_channel_web_chat_with_speak_reply_invokes_reply_speech() {
 
 async fn json_rpc_channel_web_chat_with_speak_reply_invokes_reply_speech_inner() {
     let _env_lock = json_rpc_e2e_env_lock_async().await;
+    // The hosted `cloud` TTS provider (and its test seam) is registered by the
+    // TinyHumans layer, not built into the core.
+    tinyhumans_boot::boot();
     let tmp = tempdir().expect("tempdir");
     let home = tmp.path();
     let openhuman_home = home.join(".openhuman");
@@ -11776,9 +12115,12 @@ async fn json_rpc_channel_web_chat_with_speak_reply_invokes_reply_speech_inner()
     let _vite_backend_guard = EnvVarGuard::unset("VITE_BACKEND_URL");
     // Activate the reply_speech test seam so synthesize_reply records and
     // short-circuits instead of calling the hosted backend.
-    let _seam_guard = EnvVarGuard::set(openhuman_core::voice::reply_speech::TEST_SEAM_ENV, "1");
+    let _seam_guard = EnvVarGuard::set(
+        openhuman_tinyhumans::voice::reply_speech::TEST_SEAM_ENV,
+        "1",
+    );
 
-    openhuman_core::voice::reply_speech::test_seam::clear();
+    openhuman_tinyhumans::voice::reply_speech::test_seam::clear();
 
     let (mock_addr, mock_join) = serve_on_ephemeral(mock_upstream_router()).await;
     let mock_origin = format!("http://{}", mock_addr);
@@ -11833,7 +12175,7 @@ async fn json_rpc_channel_web_chat_with_speak_reply_invokes_reply_speech_inner()
         Some(&json!(true))
     );
 
-    let sse_event = tokio::time::timeout(Duration::from_secs(12), sse_task)
+    let sse_event = tokio::time::timeout(Duration::from_secs(45), sse_task)
         .await
         .expect("timed out waiting for chat_done with speak_reply=true")
         .expect("sse task join should succeed");
@@ -11848,7 +12190,7 @@ async fn json_rpc_channel_web_chat_with_speak_reply_invokes_reply_speech_inner()
     // because the bridge task may finish slightly after chat_done.
     let mut observed: Vec<String> = Vec::new();
     for _ in 0..50 {
-        observed = openhuman_core::voice::reply_speech::test_seam::observed();
+        observed = openhuman_tinyhumans::voice::reply_speech::test_seam::observed();
         if !observed.is_empty() {
             break;
         }

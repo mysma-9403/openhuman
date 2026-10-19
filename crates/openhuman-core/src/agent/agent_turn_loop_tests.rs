@@ -194,7 +194,7 @@ async fn turn_handles_unknown_tool_gracefully() {
 // 6. Tool execution failure recovery
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn turn_recovers_from_tool_failure_and_tool_error() {
     let cases: [(&str, Box<dyn Tool>); 2] = [
         ("fail", Box::new(FailingTool)),
@@ -224,7 +224,7 @@ async fn turn_recovers_from_tool_failure_and_tool_error() {
 // 7. Provider error propagation
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn turn_propagates_provider_error() {
     let (mut agent, _tmp) =
         build_agent_with(Arc::new(FailingProvider), vec![], Box::new(NativeDialect));

@@ -2,42 +2,22 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tinyagents_runtime::{
-    DriverFailure, DriverOutcome, DriverRequest, PrefixSnapshot, ResumeMode, SessionDriver,
-    SessionTerminal, SessionTurnRequest, ToolSnapshot, TranscriptCodec, TranscriptTurnOptions,
-    TurnOptions,
+    DriverFailure, DriverOutcome, DriverRequest, PrefixSnapshot, ResumeMode, SessionBuilder,
+    SessionDriver, SessionTerminal, SessionTurnRequest, ToolSnapshot, TranscriptCodec,
+    TranscriptTurnOptions, TurnOptions,
 };
-use tinyagents_session::transcript::{FileTranscriptLocator, TranscriptMeta};
+use tinyagents_session::port::{InMemorySessionStores, SessionStoreProvider};
+use tinyagents_session::transcript::TranscriptMeta;
 use tinyinference_llm::message::Message;
 
-use super::announcement_notes::{
+use super::runtime_session::{account_committed_turn_against_goal, holistic_last_turn_usage};
+use super::{OpenHumanSessionHooks, OpenHumanTranscriptCodec};
+use crate::agent::tinyagents::host::OpenHumanRunContext;
+use crate::integrations::announcement_notes::{
     integration_announcement_note, mcp_announcement_note, skill_announcement_note,
 };
-use super::runtime_session::{
-    account_committed_turn_against_goal, begin_turn_resume, holistic_last_turn_usage,
-    reconcile_synthesized_visibility, OpenHumanSessionState,
-};
-use super::{OpenHumanSessionFactory, OpenHumanSessionHooks, OpenHumanTranscriptCodec};
-use crate::agent::tinyagents::host::OpenHumanRunContext;
 
 struct RecordingDriver(Arc<Mutex<Vec<OpenHumanRunContext>>>);
-
-#[test]
-fn transcript_suppression_is_applied_before_resume() {
-    let mut state = OpenHumanSessionState::default();
-    state.pending_turn_overrides = super::TurnOverrides {
-        suppress_transcript_autoload: true,
-        suppress_tools: true,
-        ..Default::default()
-    };
-    let mut resume = ResumeMode::LatestForAgent;
-
-    begin_turn_resume(&mut state, &mut resume);
-
-    assert_eq!(resume, ResumeMode::Never);
-    assert!(state.pending_turn_overrides == super::TurnOverrides::default());
-    assert!(state.active_turn_overrides.suppress_transcript_autoload);
-    assert!(state.active_turn_overrides.suppress_tools);
-}
 
 #[async_trait]
 impl SessionDriver<OpenHumanRunContext> for RecordingDriver {
@@ -65,7 +45,7 @@ impl SessionDriver<OpenHumanRunContext> for RecordingDriver {
 fn codec_marks_failed_tool_rows_from_the_explicit_turn_sidecar() {
     let context = OpenHumanRunContext::new();
     context.session_sidecar.lock().unwrap().tool_outcomes.push(
-        crate::agent::tinyagents::ToolCallOutcome {
+        tinyagents_harness::turn_outcome::ToolCallOutcome {
             call_id: "call-1".into(),
             name: "dangerous_tool".into(),
             arguments: serde_json::json!({"path": "secret"}),
@@ -112,16 +92,16 @@ fn codec_attaches_only_this_agents_own_sidecar_usage_to_atomic_append() {
         sidecar.input_tokens = 13;
         sidecar.output_tokens = 8;
         sidecar.cached_input_tokens = 3;
-        sidecar.cost = crate::agent::cost::CostTally {
+        sidecar.cost = tinyagents_harness::cost::CostTally {
             known_usd: 0.004,
-            source: crate::agent::cost::CostSource::Charged,
+            source: tinyagents_harness::cost::CostSource::Charged,
         };
         sidecar.context_window = 128_000;
         sidecar.last_call_input_tokens = 9;
         sidecar.last_call_output_tokens = 2;
         sidecar
             .tool_outcomes
-            .push(crate::agent::tinyagents::ToolCallOutcome {
+            .push(tinyagents_harness::turn_outcome::ToolCallOutcome {
                 call_id: "call-usage".into(),
                 name: "read_file".into(),
                 arguments: serde_json::json!({"path": "Cargo.toml"}),
@@ -138,7 +118,7 @@ fn codec_attaches_only_this_agents_own_sidecar_usage_to_atomic_append() {
             output_tokens: 2,
             cached_input_tokens: 1,
             charged_amount_usd: 0.001,
-            cost_source: crate::agent::cost::CostSource::Charged,
+            cost_source: tinyagents_harness::cost::CostSource::Charged,
         },
     });
     // `OpenHumanRunContext` is `Clone` and its child ledger is an `Arc`, so this
@@ -203,29 +183,27 @@ fn last_turn_usage_reports_the_same_holistic_totals_as_transcript_billing() {
         input_tokens: 13,
         output_tokens: 8,
         cached_input_tokens: 3,
-        cost: crate::agent::cost::CostTally {
+        cost: tinyagents_harness::cost::CostTally {
             known_usd: 0.004,
-            source: crate::agent::cost::CostSource::Charged,
+            source: tinyagents_harness::cost::CostSource::Charged,
         },
         context_window: 128_000,
         last_call_input_tokens: 9,
         last_call_output_tokens: 2,
         ..Default::default()
     };
-    sidecar
-        .subagents
-        .push(crate::agent::tinyagents::host::SubagentUsageEntry {
-            task_id: "child-ui".into(),
-            agent_id: "researcher".into(),
-            usage: crate::agent::subagent_host::SubagentUsage {
-                input_tokens: 5,
-                output_tokens: 2,
-                cached_input_tokens: 1,
-                charged_amount_usd: 0.001,
-                cost_source: crate::agent::cost::CostSource::Charged,
-            },
-        });
-
+    let child = crate::agent::tinyagents::host::SubagentUsageEntry {
+        task_id: "child-ui".into(),
+        agent_id: "researcher".into(),
+        usage: crate::agent::subagent_host::SubagentUsage {
+            input_tokens: 5,
+            output_tokens: 2,
+            cached_input_tokens: 1,
+            charged_amount_usd: 0.001,
+            cost_source: tinyagents_harness::cost::CostSource::Charged,
+        },
+    };
+    sidecar.subagents.push(child.clone());
     let usage = holistic_last_turn_usage(&sidecar);
     assert_eq!(usage.input_tokens, 18);
     assert_eq!(usage.output_tokens, 10);
@@ -240,7 +218,7 @@ fn last_turn_usage_reports_the_same_holistic_totals_as_transcript_billing() {
 
 #[test]
 fn explicit_hidden_delegate_stays_hidden_across_dynamic_refreshes() {
-    let mut visible = ["read_file".to_string()]
+    let visible = ["read_file".to_string()]
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
     let prior = [
@@ -256,25 +234,29 @@ fn explicit_hidden_delegate_stays_hidden_across_dynamic_refreshes() {
     .into_iter()
     .collect::<std::collections::HashSet<_>>();
 
-    reconcile_synthesized_visibility(&mut visible, &prior, &refreshed, false);
+    let mut managed = tinyagents_runtime::ManagedToolNames {
+        visible,
+        ..Default::default()
+    };
+    managed.refresh_synthesized(&prior, &refreshed, false);
 
     assert!(
-        !visible.contains("delegate_research"),
+        !managed.visible.contains("delegate_research"),
         "an explicitly hidden existing delegate remains hidden after refresh"
     );
     assert!(
-        !visible.contains("delegate_drive"),
+        !managed.visible.contains("delegate_drive"),
         "a new connection cannot bypass an explicit visibility restriction"
     );
     assert!(
-        !visible.contains("delegate_calendar"),
+        !managed.visible.contains("delegate_calendar"),
         "a revoked connection leaves the surface"
     );
 }
 
 #[test]
 fn wildcard_delegate_visibility_admits_new_connections_and_removes_revoked_ones() {
-    let mut visible = ["read_file".to_string(), "delegate_calendar".to_string()]
+    let visible = ["read_file".to_string(), "delegate_calendar".to_string()]
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
     let prior = ["delegate_calendar".to_string()]
@@ -284,33 +266,48 @@ fn wildcard_delegate_visibility_admits_new_connections_and_removes_revoked_ones(
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
 
-    reconcile_synthesized_visibility(&mut visible, &prior, &refreshed, true);
+    let mut managed = tinyagents_runtime::ManagedToolNames {
+        visible,
+        ..Default::default()
+    };
+    managed.refresh_synthesized(&prior, &refreshed, true);
 
-    assert!(visible.contains("delegate_drive"));
-    assert!(!visible.contains("delegate_calendar"));
-    assert!(visible.contains("read_file"));
+    assert!(managed.visible.contains("delegate_drive"));
+    assert!(!managed.visible.contains("delegate_calendar"));
+    assert!(managed.visible.contains("read_file"));
 }
 
 #[tokio::test]
 async fn committed_goal_accounting_uses_direct_and_completed_child_usage() {
     let workspace = tempfile::tempdir().unwrap();
-    crate::agent::goals::store::set(
-        workspace.path(),
-        "receipt-goal",
-        "finish migration",
-        Some(20),
-    )
-    .await
-    .unwrap();
-    let mut sidecar = crate::agent::tinyagents::host::run_context::SessionTurnSidecar {
-        input_tokens: 9,
-        output_tokens: 4,
-        duration: Some(std::time::Duration::from_secs(2)),
-        ..Default::default()
-    };
-    sidecar
-        .subagents
-        .push(crate::agent::tinyagents::host::SubagentUsageEntry {
+    let core = crate::core::runtime::CoreContext::for_test(
+        crate::core::runtime::DomainSet::full(),
+        Some(workspace.path().to_path_buf()),
+    );
+    crate::core::runtime::CoreContext::scope(core, async {
+        let goal_store = crate::storage::sessions::stores_or_ephemeral(workspace.path()).kv;
+        tinyagents_graph::goals::store::set(
+            &goal_store,
+            "receipt-goal",
+            "finish migration",
+            Some(20),
+        )
+        .await
+        .unwrap();
+        assert!(
+            tinyagents_graph::goals::store::get(&goal_store, "receipt-goal")
+                .await
+                .unwrap()
+                .is_some(),
+            "the scoped goal store must contain the fixture before accounting"
+        );
+        let mut sidecar = crate::agent::tinyagents::host::run_context::SessionTurnSidecar {
+            input_tokens: 9,
+            output_tokens: 4,
+            duration: Some(std::time::Duration::from_secs(2)),
+            ..Default::default()
+        };
+        let child = crate::agent::tinyagents::host::SubagentUsageEntry {
             task_id: "child-goal".into(),
             agent_id: "researcher".into(),
             usage: crate::agent::subagent_host::SubagentUsage {
@@ -318,23 +315,25 @@ async fn committed_goal_accounting_uses_direct_and_completed_child_usage() {
                 output_tokens: 3,
                 ..Default::default()
             },
-        });
+        };
+        sidecar.subagents.push(child);
+        account_committed_turn_against_goal(workspace.path(), Some("receipt-goal"), &sidecar).await;
 
-    account_committed_turn_against_goal(workspace.path(), Some("receipt-goal"), &sidecar).await;
-
-    let goal = crate::agent::goals::store::get(workspace.path(), "receipt-goal")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        goal.tokens_used, 21,
-        "receipt accounts direct + child usage"
-    );
-    assert_eq!(
-        goal.status,
-        crate::agent::goals::ThreadGoalStatus::BudgetLimited,
-        "receipt-backed accounting advances continuation/budget state"
-    );
+        let goal = tinyagents_graph::goals::store::get(&goal_store, "receipt-goal")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            goal.tokens_used, 21,
+            "receipt accounts direct + child usage"
+        );
+        assert_eq!(
+            goal.status,
+            tinyagents_graph::goals::ThreadGoalStatus::BudgetLimited,
+            "receipt-backed accounting advances continuation/budget state"
+        );
+    })
+    .await;
 }
 
 fn meta() -> TranscriptMeta {
@@ -393,22 +392,19 @@ async fn runtime_adapter_passes_host_context_commits_before_finalize_and_emits_o
             }
         },
     ));
-    let root = std::env::temp_dir().join(format!(
-        "openhuman-session-adapter-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let locator = InMemorySessionStores::new()
+        .for_agent("adapter-test")
+        .transcripts;
     let context = OpenHumanRunContext::new();
     let cancellation = context.cancellation.clone();
-    let mut session = OpenHumanSessionFactory::build(
-        Arc::new(RecordingDriver(Arc::clone(&seen_context))),
-        hooks,
-        PrefixSnapshot::default(),
-        ToolSnapshot::default(),
-        Arc::new(FileTranscriptLocator::new(&root)),
-        "adapter-test",
-        meta(),
-    )
-    .unwrap();
+    let mut session = SessionBuilder::new(Arc::new(RecordingDriver(Arc::clone(&seen_context))))
+        .codec(Arc::new(OpenHumanTranscriptCodec))
+        .hooks(hooks)
+        .prefix(PrefixSnapshot::default())
+        .tool_snapshot(ToolSnapshot::default())
+        .transcript(Arc::clone(&locator), "adapter-test", meta())
+        .build()
+        .unwrap();
 
     session
         .turn(
@@ -422,6 +418,7 @@ async fn runtime_adapter_passes_host_context_commits_before_finalize_and_emits_o
                 cancellation: cancellation.clone(),
                 run_context: context
                     .into_tinyagents(tinyagents_harness::context::RunConfig::new("adapter-turn")),
+                controls: Default::default(),
             },
         )
         .await
@@ -434,10 +431,10 @@ async fn runtime_adapter_passes_host_context_commits_before_finalize_and_emits_o
         [SessionTerminal::Completed(_)]
     ));
     assert!(
-        root.join("session_raw").exists(),
+        locator.latest_for_agent("adapter-test").is_some()
+            || locator.root_for_thread("thread-1").is_some(),
         "commit precedes finalization"
     );
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// Mid-conversation availability notes are prepended to the user's next
@@ -488,8 +485,9 @@ fn a_subagent_thread_binding_claims_no_session_identity() {
     };
     std::fs::create_dir_all(&config.workspace_dir).unwrap();
 
+    let ctx = crate::core::runtime::DispatchCtx::ambient();
     let mut root =
-        super::OpenHumanSessionHost::from_config_for_agent(&config, "orchestrator").unwrap();
+        super::OpenHumanSessionHost::from_config_for_agent(&ctx, &config, "orchestrator").unwrap();
     root.set_thread_id(Some("thread-1"));
     // The exact stem encoding (sanitisation, per-component digest, generation
     // suffix) belongs to tinyagents and is pinned by its own tests. What
@@ -504,7 +502,7 @@ fn a_subagent_thread_binding_claims_no_session_identity() {
     );
 
     let mut child =
-        super::OpenHumanSessionHost::from_config_for_agent(&config, "orchestrator").unwrap();
+        super::OpenHumanSessionHost::from_config_for_agent(&ctx, &config, "orchestrator").unwrap();
     child.session_parent_prefix = Some("1713000000_orchestrator".into());
     child.set_thread_id(Some("thread-1"));
     assert_eq!(child.session_id(), None);
@@ -613,14 +611,13 @@ async fn production_turn_path_wires_an_artifact_store_outside_the_project() {
         "the production turn path must wire an artifact store, or oversized \
          tool results are truncated with their tail discarded (#6408)",
     );
-    assert!(store.is_detached(), "the pointer must be absolute");
     assert_eq!(
-        store.root(),
+        store.materialize_root(),
         crate::security::policy::tool_result_artifacts_dir(workspace.path()),
         "the store must live under the workspace, not in the project the agent edits"
     );
-    assert!(!store.root().starts_with(action_dir.path()));
-    assert!(!store.root().starts_with(turn_root.path()));
+    assert!(!store.materialize_root().starts_with(action_dir.path()));
+    assert!(!store.materialize_root().starts_with(turn_root.path()));
 }
 
 /// Without a descriptor the answer is the same: the workspace, not
@@ -656,7 +653,7 @@ async fn artifact_store_stays_in_the_workspace_without_a_descriptor() {
         .as_ref()
         .expect("artifact store");
     assert_eq!(
-        store.root(),
+        store.materialize_root(),
         crate::security::policy::tool_result_artifacts_dir(workspace.path())
     );
 }

@@ -5,7 +5,7 @@
 //! |---|---|---|
 //! | [`cli`] | `tinyhumans::install` → the server launcher → `run_core_from_args` | [`cli_builder`]: the `cli` preset, connected, with the server launcher and the `http_host` controllers |
 //! | [`desktop`] | `tinyhumans::install` + the embedded server entry | [`desktop_builder`]: the `desktop` preset, connected, with the bearer, listener, services, server launcher and `http_host` controllers |
-//! | [`tui`] | `tinyhumans::install` + `session_store::install_for_host` + `CoreBuilder(full, none)` | [`tui_builder`]: the `tui` preset, connected, with the on-disk session store ([`tui`] swaps in the configured storage URL's store) |
+//! | [`tui`] | `tinyhumans::install` + `session_store::install_for_host` + `CoreBuilder(full, none)` | [`tui_builder`]: the `tui` preset, connected ([`tui`] adds the storage-backed session store) |
 //!
 //! Each `*_builder` returns a [`tinyhumans::RuntimeBuilder`] so a host can
 //! adjust it (product identity, hooks, a different ranker) before handing it
@@ -17,12 +17,12 @@
 //!
 //! # Behavior notes
 //!
-//! - The desktop and CLI servers install the on-disk session store for the
-//!   life of the process (see `server::shims::build_and_serve`), exactly as the
-//!   `run_server*` shims do; the TUI hands it to the builder, which restores
-//!   the previous provider when its runtime drops at exit. Both honour a
-//!   storage URL (`OPENHUMAN_STORAGE_URL`, else `[storage] url`): with one,
-//!   conversations live in that backend instead of the on-disk layout.
+//! - The desktop and CLI servers install the storage-backed session store for
+//!   the life of the process (see `server::shims::build_and_serve`), exactly as
+//!   the `run_server*` shims do; the TUI hands it to the builder, which
+//!   restores the previous provider when its runtime drops at exit. Both
+//!   resolve one storage URL (`OPENHUMAN_STORAGE_URL`, else `[storage] url`,
+//!   else `sqlite:<workspace>/storage`).
 //! - Builder seams follow embed's install/restore rules: the hosted and
 //!   `http_host` controllers and the server launcher stay for the process; the
 //!   Jev ranker is restored when the runtime drops. A desktop server that
@@ -81,6 +81,8 @@ fn embed_info(args: &[String]) -> anyhow::Result<Option<crate::embed::RuntimeInf
 /// the dispatched command failed.
 #[cfg(feature = "server")]
 pub fn cli(args: &[String]) -> anyhow::Result<()> {
+    // Config reads below (and in the dispatcher) need the enricher.
+    openhuman_tinyhumans::register_hooks();
     // Introspection belongs above the core: never introduce a core -> embed dependency.
     if let Some(info) = embed_info(args)? {
         println!("{}", serde_json::to_string_pretty(&info)?);
@@ -108,15 +110,11 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
             && crate::core_host::core::all::cli_handler_for_namespace(namespace).is_some()
     }) {
         // A one-shot command reads the same backend the server would: the
-        // configured storage URL, opened on the core's storage runtime so the
-        // backend outlives this call. No URL leaves the classic layout alone.
-        let provider = crate::core_host::storage::block_on_anyhow(
-            crate::session_store::provider_if_configured(),
-        )?;
-        if let Some(provider) = provider {
-            log::debug!("[rpc:host] cli: storage-backed session store installed");
-            builder = builder.session_store(provider);
-        }
+        // resolved storage URL, opened on the core's storage runtime so the
+        // backend outlives this call.
+        let provider = crate::core_host::storage::block_on_anyhow(session_store_for_boot())?;
+        log::debug!("[rpc:host] cli: storage-backed session store installed");
+        builder = builder.session_store(provider);
     }
     builder.run_from_args(args)
 }
@@ -267,6 +265,7 @@ pub async fn desktop(
     shutdown_token: CancellationToken,
     ready_tx: tokio::sync::oneshot::Sender<EmbeddedReadySignal>,
 ) -> anyhow::Result<()> {
+    openhuman_tinyhumans::register_hooks();
     secret_storage::install();
     log::debug!("[rpc:host] desktop options={options:?}");
     serve_desktop(desktop_builder(&options), shutdown_token, ready_tx).await
@@ -295,20 +294,19 @@ pub async fn serve_desktop(
 }
 
 /// The terminal UI's builder: the `tui` preset (every domain, no transport,
-/// no background services) with the on-disk session store.
+/// no background services). [`tui`] adds the storage-backed session store.
 #[cfg(feature = "session-store")]
 pub fn tui_builder() -> RuntimeBuilder {
-    RuntimeBuilder::tui().session_store(crate::session_store::provider())
+    RuntimeBuilder::tui()
 }
 
 /// Boot the TUI's in-process core, connected. The returned runtime owns the
 /// core for the session; `Runtime::core_runtime` hands the TUI its
 /// `CoreRuntime`.
 ///
-/// Conversations stay in the classic on-disk layout, as the desktop keeps
-/// them, unless a storage URL (`OPENHUMAN_STORAGE_URL` / `[storage] url`) is
-/// set: then [`tui_builder`]'s on-disk store is replaced with the storage-backed
-/// one ([`crate::session_store::provider_for_host`]).
+/// Conversations live in the storage backend the host's configuration names
+/// (`OPENHUMAN_STORAGE_URL` / `[storage] url`, else `sqlite:<workspace>/storage`;
+/// [`crate::session_store::provider_for_host`]).
 ///
 /// # Errors
 ///
@@ -316,9 +314,10 @@ pub fn tui_builder() -> RuntimeBuilder {
 /// could not be built.
 #[cfg(feature = "session-store")]
 pub async fn tui() -> anyhow::Result<openhuman_tinyhumans::embed::Runtime> {
+    openhuman_tinyhumans::register_hooks();
     secret_storage::install();
     log::debug!("[rpc:host] tui: building connected runtime");
-    let session_store = crate::session_store::provider_for_host().await?;
+    let session_store = session_store_for_boot().await?;
     let runtime = tui_builder()
         .session_store(session_store)
         .build()
@@ -329,6 +328,18 @@ pub async fn tui() -> anyhow::Result<openhuman_tinyhumans::embed::Runtime> {
         })?;
     log::info!("[rpc:host] tui: core built (DomainSet::full, ServiceSet::none)");
     Ok(runtime)
+}
+
+/// The storage-backed session store a host opens *before* its runtime is
+/// connected. Opening it loads the config (to resolve `[storage] url`), so the
+/// TinyHumans config hooks go in first: without the enricher the load-time
+/// migrations cannot tell a managed endpoint from a custom one and would
+/// rewrite a legacy managed config.
+#[cfg(feature = "session-store")]
+async fn session_store_for_boot(
+) -> anyhow::Result<std::sync::Arc<dyn tinyagents_session::port::SessionStoreProvider>> {
+    openhuman_tinyhumans::register_hooks();
+    crate::session_store::provider_for_host().await
 }
 
 #[cfg(test)]

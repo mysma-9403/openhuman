@@ -4,9 +4,10 @@
 //! serves a profile) and until when. Two implementations share the
 //! [`LeaseStore`] contract:
 //!
-//! - [`DocumentLeases`] keeps one record per key in the document port
-//!   (scope [`CLUSTER_SCOPE`], collection [`LEASE_COLLECTION`]) and moves it
-//!   only by compare-and-swap, so it is correct across processes on a driver
+//! - [`DocumentLeases`] keeps one record per key in tinystoragedrivers'
+//!   `tsd.leases` ([`LEASE_COLLECTION`], scope [`CLUSTER_SCOPE`]) through
+//!   its [`Leases`](tinystoragedrivers::Leases) primitive, which moves it only
+//!   by compare-and-swap, so it is correct across processes on a driver
 //!   with cross-process CAS ([`super::driver_has_cross_process_cas`]).
 //! - [`LocalLeases`] is for hosts without a backend: an exclusive `flock` on
 //!   `<root>/<sha256(key) hex>/.lease`, which the OS drops when the holder dies.
@@ -28,10 +29,12 @@
 //!   node supplies its own `now_ms`). This module does not check epochs at
 //!   the protected resource; [`super::fence`] does, for storage-port writes. An epoch at `u64::MAX` cannot be advanced, so a
 //!   takeover of it fails with a storage error instead of repeating it.
-//! - **renew** extends a grant by compare-and-swap on the version it holds.
-//!   Any write since (a takeover, a release) makes it [`LeaseError::Lost`].
-//! - **release** marks the record `released = true` under the same CAS and
-//!   keeps it, so the next acquirer can tell a clean hand-over from a crash.
+//! - **renew** extends a grant while it is the latest one its holder was
+//!   issued at that epoch and the stored record still names its holder and
+//!   epoch. Any takeover, release or newer grant since makes it
+//!   [`LeaseError::Lost`].
+//! - **release** marks the record `released = true` and keeps it, so the next
+//!   acquirer can tell a clean hand-over from a crash.
 //!
 //! # `previous_unclean`
 //!
@@ -55,14 +58,14 @@ use tinystoragedrivers::Version;
 
 use super::StorageError;
 
-pub use super::lease_documents::DocumentLeases;
+pub use super::lease_documents::{DocumentLeases, LEASE_OWNER};
 pub use super::lease_local::LocalLeases;
 
 /// The storage scope lease records live under, shared by every node.
 pub const CLUSTER_SCOPE: &str = "cluster";
 
-/// The collection lease records live in.
-pub const LEASE_COLLECTION: &str = "leases";
+/// The collection lease records live in: tinystoragedrivers' `tsd.leases`.
+pub const LEASE_COLLECTION: &str = tinystoragedrivers::primitives::LEASES;
 
 /// The longest key a lease accepts, in bytes.
 pub const MAX_KEY_LEN: usize = 200;
@@ -108,7 +111,8 @@ pub struct LeaseGrant {
     pub key: String,
     /// The epoch this grant fences with.
     pub epoch: u64,
-    /// The record version this grant wrote; renew and release CAS on it.
+    /// Which grant of this epoch it is: every acquire or renew by the holder
+    /// issues the next one, and only the latest can renew or release.
     pub version: Version,
     /// The grant is void from this instant (milliseconds) on unless renewed.
     pub expires_at_ms: u64,
@@ -167,13 +171,18 @@ pub trait LeaseStore: Send + Sync {
     /// [`LeaseError::Storage`].
     async fn holder(&self, key: &str) -> Result<Option<LeaseRecord>, LeaseError>;
 
-    /// The storage scope whose [`LEASE_COLLECTION`] holds this store's
-    /// records (document id = key), when they live in the storage ports at
-    /// all. A storage driver with fencing can then check a write against the
-    /// record in the same atomic step ([`super::fence::LeaseFence::driver_fence`]).
-    /// `None` (the default) for stores that keep records elsewhere, such as
-    /// file locks.
-    fn record_scope(&self) -> Option<tinystoragedrivers::Scope> {
+    /// The fence a storage driver enforces for `node`'s grant on `key` at
+    /// `epoch`, when the record lives in the storage ports at all: the
+    /// record must still name `node` at `epoch`, unreleased. The driver then
+    /// checks a write against the record in the same atomic step
+    /// ([`super::fence::LeaseFence::driver_fence`]). `None` (the default) for
+    /// stores that keep records elsewhere, such as file locks.
+    fn driver_fence(
+        &self,
+        _key: &str,
+        _node: &str,
+        _epoch: u64,
+    ) -> Option<tinystoragedrivers::Fence> {
         None
     }
 }

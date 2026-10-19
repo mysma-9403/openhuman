@@ -18,7 +18,9 @@ async fn inference_gate_skips_when_no_agent_nodes() {
         ],
         "edges": [ { "from_node": "t", "to_node": "post" } ]
     }));
-    let errors = validate_inference_readiness(&config, &g).await;
+    let errors =
+        validate_inference_readiness(&crate::core::runtime::DispatchCtx::ambient(), &config, &g)
+            .await;
     assert!(errors.is_empty(), "{errors:?}");
 }
 
@@ -35,7 +37,7 @@ async fn run_builder_gates_does_not_reject_when_signed_out() {
     // Authoring is never blocked by inference readiness (design correction,
     // B45): a signed-out session must NOT appear among `run_builder_gates`'
     // errors for an otherwise-valid agent-node graph.
-    let _signed_out = crate::cron::scheduler_gate::SignedOutTestGuard::set(true);
+    let _signed_out = crate::platform::llm_gate::SignedOutTestGuard::set(true);
 
     let tmp = TempDir::new().unwrap();
     let config = test_config(&tmp);
@@ -46,7 +48,8 @@ async fn run_builder_gates_does_not_reject_when_signed_out() {
         ],
         "edges": [ { "from_node": "t", "to_node": "a" } ]
     }));
-    let errors = run_builder_gates(&config, &g).await;
+    let errors =
+        run_builder_gates(&crate::core::runtime::DispatchCtx::ambient(), &config, &g).await;
     assert!(
         errors.is_empty(),
         "authoring must not be blocked by a signed-out session: {errors:?}"
@@ -61,7 +64,7 @@ async fn proposal_surfaces_signed_out_inference_status() {
     // The proposal still WARNS about the signed-out state (advisory, never a
     // rejection) so the UI can render a "sign in" nudge alongside the built
     // workflow.
-    let _signed_out = crate::cron::scheduler_gate::SignedOutTestGuard::set(true);
+    let _signed_out = crate::platform::llm_gate::SignedOutTestGuard::set(true);
 
     let tmp = TempDir::new().unwrap();
     let config = test_config(&tmp);
@@ -74,6 +77,7 @@ async fn proposal_surfaces_signed_out_inference_status() {
     }));
 
     let payload = build_builder_proposal(
+        &crate::core::runtime::DispatchCtx::ambient(),
         &config,
         "propose_workflow",
         "agent-flow",
@@ -122,7 +126,9 @@ async fn inference_gate_passes_when_model_constructs() {
         ],
         "edges": [ { "from_node": "t", "to_node": "a" } ]
     }));
-    let errors = validate_inference_readiness(&config, &g).await;
+    let errors =
+        validate_inference_readiness(&crate::core::runtime::DispatchCtx::ambient(), &config, &g)
+            .await;
     assert!(errors.is_empty(), "{errors:?}");
 }
 
@@ -149,7 +155,9 @@ async fn inference_gate_surfaces_construction_error() {
         ],
         "edges": [ { "from_node": "t", "to_node": "a" } ]
     }));
-    let errors = validate_inference_readiness(&config, &g).await;
+    let errors =
+        validate_inference_readiness(&crate::core::runtime::DispatchCtx::ambient(), &config, &g)
+            .await;
     assert!(!errors.is_empty(), "a construction failure must reject");
     assert!(
         errors.iter().any(|e| e.contains("Node 'a'")),
@@ -181,7 +189,7 @@ fn agent_node_role_prefers_custom_registry_entry_model_pin_over_default() {
     // precedence `OpenHumanAgentRunner::run_via_harness` applies via
     // `resolve_node_model(&request, entry_model)`, reusing the same sync,
     // config-only accessor (`find_custom_in_config`) it calls.
-    use crate::agent::registry::types::{AgentRegistryEntry, AgentRegistrySource};
+    use crate::agent_registry::types::{AgentRegistryEntry, AgentRegistrySource};
 
     let tmp = TempDir::new().unwrap();
     let mut config = test_config(&tmp);
@@ -249,7 +257,9 @@ async fn inference_gate_probes_every_distinct_agent_node_role() {
         ]
     }));
 
-    let errors = validate_inference_readiness(&config, &g).await;
+    let errors =
+        validate_inference_readiness(&crate::core::runtime::DispatchCtx::ambient(), &config, &g)
+            .await;
     assert!(
         !errors.is_empty(),
         "both roles are broken, the gate must reject"

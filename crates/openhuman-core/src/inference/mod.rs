@@ -32,8 +32,11 @@ pub mod http;
 pub mod model_context;
 pub mod ops;
 pub mod provider;
+pub(crate) mod reasoning;
+pub mod registry;
 mod schemas;
 pub mod tokenjuice;
+pub mod turn_models;
 
 pub use ops as rpc;
 pub use schemas::{
@@ -45,9 +48,7 @@ pub use schemas::{
 pub use host_runtime::all_local_inference_controller_schemas;
 pub use host_runtime::all_local_inference_registered_controllers;
 pub use model_context::context_window_for_model;
-pub use tinyinference_local::status::{
-    LocalAiEmbeddingResult, LocalAiSpeechResult, LocalAiStatus, LocalAiTtsResult,
-};
+use tinyinference_local::status::LocalAiStatus;
 
 /// Wire label for the local vision mode: `"ondemand"` when a vision model is
 /// configured, `"disabled"` otherwise. Mirrors TinyInference's own label: the
@@ -118,6 +119,10 @@ impl tinyinference_local::models::LocalModelConfig for crate::config::Config {
         &self.local_ai.tts_voice_id
     }
 }
+
+#[cfg(test)]
+#[path = "registry_test_support_tests.rs"]
+pub(crate) mod registry_test_support;
 
 // Test helpers (re-exported for sibling test files that use inference_test_guard)
 #[cfg(test)]

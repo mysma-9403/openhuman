@@ -7,24 +7,23 @@ pub mod repl_tools;
 pub mod savings;
 pub mod schemas;
 pub mod tools;
-pub mod types;
 
+use crate::core::runtime::DispatchCtx;
 use tinyjuice_bus::names::methods;
+use tinyjuice_bus::types::{AgentTokenjuiceCompression, CompressorKind};
 
-pub use repl_tools::{is_repl_tool, repl_tools, repl_tools_for, REPL_TOOL_NAMES};
+pub use repl_tools::{is_repl_tool, repl_tools, repl_tools_for};
 pub use tools::TokenjuiceRetrieveTool;
-pub use types::{AgentTokenjuiceCompression, CompressorKind, ContentKind};
 
-use types::InstallRequest;
+use tinyjuice_bus::wire::InstallRequest;
 
-pub const RETRIEVE_TOOL_NAME: &str = "juice_retrieve";
-pub const LEGACY_TINYJUICE_RETRIEVE_TOOL_NAME: &str = "tinyjuice_retrieve";
+use tinyjuice_bus::tools::{LEGACY_RETRIEVE, REPL_TOOLS, RETRIEVE};
 pub const LEGACY_RETRIEVE_TOOL_NAME: &str = "retrieve_tool_output";
 /// Every name the recovery surface answers to: the live tool plus the two
 /// migration aliases a replayed transcript may still call.
 pub const RECOVERY_TOOL_NAMES: &[&str] = &[
-    RETRIEVE_TOOL_NAME,
-    LEGACY_TINYJUICE_RETRIEVE_TOOL_NAME,
+    RETRIEVE,
+    LEGACY_RETRIEVE,
     "tokenjuice_retrieve",
     LEGACY_RETRIEVE_TOOL_NAME,
 ];
@@ -33,10 +32,17 @@ pub const RECOVERY_TOOL_NAMES: &[&str] = &[
 /// advertise. Only the live tool: the aliases stay registered so an old
 /// transcript replays, but putting all three on the wire charged every
 /// Named agent for three copies of one schema.
-pub const RECOVERY_TOOL_VISIBLE: &[&str] = &[RETRIEVE_TOOL_NAME];
+pub const RECOVERY_TOOL_VISIBLE: &[&str] = &[RETRIEVE];
 
 pub fn is_recovery_tool(name: &str) -> bool {
     RECOVERY_TOOL_NAMES.contains(&name)
+}
+
+/// Whether the `[components] juice` switch is on. Off means turns truncate
+/// tool output only: no compaction, no summary, no `juice_*` / recovery tools,
+/// and the module is never loaded for it.
+pub fn enabled(config: &crate::config::Config) -> bool {
+    config.components.juice
 }
 
 /// Whether large results are stored behind a handle (stats, head, handle)
@@ -45,7 +51,8 @@ pub fn is_recovery_tool(name: &str) -> bool {
 /// points into, and the compaction switch that lets the module rewrite results
 /// at all.
 pub fn repl_handle_active(config: &crate::config::Config) -> bool {
-    config.context.compaction_enabled
+    enabled(config)
+        && config.context.compaction_enabled
         && config.tokenjuice.router_enabled
         && config.tokenjuice.ccr_enabled
         && config.tokenjuice.repl_handle_enabled
@@ -54,7 +61,9 @@ pub fn repl_handle_active(config: &crate::config::Config) -> bool {
 /// Whether TinyJuice may summarize this agent's tool output. Only the
 /// orchestrator gets a summary model, and a zero threshold turns it off.
 pub fn summarizes_tool_output(agent_id: &str, config: &crate::config::Config) -> bool {
-    agent_id == "orchestrator" && config.context.summarizer_payload_threshold_tokens > 0
+    enabled(config)
+        && agent_id == "orchestrator"
+        && config.context.summarizer_payload_threshold_tokens > 0
 }
 
 /// The TinyJuice tools a compacted result can point the model at: the CCR
@@ -68,11 +77,13 @@ pub fn summarizes_tool_output(agent_id: &str, config: &crate::config::Config) ->
 /// was told to call.
 pub fn companion_tool_names(agent_id: &str, config: &crate::config::Config) -> Vec<&'static str> {
     let mut names: Vec<&'static str> = Vec::new();
-    if config.context.compaction_enabled || summarizes_tool_output(agent_id, config) {
+    if enabled(config)
+        && (config.context.compaction_enabled || summarizes_tool_output(agent_id, config))
+    {
         names.extend(RECOVERY_TOOL_VISIBLE.iter().copied());
     }
     if repl_handle_active(config) {
-        names.extend(REPL_TOOL_NAMES.iter().copied());
+        names.extend(REPL_TOOLS.iter().copied());
     }
     names
 }
@@ -87,7 +98,7 @@ pub fn repl_save_dir(workspace_dir: &std::path::Path) -> std::path::PathBuf {
 pub(crate) fn install_request(config: &crate::config::Config) -> InstallRequest {
     let tj = &config.tokenjuice;
     InstallRequest {
-        options: types::CompressOptions {
+        options: tinyjuice_bus::types::CompressOptions {
             router_enabled: tj.router_enabled,
             ccr_enabled: tj.ccr_enabled,
             search_enabled: tj.search_enabled,
@@ -102,13 +113,13 @@ pub(crate) fn install_request(config: &crate::config::Config) -> InstallRequest 
             // Never at ingest: a large result gets deterministic compression
             // and a recovery handle, and the model writes a summary only when
             // the agent asks for one with `juice_summarize` (#6955).
-            llm_summary_mode: types::LlmSummaryMode::OnDemand,
+            llm_summary_mode: tinyjuice_bus::types::LlmSummaryMode::OnDemand,
             llm_summary_threshold_tokens: config.context.summarizer_payload_threshold_tokens,
             llm_summary_max_input_tokens: config.context.summarizer_max_payload_tokens,
             repl_handle: repl_handle_active(config),
             repl_save_dir: (repl_handle_active(config) && tj.repl_save_enabled)
                 .then(|| repl_save_dir(&config.workspace_dir)),
-            ..types::CompressOptions::default()
+            ..tinyjuice_bus::types::CompressOptions::default()
         },
         max_cache_entries: tj.max_cache_entries,
         max_cache_bytes: tj.max_cache_bytes,
@@ -121,14 +132,35 @@ pub(crate) fn install_request(config: &crate::config::Config) -> InstallRequest 
 }
 
 pub async fn install_from_config(config: &crate::config::Config) -> Result<(), String> {
+    if !enabled(config) {
+        log::debug!("[tokenjuice] component disabled; module install skipped");
+        return Ok(());
+    }
     savings::configure(
         config
             .default_model
             .clone()
             .unwrap_or_else(|| crate::config::DEFAULT_MODEL.to_string()),
-        &config.workspace_dir,
     );
+    // Totals the old build kept in a snapshot file move into the module's
+    // storage first (once per file, best effort).
+    crate::modules::import_legacy_tinyjuice_savings(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        &client(config),
+        &config.workspace_dir,
+    )
+    .await;
     let request = install_request(config);
+    // The module keeps the durable tier on its blob storage; originals the old
+    // disk tier wrote move across first (once per directory, best effort).
+    if let Some(root) = request.disk_tier_root.as_deref() {
+        crate::modules::import_legacy_tinyjuice(
+            &crate::core::runtime::DispatchCtx::ambient(),
+            std::path::Path::new(root),
+            request.ccr_ttl_secs.map(std::time::Duration::from_secs),
+        )
+        .await;
+    }
     let fingerprint = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     static INSTALLED: std::sync::OnceLock<tokio::sync::Mutex<Option<Vec<u8>>>> =
         std::sync::OnceLock::new();
@@ -148,8 +180,8 @@ pub async fn install_from_config(config: &crate::config::Config) -> Result<(), S
 }
 
 /// Construct explicit access over the shared process-wide loader.
-fn client(config: &crate::config::Config) -> crate::modules::client::ModuleClient {
-    crate::modules::client::ModuleClient::new(config.clone())
+pub(super) fn client(config: &crate::config::Config) -> tinybus::module::ModuleClient {
+    crate::modules::client(config.clone())
 }
 
 /// Everything the module considers about one tool result.
@@ -244,7 +276,7 @@ pub async fn compact_tool_output(call: ToolOutputCompaction<'_>) -> CompactedToo
     }
     #[cfg(test)]
     if let Ok(stub) = module_stub::STUB.try_with(std::sync::Arc::clone) {
-        let response = stub(types::CompactRequest {
+        let response = stub(tinyjuice_bus::wire::CompactRequest {
             content,
             tool_name: tool_name.to_string(),
             enabled,
@@ -268,18 +300,21 @@ pub async fn compact_tool_output(call: ToolOutputCompaction<'_>) -> CompactedToo
         },
     };
     #[cfg(test)]
-    let config = if std::env::var_os("TINYJUICE_TEST_MODULE").is_some() {
-        // The released-module regression must not inherit an operator's
-        // persisted compression thresholds or disabled router flags.
-        std::sync::Arc::new(crate::config::Config::default())
-    } else {
-        config
-    };
+    // Only the config loaded from disk is replaced: a caller-supplied one is
+    // what the test is asking about.
+    let config =
+        if runtime_config.is_none() && crate::modules::local_artifact("tinyjuice").is_some() {
+            // The released-module regression must not inherit an operator's
+            // persisted compression thresholds or disabled router flags.
+            std::sync::Arc::new(crate::config::Config::default())
+        } else {
+            config
+        };
     if let Err(error) = install_from_config(&config).await {
         log::debug!("[tokenjuice] module configuration failed, passing through: {error}");
         return CompactedToolOutput::passthrough(content, wants_summary);
     }
-    let request = types::CompactRequest {
+    let request = tinyjuice_bus::wire::CompactRequest {
         content: content.clone(),
         tool_name: tool_name.to_string(),
         enabled,
@@ -291,7 +326,11 @@ pub async fn compact_tool_output(call: ToolOutputCompaction<'_>) -> CompactedToo
     };
     let response = match client(&config)
         .with_timeout(COMPACT_WITH_TIMEOUT)
-        .call::<types::CompactResponse>("tinyjuice", methods::COMPACT_WITH, (request,))
+        .call::<tinyjuice_bus::wire::CompactResponse>(
+            "tinyjuice",
+            methods::COMPACT_WITH,
+            (request,),
+        )
         .await
     {
         Ok(response) => response,
@@ -300,11 +339,11 @@ pub async fn compact_tool_output(call: ToolOutputCompaction<'_>) -> CompactedToo
             return CompactedToolOutput::passthrough(content, wants_summary);
         }
     };
-    record_savings(&response);
+    record_savings(&client(&config), &response).await;
     compacted_from(response)
 }
 
-fn compacted_from(response: types::CompactResponse) -> CompactedToolOutput {
+fn compacted_from(response: tinyjuice_bus::wire::CompactResponse) -> CompactedToolOutput {
     let summarized_from_bytes = (response.compressor == CompressorKind::LlmSummary.as_str())
         .then_some(response.original_bytes);
     CompactedToolOutput {
@@ -314,19 +353,25 @@ fn compacted_from(response: types::CompactResponse) -> CompactedToolOutput {
     }
 }
 
-fn record_savings(response: &types::CompactResponse) {
+async fn record_savings(
+    client: &tinybus::module::ModuleClient,
+    response: &tinyjuice_bus::wire::CompactResponse,
+) {
     use std::str::FromStr as _;
-    let kind = ContentKind::from_str(&response.content_kind).unwrap_or(ContentKind::PlainText);
     let compressor = CompressorKind::from_str(&response.compressor).unwrap_or(CompressorKind::None);
     savings::record(
-        kind,
+        client,
         compressor,
         response.original_tokens,
         response.compacted_tokens,
-    );
+    )
+    .await;
 }
 
-pub async fn detect(content: String, hint: types::ContentHint) -> Result<String, String> {
+pub async fn detect(
+    content: String,
+    hint: tinyjuice_bus::types::ContentHint,
+) -> Result<String, String> {
     let config = crate::config::Config::load_or_init()
         .await
         .map_err(|error| error.to_string())?;
@@ -338,28 +383,29 @@ pub async fn detect(content: String, hint: types::ContentHint) -> Result<String,
 
 pub async fn compress(
     content: String,
-    hint: types::ContentHint,
-) -> Result<types::CompressedOutput, String> {
+    hint: tinyjuice_bus::types::ContentHint,
+) -> Result<tinyjuice_bus::types::CompressedOutput, String> {
     let config = crate::config::Config::load_or_init()
         .await
         .map_err(|error| error.to_string())?;
     install_from_config(&config).await?;
-    let response: types::CompressedOutput = client(&config)
+    let response: tinyjuice_bus::types::CompressedOutput = client(&config)
         .call("tinyjuice", methods::COMPRESS, (content, hint))
         .await
         .map_err(|error| error.to_string())?;
     savings::record(
-        response.content_kind,
+        &client(&config),
         response.compressor,
         (response.original_bytes as u64).div_ceil(4),
         (response.compacted_bytes as u64).div_ceil(4),
-    );
+    )
+    .await;
     Ok(response)
 }
 
 pub async fn retrieve(
     token: String,
-    range: Option<types::RetrieveRange>,
+    range: Option<tinyjuice_bus::wire::RetrieveRange>,
 ) -> Result<Option<String>, String> {
     let config = crate::config::Config::load_or_init()
         .await
@@ -371,7 +417,7 @@ pub async fn retrieve(
         .map_err(|error| error.to_string())
 }
 
-pub async fn cache_stats() -> Result<types::CacheStats, String> {
+pub async fn cache_stats() -> Result<tinyjuice_bus::wire::CacheStats, String> {
     let config = crate::config::Config::load_or_init()
         .await
         .map_err(|error| error.to_string())?;
@@ -400,9 +446,10 @@ mod repl_module_tests;
 
 /// Run a typed query inside TinyJuice; cached originals stay inside the module.
 pub async fn query(
+    ctx: &DispatchCtx,
     request: tinyjuice_bus::wire::QueryRequest,
 ) -> Result<tinyjuice_bus::wire::QueryResponse, String> {
-    let config = crate::config::ops::load_config_with_timeout().await?;
+    let config = ctx.load_config().await?;
     query_for_config(&config, request).await
 }
 
@@ -418,11 +465,15 @@ pub(crate) async fn query_for_config(
 }
 
 /// Extract HTML through the compiled module independently of compression settings.
-pub async fn extract_html(html: String) -> Result<String, String> {
-    let config = crate::config::ops::load_config_with_timeout().await?;
+pub async fn extract_html(ctx: &DispatchCtx, html: String) -> Result<String, String> {
+    let config = ctx.load_config().await?;
     let response: tinyjuice_bus::wire::HtmlResponse = client(&config)
         .call("tinyjuice", methods::EXTRACT_HTML, (html,))
         .await
         .map_err(|e| e.to_string())?;
     response.map_err(|_| "juice: HTML input exceeds module limit".into())
 }
+
+#[cfg(test)]
+#[path = "mod_contract_tests.rs"]
+mod contract_tests;

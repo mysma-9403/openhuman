@@ -33,19 +33,33 @@ llvm_cov() {
       bash scripts/ci-cancel-aware.sh cargo llvm-cov "$@"
       ;;
     *)
-      bash scripts/ci-cancel-aware.sh cargo llvm-cov \
-        --features "${CORE_PRODUCT_FEATURES}" "$@"
+      if [ "${OH_COV_RUNNER:-cargo}" = "nextest" ]; then
+        bash scripts/ci/nextest-coverage.sh "${COV_SUITE:-coverage}" cargo llvm-cov nextest --profile ci --no-tests=fail \
+          --features "${CORE_PRODUCT_FEATURES}" "$@"
+      else
+        bash scripts/ci-cancel-aware.sh cargo llvm-cov \
+          --features "${CORE_PRODUCT_FEATURES}" "$@"
+      fi
       ;;
   esac
 }
 
 llvm_cov_package() {
-  bash scripts/ci-cancel-aware.sh cargo llvm-cov "$@"
+  if [ "${OH_COV_RUNNER:-cargo}" = "nextest" ]; then
+    bash scripts/ci/nextest-coverage.sh "${COV_SUITE:-coverage}" cargo llvm-cov nextest --profile ci --no-tests=fail "$@"
+  else
+    bash scripts/ci-cancel-aware.sh cargo llvm-cov "$@"
+  fi
 }
 
 llvm_cov_product_facade() {
-  bash scripts/ci-cancel-aware.sh cargo llvm-cov \
-    --features "${CORE_PRODUCT_FEATURES}" "$@"
+  if [ "${OH_COV_RUNNER:-cargo}" = "nextest" ]; then
+    bash scripts/ci/nextest-coverage.sh "${COV_SUITE:-coverage}" cargo llvm-cov nextest --profile ci --no-tests=fail \
+      --features "${CORE_PRODUCT_FEATURES}" "$@"
+  else
+    bash scripts/ci-cancel-aware.sh cargo llvm-cov \
+      --features "${CORE_PRODUCT_FEATURES}" "$@"
+  fi
 }
 
 llvm_cov_embed() {
@@ -102,6 +116,30 @@ target_features_satisfied() {
   done
 }
 
+# These target-level cfgs intentionally produce empty binaries in this build.
+# Keep exceptions named and narrow: every other expected target must report
+# tests, including newly added targets. The Composio stress case runs once in
+# the private uninstrumented lane; existing Windows checks remain separate.
+target_expected_in_coverage() {
+  local target="$1" platform="${2:-$(uname -s)}"
+  case "$target" in
+    composio_list_tools_stack_overflow_regression)
+      log "not expecting ${target} in coverage: #![cfg(not(coverage))]; tested uninstrumented"
+      return 1
+      ;;
+    windows_sandbox_env_e2e)
+      case "$platform" in
+        MINGW* | MSYS* | CYGWIN* | Windows_NT) ;;
+        *)
+          log "not expecting ${target} on ${platform}: all tests are #[cfg(windows)]"
+          return 1
+          ;;
+      esac
+      ;;
+  esac
+  return 0
+}
+
 # Every suite runs even when an earlier one fails, so one red crate never
 # hides the results of the crates and targets after it. Failures are
 # collected and reported together at the end, after the lcov report is still
@@ -111,7 +149,7 @@ FAILED_SUITES=()
 suite() {
   local name="$1" rc=0
   shift
-  "$@" || rc=$?
+  COV_SUITE="$(printf '%s' "$name" | tr -cs '[:alnum:]' '-')" "$@" || rc=$?
   case "${rc}" in
     0) ;;
     130 | 143)
@@ -150,6 +188,11 @@ run_integration_target() {
       suite "${target}::${module}" llvm_cov --no-report --no-fail-fast -p openhuman-cli \
         --test "${target}" -- "${module}::"
     done < <(in_process_modules)
+  elif [ "${target}" = "mcp_registry_multi_server" ]; then
+    # Its cases share TinyMCP's process-wide module client; keep them serial,
+    # as scripts/test-rust-with-mock.sh does.
+    suite "${target}" llvm_cov --no-report --no-fail-fast -p openhuman-cli \
+      --test "${target}" -- --test-threads=1
   elif [ "${target}" = "json_rpc_e2e" ]; then
     # JSON-RPC tests share runtime/config globals and must remain serial.
     suite "${target}" llvm_cov --no-report --no-fail-fast -p openhuman-cli \
@@ -177,41 +220,46 @@ fi
 log "running complete instrumented Rust suite (runner: ${OH_COV_RUNNER:-cargo})"
 llvm_cov clean --workspace
 
-UNIT_PID=""
+# The storage-host cdylib tests load a real fixture module. Left to the tests,
+# every test process (nextest runs one per test) runs its own `cargo build` of
+# it and queues on the fixture target's lock: 14 tests at ~30-40 s each. Build
+# it once, uninstrumented exactly as the tests would, and hand them the path.
+if [ -z "${OPENHUMAN_STORAGE_PROBE_MODULE:-}" ]; then
+  probe_target="${PWD}/target/storage-probe"
+  log "building the storage probe module once into ${probe_target}"
+  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u RUSTC_WRAPPER -u CARGO_TARGET_DIR \
+    bash scripts/ci-cancel-aware.sh cargo build --quiet \
+    --manifest-path tests/fixtures/storage_probe_module/Cargo.toml \
+    --target-dir "${probe_target}"
+  case "$(uname -s)" in
+    Darwin) probe_file="libstorage_probe_module.dylib" ;;
+    MINGW* | MSYS* | CYGWIN*) probe_file="storage_probe_module.dll" ;;
+    *) probe_file="libstorage_probe_module.so" ;;
+  esac
+  export OPENHUMAN_STORAGE_PROBE_MODULE="${probe_target}/debug/${probe_file}"
+fi
+
+# Keep the private invocations sequential in the configured coverage target.
+# Each package retains its own feature resolution; instrumentation is merged
+# once after all suites, including successful suites before a failure.
+COVERAGE_REPORTED=0
+preserve_coverage() {
+  local status=$?
+  trap - EXIT INT TERM HUP
+  if [ "${COVERAGE_REPORTED}" = "0" ]; then
+    log "preserving partial coverage into ${OUT} (exit ${status})"
+    CI_CANCEL_WATCHDOG=0 llvm_cov report --lcov --output-path "${OUT}" || \
+      log "partial coverage report unavailable; retaining raw profiles"
+  fi
+  exit "${status}"
+}
+trap preserve_coverage EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
 if [ "${OH_COV_RUNNER:-cargo}" = "nextest" ]; then
-  # cargo-nextest runs every test in its own process, in parallel. Process
-  # globals (the event bus, registries, env vars, one-shot OnceLocks) are then
-  # per test, so the serial runner and the isolated reaper run below are not
-  # needed: every test is isolated. Settings: .config/nextest.toml [profile.ci].
-  #
-  # The core's unit tests compile the core as a test program; every other suite
-  # below compiles it as a library. Neither build needs the other, so the unit
-  # tests run in the background in a target dir of their own (one cargo per
-  # target dir; a shared one would serialize them on its lock) and write their
-  # own lcov file, beside this run's. Each invocation keeps exactly the package
-  # selection, and so the feature resolution, it has when run alone.
-  UNIT_TARGET_DIR="${CARGO_TARGET_DIR:-${PWD}/target}/cov-unit"
-  UNIT_OUT="${OUT%.info}-unit.info"
-  UNIT_LOG="${OUT%.info}-unit.log"
-  UNIT_STATUS="${OUT%.info}-unit.status"
-  rm -f "${UNIT_OUT}" "${UNIT_STATUS}"
-  (
-    export CARGO_TARGET_DIR="${UNIT_TARGET_DIR}"
-    rc=0
-    llvm_cov clean --workspace || rc=$?
-    if [ "${rc}" = 0 ]; then
-      llvm_cov nextest --profile ci --no-report --no-fail-fast -p openhuman --lib --bins || rc=$?
-    fi
-    case "${rc}" in 130 | 143) ;; *)
-      report_rc=0
-      llvm_cov report --lcov --output-path "${UNIT_OUT}" || report_rc=$?
-      [ "${rc}" != 0 ] || rc="${report_rc}"
-      ;;
-    esac
-    echo "${rc}" >"${UNIT_STATUS}"
-  ) >"${UNIT_LOG}" 2>&1 &
-  UNIT_PID=$!
-  log "core unit tests started in the background (pid ${UNIT_PID}, target ${UNIT_TARGET_DIR}, log ${UNIT_LOG})"
+  # One process per test isolates process globals without separate target dirs.
+  suite "openhuman lib+bins (nextest)" llvm_cov --no-report --no-fail-fast -p openhuman --lib --bins
 else
   # Keep the aggregate unit-test process aligned with the canonical Rust runner.
   # The isolated reaper test installs one-shot process globals, so it cannot run
@@ -230,6 +278,12 @@ fi
 suite "openhuman-embed" llvm_cov_embed --no-report --no-fail-fast -p openhuman-embed --all-targets
 suite "openhuman-rpc" llvm_cov_package --no-report --no-fail-fast -p openhuman-rpc --all-targets
 suite "openhuman-tinyhumans" llvm_cov_product_facade --no-report --no-fail-fast -p openhuman-tinyhumans --all-targets
+if [ "${OH_COV_RUNNER:-cargo}" = "nextest" ]; then
+  # Contributor/default features are distinct from product features. Keep both
+  # configurations instrumented rather than dropping the default-only surface.
+  suite "openhuman-embed (default)" llvm_cov_package --no-report --no-fail-fast -p openhuman-embed --all-targets
+  suite "openhuman-tinyhumans (default)" llvm_cov_package --no-report --no-fail-fast -p openhuman-tinyhumans --all-targets
+fi
 # The terminal frontend builds the core a third time (default features, not the
 # product set). It is on by default and on in the PR lane; OH_COV_TUI=0 is an
 # opt-out for local runs.
@@ -245,7 +299,31 @@ if [ "${OH_COV_RUNNER:-cargo}" = "nextest" ]; then
   # other without the per-module and serial invocations below. Cargo skips a
   # target whose required-features are not in the product set; `kind(test)`
   # keeps the run to the integration targets, as the loop below runs them.
-  suite "openhuman-cli integration tests (nextest)" llvm_cov nextest --profile ci \
+  mkdir -p ci-out/nextest
+  expected_targets="${PWD}/ci-out/nextest/cli-expected-targets.txt"
+  : >"${expected_targets}"
+  while IFS= read -r target; do
+    [ -n "${target}" ] || continue
+    if target_features_satisfied "${target}" && target_expected_in_coverage "${target}"; then
+      printf '%s\n' "${target}" >>"${expected_targets}"
+    fi
+  done < <(integration_test_targets)
+  expected_inventory=""
+  if [ -s "${expected_targets}" ]; then
+    expected_inventory="${PWD}/ci-out/nextest/cli-inventory.json"
+    # Listing executes no tests. cargo-llvm-cov supplies the same wrapper and
+    # instrumentation environment, so Cargo can reuse this CLI test build.
+    cli_inventory() (
+      inventory_env="$(bash scripts/ci-cancel-aware.sh cargo llvm-cov show-env --sh)" || exit $?
+      eval "${inventory_env}"
+      bash scripts/ci-cancel-aware.sh cargo nextest list --message-format json --features "${CORE_PRODUCT_FEATURES}" \
+        -p openhuman-cli --tests -E 'kind(test)' >"${expected_inventory}"
+    )
+    suite "openhuman-cli test inventory" cli_inventory
+  fi
+  NEXTEST_EXPECTED_TARGETS="${expected_targets}" \
+  NEXTEST_EXPECTED_INVENTORY="${expected_inventory}" \
+  suite "openhuman-cli integration tests (nextest)" llvm_cov \
     --no-report --no-fail-fast -p openhuman-cli --tests -E 'kind(test)'
 else
   while IFS= read -r target; do
@@ -269,20 +347,7 @@ fi
 log "merging coverage into ${OUT}"
 suite "lcov report" llvm_cov report --lcov --output-path "${OUT}"
 
-presence_lcov="${OUT}"
-if [ -n "${UNIT_PID}" ]; then
-  log "waiting for the core unit tests (pid ${UNIT_PID})"
-  wait "${UNIT_PID}" || true
-  echo "::group::[ci][rust-cov] core unit tests (nextest, background)"
-  cat "${UNIT_LOG}"
-  echo "::endgroup::"
-  unit_rc="$(cat "${UNIT_STATUS}" 2>/dev/null || echo 1)"
-  suite "openhuman lib+bins (nextest)" test "${unit_rc}" = 0 || true
-  case "${unit_rc}" in 130 | 143) exit "${unit_rc}" ;; esac
-  # One file for the presence gate; diff-cover reads both lcov files itself.
-  presence_lcov="${OUT%.info}.presence"
-  cat "${OUT}" "${UNIT_OUT}" >"${presence_lcov}" 2>/dev/null || true
-fi
+COVERAGE_REPORTED=1
 
 # A full product build must produce records for every eligible source file,
 # except in the crates whose suites this run skipped (OH_COV_TUI=0).
@@ -290,8 +355,7 @@ presence_skip=""
 [ "${OH_COV_TUI:-1}" = "1" ] || presence_skip="crates/openhuman-tui/src/"
 [ -z "${presence_skip}" ] || log "coverage presence: not checking ${presence_skip} (suite skipped)"
 suite "coverage presence" env COVERAGE_PRESENCE_SKIP_PREFIXES="${presence_skip}" \
-  bash scripts/ci/assert-coverage-presence.sh "${presence_lcov}" --all
-[ "${presence_lcov}" = "${OUT}" ] || rm -f "${presence_lcov}"
+  bash scripts/ci/assert-coverage-presence.sh "${OUT}" --all
 
 if [ "${#FAILED_SUITES[@]}" -gt 0 ]; then
   log "${#FAILED_SUITES[@]} suite(s) failed:"

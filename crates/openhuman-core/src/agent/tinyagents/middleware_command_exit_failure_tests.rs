@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::tinyagents::middleware::repeated_failure::RepeatedToolFailureMiddleware;
 
 use super::super::repeated_failure::recovery_policy;
 
@@ -14,13 +15,14 @@ fn sigpipe_git_log_report() -> String {
 
 async fn run_shell(
     mw: &RepeatedToolFailureMiddleware,
+    context: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
     id: &str,
     command: &str,
     mut result: TaToolResult,
 ) {
     let mut call = TaToolCall::new(id, "shell", json!({ "command": command }));
-    mw.before_tool(&mut ctx(), &(), &mut call).await.unwrap();
-    mw.after_tool(&mut ctx(), &(), &invocation(id, "shell"), &mut result)
+    mw.before_tool(context, &(), &mut call).await.unwrap();
+    mw.after_tool(context, &(), &invocation(id, "shell"), &mut result)
         .await
         .unwrap();
 }
@@ -66,8 +68,10 @@ async fn a_sigpipe_with_401_in_its_output_does_not_halt_the_run() {
     let handle = SteeringHandle::allow_all();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mw = RepeatedToolFailureMiddleware::new(handle.clone(), 3, slot.clone());
+    let mut context = ctx();
     run_shell(
         &mw,
+        &mut context,
         "log-1",
         "git log --oneline | head",
         failing_result("shell", &sigpipe_git_log_report()),
@@ -85,6 +89,7 @@ async fn rerunning_a_failing_test_between_edits_never_halts() {
     let handle = SteeringHandle::allow_all();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mw = RepeatedToolFailureMiddleware::new(handle.clone(), 3, slot.clone());
+    let mut context = ctx();
     let report = tinytools::render_command_failure(
         Some(1),
         "FAILED tests/test_consumer.py::test_priority - TimeoutError: timed out",
@@ -93,6 +98,7 @@ async fn rerunning_a_failing_test_between_edits_never_halts() {
     for round in 0..12 {
         run_shell(
             &mw,
+            &mut context,
             &format!("test-{round}"),
             "python -m pytest tests/test_consumer.py",
             failing_result("shell", &report),
@@ -100,6 +106,7 @@ async fn rerunning_a_failing_test_between_edits_never_halts() {
         .await;
         run_shell(
             &mw,
+            &mut context,
             &format!("edit-{round}"),
             "sed -i 's/a/b/' kombu/consumer.py",
             tool_result("shell", ""),
@@ -117,9 +124,17 @@ async fn an_identical_failing_command_repeated_unchanged_still_halts() {
     let handle = SteeringHandle::allow_all();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mw = RepeatedToolFailureMiddleware::new(handle.clone(), 3, slot.clone());
+    let mut context = ctx();
     let report = tinytools::render_command_failure(Some(2), "", "make: *** No rule to make target");
     for id in ["make-1", "make-2", "make-3", "make-4"] {
-        run_shell(&mw, id, "make build", failing_result("shell", &report)).await;
+        run_shell(
+            &mw,
+            &mut context,
+            id,
+            "make build",
+            failing_result("shell", &report),
+        )
+        .await;
     }
     assert_eq!(drain_pause_count(&handle), 1);
 }
@@ -141,14 +156,14 @@ fn a_faulted_module_is_unavailable_not_transient() {
 fn quoted_module_fault_marker_is_not_enough_to_mark_a_tool_unavailable() {
     let quoted = format!(
         "search result quoted: {}",
-        crate::tools::status::MODULE_FAULT_MARKER
+        tinytools::status::MODULE_FAULT_MARKER
     );
     assert_eq!(recovery_policy("web_search_tool", &quoted, false), None);
 }
 
 #[test]
 fn the_module_fault_marker_matches_the_producer_wording() {
-    assert!(MODULE_FAULT.contains(crate::tools::status::MODULE_FAULT_MARKER));
+    assert!(MODULE_FAULT.contains(tinytools::status::MODULE_FAULT_MARKER));
 }
 
 #[tokio::test]
@@ -156,11 +171,12 @@ async fn a_faulted_module_tool_is_steered_away_once_then_halts() {
     let handle = SteeringHandle::allow_all();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mw = RepeatedToolFailureMiddleware::new(handle.clone(), 3, slot.clone());
+    let mut context = ctx();
     let mut call = TaToolCall::new("search-1", "web_search_tool", json!({ "query": "one" }));
-    mw.before_tool(&mut ctx(), &(), &mut call).await.unwrap();
+    mw.before_tool(&mut context, &(), &mut call).await.unwrap();
     let mut result = failing_result("web_search_tool", MODULE_FAULT);
     mw.after_tool(
-        &mut ctx(),
+        &mut context,
         &(),
         &invocation("search-1", "web_search_tool"),
         &mut result,
@@ -168,16 +184,16 @@ async fn a_faulted_module_tool_is_steered_away_once_then_halts() {
     .await
     .unwrap();
     assert_eq!(drain_pause_count(&handle), 0);
-    let nudges = drain_nudge_messages(&mw);
+    let nudges = drain_nudge_messages(&mw, &mut context).await;
     assert_eq!(nudges.len(), 1, "{nudges:?}");
     assert!(nudges[0].contains("`web_search_tool`"), "{}", nudges[0]);
     assert!(nudges[0].contains("Do not call"), "{}", nudges[0]);
 
     let mut call = TaToolCall::new("search-2", "web_search_tool", json!({ "query": "two" }));
-    mw.before_tool(&mut ctx(), &(), &mut call).await.unwrap();
+    mw.before_tool(&mut context, &(), &mut call).await.unwrap();
     let mut result = failing_result("web_search_tool", MODULE_FAULT);
     mw.after_tool(
-        &mut ctx(),
+        &mut context,
         &(),
         &invocation("search-2", "web_search_tool"),
         &mut result,
@@ -224,6 +240,7 @@ async fn six_different_failing_command_exit_reports_never_feed_the_ladder() {
     let handle = SteeringHandle::allow_all();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mw = RepeatedToolFailureMiddleware::new(handle.clone(), 3, slot.clone());
+    let mut context = ctx();
     let attempts = [
         (
             "pip install fasttext",
@@ -258,6 +275,7 @@ async fn six_different_failing_command_exit_reports_never_feed_the_ladder() {
     for (i, (command, report)) in attempts.iter().enumerate() {
         run_shell(
             &mw,
+            &mut context,
             &format!("probe-{i}"),
             command,
             failing_result("shell", report),
@@ -277,9 +295,11 @@ async fn the_same_failing_command_three_times_still_halts() {
     let handle = SteeringHandle::allow_all();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mw = RepeatedToolFailureMiddleware::new(handle.clone(), 3, slot.clone());
+    let mut context = ctx();
     for i in 0..3 {
         run_shell(
             &mw,
+            &mut context,
             &format!("same-{i}"),
             "pip install fasttext",
             failing_result(
@@ -306,24 +326,26 @@ async fn a_different_command_between_repeats_resets_the_identical_count() {
     let handle = SteeringHandle::allow_all();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mw = RepeatedToolFailureMiddleware::new(handle.clone(), 3, slot.clone());
+    let mut context = ctx();
     let same = || failing_result("shell", &exit_report(1, "", "boom"));
-    run_shell(&mw, "a-1", "make", same()).await;
-    run_shell(&mw, "a-2", "make", same()).await;
+    run_shell(&mw, &mut context, "a-1", "make", same()).await;
+    run_shell(&mw, &mut context, "a-2", "make", same()).await;
     run_shell(
         &mw,
+        &mut context,
         "b-1",
         "ls build/",
         failing_result("shell", &exit_report(2, "", "No such file")),
     )
     .await;
-    run_shell(&mw, "a-3", "make", same()).await;
-    run_shell(&mw, "a-4", "make", same()).await;
+    run_shell(&mw, &mut context, "a-3", "make", same()).await;
+    run_shell(&mw, &mut context, "a-4", "make", same()).await;
     assert_eq!(
         drain_pause_count(&handle),
         0,
         "the streak restarted after `ls build/`"
     );
-    run_shell(&mw, "a-5", "make", same()).await;
+    run_shell(&mw, &mut context, "a-5", "make", same()).await;
     assert_eq!(
         drain_pause_count(&handle),
         1,

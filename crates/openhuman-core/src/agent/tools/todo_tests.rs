@@ -1,16 +1,23 @@
 use super::*;
-use crate::agent::todos::ops::{TodoItem, TodoStatus};
 use serde_json::{json, Value};
+use tinyagents_graph::todos::{TodoItem, TodoStatus};
 
 /// Serialize tests that share the process-global scratch store. Same lock
-/// as `todos::ops` — otherwise the two test modules race under `cargo test`'s
-/// thread pool.
+/// process-global scratch store.
+static SCRATCH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn scratch_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    crate::agent::todos::ops::scratch_test_lock()
+    SCRATCH_TEST_LOCK.blocking_lock()
 }
 
 async fn scratch_lock_async() -> tokio::sync::MutexGuard<'static, ()> {
-    crate::agent::todos::ops::scratch_test_lock_async().await
+    SCRATCH_TEST_LOCK.lock().await
+}
+
+fn todo_store(
+    workspace_dir: &std::path::Path,
+) -> std::sync::Arc<dyn tinyagents_harness::store::Store> {
+    crate::storage::sessions::stores_or_ephemeral(workspace_dir).kv
 }
 
 /// A fresh on-disk workspace root for one test's `FileStore`-backed todo
@@ -23,7 +30,7 @@ fn test_workspace() -> std::path::PathBuf {
 }
 
 async fn reset_scratch(workspace_dir: &std::path::Path) {
-    crate::agent::todos::ops::clear(workspace_dir, &TodoScope::Scratch)
+    tinyagents_graph::todos::store::clear(&todo_store(workspace_dir), "_scratch_")
         .await
         .expect("clear scratch");
 }
@@ -148,11 +155,12 @@ fn every_agent_binds_to_its_own_thread() {
         session_id: "orchestrator_thread-live".into(),
         channel: "test".into(),
         connected_integrations: Vec::new(),
-        tool_call_format: crate::agent::prompts::ToolCallFormat::Native,
+        tool_call_format: tinytools_agent::dialect::ToolCallFormat::Native,
         session_key: "parent-key".into(),
         session_parent_prefix: None,
         on_progress: None,
         run_queue: None,
+        host_env: Default::default(),
     };
 
     assert_eq!(
@@ -206,11 +214,12 @@ async fn a_legacy_session_keyed_list_is_migrated_forward_once() {
         session_id: "client-1|thread-legacy".into(),
         channel: "test".into(),
         connected_integrations: Vec::new(),
-        tool_call_format: crate::agent::prompts::ToolCallFormat::Native,
+        tool_call_format: tinytools_agent::dialect::ToolCallFormat::Native,
         session_key: "parent-key".into(),
         session_parent_prefix: None,
         on_progress: None,
         run_queue: None,
+        host_env: Default::default(),
     };
 
     // Seed the legacy session-keyed list directly through the store, as if a
@@ -219,9 +228,13 @@ async fn a_legacy_session_keyed_list_is_migrated_forward_once() {
         id: parent.session_id.clone(),
     };
     let item = TodoItem::with_status("carried over", TodoStatus::InProgress);
-    crate::agent::todos::ops::replace(&workspace_dir, &legacy_scope, vec![item])
-        .await
-        .unwrap();
+    tinyagents_graph::todos::store::replace(
+        &todo_store(&workspace_dir),
+        legacy_scope.key(),
+        vec![item],
+    )
+    .await
+    .unwrap();
 
     let tool = TodoTool::new(workspace_dir.clone());
     let read = tool
@@ -241,9 +254,10 @@ async fn a_legacy_session_keyed_list_is_migrated_forward_once() {
     let thread_scope = TodoScope::Session {
         id: "thread-legacy".into(),
     };
-    let migrated = crate::agent::todos::ops::list(&workspace_dir, &thread_scope)
-        .await
-        .unwrap();
+    let migrated =
+        tinyagents_graph::todos::store::list(&todo_store(&workspace_dir), thread_scope.key())
+            .await
+            .unwrap();
     assert_eq!(migrated.items.len(), 1);
 }
 
@@ -256,19 +270,19 @@ async fn sessions_do_not_see_each_other_and_a_list_survives_across_turns() {
     let b = TodoScope::Session {
         id: "sess-b".into(),
     };
-    crate::agent::todos::ops::clear(&workspace_dir, &a)
+    tinyagents_graph::todos::store::clear(&todo_store(&workspace_dir), a.key())
         .await
         .unwrap();
-    crate::agent::todos::ops::clear(&workspace_dir, &b)
+    tinyagents_graph::todos::store::clear(&todo_store(&workspace_dir), b.key())
         .await
         .unwrap();
 
     let item = TodoItem::with_status("only in a", TodoStatus::InProgress);
-    crate::agent::todos::ops::replace(&workspace_dir, &a, vec![item])
+    tinyagents_graph::todos::store::replace(&todo_store(&workspace_dir), a.key(), vec![item])
         .await
         .unwrap();
 
-    let a_again = crate::agent::todos::ops::list(&workspace_dir, &a)
+    let a_again = tinyagents_graph::todos::store::list(&todo_store(&workspace_dir), a.key())
         .await
         .unwrap();
     assert_eq!(
@@ -277,9 +291,11 @@ async fn sessions_do_not_see_each_other_and_a_list_survives_across_turns() {
         "a later turn of the same session reads it back"
     );
     assert_eq!(a_again.thread_id, "sess-a");
-    assert!(crate::agent::todos::ops::list(&workspace_dir, &b)
-        .await
-        .unwrap()
-        .items
-        .is_empty());
+    assert!(
+        tinyagents_graph::todos::store::list(&todo_store(&workspace_dir), b.key())
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
 }

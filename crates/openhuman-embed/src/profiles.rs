@@ -53,10 +53,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use openhuman_core::agent::session_store::SessionStoreProvider;
 use openhuman_core::core::runtime::CoreRuntime;
 use openhuman_core::profiles::credentials::UserCredentialKind;
 use openhuman_core::profiles::ProfileHost;
+use tinyagents_session::port::SessionStoreProvider;
 
 use crate::error::CoreError;
 
@@ -198,7 +198,7 @@ impl ProfileRuntimeBuilder {
         // the core builds. Save the previous provider so we can restore it on failure.
         let previous_session_store = if let Some(provider) = session_store {
             log::debug!("[embed][profiles] installing the host's session store");
-            openhuman_core::agent::session_store::install(provider)
+            openhuman_core::storage::sessions::install(provider)
         } else {
             None
         };
@@ -215,7 +215,7 @@ impl ProfileRuntimeBuilder {
             Err(e) => {
                 // Boot failed; restore the previous session store if we installed one.
                 if let Some(previous) = previous_session_store {
-                    let _restored = openhuman_core::agent::session_store::install(previous);
+                    let _restored = openhuman_core::storage::sessions::install(previous);
                 }
                 return Err(ProfileError::Boot(format!("{e:#}")));
             }
@@ -224,7 +224,7 @@ impl ProfileRuntimeBuilder {
         let host = openhuman_core::profiles::host::host().ok_or_else(|| {
             // Boot guard check failed; restore the previous session store if we installed one.
             if let Some(previous) = previous_session_store {
-                let _restored = openhuman_core::agent::session_store::install(previous);
+                let _restored = openhuman_core::storage::sessions::install(previous);
             }
             ProfileError::Boot("the SaaS core installed no profile host".to_string())
         })?;

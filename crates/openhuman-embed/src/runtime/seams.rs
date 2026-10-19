@@ -10,7 +10,7 @@
 //! |---|---|---|
 //! | [`controller_extension`](RuntimeBuilder::controller_extension) | before boot | kept: the registry has no removal; re-registering the same controllers is a no-op |
 //! | [`tool_ranker`](RuntimeBuilder::tool_ranker) | before boot | the previous ranker is restored, if ours still holds the slot |
-//! | [`post_turn_hook`](RuntimeBuilder::post_turn_hook) / [`tool_hook`](RuntimeBuilder::tool_hook) | before boot, replacing a same-named hook | newest first, while ours still holds the name: ours removed, a replaced same-named hook restored |
+//! | [`post_turn_hook`](RuntimeBuilder::post_turn_hook) / [`tool_hook`](RuntimeBuilder::tool_hook) | before boot; learning sinks get private runtime identities, tool hooks retain declared names | newest first, while ours still holds the identity: ours removed, a replaced hook restored |
 //! | [`server_launcher`](RuntimeBuilder::server_launcher) | before boot | kept: first install wins for the process |
 //! | [`live_policy`](RuntimeBuilder::live_policy) | after boot | kept: the next boot (or a config reload) installs its own |
 //! | [`storage`](RuntimeBuilder::storage) | before boot | the previous backend is restored (or cleared), if ours still holds the slot |
@@ -22,9 +22,12 @@
 
 use std::sync::Arc;
 
+use crate::seams::{LearningSink, OpenHumanRunContext, ToolHook};
+#[cfg(test)]
+use openhuman_core::agent::hooks::embedder_post_turn_hooks;
 use openhuman_core::agent::hooks::{
-    embedder_post_turn_hooks, embedder_tool_hooks, replace_embedder_post_turn_hook,
-    replace_embedder_tool_hook, PostTurnHook, ToolHook,
+    embedder_post_turn_hook_named, embedder_tool_hooks, replace_embedder_post_turn_hook,
+    replace_embedder_tool_hook,
 };
 use openhuman_core::agent::tinyagents::discovery::{
     clear_tool_ranker, install_tool_ranker, installed_tool_ranker,
@@ -81,8 +84,8 @@ impl From<Arc<dyn StorageBackend>> for StorageSource {
 pub(crate) struct HostSeams {
     pub(crate) controller_extensions: Vec<ControllerExtension>,
     pub(crate) tool_ranker: Option<Arc<dyn ToolRanker>>,
-    pub(crate) post_turn_hooks: Vec<Arc<dyn PostTurnHook>>,
-    pub(crate) tool_hooks: Vec<Arc<dyn ToolHook>>,
+    pub(crate) post_turn_hooks: Vec<Arc<dyn LearningSink>>,
+    pub(crate) tool_hooks: Vec<Arc<dyn ToolHook<OpenHumanRunContext>>>,
     pub(crate) server_launcher: Option<ServerLauncher>,
     pub(crate) live_policy: Option<Arc<SecurityPolicy>>,
     pub(crate) storage: Option<StorageSource>,
@@ -157,10 +160,13 @@ impl HostSeams {
             .post_turn_hooks
             .into_iter()
             .map(|hook| {
-                let name = hook.name().to_string();
-                let previous = embedder_post_turn_hooks()
-                    .into_iter()
-                    .find(|existing| existing.name() == name);
+                static NEXT_LEARNING_SINK: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let name = format!(
+                    "embedder.learning_sink.{:020}",
+                    NEXT_LEARNING_SINK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
+                let previous = embedder_post_turn_hook_named(&name);
                 replace_embedder_post_turn_hook(&name, Some(Arc::clone(&hook)));
                 log::debug!(
                     "[embed][seams] post-turn hook installed name={name} replaced={}",
@@ -241,34 +247,28 @@ pub(crate) struct InstalledSeams {
     storage: Option<InstalledStorage>,
     ranker: Option<InstalledRanker>,
     /// Our hooks, in install order, each with the same-named hook it replaced.
-    post_turn_hooks: Vec<InstalledHook<dyn PostTurnHook>>,
-    tool_hooks: Vec<InstalledHook<dyn ToolHook>>,
+    post_turn_hooks: Vec<InstalledHook<dyn LearningSink>>,
+    tool_hooks: Vec<InstalledHook<dyn ToolHook<OpenHumanRunContext>>>,
     /// Installed only once the core has booted.
     live_policy: Option<Arc<SecurityPolicy>>,
     restore: bool,
 }
 
 impl InstalledSeams {
-    pub(crate) fn post_turn_hook(&mut self, name: &str, hook: Option<Arc<dyn PostTurnHook>>) {
+    pub(crate) fn post_turn_hook(&mut self, name: &str, hook: Option<Arc<dyn LearningSink>>) {
         while let Some(index) = self
             .post_turn_hooks
             .iter()
             .rposition(|installed| installed.name == name)
         {
             let installed = self.post_turn_hooks.remove(index);
-            let current = embedder_post_turn_hooks()
-                .into_iter()
-                .find(|hook| hook.name() == name);
+            let current = embedder_post_turn_hook_named(name);
             if current.is_some_and(|current| Arc::ptr_eq(&current, &installed.ours)) {
                 replace_embedder_post_turn_hook(name, installed.previous);
             }
         }
         if let Some(hook) = hook {
-            let hook: Arc<dyn PostTurnHook> =
-                Arc::new(super::live_hooks::NamedPostTurnHook(name.to_owned(), hook));
-            let previous = embedder_post_turn_hooks()
-                .into_iter()
-                .find(|hook| hook.name() == name);
+            let previous = embedder_post_turn_hook_named(name);
             replace_embedder_post_turn_hook(name, Some(hook.clone()));
             self.post_turn_hooks.push(InstalledHook {
                 name: name.to_owned(),
@@ -277,7 +277,11 @@ impl InstalledSeams {
             });
         }
     }
-    pub(crate) fn tool_hook(&mut self, name: &str, hook: Option<Arc<dyn ToolHook>>) {
+    pub(crate) fn tool_hook(
+        &mut self,
+        name: &str,
+        hook: Option<Arc<dyn ToolHook<OpenHumanRunContext>>>,
+    ) {
         while let Some(index) = self
             .tool_hooks
             .iter()
@@ -292,7 +296,7 @@ impl InstalledSeams {
             }
         }
         if let Some(hook) = hook {
-            let hook: Arc<dyn ToolHook> =
+            let hook: Arc<dyn ToolHook<OpenHumanRunContext>> =
                 Arc::new(super::live_hooks::NamedToolHook(name.to_owned(), hook));
             let previous = embedder_tool_hooks()
                 .into_iter()
@@ -374,9 +378,7 @@ impl Drop for InstalledSeams {
         // over the original. And only while ours still holds the name, so a
         // hook installed after build is not clobbered.
         while let Some(hook) = self.post_turn_hooks.pop() {
-            let current = embedder_post_turn_hooks()
-                .into_iter()
-                .find(|existing| existing.name() == hook.name);
+            let current = embedder_post_turn_hook_named(&hook.name);
             if current.is_some_and(|now| Arc::ptr_eq(&now, &hook.ours)) {
                 replace_embedder_post_turn_hook(&hook.name, hook.previous);
                 log::debug!("[embed][seams] post-turn hook restored name={}", hook.name);
@@ -424,17 +426,17 @@ impl RuntimeBuilder {
         self
     }
 
-    /// A hook every agent session runs after each turn. Replaces a
-    /// registered hook of the same [`name`](PostTurnHook::name); removed (and
-    /// the replaced one restored) when the runtime drops.
-    pub fn post_turn_hook(mut self, hook: Arc<dyn PostTurnHook>) -> Self {
+    /// A hook every agent session runs after each turn. The runtime registers
+    /// it with a private identity before boot and removes it when the runtime
+    /// drops.
+    pub fn post_turn_hook(mut self, hook: Arc<dyn LearningSink>) -> Self {
         self.seams.post_turn_hooks.push(hook);
         self
     }
 
     /// A hook every agent session runs around each tool call. Same
     /// replacement and restore rules as [`post_turn_hook`](Self::post_turn_hook).
-    pub fn tool_hook(mut self, hook: Arc<dyn ToolHook>) -> Self {
+    pub fn tool_hook(mut self, hook: Arc<dyn ToolHook<OpenHumanRunContext>>) -> Self {
         self.seams.tool_hooks.push(hook);
         self
     }

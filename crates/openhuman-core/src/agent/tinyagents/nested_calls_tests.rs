@@ -27,10 +27,9 @@ use tinyinference_llm::providers::MockModel;
 use tinyinference_llm::tool::ToolCall;
 use tinytools::{PermissionLevel, Tool, ToolResult};
 
-use crate::agent::hooks::{ToolHook, ToolHookContext, ToolHookDecision};
 use crate::agent::tinyagents::host::{OpenHumanRunContext, OpenHumanSecurityGate};
-use crate::agent::tinyagents::middleware::EmbedderToolHooksMiddleware;
 use crate::security::policy::{AutonomyLevel, SecurityPolicy};
+use tinyagents_hooks::tool::{ToolHook, ToolHookContext, ToolHooksMiddleware};
 
 type Outcome = Result<ToolResult, String>;
 
@@ -101,24 +100,26 @@ impl Tool for Caller {
 struct DenyNamed(&'static str);
 
 #[async_trait]
-impl ToolHook for DenyNamed {
+impl ToolHook<OpenHumanRunContext> for DenyNamed {
     fn name(&self) -> &str {
         "deny_named"
     }
-    async fn before_tool(&self, context: &ToolHookContext) -> anyhow::Result<()> {
+    async fn before_tool(
+        &self,
+        _: &OpenHumanRunContext,
+        context: &ToolHookContext,
+    ) -> anyhow::Result<()> {
         if context.tool_name == self.0 {
             anyhow::bail!("{} is forbidden", self.0);
         }
         Ok(())
     }
-    async fn after_tool(&self, _context: &ToolHookContext) -> anyhow::Result<()> {
+    async fn after_tool(
+        &self,
+        _: &OpenHumanRunContext,
+        _context: &ToolHookContext,
+    ) -> anyhow::Result<()> {
         Ok(())
-    }
-    async fn before_tool_decision(&self, context: &ToolHookContext) -> ToolHookDecision {
-        match self.before_tool(context).await {
-            Ok(()) => ToolHookDecision::Proceed,
-            Err(error) => ToolHookDecision::Deny(format!("{error:#}")),
-        }
     }
 }
 
@@ -165,9 +166,9 @@ async fn run_with_hooks(target: &'static str) -> (Option<Outcome>, usize, usize)
         target,
         outcome: outcome.clone(),
     }));
-    harness.push_middleware(Arc::new(EmbedderToolHooksMiddleware::new(vec![Arc::new(
-        DenyNamed("secret"),
-    )])));
+    harness.push_middleware(Arc::new(ToolHooksMiddleware::<OpenHumanRunContext>::new(
+        vec![Arc::new(DenyNamed("secret"))],
+    )));
     harness
         .invoke_in_context(&(), run_context(), vec![Message::user("go")])
         .await

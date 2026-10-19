@@ -30,7 +30,7 @@ OpenHuman's policy.
           v   v                                                    v
  +----------------------+    +-------------------------------------------+
  | openhuman-rpc        |    | openhuman-tinyhumans                      |
- | JSON-RPC envelopes,  |    | SdkBackendTransport, RuntimeBuilder,      |
+ | JSON-RPC envelopes,  |    | transport, client, hosted providers,      |
  | HTTP client, axum    |    | login/session owner, hosted RPC proxies   |
  | server, Socket.IO,   |    |   +-------------------------------------+ |
  | session store        |    |   | openhuman-embed                     | |
@@ -44,7 +44,7 @@ OpenHuman's policy.
  |  core/: Outcome, ControllerSchema, registry (all.rs), invoke, BUS,      |
  |         CoreBuilder -> CoreRuntime, CLI                                 |
  |  src/<domain>/: agent, memory, tools, security, inference, channels...  |
- |  backend/transport: BackendTransport port (implemented above)           |
+ |  generic registries (tools::sources, inference::registry, ...)          |
  +-------------------------------------------------------------------------+
             |
             v
@@ -60,13 +60,19 @@ OpenHuman's policy.
 Arrows point at what a crate depends on. Two seams let the upper crates plug
 into the core without the core naming them:
 
-- The backend transport port ([`backend/transport/`](./src/backend/transport/): `BackendTransport`,
-  `BackendRequest`, `BackendTransportError`). `openhuman-tinyhumans`
-  implements it with the TinyHumans SDK and installs it once per process
-  (`openhuman_tinyhumans::install`, `RuntimeBuilder`, or
-  `CoreBuilder::backend_transport`). With no transport installed, agents,
-  memory, tools, and RPC still run, and backend calls answer
-  `BACKEND_UNAVAILABLE:`. The core never depends on `tinyhumans-sdk`.
+- The generic registries (`tools::sources`, `voice::factory::registry`,
+  `voice::live::registry`, `inference::registry`, `channels::callback_slot`,
+  `config::register_enricher`, `memory::engine_registry`,
+  `integrations::composio::client::register_composio_route_builder`,
+  `modules::connectors::register_proxy_target`, `modules::wallet_backend`).
+  Each is keyed by a slug or id and knows nothing of what it serves.
+  `openhuman-tinyhumans` fills them (`openhuman_tinyhumans::install` or
+  `RuntimeBuilder`) with the hosted transport, client, routes and providers.
+  The core has no backend module and no transport slot, and
+  `scripts/ci/check-core-hosted-free.mjs` keeps hosted names out of it. With
+  nothing registered, agents, memory, tools, and RPC still run, and
+  backend-touching calls answer `BACKEND_UNAVAILABLE:`. The core never depends
+  on `tinyhumans-sdk`.
 - The controller extension hook (`core::all::register_controller_extension`).
   `openhuman-tinyhumans` registers the hosted proxies (`billing`, `team`,
   `referral`, `announcements`, `webhooks`, `channel_link`, `oauth`) under
@@ -285,16 +291,16 @@ and reaches the mock backend must call `tinyhumans_boot::boot()` from
 [`tests/support/tinyhumans_boot.rs`](../../tests/support/tinyhumans_boot.rs) first.
 
 Further reading:
-[`gitbooks/developing/architecture.md`](../../gitbooks/developing/architecture.md),
-[`gitbooks/developing/engines.md`](../../gitbooks/developing/engines.md)
+[`docs/gitbooks/en/developing/architecture.md`](../../docs/gitbooks/en/developing/architecture.md),
+[`docs/gitbooks/en/developing/engines.md`](../../docs/gitbooks/en/developing/engines.md)
 (inference providers),
-[`gitbooks/developing/jev.md`](../../gitbooks/developing/jev.md) (the Jev
+[`docs/gitbooks/en/developing/jev.md`](../../docs/gitbooks/en/developing/jev.md) (the Jev
 ranker), and
-[`gitbooks/developing/embedding.md`](../../gitbooks/developing/embedding.md)
+[`docs/gitbooks/en/developing/embedding.md`](../../docs/gitbooks/en/developing/embedding.md)
 (embedding the core).
 
 ## Further reading
 
-- [Building the Rust core](../../gitbooks/developing/building-rust-core.md)
+- [Building the Rust core](../../docs/gitbooks/en/developing/building-rust-core.md)
 - [Crates overview](../README.md)
 - [Repository conventions (AGENTS.md)](../../AGENTS.md)

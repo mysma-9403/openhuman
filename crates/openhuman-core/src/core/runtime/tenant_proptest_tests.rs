@@ -40,7 +40,7 @@ fn normalized(t: &Tenant) -> Tenant {
         agent: t
             .agent
             .clone()
-            .filter(|a| a != crate::agent::session_store::DEFAULT_AGENT),
+            .filter(|a| a != crate::storage::sessions::DEFAULT_AGENT),
     }
 }
 

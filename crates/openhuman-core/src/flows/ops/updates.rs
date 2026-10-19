@@ -1,20 +1,22 @@
 use super::*;
 
-/// Maps a store-level [`FlowUpdateError`](store::FlowUpdateError) to the RPC
+/// Maps a store-level [`FlowUpdateError`](tinyflows_catalog::store::FlowUpdateError) to the RPC
 /// error string. A concurrency conflict is encoded as a JSON object the UI can
 /// parse (`{ code: "version_conflict", message, current }`) so it can offer a
 /// reload/diff instead of silently clobbering; other variants are plain text.
-fn map_flow_update_error(e: store::FlowUpdateError) -> String {
+fn map_flow_update_error(e: tinyflows_catalog::store::FlowUpdateError) -> String {
     match e {
-        store::FlowUpdateError::NotFound => "flow not found".to_string(),
-        store::FlowUpdateError::Conflict(current) => serde_json::to_string(&json!({
-            "code": "version_conflict",
-            "message": "This flow changed since you loaded it. Reload to see the latest \
-                        version, then reapply your change.",
-            "current": *current,
-        }))
-        .unwrap_or_else(|_| "version_conflict".to_string()),
-        store::FlowUpdateError::Store(err) => err.to_string(),
+        tinyflows_catalog::store::FlowUpdateError::NotFound => "flow not found".to_string(),
+        tinyflows_catalog::store::FlowUpdateError::Conflict(current) => {
+            serde_json::to_string(&json!({
+                "code": "version_conflict",
+                "message": "This flow changed since you loaded it. Reload to see the latest \
+                            version, then reapply your change.",
+                "current": *current,
+            }))
+            .unwrap_or_else(|_| "version_conflict".to_string())
+        }
+        tinyflows_catalog::store::FlowUpdateError::Store(err) => err.to_string(),
     }
 }
 
@@ -233,7 +235,7 @@ pub fn flows_get_history(
     config: &Config,
     id: &str,
     limit: usize,
-) -> Result<Outcome<Vec<crate::flows::FlowRevision>>, String> {
+) -> Result<Outcome<Vec<tinyflows_catalog::FlowRevision>>, String> {
     let revisions = store::list_revisions(config, id, limit).map_err(|e| e.to_string())?;
     let count = revisions.len();
     Ok(Outcome::single_log(

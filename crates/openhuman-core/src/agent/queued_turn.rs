@@ -41,7 +41,7 @@ pub fn text_preview(text: &str) -> String {
     let mut names = Vec::new();
     let caption = MARKERS.replace_all(text, |capture: &regex::Captures<'_>| {
         if &capture[1] == "ATTACHMENT" {
-            let (_, files) = super::attachments::parse(&capture[0]);
+            let (_, files) = crate::attachments::parse(&capture[0]);
             let Some(file) = files.into_iter().next() else {
                 return capture[0].to_owned();
             };

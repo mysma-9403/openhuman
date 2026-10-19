@@ -1,5 +1,5 @@
 use super::*;
-use tinyagents_runtime::ResumeMode;
+use tinyagents_runtime::{ResumeMode, TranscriptCodec, TranscriptTurnOptions};
 
 fn meta() -> tinyagents_session::transcript::TranscriptMeta {
     tinyagents_session::transcript::TranscriptMeta {
@@ -47,6 +47,66 @@ fn codec_still_rejects_an_orphan_result_after_a_user_message() {
 }
 
 #[test]
+fn durable_turn_usage_keeps_the_root_record_exclusive_with_child_entries() {
+    let context = crate::agent::tinyagents::host::OpenHumanRunContext::new();
+    *context
+        .session_sidecar
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        crate::agent::tinyagents::host::run_context::SessionTurnSidecar {
+            input_tokens: 11,
+            output_tokens: 5,
+            cached_input_tokens: 3,
+            cost: tinyagents_harness::cost::CostTally {
+                known_usd: 0.004,
+                source: tinyagents_harness::cost::CostSource::Charged,
+            },
+            ..Default::default()
+        };
+    context
+        .subagent_usage
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(crate::agent::tinyagents::host::SubagentUsageEntry {
+            task_id: "child-exclusive".into(),
+            agent_id: "researcher".into(),
+            usage: crate::agent::subagent_host::SubagentUsage {
+                input_tokens: 7,
+                output_tokens: 2,
+                cached_input_tokens: 1,
+                charged_amount_usd: 0.002,
+                cost_source: tinyagents_harness::cost::CostSource::Charged,
+            },
+        });
+
+    let options = TranscriptTurnOptions {
+        request_id: Some("request-exclusive".into()),
+        thread_id: Some("thread-exclusive".into()),
+        stream: false,
+        resume: ResumeMode::Never,
+        context: context.clone(),
+    };
+    let usage = OpenHumanTranscriptCodec
+        .turn_usage(&options)
+        .unwrap()
+        .expect("root call usage is durable");
+
+    assert_eq!(usage.usage.input, 11);
+    assert_eq!(usage.usage.output, 5);
+    assert_eq!(usage.usage.cached_input, 3);
+    assert_eq!(usage.usage.cost_usd, 0.004);
+    let sidecar = context
+        .session_sidecar
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        sidecar.subagents.len(),
+        1,
+        "children remain available to UI billing"
+    );
+}
+
+#[test]
 fn codec_retains_authoritative_row_metadata_after_legacy_head_adoption() {
     let transcript = tinyagents_session::transcript::SessionTranscript {
         meta: meta(),
@@ -88,4 +148,47 @@ fn codec_retains_authoritative_row_metadata_after_legacy_head_adoption() {
     );
     assert_eq!(rows[2].request_id.as_deref(), Some("new-turn"));
     assert_eq!(transcript.messages[1].id.as_deref(), Some("legacy-head"));
+}
+
+/// Providers reuse tool-call ids across turns (`call_0`, `call_1`, ...). A
+/// failure in this turn must not retroactively mark an earlier turn's
+/// successful result with the same id as failed: that rewrites a persisted row,
+/// so the commit no longer extends the transcript and opens a new generation.
+#[test]
+fn failed_tool_outcome_does_not_mark_an_earlier_turns_result_with_the_same_call_id() {
+    let options = |context| TranscriptTurnOptions {
+        request_id: Some("turn".into()),
+        thread_id: None,
+        stream: false,
+        resume: ResumeMode::Never,
+        context,
+    };
+    let first = vec![Message::user("one"), Message::tool("call_1", "scheduled")];
+    let prior = OpenHumanTranscriptCodec
+        .reconcile(&[], &[], &first, &options(OpenHumanRunContext::new()))
+        .unwrap();
+    assert!(prior[1].tool_failure.is_none());
+
+    let context = OpenHumanRunContext::new();
+    context.session_sidecar.lock().unwrap().tool_outcomes.push(
+        tinyagents_harness::turn_outcome::ToolCallOutcome {
+            call_id: "call_1".into(),
+            name: "cron".into(),
+            arguments: serde_json::json!({}),
+            success: false,
+            content: "refused".into(),
+            duration_ms: 0,
+        },
+    );
+    let mut next = first.clone();
+    next.push(Message::user("two"));
+    next.push(Message::tool("call_1", "refused"));
+    let rows = OpenHumanTranscriptCodec
+        .reconcile(&prior, &first, &next, &options(context))
+        .unwrap();
+    assert!(
+        rows[1].tool_failure.is_none(),
+        "an earlier turn's result keeps its recorded status"
+    );
+    assert!(rows[3].tool_failure.as_ref().is_some_and(|f| f.failed));
 }

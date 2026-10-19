@@ -2,14 +2,11 @@ use super::*;
 use crate::config::{BrowserConfig, Config};
 use crate::security::credentials::{AuthService, APP_SESSION_PROVIDER, DEFAULT_AUTH_PROFILE_NAME};
 use crate::security::AuditLogger;
-use crate::skills::types::ToolContent;
 use crate::tools::ops::{all_tools, tool_group};
 use std::collections::HashMap;
 use tempfile::TempDir;
+use tinytools::ToolContent;
 use tinytools::ToolResult;
-
-#[path = "../integrations/test_support.rs"]
-mod integration_test_support;
 
 fn test_config(tmp: &TempDir) -> Config {
     Config {
@@ -35,7 +32,7 @@ fn assert_contains_all(names: &[String], expected: &[&str]) {
 
 fn only_json_content(result: &ToolResult) -> &serde_json::Value {
     match result.content.as_slice() {
-        [ToolContent::Json { data }] => &data,
+        [ToolContent::Json { data }] => data,
         other => panic!("expected a single JSON content block, got {other:?}"),
     }
 }
@@ -125,9 +122,11 @@ const PRODUCTIVITY_TOOLS: &[&str] = &[
     // `agent_workflows` domain was dissolved into `workflows`; workflow
     // discovery/run tools now live under the Knowledge theme
     // (`list_workflows`, `run_workflow`, …).
-    "artifact_list",
-    "artifact_get",
-    "artifact_delete",
+    "create_artifact",
+    "read_artifact",
+    "update_artifact",
+    "list_artifacts",
+    "delete_artifact",
     "task_source_list",
     "task_source_get",
     "task_source_fetch",
@@ -140,15 +139,17 @@ const PRODUCTIVITY_TOOLS: &[&str] = &[
 ];
 
 const PRODUCTIVITY_DEFAULT_OFF: &[&str] = &[
-    "artifact_delete",
+    "delete_artifact",
     "task_source_add",
     "task_source_update",
     "task_source_remove",
 ];
 
 const PRODUCTIVITY_ALWAYS_ON: &[&str] = &[
-    "artifact_list",
-    "artifact_get",
+    "create_artifact",
+    "read_artifact",
+    "update_artifact",
+    "list_artifacts",
     "task_source_fetch",
     "task_source_status",
 ];

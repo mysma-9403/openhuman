@@ -14,11 +14,14 @@
 //! Outside SaaS, and for work that serves no hosted profile, a drain has no
 //! fence and always runs.
 
+use crate::core::runtime::DispatchCtx;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::storage::fence::LeaseFence;
+use tinyagents_tasks::DeliveryFence;
 
 use super::busy_guard::is_busy;
 
@@ -44,8 +47,8 @@ impl DrainFence {
 
     /// The fence of the profile the calling task serves, when this node hosts
     /// it. `None` outside SaaS or outside a profile.
-    pub(crate) fn current() -> Self {
-        Self(crate::profiles::host::current().map(|profile| Arc::clone(profile.lease_fence())))
+    pub(crate) fn current(ctx: &crate::core::runtime::DispatchCtx) -> Self {
+        Self(crate::profiles::host::current(ctx).map(|profile| Arc::clone(profile.lease_fence())))
     }
 
     /// Whether this node may still act for the profile: the fence is not
@@ -76,6 +79,19 @@ impl DrainFence {
     }
 }
 
+impl DeliveryFence for DrainFence {
+    fn admitted(&self) -> bool {
+        self.admits()
+    }
+
+    fn lost(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        match &self.0 {
+            Some(fence) => Box::pin(async move { fence.fenced().await }),
+            None => Box::pin(std::future::pending()),
+        }
+    }
+}
+
 /// How a drain ended.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum DrainOutcome {
@@ -93,6 +109,7 @@ pub(super) enum DrainOutcome {
 /// `wait_idle` serves a recovered record: it has no owner noted (that table is
 /// process-local), so the busy turn's completion event would not wake it.
 pub(super) async fn run_drain<F, Fut>(
+    ctx: &DispatchCtx,
     thread_id: &str,
     delay: Duration,
     wait_idle: bool,
@@ -112,7 +129,7 @@ where
     }
     if wait_idle {
         let mut polls = 0;
-        while is_busy(thread_id) && polls < RECOVERY_BUSY_POLLS {
+        while is_busy(ctx, thread_id) && polls < RECOVERY_BUSY_POLLS {
             polls += 1;
             if !fence.sleep(poll).await {
                 log::info!(
@@ -122,7 +139,7 @@ where
                 return DrainOutcome::Fenced;
             }
         }
-        if is_busy(thread_id) {
+        if is_busy(ctx, thread_id) {
             return DrainOutcome::StillBusy;
         }
     }

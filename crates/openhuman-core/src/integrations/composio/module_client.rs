@@ -12,11 +12,9 @@
 //!
 //! # What the member names do *not* depend on
 //!
-//! [`methods`] comes from `tinyconnectors_bus`, an ordinary dependency with no
+//! The method constants come from `tinyconnectors_bus`, an ordinary dependency with no
 //! feature gate. A gates-off build can still name a member and match on the
 //! contract; it just cannot call one.
-
-pub use tinyconnectors_bus::names::methods;
 
 /// Whether a member failure is the module refusing an operation the live route
 /// does not offer.
@@ -90,6 +88,43 @@ const WITHOUT_MODULES: &str =
     "composio is unavailable in this build: connectors run in the `tinyconnectors` module, \
      which needs the `modules` feature";
 
+/// Fill the process snapshot of the module's curated catalogs, once per
+/// pinned module version. The synchronous catalog lookups read that snapshot,
+/// so it must exist before the first call whose reply they gate. A failure is
+/// logged and the call proceeds: the lookups then read every toolkit as
+/// uncurated until a later call succeeds.
+#[cfg(feature = "modules")]
+async fn prime_curated_catalogs(config: &crate::config::Config) {
+    if let Err(error) = super::contract::curated::prime(config).await {
+        tracing::debug!("[composio][curated] prime failed: {error}");
+    }
+}
+
+/// Make sure the curated-catalog snapshot is filled before a lookup that does
+/// not itself call the module (the agent-ready list, catalog search). The
+/// module is loaded if it is not yet, then asked once per pinned version.
+///
+/// # Errors
+///
+/// The module could not be reached, so the snapshot is empty and an answer read
+/// from it would look like "no curated toolkits" rather than "unknown". A build
+/// without a module loader has no catalogs to read and answers `Ok`.
+#[cfg(feature = "modules")]
+pub async fn ensure_catalogs(config: &crate::config::Config) -> Result<(), String> {
+    super::contract::curated::prime(config)
+        .await
+        .map_err(|error| {
+            tracing::debug!("[composio][curated] prime failed: {error}");
+            error
+        })
+}
+
+/// Without the module loader there is no catalog to read.
+#[cfg(not(feature = "modules"))]
+pub async fn ensure_catalogs(_config: &crate::config::Config) -> Result<(), String> {
+    Ok(())
+}
+
 /// Call one member with an argument and decode its reply.
 ///
 /// # Errors
@@ -110,6 +145,7 @@ where
     Request: serde::Serialize + Send,
     Reply: serde::de::DeserializeOwned,
 {
+    prime_curated_catalogs(config).await;
     crate::modules::connectors::call(config, member, request)
         .await
         .map_err(|error| normalize_error(member, error))
@@ -130,7 +166,7 @@ where
     Request: serde::Serialize + Send,
     Reply: serde::de::DeserializeOwned,
 {
-    crate::modules::client::ModuleClient::new(_config.clone())
+    crate::modules::client(_config.clone())
         .call::<Reply>("tinyconnectors", member, (_request,))
         .await
         .map_err(|error| format!("{member}: {error}; {WITHOUT_MODULES}"))
@@ -172,6 +208,7 @@ where
     Request: serde::Serialize + Send,
     Reply: serde::de::DeserializeOwned,
 {
+    prime_curated_catalogs(config).await;
     crate::modules::connectors::call_stateless(config, member, request).await
 }
 
@@ -190,7 +227,7 @@ where
     Request: serde::Serialize + Send,
     Reply: serde::de::DeserializeOwned,
 {
-    crate::modules::client::ModuleClient::new(_config.clone())
+    crate::modules::client(_config.clone())
         .call::<Reply>("tinyconnectors", member, (_request,))
         .await
         .map_err(|error| format!("{member}: {error}; {WITHOUT_MODULES}"))
@@ -233,6 +270,7 @@ pub async fn call_bare<Reply: serde::de::DeserializeOwned>(
     config: &crate::config::Config,
     member: &str,
 ) -> Result<Reply, String> {
+    prime_curated_catalogs(config).await;
     crate::modules::connectors::call_bare(config, member)
         .await
         .map_err(|error| normalize_error(member, error))
@@ -248,7 +286,7 @@ pub async fn call_bare<Reply: serde::de::DeserializeOwned>(
     _config: &crate::config::Config,
     member: &str,
 ) -> Result<Reply, String> {
-    crate::modules::client::ModuleClient::new(_config.clone())
+    crate::modules::client(_config.clone())
         .call::<Reply>("tinyconnectors", member, ())
         .await
         .map_err(|error| format!("{member}: {error}; {WITHOUT_MODULES}"))
@@ -276,6 +314,9 @@ pub(crate) static MODULE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::cons
 /// Take the module lock for the rest of the test.
 #[cfg(test)]
 pub(crate) async fn module_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    // Tests that take the module drive its backend mode against a local mock;
+    // give this thread the stand-in route a host would register.
+    super::test_backend_route::register();
     MODULE_LOCK.lock().await
 }
 

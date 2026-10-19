@@ -60,6 +60,11 @@ pub struct DurableSubagentSession {
     pub task_key: String,
     pub task_title: String,
     pub current_task_id: Option<String>,
+    /// TinyAgents' full lifecycle identity for the current task. Older rows
+    /// do not contain this field; hosts recover those identities from the
+    /// validated checkpoint before resuming or controlling a live child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_key: Option<tinyagents_orchestration::subagent::SubagentTaskKey>,
     pub status: DurableSubagentStatus,
     pub reusable: bool,
     #[serde(default, with = "crate::agent::messages::history_wire::option")]
@@ -137,6 +142,10 @@ pub struct SubagentSessionUpsert {
     pub task_title: String,
     pub worker_thread_id: Option<String>,
     pub task_id: String,
+    /// Full TinyAgents lifecycle identity when the caller owns one. `None` is
+    /// retained for legacy host paths and rows written before this field was
+    /// introduced.
+    pub lifecycle_key: Option<tinyagents_orchestration::subagent::SubagentTaskKey>,
 }
 
 #[derive(Debug, Clone)]

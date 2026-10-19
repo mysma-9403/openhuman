@@ -195,7 +195,7 @@ fn connected_integrations_cache_is_keyed_per_credential() {
     cache.write().unwrap().insert(
         cache_key(&agent_a),
         CachedIntegrations {
-            entries: vec![crate::agent::prompts::ConnectedIntegration {
+            entries: vec![crate::integrations::ConnectedIntegration {
                 toolkit: "gmail".into(),
                 description: String::new(),
                 tools: Vec::new(),

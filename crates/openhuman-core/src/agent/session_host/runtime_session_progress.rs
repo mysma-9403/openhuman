@@ -1,8 +1,8 @@
 //! Post-commit progress delivery for a chat turn.
 
-use crate::agent::progress::AgentProgress;
 use crate::agent::tinyagents::host::OpenHumanRunContext;
-use crate::agent::turn_stop::TurnStop;
+use crate::progress::AgentProgress;
+use tinyagents_harness::turn_stop::TurnStop;
 use tinyagents_runtime::CommitReceipt;
 
 /// Preserve the response path if a progress receiver stays open but stops

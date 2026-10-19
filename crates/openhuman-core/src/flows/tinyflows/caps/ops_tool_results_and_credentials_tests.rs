@@ -156,17 +156,29 @@ fn connection_ref_resolves_to_the_chosen_account() {
 /// but simply doesn't contain it.
 #[tokio::test]
 async fn unknown_toolkit_still_rejects() {
-    use crate::integrations::composio::providers::catalog_for_toolkit;
+    // Reaches the connector module, whose route is process-wide: hold the module
+    // lock (before TEST_ENV_LOCK, the established order) for the whole test.
+    let _module = crate::integrations::composio::module_client::module_guard().await;
+    use crate::integrations::composio::contract::catalog_for_toolkit;
     let config = Config::default();
     // Precondition: `flowstestkit` is genuinely uncatalogued, so the decision
     // flows through the connected-set path (not the static curated path).
     assert!(catalog_for_toolkit("flowstestkit").is_none());
 
     // No connected set at all → fail-closed reject.
-    assert!(!flow_tool_allowed(&config, "FLOWSTESTKIT_DO_THING", None).await);
+    assert!(
+        !flow_tool_allowed(
+            &crate::core::runtime::DispatchCtx::ambient(),
+            &config,
+            "FLOWSTESTKIT_DO_THING",
+            None
+        )
+        .await
+    );
     // Connected set present but does not include this toolkit → reject.
     assert!(
         !flow_tool_allowed(
+            &crate::core::runtime::DispatchCtx::ambient(),
             &config,
             "FLOWSTESTKIT_DO_THING",
             Some(&["gmail".to_string()])
@@ -174,7 +186,15 @@ async fn unknown_toolkit_still_rejects() {
         .await
     );
     // A blank slug is always rejected.
-    assert!(!flow_tool_allowed(&config, "", Some(&["flowstestkit".to_string()])).await);
+    assert!(
+        !flow_tool_allowed(
+            &crate::core::runtime::DispatchCtx::ambient(),
+            &config,
+            "",
+            Some(&["flowstestkit".to_string()])
+        )
+        .await
+    );
 }
 
 /// A real Composio toolkit OpenHuman ships no static catalog for now PASSES
@@ -184,7 +204,10 @@ async fn unknown_toolkit_still_rejects() {
 /// The exact same slug rejects above without a connection.
 #[tokio::test]
 async fn connected_uncatalogued_toolkit_now_passes() {
-    use crate::integrations::composio::providers::catalog_for_toolkit;
+    // Reaches the connector module, whose route is process-wide: hold the module
+    // lock (before TEST_ENV_LOCK, the established order) for the whole test.
+    let _module = crate::integrations::composio::module_client::module_guard().await;
+    use crate::integrations::composio::contract::catalog_for_toolkit;
     assert!(catalog_for_toolkit("flowstestkit").is_none());
 
     let config = Config::default();
@@ -205,6 +228,7 @@ async fn connected_uncatalogued_toolkit_now_passes() {
 
     assert!(
         flow_tool_allowed(
+            &crate::core::runtime::DispatchCtx::ambient(),
             &config,
             "FLOWSTESTKIT_DO_THING",
             Some(&["flowstestkit".to_string()])
@@ -214,6 +238,7 @@ async fn connected_uncatalogued_toolkit_now_passes() {
     // Case-insensitive match on the toolkit slug.
     assert!(
         flow_tool_allowed(
+            &crate::core::runtime::DispatchCtx::ambient(),
             &config,
             "FLOWSTESTKIT_DO_THING",
             Some(&["FlowsTestKit".to_string()])
@@ -233,7 +258,10 @@ async fn connected_uncatalogued_toolkit_now_passes() {
 /// which passes.
 #[tokio::test]
 async fn expired_live_catalog_entry_is_treated_as_a_cache_miss() {
-    use crate::integrations::composio::providers::catalog_for_toolkit;
+    // Reaches the connector module, whose route is process-wide: hold the module
+    // lock (before TEST_ENV_LOCK, the established order) for the whole test.
+    let _module = crate::integrations::composio::module_client::module_guard().await;
+    use crate::integrations::composio::contract::catalog_for_toolkit;
     assert!(catalog_for_toolkit("flowsexpiredkit").is_none());
 
     let config = Config::default();
@@ -254,6 +282,7 @@ async fn expired_live_catalog_entry_is_treated_as_a_cache_miss() {
 
     assert!(
         !flow_tool_allowed(
+            &crate::core::runtime::DispatchCtx::ambient(),
             &config,
             "FLOWSEXPIREDKIT_DO_THING",
             Some(&["flowsexpiredkit".to_string()])
@@ -270,7 +299,10 @@ async fn expired_live_catalog_entry_is_treated_as_a_cache_miss() {
 /// sufficient, the slug itself must be real.
 #[tokio::test]
 async fn connected_uncatalogued_toolkit_rejects_a_hallucinated_slug() {
-    use crate::integrations::composio::providers::catalog_for_toolkit;
+    // Reaches the connector module, whose route is process-wide: hold the module
+    // lock (before TEST_ENV_LOCK, the established order) for the whole test.
+    let _module = crate::integrations::composio::module_client::module_guard().await;
+    use crate::integrations::composio::contract::catalog_for_toolkit;
     assert!(catalog_for_toolkit("flowstestkit").is_none());
 
     let config = Config::default();
@@ -291,6 +323,7 @@ async fn connected_uncatalogued_toolkit_rejects_a_hallucinated_slug() {
 
     assert!(
         !flow_tool_allowed(
+            &crate::core::runtime::DispatchCtx::ambient(),
             &config,
             "FLOWSTESTKIT_MADE_UP_ACTION",
             Some(&["flowstestkit".to_string()])

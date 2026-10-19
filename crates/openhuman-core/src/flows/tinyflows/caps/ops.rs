@@ -12,8 +12,6 @@
 
 use std::sync::Arc;
 
-use crate::flows::tinyflows::checkpoint_sqlite::SqliteCheckpointer;
-use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tinyflows::caps::*;
@@ -29,9 +27,10 @@ use crate::flows;
 #[cfg(test)]
 use crate::security::credentials::HttpCredential;
 use crate::security::credentials::HttpCredentialsStore;
-use crate::security::{CommandClass, SecurityPolicy};
 #[cfg(test)]
-use crate::security::{GateDecision, POLICY_BLOCKED_MARKER};
+use crate::security::GateDecision;
+use crate::security::SecurityPolicy;
+use tinybox_bus::CommandClass;
 
 // The live Composio catalog and probe moved to `composio::catalog` -- the domain
 // that owns Composio's vocabulary. This import is the edge pointing the right
@@ -40,8 +39,7 @@ use crate::security::{GateDecision, POLICY_BLOCKED_MARKER};
 #[cfg(test)]
 pub(crate) use crate::integrations::composio::catalog::ProbedOutputSample;
 pub(crate) use crate::integrations::composio::catalog::{
-    apply_probe_override, composio_required_args, fetch_live_toolkit_catalog,
-    probe_tool_output_sample, ToolContract,
+    composio_required_args, fetch_live_toolkit_catalog, probe_tool_output_sample, ToolContract,
 };
 #[cfg(test)]
 pub(crate) use crate::integrations::composio::catalog::{
@@ -140,14 +138,15 @@ pub(crate) fn http_cred_name(conn: &str) -> Option<&str> {
 /// connected set is never consulted then) or when the connected set could not
 /// be fetched (fail-closed).
 async fn flow_tool_allowed(
+    ctx: &crate::core::runtime::DispatchCtx,
     config: &Config,
     slug: &str,
     connected_toolkits: Option<&[String]>,
 ) -> bool {
-    use crate::integrations::composio::ops::load_user_scope_pref;
-    use crate::integrations::composio::providers::{
+    use crate::integrations::composio::contract::{
         catalog_for_toolkit, classify_unknown, find_curated, toolkit_from_slug,
     };
+    use crate::integrations::composio::ops::load_user_scope_pref;
 
     let Some(toolkit) = toolkit_from_slug(slug) else {
         tracing::debug!(target: "flows", %slug, "[flows] tool_call curation: reject — slug has no extractable toolkit prefix");
@@ -157,11 +156,11 @@ async fn flow_tool_allowed(
     // Path A: a toolkit OpenHuman ships a static curated catalog for keeps its
     // strict curated-action + per-user scope gating (unchanged from B2).
     if let Some(catalog) = catalog_for_toolkit(&toolkit) {
-        let Some(curated) = find_curated(catalog, slug) else {
+        let Some(curated) = find_curated(&catalog, slug) else {
             tracing::debug!(target: "flows", %slug, %toolkit, "[flows] tool_call curation: reject — slug is not a curated action of this toolkit");
             return false;
         };
-        let pref = load_user_scope_pref(config, &toolkit).await;
+        let pref = load_user_scope_pref(ctx, config, &toolkit).await;
         let allowed = pref.allows(curated.scope);
         tracing::debug!(target: "flows", %slug, %toolkit, allowed, "[flows] tool_call curation: static curated catalog decision");
         return allowed;
@@ -203,7 +202,7 @@ async fn flow_tool_allowed(
     // classify_unknown heuristic (mirrors
     // `providers::is_action_visible_with_pref`'s uncurated branch), which the
     // pre-fix Path B never applied at all.
-    let pref = load_user_scope_pref(config, &toolkit).await;
+    let pref = load_user_scope_pref(ctx, config, &toolkit).await;
     let allowed = pref.allows(classify_unknown(slug));
     tracing::debug!(target: "flows", %slug, %toolkit, allowed, "[flows] tool_call curation: live catalog + scope decision");
     allowed
@@ -214,7 +213,7 @@ async fn flow_tool_allowed(
 /// offline (a registry lookup) so the common cataloged-toolkit path never pays
 /// for a connected-set fetch.
 fn slug_needs_connected_set(slug: &str) -> bool {
-    use crate::integrations::composio::providers::{catalog_for_toolkit, toolkit_from_slug};
+    use crate::integrations::composio::contract::{catalog_for_toolkit, toolkit_from_slug};
     match toolkit_from_slug(slug) {
         Some(toolkit) => catalog_for_toolkit(&toolkit).is_none(),
         None => false,
@@ -262,7 +261,7 @@ async fn connected_toolkit_slugs(config: &Config) -> Option<Vec<String>> {
 /// [`CommandClass`] the autonomy-tier gate ([`enforce_node_tier_gate`])
 /// evaluates it under.
 ///
-/// Reuses [`curated_scope_for`](crate::integrations::composio::providers::curated_scope_for),
+/// Reuses [`curated_scope_for`](crate::integrations::composio::contract::curated_scope_for),
 /// the same catalog walk `composio::ops`'s `gated_tools` hints use — a
 /// registered native provider's `curated_tools()` first, then the static
 /// `catalog_for_toolkit` fallback. **Fail-safe by construction:** only a
@@ -275,7 +274,7 @@ async fn connected_toolkit_slugs(config: &Config) -> Option<Vec<String>> {
 /// (prompts under Supervised/Full, blocks under ReadOnly).
 ///
 /// Deliberately does **not** fall back to
-/// [`classify_unknown`](crate::integrations::composio::providers::classify_unknown)
+/// [`classify_unknown`](crate::integrations::composio::contract::classify_unknown)
 /// for uncurated slugs: that heuristic is tuned for the *curation*
 /// allowlist (`flow_tool_allowed`'s Path B — "is this slug even visible to
 /// the agent"), not for deciding whether a real side-effecting call skips
@@ -286,7 +285,7 @@ async fn connected_toolkit_slugs(config: &Config) -> Option<Vec<String>> {
 /// from what actually gates (a parallel re-implementation would list
 /// permissions that never prompt, or miss ones that do).
 pub(crate) async fn classify_composio_action_for_tier(slug: &str) -> CommandClass {
-    use crate::integrations::composio::providers::{curated_scope_for, ToolScope};
+    use crate::integrations::composio::contract::{curated_scope_for, ToolScope};
 
     match curated_scope_for(slug) {
         Some(ToolScope::Read) => CommandClass::Read,
@@ -297,13 +296,17 @@ pub(crate) async fn classify_composio_action_for_tier(slug: &str) -> CommandClas
 /// Deny-by-default curation gate for a flow `tool_call` slug (see
 /// [`flow_tool_allowed`] for the decision matrix). Fetches the user's live
 /// connected-toolkit set only when the slug's toolkit has no static catalog.
-pub(crate) async fn is_curated_flow_tool(config: &Config, slug: &str) -> bool {
+pub(crate) async fn is_curated_flow_tool(
+    ctx: &crate::core::runtime::DispatchCtx,
+    config: &Config,
+    slug: &str,
+) -> bool {
     let connected = if slug_needs_connected_set(slug) {
         connected_toolkit_slugs(config).await
     } else {
         None
     };
-    flow_tool_allowed(config, slug, connected.as_deref()).await
+    flow_tool_allowed(ctx, config, slug, connected.as_deref()).await
 }
 
 /// Finds the connected account a Composio `connection_id` refers to within a
@@ -360,7 +363,7 @@ pub(crate) async fn resolve_composio_account(
 /// - **connection_ref**: `conn` (`"composio:<toolkit>:<connection_id>"`) is
 ///   parsed and forwarded in both modes: Direct passes it to Composio's
 ///   execute endpoint, while Backend includes it as `connectionId` in the
-///   authenticated `/agent-integrations/composio/execute` request. Omitting a
+///   authenticated composio execute request. Omitting a
 ///   ref deliberately keeps the ambient-account behavior. A supplied but
 ///   stale/foreign id is still forwarded exactly so the provider rejects it;
 ///   it must never degrade to the ambient account (fixes #5751 / E-m3).
@@ -382,8 +385,14 @@ pub(crate) async fn resolve_composio_account(
 /// // For such flows authors should set `require_approval`. FOLLOW-UP: auto-force
 /// // approval when a trigger-driven run's tool/http config contains `=`-exprs.
 pub struct OpenHumanTools {
+    /// The context the run acts under: the scope-pref reads of the curation
+    /// gate resolve against it rather than the calling task's own scope.
+    pub ctx: crate::core::runtime::DispatchCtx,
     pub config: Arc<Config>,
     pub security: Arc<SecurityPolicy>,
+    /// The run's approval context (flow run correlation), handed to the gate
+    /// with every acting dispatch.
+    pub approval: crate::security::approval::ApprovalTurnContext,
 }
 
 /// Required-arg preflight for a Composio `tool_call`: fails **before** the
@@ -506,7 +515,7 @@ pub(crate) fn reject_unsuccessful_composio_response(
 /// rather than a false "Completed".
 pub(crate) fn reject_failed_native_tool_result(
     slug: &str,
-    result: &crate::skills::types::ToolResult,
+    result: &tinytools::ToolResult,
 ) -> Result<()> {
     if !result.is_error {
         return Ok(());
@@ -540,8 +549,8 @@ pub(crate) fn reject_failed_native_tool_result(
 /// binds with the same `=nodes.<id>.item.json.<field>` shape used everywhere
 /// else. Anything else (plain text, or mixed/multiple blocks) collapses to
 /// `{ "text": <output()> }` so there is always a predictable field to bind.
-pub(crate) fn native_tool_payload(result: &crate::skills::types::ToolResult) -> Value {
-    use crate::skills::types::ToolContent;
+pub(crate) fn native_tool_payload(result: &tinytools::ToolResult) -> Value {
+    use tinytools::ToolContent;
     match result.content.as_slice() {
         [ToolContent::Json { data }] => data.clone(),
         _ => json!({ "text": result.output() }),
@@ -581,8 +590,10 @@ impl ToolInvoker for PreflightToolInvoker {
 impl ToolInvoker for OpenHumanTools {
     async fn invoke(&self, slug: &str, args: Value, conn: Option<&str>) -> Result<Value> {
         let ctx = tools::ToolCallCtx {
+            dispatch: &self.ctx,
             config: &self.config,
             security: &self.security,
+            approval: &self.approval,
         };
         match tools::backend_for(slug) {
             Some(backend) => backend.invoke(&ctx, slug, args, conn).await,
@@ -602,32 +613,58 @@ impl ToolInvoker for OpenHumanTools {
 /// per-flow namespace (e.g. `"flow:<id>"`). This KV namespace is unrelated to
 /// flow-scoped memory: `OpenHumanMemory` tags memory items with
 /// `flows::flow_tag`, derived independently from the run's trusted origin.
-pub fn build_capabilities(config: Arc<Config>, state_namespace: impl Into<String>) -> Capabilities {
+///
+/// `ctx` is the context the run acts under: the agent, code and HTTP adapters
+/// act for it instead of reading the calling task's own scope.
+///
+/// `flow_run` is the run the capabilities serve: every acting dispatch hands it
+/// to the approval gate (with the tool call), so a parked approval is stamped
+/// with the exact flow and run. `None` for a run with no flow identity (a dry
+/// run, a preview).
+pub fn build_capabilities(
+    ctx: &crate::core::runtime::DispatchCtx,
+    config: Arc<Config>,
+    state_namespace: impl Into<String>,
+    flow_run: Option<crate::security::approval::FlowRunContext>,
+) -> Capabilities {
+    let approval = crate::security::approval::ApprovalTurnContext {
+        flow_run,
+        ..Default::default()
+    };
     let security = Arc::new(SecurityPolicy::for_config(&config));
     let http_config = config.http_request.clone();
     let http_creds = Arc::new(HttpCredentialsStore::from_config(&config));
 
     Capabilities {
         llm: Arc::new(OpenHumanLlm {
+            ctx: ctx.clone(),
             config: config.clone(),
         }),
         tools: Arc::new(OpenHumanTools {
+            ctx: ctx.clone(),
             config: config.clone(),
             security: security.clone(),
+            approval: approval.clone(),
         }),
         http: Arc::new(OpenHumanHttp {
+            ctx: ctx.clone(),
             security: security.clone(),
             http_config,
             http_creds,
+            approval: approval.clone(),
         }),
         code: Arc::new(OpenHumanCode {
+            ctx: ctx.clone(),
             config: config.clone(),
             security: security.clone(),
+            approval: approval.clone(),
         }),
         state: crate::flows::tinyflows::state::FlowState::open(&config, state_namespace)
             .into_state_store(),
         agent: Some(Arc::new(OpenHumanAgentRunner {
+            ctx: ctx.clone(),
             config: config.clone(),
+            approval: approval.clone(),
         })),
         // Shell execution needs a dedicated OpenHuman adapter that applies the
         // host's autonomy and sandbox policy. Keep the capability unavailable
@@ -650,8 +687,10 @@ pub fn build_capabilities(config: Arc<Config>, state_namespace: impl Into<String
         approvals: None,
         memory: Some(Arc::new(
             crate::flows::tinyflows::memory_adapter::OpenHumanMemory {
+                ctx: ctx.clone(),
                 config: config.clone(),
                 security,
+                approval,
             },
         )),
         resolver: Arc::new(OpenHumanWorkflowResolver { config }),
@@ -659,35 +698,20 @@ pub fn build_capabilities(config: Arc<Config>, state_namespace: impl Into<String
 }
 
 /// Opens the durable, cross-process checkpointer a `flows_run` uses via
-/// `tinyflows::engine::run_with_checkpointer` — this host's
-/// [`SqliteCheckpointer`], stored under `<workspace_dir>/flows/checkpoints.db`,
-/// or, when the host configured a storage backend ([`crate::storage`]),
-/// `tinyflows_drivers::DriverCheckpointer` over it in the acting agent's scope.
+/// `tinyflows::engine::run_with_checkpointer`:
+/// `tinyflows_drivers::DriverCheckpointer` over the flow catalog's storage
+/// ([`crate::flows::store`]) in the acting agent's scope.
 ///
-/// It became host-owned when tinyflows vendored its state-graph runtime and
-/// dropped the SQLite backend with it (tinyflows PR #43). The port keeps the
-/// schema and SQL byte-identical, so an existing `checkpoints.db` — and any
-/// run interrupted before the upgrade — resumes unchanged. See
-/// [`super::super::checkpoint_sqlite`].
+/// tinyflows no longer has a SQLite checkpointer; the `checkpoints.db` it wrote
+/// is imported once, so a run interrupted before the upgrade still resumes.
 pub fn open_flow_checkpointer(
     config: &Config,
 ) -> anyhow::Result<Arc<dyn tinyflows::engine::Checkpointer<serde_json::Value>>> {
-    if let Some(scoped) = crate::storage::current_scoped()? {
-        tracing::debug!(target: "flows", "[flows] opening checkpointer on the storage backend");
-        return Ok(Arc::new(tinyflows_drivers::DriverCheckpointer::<
-            serde_json::Value,
-        >::new(Arc::clone(scoped.documents()))));
-    }
-    let db_path = config.workspace_dir.join("flows").join("checkpoints.db");
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create flows directory: {}", parent.display()))?;
-    }
-    tracing::debug!(target: "flows", db = %db_path.display(), "[flows] opening checkpointer");
-    Ok(Arc::new(
-        SqliteCheckpointer::<serde_json::Value>::open(&db_path)
-            .with_context(|| format!("Failed to open flows checkpointer: {}", db_path.display()))?,
-    ))
+    let scoped = crate::flows::store::scoped(config)?;
+    tracing::debug!(target: "flows", "[flows] opening checkpointer on the flow storage");
+    Ok(Arc::new(tinyflows_drivers::DriverCheckpointer::<
+        serde_json::Value,
+    >::new(Arc::clone(scoped.documents()))))
 }
 
 #[cfg(test)]

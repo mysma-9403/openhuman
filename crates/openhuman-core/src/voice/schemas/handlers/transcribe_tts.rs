@@ -1,37 +1,34 @@
 //! Handlers for transcription, TTS synthesis, and factory-dispatch RPCs.
 
+use crate::core::runtime::DispatchCtx;
 use serde_json::{Map, Value};
 
-use crate::config::rpc as config_rpc;
 use crate::core::all::ControllerFuture;
 
 use crate::voice::schemas::helpers::{
     deserialize_params, effective_stt_provider, effective_tts_provider, to_json,
 };
 use crate::voice::schemas::params::{
-    CloudTranscribeParams, ReplySynthesizeParams, SttDispatchParams, TranscribeBytesParams,
-    TranscribeParams, TtsDispatchParams, TtsParams,
+    ReplySynthesizeParams, SttDispatchParams, TranscribeBytesParams, TranscribeParams,
+    TtsDispatchParams, TtsParams,
 };
 
-pub(crate) fn handle_voice_status(_params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_voice_status(
+    ctx: DispatchCtx,
+    _params: Map<String, Value>,
+) -> ControllerFuture {
     Box::pin(async move {
-        let config = config_rpc::load_config_with_timeout().await?;
+        let config = ctx.load_config().await?;
         to_json(crate::voice::voice_status(&config).await?)
     })
 }
 
-/// Mint a realtime voice-agent signed WebSocket URL (#5399). Takes no params —
-/// the agent is server-configured; the desktop only asks for a fresh signed URL.
-pub(crate) fn handle_voice_agent_signed_url(_params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_voice_transcribe(
+    ctx: DispatchCtx,
+    params: Map<String, Value>,
+) -> ControllerFuture {
     Box::pin(async move {
-        let config = config_rpc::load_config_with_timeout().await?;
-        to_json(crate::voice::realtime::mint_voice_agent_signed_url(&config).await?)
-    })
-}
-
-pub(crate) fn handle_voice_transcribe(params: Map<String, Value>) -> ControllerFuture {
-    Box::pin(async move {
-        let config = config_rpc::load_config_with_timeout().await?;
+        let config = ctx.load_config().await?;
         let p = deserialize_params::<TranscribeParams>(params)?;
         to_json(
             crate::voice::voice_transcribe(
@@ -45,9 +42,12 @@ pub(crate) fn handle_voice_transcribe(params: Map<String, Value>) -> ControllerF
     })
 }
 
-pub(crate) fn handle_voice_transcribe_bytes(params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_voice_transcribe_bytes(
+    ctx: DispatchCtx,
+    params: Map<String, Value>,
+) -> ControllerFuture {
     Box::pin(async move {
-        let config = config_rpc::load_config_with_timeout().await?;
+        let config = ctx.load_config().await?;
         let p = deserialize_params::<TranscribeBytesParams>(params)?;
         to_json(
             crate::voice::voice_transcribe_bytes(
@@ -62,17 +62,20 @@ pub(crate) fn handle_voice_transcribe_bytes(params: Map<String, Value>) -> Contr
     })
 }
 
-pub(crate) fn handle_voice_tts(params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_voice_tts(ctx: DispatchCtx, params: Map<String, Value>) -> ControllerFuture {
     Box::pin(async move {
-        let config = config_rpc::load_config_with_timeout().await?;
+        let config = ctx.load_config().await?;
         let p = deserialize_params::<TtsParams>(params)?;
         to_json(crate::voice::voice_tts(&config, &p.text, p.output_path.as_deref()).await?)
     })
 }
 
-pub(crate) fn handle_voice_reply_synthesize(params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_voice_reply_synthesize(
+    ctx: DispatchCtx,
+    params: Map<String, Value>,
+) -> ControllerFuture {
     Box::pin(async move {
-        let config = config_rpc::load_config_with_timeout().await?;
+        let config = ctx.load_config().await?;
         let p = deserialize_params::<ReplySynthesizeParams>(params)?;
         // Dispatch through the TTS factory so the user's `tts_provider`
         // setting (cloud / piper / …) is honored on the spoken-reply path,
@@ -115,26 +118,12 @@ pub(crate) fn handle_voice_reply_synthesize(params: Map<String, Value>) -> Contr
     })
 }
 
-pub(crate) fn handle_voice_cloud_transcribe(params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_voice_stt_dispatch(
+    ctx: DispatchCtx,
+    params: Map<String, Value>,
+) -> ControllerFuture {
     Box::pin(async move {
-        let config = config_rpc::load_config_with_timeout().await?;
-        let p = deserialize_params::<CloudTranscribeParams>(params)?;
-        let opts = crate::voice::cloud_transcribe::CloudTranscribeOptions {
-            model: p.model,
-            language: p.language,
-            mime_type: p.mime_type,
-            file_name: p.file_name,
-        };
-        to_json(
-            crate::voice::cloud_transcribe::transcribe_cloud(&config, &p.audio_base64, &opts)
-                .await?,
-        )
-    })
-}
-
-pub(crate) fn handle_voice_stt_dispatch(params: Map<String, Value>) -> ControllerFuture {
-    Box::pin(async move {
-        let config = config_rpc::load_config_with_timeout().await?;
+        let config = ctx.load_config().await?;
         let p = deserialize_params::<SttDispatchParams>(params)?;
         let provider_name = p
             .provider
@@ -173,9 +162,12 @@ pub(crate) fn handle_voice_stt_dispatch(params: Map<String, Value>) -> Controlle
     })
 }
 
-pub(crate) fn handle_voice_tts_dispatch(params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_voice_tts_dispatch(
+    ctx: DispatchCtx,
+    params: Map<String, Value>,
+) -> ControllerFuture {
     Box::pin(async move {
-        let config = config_rpc::load_config_with_timeout().await?;
+        let config = ctx.load_config().await?;
         let p = deserialize_params::<TtsDispatchParams>(params)?;
         let provider_name = p
             .provider

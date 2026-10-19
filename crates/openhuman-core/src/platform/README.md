@@ -20,7 +20,6 @@ startup, and two are driven by events rather than calls. In boot order:
 ```text
  core/runtime/bootstrap.rs
    |- platform::cost::init_global(cfg.cost, workspace)    cost ledger singleton
-   |- platform::startup::run_workspace_migrations(ws)     one-shot migrations
    |- platform::socket::set_global_socket_manager(..)    SocketManager singleton
  core/runtime/subscribers.rs
    |- platform::health::bus::register_health_subscriber()
@@ -112,9 +111,9 @@ lifecycle mutators ship off by default through the user tool filter.
 - The JSON-RPC server, `/health` route, and Socket.IO server the frontend
   connects to belong to `crates/openhuman-rpc`. `platform::socket` is the
   core's outbound client to the backend, not that server.
-- The backend URL and transport belong to the installed backend transport
-  (`crates/openhuman-tinyhumans`). `socket` asks for them; with no transport
-  installed it does not auto-connect.
+- The backend URL belongs to the host crate that registers the config enricher
+  (`crates/openhuman-tinyhumans`). `socket` reads `Config.resolved_endpoints`;
+  with none resolved it does not auto-connect.
 - The session credential belongs to the host's session owner. `socket` reads
   whatever token the core was given through `auth.set_credential`.
 - How the desktop shell supervises the core belongs to
@@ -144,6 +143,6 @@ pnpm debug rust platform::
 
 ## Further reading
 
-- [Platform and availability](../../../../gitbooks/features/platform.md)
-- [Tauri shell architecture](../../../../gitbooks/developing/architecture/tauri-shell.md)
-- [Architecture overview](../../../../gitbooks/developing/architecture.md)
+- [Platform and availability](../../../../docs/gitbooks/en/features/platform.md)
+- [Tauri shell architecture](../../../../docs/gitbooks/en/developing/architecture/tauri-shell.md)
+- [Architecture overview](../../../../docs/gitbooks/en/developing/architecture.md)

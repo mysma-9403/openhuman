@@ -21,7 +21,6 @@
 //! | [`types`]     | `OpenHumanSessionHost` and `SessionHostBuilder` struct definitions (no logic).        |
 //! | [`builder`]   | `SessionHostBuilder` fluent API + `OpenHumanSessionHost::from_config` factory.        |
 //! | [`runtime_session`] | Runtime session composition and public `turn()`.          |
-//! | [`session_api`] | Start / read / list the durable session.                       |
 //! | [`driver`]    | OpenHuman model/harness `SessionDriver`.                         |
 //! | [`hooks`]     | Product preparation/commit/terminal hooks.                       |
 //! | [`runtime`]   | Public accessors and `run_single` / `run_interactive`.           |
@@ -35,23 +34,18 @@ pub(crate) use builder::provider_role_for_definition;
 pub use builder::{HostOnlyToolPolicy, HostTools, HostTurnTools, TurnContext};
 
 mod builder;
+mod builder_config;
 mod codec;
 mod driver;
-mod factory;
-mod hooks;
 // Tool surface for live voice sessions (`voice::live`).
 #[cfg(feature = "voice")]
 mod live_tools;
-mod managed_tools;
-mod policy;
-mod prefix_snapshot;
-mod recorded_tools;
+#[cfg(test)]
+#[path = "resume_bound_session_tests.rs"]
+mod resume_bound_session_tests;
 mod runtime;
 mod runtime_session;
-mod session_api;
 pub(crate) mod stop_summary;
-#[cfg(test)]
-mod tool_progress;
 mod turn;
 // `pub(crate)` since issue #6014: the tool-call-cap instruction is now appended
 // inside the loop by `tinyagents::middleware::FinalCallWrapUpMiddleware`, so the
@@ -62,8 +56,8 @@ pub(crate) mod turn_checkpoint;
 mod types;
 
 pub use codec::OpenHumanTranscriptCodec;
-pub use factory::OpenHumanSessionFactory;
-pub use hooks::OpenHumanSessionHooks;
+pub type OpenHumanSessionHooks =
+    tinyagents_runtime::FnSessionHooks<crate::agent::tinyagents::host::OpenHumanRunContext>;
 pub use types::{OpenHumanSessionHost, SessionHostBuilder, TurnOverrides};
 
 // Re-export the duplicate-tool-spec guard for sibling harness modules
@@ -71,14 +65,22 @@ pub use types::{OpenHumanSessionHost, SessionHostBuilder, TurnOverrides};
 // share one tested implementation.
 pub(crate) use builder::dedup_visible_tool_specs;
 
-mod announcement_notes;
-mod artifact_wiring;
-
 #[cfg(test)]
 mod orphaned_head_resume_tests;
 #[cfg(test)]
+mod response_shape_turn_tests;
+#[cfg(test)]
+mod runtime_adapter_session_state_tests;
+#[cfg(test)]
 mod runtime_adapter_tests;
 #[cfg(test)]
+mod runtime_adapter_trace_tests;
+#[cfg(test)]
+mod runtime_adapter_usage_tests;
+#[cfg(test)]
 mod transcript_compat_tests;
+#[cfg(test)]
+#[path = "transcript_resume_stable_tests.rs"]
+mod transcript_resume_stable_tests;
 #[cfg(test)]
 mod typed_transcript_compat_tests;

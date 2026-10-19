@@ -51,8 +51,9 @@ async fn turn_routes_a_bare_packed_tool_call_through_use_skill() {
     let (mut agent, _tmp) = build_agent_with(provider, tools, Box::new(NativeDialect));
     assert!(
         !agent
-            .visible_tool_names_for_test()
-            .contains("skill_registry_search"),
+            .visible_tool_specs_arc()
+            .iter()
+            .any(|spec| spec.name == "skill_registry_search"),
         "precondition: the tool is withheld behind its pack"
     );
 

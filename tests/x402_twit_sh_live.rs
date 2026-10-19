@@ -26,7 +26,13 @@ async fn x402_pay_twit_sh_for_hal_finney_tweet() {
         action_dir: tmp.path().to_path_buf(),
         ..SecurityPolicy::default()
     });
-    let tool = x402::request_tool(security, vec!["x402.twit.sh".into()]);
+    let tool = openhuman_core::tools::http_request_tool(
+        &openhuman_core::core::runtime::DispatchCtx::process_default(),
+        security,
+        vec!["x402.twit.sh".into()],
+        0,
+        0,
+    );
     let result = tool
         .execute(json!({
             "url": "https://x402.twit.sh/tweets/by/id?id=1110302988",
@@ -37,7 +43,7 @@ async fn x402_pay_twit_sh_for_hal_finney_tweet() {
 
     println!("=== x402 tool result ===");
     for content in &result.content {
-        if let openhuman_core::skills::types::ToolContent::Text { text } = content {
+        if let tinytools::ToolContent::Text { text } = content {
             println!("{text}");
         }
     }

@@ -37,11 +37,13 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
-use crate::agent::turn_origin::{self, AgentTurnOrigin, TrustedAutomationSource};
 use crate::config::Config;
 use crate::core::bus::BUS;
 use crate::core::events::DomainEvent;
-use crate::security::POLICY_DENIED_MARKER;
+#[cfg(test)]
+use crate::security::turn_origin;
+use crate::security::turn_origin::{AgentTurnOrigin, TrustedAutomationSource};
+use tinytools::status::POLICY_DENIED_MARKER;
 
 use super::store;
 use super::types::{
@@ -102,9 +104,9 @@ const DEFAULT_APPROVAL_TTL: Duration = Duration::from_secs(60 * 10);
 /// to leave a live Slack/Gmail/HTTP node waiting; if nobody approves within
 /// three minutes, deny and let the authoring turn continue (the user can
 /// still re-trigger the run from the Runs rail). Scoped by
-/// [`APPROVAL_COPILOT_STREAM_CONTEXT`]. Deliberately NOT applied to
+/// [`ApprovalTurnContext::copilot_stream`]. Deliberately NOT applied to
 /// main-chat `WebChat` parks — only `flows::ops::flows_build`'s streaming
-/// branch scopes the task-local below.
+/// branch sets the flag.
 const COPILOT_APPROVAL_TTL: Duration = Duration::from_secs(180);
 
 /// Shorter park window for approvals raised inside a sub-agent run — a
@@ -141,13 +143,11 @@ pub fn is_unanswered_approval_reason(reason: &str) -> bool {
 }
 
 /// Per-turn chat context for routing a parked approval's yes/no reply back to
-/// the originating thread. The web channel scopes this task-local around the
-/// agent run (`web_chat`); because the `run_turn` handler, the
-/// tool loop, and `intercept` all run inline (`.await`) within that spawned
-/// task, it propagates down to `intercept` with no signature plumbing. Absent
-/// for non-chat callers (CLI, sub-agents) — their approvals are simply not
-/// chat-routable.
-#[derive(Clone, Debug)]
+/// the originating thread. The web channel hands it to the turn it starts
+/// (inside an [`ApprovalTurnContext`]); the turn's run context carries it to
+/// the gate and to the tools that read it. Absent for non-chat callers (CLI,
+/// detached sub-agents) — their approvals are simply not chat-routable.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovalChatContext {
     pub thread_id: String,
     pub client_id: String,
@@ -158,27 +158,10 @@ pub struct ApprovalChatContext {
     pub request_id: Option<String>,
 }
 
-tokio::task_local! {
-    pub static APPROVAL_CHAT_CONTEXT: ApprovalChatContext;
-}
-
-tokio::task_local! {
-    /// Marks a park as originating from the Flow Canvas copilot's streaming
-    /// `flows_build` path — scoped by `flows::ops::flows_build` around the
-    /// streaming `agent.run_single(&prompt)` call, alongside the existing
-    /// `AgentTurnOrigin::WebChat` + [`APPROVAL_CHAT_CONTEXT`] double-scope that
-    /// path already uses. Presence alone is the signal (no fields needed): when
-    /// set, the park window is clamped to [`COPILOT_APPROVAL_TTL`] instead of
-    /// the gate's own (possibly env-overridden) TTL. Absent for every other
-    /// caller — in particular, plain main-chat `WebChat` turns do not scope
-    /// this, so they keep the full [`DEFAULT_APPROVAL_TTL`].
-    pub static APPROVAL_COPILOT_STREAM_CONTEXT: ();
-}
-
 /// Per-run flow context (flow-approval-surface, PR2 of the tinyflows
 /// approval-surfacing design). `flows::ops::flows_run` / `flows_resume`
-/// scope this around the engine invocation, alongside the existing
-/// `Workflow` [`AgentTurnOrigin`](crate::agent::turn_origin::AgentTurnOrigin),
+/// hand it to the engine's capabilities, alongside the existing
+/// `Workflow` [`AgentTurnOrigin`](crate::security::turn_origin::AgentTurnOrigin),
 /// so a tool call parked from that run can correlate
 /// [`PendingApproval::source_context`](super::types::PendingApproval) back to
 /// the exact flow + run (the origin alone only carries `flow_id`, not
@@ -190,8 +173,60 @@ pub struct FlowRunContext {
     pub run_id: String,
 }
 
-tokio::task_local! {
-    pub static APPROVAL_FLOW_RUN_CONTEXT: FlowRunContext;
+/// What the approval gate needs to know about the turn that owns a gated call,
+/// beyond the turn origin: where to route the yes/no reply, whether the turn is
+/// the Flow Canvas copilot, and which flow run it belongs to.
+///
+/// This is an explicit value, handed from the entry point that starts the turn
+/// to the gate check (and to the tools that route their own prompts) through
+/// the turn's run context. It used to be three ambient task-locals, which meant
+/// "no chat context" was indistinguishable from "this task lost its scope".
+///
+/// Deliberately **not** carried across a detached spawn: a detached sub-agent
+/// (`OpenHumanRunContext::detached_child`) starts with the default value, so
+/// its parks route via the origin as `detached` and survive the parent turn
+/// (#5499). Inline children clone their parent's value.
+#[derive(Clone, Debug, Default)]
+pub struct ApprovalTurnContext {
+    /// Thread/client to surface a parked approval to. `None` for non-chat
+    /// callers (CLI, cron, background, detached sub-agents).
+    pub chat: Option<ApprovalChatContext>,
+    /// The turn is the Flow Canvas copilot's streaming `flows_build` path: the
+    /// park window is clamped to [`COPILOT_APPROVAL_TTL`] instead of the gate's
+    /// own (possibly env-overridden) TTL. Plain main-chat `WebChat` turns leave
+    /// it `false` and keep the full [`DEFAULT_APPROVAL_TTL`].
+    pub copilot_stream: bool,
+    /// The flow run the turn belongs to, so a park stamps its
+    /// `PendingApproval::source_context` with the exact flow and run. `None`
+    /// for every non-flow caller.
+    pub flow_run: Option<FlowRunContext>,
+}
+
+impl ApprovalTurnContext {
+    /// A chat-routed turn.
+    pub fn chat(chat: ApprovalChatContext) -> Self {
+        Self {
+            chat: Some(chat),
+            ..Self::default()
+        }
+    }
+
+    /// Marks the turn as the Flow Canvas copilot's streaming build.
+    pub fn with_copilot_stream(mut self) -> Self {
+        self.copilot_stream = true;
+        self
+    }
+
+    /// Binds the turn to one flow run.
+    pub fn with_flow_run(mut self, flow_run: FlowRunContext) -> Self {
+        self.flow_run = Some(flow_run);
+        self
+    }
+
+    /// Whether the turn is interactive: a chat surface is attached to it.
+    pub fn is_interactive(&self) -> bool {
+        self.chat.is_some()
+    }
 }
 
 /// Parse a chat reply to a parked approval into a binary decision (v1). Only an
@@ -277,6 +312,10 @@ pub(crate) struct RequestRoute {
     /// sub-agent routed through the origin fallback (#5499). Carried so the
     /// replay path re-emits the same `detached` flag the live event had.
     pub(crate) detached: bool,
+    /// The store the request was parked in, captured under the parking task's
+    /// storage scope, so a decision made from outside that scope (an RPC with
+    /// no agent or profile of its own) reaches the row where it was written.
+    pub(super) docs: Option<super::store_documents::Docs>,
 }
 
 /// Coordinator for pending approvals.
@@ -322,7 +361,7 @@ struct WaiterGuard<'a> {
     thread_key: Option<String>,
     /// Storage scope of the parking call, kept for `Drop`: the acting agent's
     /// task-local is gone by then.
-    docs: Result<Option<super::store_documents::Docs>, String>,
+    docs: Result<super::store_documents::Docs, String>,
     armed: bool,
 }
 
@@ -354,12 +393,7 @@ impl Drop for WaiterGuard<'_> {
             self.gate
                 .clear_thread_route_if_owned(thread_key, &self.request_id);
         }
-        let decided = store::decide_captured(
-            &self.gate.config,
-            &self.docs,
-            &self.request_id,
-            ApprovalDecision::Deny,
-        );
+        let decided = store::decide_captured(&self.docs, &self.request_id, ApprovalDecision::Deny);
         if let Ok(Some(row)) = decided {
             let route = self.gate.take_request_route(&self.request_id);
             BUS.publish(DomainEvent::ApprovalDecided {
@@ -475,13 +509,23 @@ fn publish_flow_gate_notification(
 /// `GateDecision::Allow` for every [`crate::security::CommandClass`] while the
 /// policy is off — and off is the shipped default
 /// (`AutonomyConfig::enabled = false`). `shell`, `node_exec`, `npm_exec` and
-/// `python_exec` derive `external_effect_with_args` from exactly that call, so
-/// they report no external effect and the gate is never consulted for them.
+/// `python_exec` once derived `external_effect_with_args` from exactly that
+/// call. **That is no longer how it works**, and the note must not say so: a
+/// `shell` call reaches the gate (`ShellTool` declares an external effect for
+/// any non-empty command) and is settled by the shell-specific stage,
+/// `SecurityGate::shell_decision`, which classifies the command and returns
+/// `gate_decision`. With the policy off that answers `Allow`, so the call is
+/// **allowed without parking** — not "reports no external effect".
 ///
-/// This is specific to those four. A tool that declares an external effect
-/// outright still parks with the policy off — `ScheduleTool` returns `true` for
-/// every mutating action independently of [`crate::security::SecurityPolicy`] —
-/// so the disabled note must not claim that nothing parks at all.
+/// Only that stage is shell-specific. A tool that declares an external effect
+/// outright and never goes through `shell_decision` still parks with the policy
+/// off — `ScheduleTool` returns `true` for every mutating action independently
+/// of [`crate::security::SecurityPolicy`] — so the disabled note must not claim
+/// that nothing parks at all.
+///
+/// Describe the outcome, not the mechanism: an earlier revision of this note
+/// named four tools and an internal reason, and both went stale within a week
+/// when the shell authorization path was rebuilt on TinyBox analysis upstream.
 ///
 /// The boot line is the one place an operator learns whether they are
 /// protected, so it must not claim a park that cannot happen.
@@ -489,11 +533,11 @@ pub(crate) fn arming_note(autonomy_enabled: bool) -> &'static str {
     if autonomy_enabled {
         "Prompt-class external-effect tool calls park for approval in interactive chat turns"
     } else {
-        "command tools do not park: [autonomy] enabled = false (the shipped default) makes \
-         gate_decision() return Allow for every command class, so shell/node_exec/npm_exec/\
-         python_exec report no external effect and never reach the gate. Tools that declare an \
-         external effect outright (schedule, channel sends, …) still park — set [autonomy] \
-         enabled = true to gate commands too"
+        "shell commands are allowed without parking: [autonomy] enabled = false (the shipped \
+         default) makes gate_decision() answer Allow for every command class, so the shell \
+         decision stage settles the call instead of parking it. Tools that declare an external \
+         effect outright (schedule, channel sends, …) still park — set [autonomy] enabled = true \
+         to gate commands too"
     }
 }
 

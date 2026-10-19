@@ -13,7 +13,7 @@
 //! workspace, keyed by the tenant rather than the agent. A SaaS task with no
 //! tenant scope gets no home and no install root at all.
 //!
-//! [`DEFAULT_AGENT`]: crate::agent::session_store::DEFAULT_AGENT
+//! [`DEFAULT_AGENT`]: crate::storage::sessions::DEFAULT_AGENT
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +25,7 @@ use crate::core::runtime::Tenant;
 /// with no scope.
 #[must_use]
 pub fn agent_skill_home(workspace_dir: &Path) -> Option<PathBuf> {
-    let tenant = crate::core::runtime::current_tenant().ok()?;
+    let tenant = crate::core::runtime::DispatchCtx::ambient().tenant().ok()?;
     skill_home_for(&tenant, workspace_dir)
 }
 
@@ -34,7 +34,7 @@ pub fn agent_skill_home(workspace_dir: &Path) -> Option<PathBuf> {
 pub fn skill_home_for(tenant: &Tenant, workspace_dir: &Path) -> Option<PathBuf> {
     let agent = match (&tenant.agent, &tenant.profile) {
         (Some(agent), _) => agent.as_str(),
-        (None, Some(_)) => crate::agent::session_store::DEFAULT_AGENT,
+        (None, Some(_)) => crate::storage::sessions::DEFAULT_AGENT,
         (None, None) => return None,
     };
     Some(workspace_dir.join("agents").join(agent))

@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::test_env::EnvVarGuard;
+use serde_json::json;
 
 #[test]
 fn outbound_body_has_stable_idempotency_key() {
@@ -12,26 +12,43 @@ fn outbound_body_has_stable_idempotency_key() {
 }
 
 #[tokio::test]
-async fn sender_methods_report_unavailable_without_a_hosted_session() {
-    let _env_lock = crate::config::TEST_ENV_LOCK.lock().await;
-    let workspace = tempfile::tempdir().expect("temporary workspace");
-    let _workspace_env = EnvVarGuard::workspace_unlocked(workspace.path());
-    let sender = BackendProgressiveSender;
+async fn opening_without_a_registered_callback_answers_the_unavailable_sentinel() {
+    let error = ModuleProgressiveReply::open(
+        crate::config::Config::default(),
+        "telegram".into(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .err()
+    .expect("no callback registered");
+    assert!(
+        error
+            .to_string()
+            .starts_with(crate::core::observability::BACKEND_UNAVAILABLE_PREFIX),
+        "{error}"
+    );
+}
 
-    assert!(matches!(
-        sender.send("telegram", "hello").await,
-        Err(ProgressiveSendError::Unavailable)
-    ));
-    assert!(matches!(
-        sender.edit("telegram", "message", "hello").await,
-        Err(ProgressiveSendError::Unavailable)
-    ));
-    assert!(matches!(
-        sender.delete("telegram", "message").await,
-        Err(ProgressiveSendError::Unavailable)
-    ));
-    assert!(matches!(
-        sender.typing("telegram").await,
-        Err(ProgressiveSendError::Unavailable)
-    ));
+#[test]
+fn every_transport_operation_carries_the_channel_scoped_by_the_host() {
+    for request in [
+        ProgressiveTransportRequest::Send {
+            channel: "discord:fixture".into(),
+            message: json!({"text":"hello"}),
+        },
+        ProgressiveTransportRequest::Edit {
+            channel: "discord:fixture".into(),
+            message_id: "message".into(),
+            text: "edited".into(),
+        },
+        ProgressiveTransportRequest::Delete {
+            channel: "discord:fixture".into(),
+            message_id: "message".into(),
+        },
+        ProgressiveTransportRequest::Typing {
+            channel: "discord:fixture".into(),
+        },
+    ] {
+        assert_eq!(request_channel(&request), "discord:fixture");
+    }
 }

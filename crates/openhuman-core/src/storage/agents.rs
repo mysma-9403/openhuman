@@ -13,7 +13,7 @@
 //! (`core::runtime::AgentContextRegistry`, which embed agents register on
 //! build) — its own context is used, with its configuration, policy and
 //! tools — or when an earlier process recorded its id in the backend's
-//! `local` scope (`storage_agents`, written by [`record`] when the agent
+//! `local` scope (`agents.registry`, written by [`record`] when the agent
 //! registers), so a restart still visits agents the host has not re-created
 //! yet; those are visited under the default context acting for them
 //! (`CoreContext::for_agent`).
@@ -28,14 +28,42 @@ use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use serde_json::json;
+use serde_json::{json, Value};
+use tinystoragedrivers::schema::{Schema, ScopeClass, SourceRecord, Step, TargetRecord};
 use tinystoragedrivers::{CollectionSpec, Precondition, Query, Scope};
 
+use super::schema_support::{key_of, owner};
 use super::{block_on, installed, DocumentStoreExt, StorageBackend};
-use crate::core::runtime::{AgentContextRegistry, CoreContext};
+use crate::core::runtime::{AgentContextRegistry, CoreContext, DispatchCtx};
 
 /// The `local`-scope collection recording which agents have their own scope.
-const AGENTS: &str = "storage_agents";
+pub(super) const AGENTS: &str = "agents.registry";
+/// The v1 name, `{}` per agent under the agent id.
+const LEGACY_AGENTS: &str = "storage_agents";
+
+/// What the agent registry keeps and the step from the v1 collection: the
+/// document id is `Key::of([agent id])` and the body names the agent, so a
+/// listing needs no unescaping.
+#[must_use]
+pub fn storage_schema() -> Schema {
+    Schema::new(owner("agents"))
+        .collection_with(2, CollectionSpec::new(AGENTS), ScopeClass::Tenant)
+        .step(Step::new("registry_v2", AGENTS, 1, 2, registry_v2).source(LEGACY_AGENTS))
+}
+
+fn registry_v2(batch: Vec<SourceRecord>) -> tinystoragedrivers::Result<Vec<TargetRecord>> {
+    batch
+        .into_iter()
+        .map(|record| {
+            Ok(TargetRecord::new(
+                AGENTS,
+                key_of(&record.id)?,
+                json!({ "agent_id": record.id }),
+            )
+            .created_ms(record.meta.created_ms))
+        })
+        .collect()
+}
 
 /// `(backend, agent id)` pairs this process has already recorded, the
 /// backend identified by its address (see [`backend_key`]).
@@ -95,7 +123,13 @@ fn record_in(backend: Arc<dyn StorageBackend>, agent: &str) {
     let result = block_on(async move {
         let docs = Arc::clone(backend.for_scope(&Scope::local())?.documents());
         docs.ensure_collection(&CollectionSpec::new(AGENTS)).await?;
-        docs.put(AGENTS, &id, json!({}), Precondition::None).await?;
+        docs.put(
+            AGENTS,
+            &key_of(&id)?,
+            json!({ "agent_id": id }),
+            Precondition::None,
+        )
+        .await?;
         Ok(())
     });
     match result {
@@ -118,7 +152,15 @@ fn recorded(backend: Arc<dyn StorageBackend>) -> Vec<String> {
         let docs = Arc::clone(backend.for_scope(&Scope::local())?.documents());
         docs.ensure_collection(&CollectionSpec::new(AGENTS)).await?;
         let stored = docs.query_all(AGENTS, &Query::all()).await?;
-        Ok(stored.into_iter().map(|doc| doc.id).collect::<Vec<_>>())
+        Ok(stored
+            .into_iter()
+            .filter_map(|doc| {
+                doc.doc
+                    .get("agent_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>())
     });
     result.unwrap_or_else(|error| {
         tracing::warn!(%error, "[storage::agents] could not list recorded agent scopes");
@@ -173,16 +215,26 @@ pub fn context_for(agent: &str) -> Option<Arc<CoreContext>> {
     })
 }
 
-/// Runs `fut` in the `local` scope: under the process default context when
-/// the caller is an embedded agent outside any SaaS profile, as-is otherwise.
-/// A SaaS profile (or a SaaS task with no scope) never switches to the
-/// process default context, which is the operator's.
-async fn in_local<F: Future>(fut: F) -> F::Output {
-    let acting = crate::core::runtime::current_tenant()
+/// The context the `local` scope runs under for a caller holding `ctx`: the
+/// process default context when the caller is an embedded agent outside any
+/// SaaS profile (it must see the local records, not its own), `ctx` itself
+/// otherwise. A SaaS profile (or a SaaS task with no scope) never switches to
+/// the process default context, which is the operator's.
+fn local_context(ctx: &DispatchCtx) -> DispatchCtx {
+    let acting = ctx
+        .tenant()
         .is_ok_and(|tenant| tenant.profile.is_none() && tenant.agent.is_some());
-    match CoreContext::default_context() {
-        Some(default) if acting => CoreContext::scope(default, fut).await,
-        _ => fut.await,
+    if acting && !crate::core::runtime::mode::is_saas() {
+        return DispatchCtx::process_default();
+    }
+    ctx.clone()
+}
+
+/// Runs `fut` in the `local` scope, under `local` when it is bound.
+async fn in_local<F: Future>(local: &DispatchCtx, fut: F) -> F::Output {
+    match local.core() {
+        Some(core) => CoreContext::scope(Arc::clone(core), fut).await,
+        None => fut.await,
     }
 }
 
@@ -193,12 +245,36 @@ async fn in_local<F: Future>(fut: F) -> F::Output {
 /// Returns `None`, without running `fut`, when `agent` is named but no
 /// context can act for it (SaaS with the agent gone, or no booted core):
 /// running it anywhere else would act outside the agent's scope.
-pub async fn within_agent<F: Future>(agent: Option<&str>, fut: F) -> Option<F::Output> {
+pub async fn within_agent<F: Future>(
+    ctx: &DispatchCtx,
+    agent: Option<&str>,
+    fut: F,
+) -> Option<F::Output> {
+    within_agent_ctx(ctx, agent, |_| fut).await
+}
+
+/// [`within_agent`] for work that takes the context it acts under: `step` is
+/// handed the dispatch context of the agent's scope (the host's own for
+/// `None`, which in SaaS is unbound: work that lost its tenant never acts as
+/// the operator).
+pub async fn within_agent_ctx<F, Fut>(
+    ctx: &DispatchCtx,
+    agent: Option<&str>,
+    step: F,
+) -> Option<Fut::Output>
+where
+    F: FnOnce(DispatchCtx) -> Fut,
+    Fut: Future,
+{
     let Some(agent) = agent else {
-        return Some(in_local(fut).await);
+        let local = local_context(ctx);
+        return Some(in_local(&local, step(local.clone())).await);
     };
     match context_for(agent) {
-        Some(context) => Some(CoreContext::scope(context, fut).await),
+        Some(context) => {
+            let dispatch = DispatchCtx::new(Arc::clone(&context));
+            Some(CoreContext::scope(context, step(dispatch)).await)
+        }
         None => {
             tracing::warn!(%agent, "[storage::agents] no context can act for the agent; skipped");
             None
@@ -238,14 +314,15 @@ impl std::fmt::Display for LookupFailed {
 /// [`LookupFailed`] when no scope reported the record and at least one
 /// scope's probe failed.
 pub async fn find_owner<F, Fut>(
+    ctx: &DispatchCtx,
     label: &str,
     probe: F,
 ) -> Result<Option<Option<String>>, LookupFailed>
 where
-    F: Fn() -> Fut,
+    F: Fn(DispatchCtx) -> Fut,
     Fut: Future<Output = Result<bool, String>>,
 {
-    decide(for_each_scope(label, probe).await)
+    decide(for_each_scope(ctx, label, probe).await)
 }
 
 /// [`find_owner`]'s verdict over each scope's probe result.
@@ -276,14 +353,19 @@ pub fn decide(
 /// (`None` for `local`).
 ///
 /// `label` names the caller in logs.
-pub async fn for_each_scope<T, F, Fut>(label: &str, step: F) -> Vec<(Option<String>, T)>
+pub async fn for_each_scope<T, F, Fut>(
+    ctx: &DispatchCtx,
+    label: &str,
+    step: F,
+) -> Vec<(Option<String>, T)>
 where
-    F: Fn() -> Fut,
+    F: Fn(DispatchCtx) -> Fut,
     Fut: Future<Output = T>,
 {
     let mut results = Vec::new();
     if !crate::core::runtime::mode::is_saas() {
-        results.push((None, in_local(async { step().await }).await));
+        let local = local_context(ctx);
+        results.push((None, in_local(&local, step(local.clone())).await));
     }
     for (agent, value) in for_each_agent(label, step).await {
         results.push((Some(agent), value));
@@ -296,7 +378,7 @@ where
 /// not split by agent and the `local` pass already covers everything.
 pub async fn for_each_agent<T, F, Fut>(label: &str, step: F) -> Vec<(String, T)>
 where
-    F: Fn() -> Fut,
+    F: Fn(DispatchCtx) -> Fut,
     Fut: Future<Output = T>,
 {
     if installed().is_none() {
@@ -309,14 +391,19 @@ where
 /// for work that acts as the agent — runs its flows, fetches with its
 /// connections — and so needs the agent's own configuration and tools, which
 /// a recorded agent's stand-in context (`CoreContext::for_agent`) lacks.
-pub async fn for_each_live_scope<T, F, Fut>(label: &str, step: F) -> Vec<(Option<String>, T)>
+pub async fn for_each_live_scope<T, F, Fut>(
+    ctx: &DispatchCtx,
+    label: &str,
+    step: F,
+) -> Vec<(Option<String>, T)>
 where
-    F: Fn() -> Fut,
+    F: Fn(DispatchCtx) -> Fut,
     Fut: Future<Output = T>,
 {
     let mut results = Vec::new();
     if !crate::core::runtime::mode::is_saas() {
-        results.push((None, in_local(async { step().await }).await));
+        let local = local_context(ctx);
+        results.push((None, in_local(&local, step(local.clone())).await));
     }
     if installed().is_none() {
         return results;
@@ -335,13 +422,14 @@ async fn visit<T, F, Fut>(
     step: F,
 ) -> Vec<(String, T)>
 where
-    F: Fn() -> Fut,
+    F: Fn(DispatchCtx) -> Fut,
     Fut: Future<Output = T>,
 {
     let mut results = Vec::new();
     for (agent, context) in contexts {
         tracing::trace!(%agent, label, "[storage::agents] visiting agent scope");
-        let value = CoreContext::scope(context, async { step().await }).await;
+        let dispatch = DispatchCtx::new(Arc::clone(&context));
+        let value = CoreContext::scope(context, async { step(dispatch).await }).await;
         results.push((agent, value));
     }
     results

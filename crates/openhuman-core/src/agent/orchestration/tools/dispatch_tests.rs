@@ -7,7 +7,7 @@ use super::super::collapsed_delegation::{
     dispatch_targets_from_schema, CollapsedDelegationTool, DelegateTarget,
 };
 use super::super::delegate_graph::DelegateGraphDispatch;
-use crate::agent::tools::DelegateToolDispatch;
+use crate::tools::delegate::DelegateToolDispatch;
 use tinyagents_harness::context::RunConfig;
 use tinyagents_harness::tool::ToolDispatch;
 use tinyagents_harness::tools::AskClarificationTool;
@@ -20,6 +20,8 @@ struct DelegationRegistrationTool {
 struct BlockingDelegationTool {
     started: tokio::sync::mpsc::Sender<()>,
 }
+
+struct FailingDelegationTool;
 
 #[async_trait]
 impl Tool for BlockingDelegationTool {
@@ -36,6 +38,24 @@ impl Tool for BlockingDelegationTool {
         let _ = self.started.send(()).await;
         std::future::pending::<()>().await;
         unreachable!("the parent cancellation must win")
+    }
+}
+
+#[async_trait]
+impl Tool for FailingDelegationTool {
+    fn name(&self) -> &str {
+        "delegate"
+    }
+    fn description(&self) -> &str {
+        "configured delegate that returns a product error"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<tinytools::ToolResult> {
+        Ok(tinytools::ToolResult::error(
+            "configured policy rejected the request",
+        ))
     }
 }
 
@@ -60,7 +80,7 @@ impl Tool for DelegationRegistrationTool {
 
 #[test]
 fn typed_dispatch_registration_recognises_every_synthesised_delegate_surface() {
-    let _ = crate::agent::harness::definition::AgentDefinitionRegistry::init_global_builtins();
+    let _ = crate::agent_registry::host_definition::AgentDefinitionRegistry::init_global_builtins();
     let collapsed: Arc<dyn Tool> = Arc::new(
         CollapsedDelegationTool::for_targets(vec![DelegateTarget {
             tool_name: "research".to_string(),
@@ -70,7 +90,7 @@ fn typed_dispatch_registration_recognises_every_synthesised_delegate_surface() {
         .expect("one collapsed target is routable"),
     );
     assert!(
-        DelegationDispatch::for_tool(collapsed.clone()).is_some(),
+        DelegationDispatch::for_tool(collapsed.clone(), None).is_some(),
         "every synthesised delegation name must select the typed dispatch: {}",
         collapsed.name(),
     );
@@ -84,7 +104,7 @@ fn typed_dispatch_registration_recognises_every_synthesised_delegate_surface() {
         }),
     });
     assert!(
-        DelegationDispatch::for_tool(retired).is_none(),
+        DelegationDispatch::for_tool(retired, None).is_none(),
         "delegate_to_integrations_agent must no longer select the typed dispatch"
     );
 }
@@ -96,8 +116,26 @@ fn delegate_graph_is_not_misclassified_as_an_archetype_delegate() {
         parameters: serde_json::json!({}),
     });
     assert!(
-        DelegationDispatch::for_tool(graph).is_none(),
+        DelegationDispatch::for_tool(graph, None).is_none(),
         "delegate_graph must retain its dedicated durable-graph dispatcher"
+    );
+}
+
+#[test]
+fn archetype_dispatch_uses_the_registered_target_marker_not_ambient_names() {
+    let tool: Arc<dyn Tool> = Arc::new(super::super::ArchetypeDelegationTool {
+        tool_name: "packed_custom_route".to_string(),
+        agent_id: super::super::DelegationTarget("scoped_only_agent".to_string()),
+        tool_description: "Scoped packed route".to_string(),
+    });
+
+    assert!(
+        DelegationDispatch::for_tool(tool.clone(), Some("scoped_only_agent".to_string())).is_some(),
+        "an explicitly registered delegation target is routable even when its name is not in the ambient catalogue"
+    );
+    assert!(
+        DelegationDispatch::for_tool(tool, None).is_none(),
+        "a delegate-like spelling without the host target marker must not acquire delegation authority"
     );
 }
 
@@ -137,9 +175,17 @@ async fn config_delegate_dispatch_honours_the_parent_cancellation_token() {
     });
     let dispatch = DelegateToolDispatch::new(tool);
     let cancellation = tinyagents_harness::CancellationToken::new();
+    let core = crate::core::runtime::CoreContext::for_test_with_config(
+        crate::core::runtime::DomainSet::full(),
+        crate::config::Config::default(),
+    );
     let parent = crate::agent::tinyagents::host::OpenHumanRunContext::new()
+        .with_core(Some(Arc::clone(&core)))
         .with_cancellation(cancellation.clone())
         .into_tinyagents(RunConfig::new("config-delegate-parent").with_thread("thread-parent"));
+    let jobs = crate::core::runtime::slot_for::<
+        tinyagents_orchestration::subagent::SubAgentJobRegistry,
+    >(&parent.data.dispatch_ctx());
     let execution = dispatch.execute(
         &(),
         tinyagents_harness::CallId::new("test-call"),
@@ -149,7 +195,13 @@ async fn config_delegate_dispatch_honours_the_parent_cancellation_token() {
     );
     tokio::pin!(execution);
     tokio::select! {
-        _ = started_rx.recv() => cancellation.cancel(),
+        _ = started_rx.recv() => {
+            assert!(jobs.list().iter().any(|job| {
+                job.agent == "configured"
+                    && job.status == tinyagents_orchestration::subagent::SubAgentJobStatus::Running
+            }), "configured executor is registered in the shared Jobs lifecycle");
+            cancellation.cancel();
+        },
         result = &mut execution => panic!("blocking delegate returned before cancellation: {result:?}"),
     }
     let result = execution
@@ -157,6 +209,58 @@ async fn config_delegate_dispatch_honours_the_parent_cancellation_token() {
         .expect("cancellation is reported as a tool result");
     assert!(result.is_error);
     assert!(result.output().contains("cancelled"), "{}", result.output());
+    let cancelled = jobs
+        .list()
+        .into_iter()
+        .find(|job| job.agent == "configured")
+        .expect("configured child remains in the isolated shared registry");
+    assert_eq!(
+        cancelled.status,
+        tinyagents_orchestration::subagent::SubAgentJobStatus::Cancelled,
+        "configured child cancellation settles as Cancelled"
+    );
+}
+
+#[tokio::test]
+async fn config_delegate_dispatch_preserves_tool_failure_in_shared_jobs() {
+    let dispatch = DelegateToolDispatch::new(Arc::new(FailingDelegationTool));
+    let core = crate::core::runtime::CoreContext::for_test_with_config(
+        crate::core::runtime::DomainSet::full(),
+        crate::config::Config::default(),
+    );
+    let parent = crate::agent::tinyagents::host::OpenHumanRunContext::new()
+        .with_core(Some(Arc::clone(&core)))
+        .into_tinyagents(RunConfig::new("config-delegate-error-parent"));
+    let jobs = crate::core::runtime::slot_for::<
+        tinyagents_orchestration::subagent::SubAgentJobRegistry,
+    >(&parent.data.dispatch_ctx());
+
+    let result = dispatch
+        .execute(
+            &(),
+            tinyagents_harness::CallId::new("configured-error-call"),
+            serde_json::json!({"agent": "configured-error", "prompt": "work"}),
+            tinytools::ToolCallOptions::default(),
+            &parent,
+        )
+        .await
+        .expect("the host returns the configured tool result");
+
+    assert!(result.is_error);
+    assert!(result
+        .output()
+        .contains("configured policy rejected the request"));
+    assert!(
+        jobs.list().iter().any(|job| {
+            job.agent == "configured-error"
+                && job.status == tinyagents_orchestration::subagent::SubAgentJobStatus::Incomplete
+                && job
+                    .output
+                    .as_deref()
+                    .is_some_and(|error| error.contains("configured policy rejected the request"))
+        }),
+        "the registered job retains the configured product failure"
+    );
 }
 
 #[test]
@@ -222,6 +326,7 @@ fn awaiting_user_outcome_maps_to_resume_envelope_not_bare_success() {
         agent_id: "crypto_agent".to_string(),
         output: String::new(),
         iterations: 1,
+        failure_cause: None,
         elapsed: Duration::from_secs(0),
         mode: SubagentMode::Typed,
         status: SubagentRunStatus::AwaitingUser {
@@ -298,6 +403,7 @@ fn an_unpersisted_synchronous_pause_is_a_failure_not_an_awaiting_user_envelope()
         agent_id: "crypto_agent".to_string(),
         output: String::new(),
         iterations: 1,
+        failure_cause: None,
         elapsed: Duration::from_secs(0),
         mode: SubagentMode::Typed,
         status: SubagentRunStatus::AwaitingUser {
@@ -353,6 +459,7 @@ fn the_question_in_an_unpersisted_pause_failure_is_encoded_not_interpolated() {
         agent_id: "crypto_agent".to_string(),
         output: String::new(),
         iterations: 1,
+        failure_cause: None,
         elapsed: Duration::from_secs(0),
         mode: SubagentMode::Typed,
         status: SubagentRunStatus::AwaitingUser {

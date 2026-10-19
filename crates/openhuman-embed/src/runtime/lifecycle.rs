@@ -14,44 +14,37 @@ const REMOVE_IDLE_WAIT: Duration = Duration::from_secs(10);
 // Reserve the public id until all old-instance cleanup finishes, including
 // when a caller cancels the removal future after it has started.
 struct RemovalSlot<'a> {
-    runtime: &'a Runtime,
+    _runtime: &'a Runtime,
     inner: Arc<crate::agent::AgentInner>,
     purge: bool,
-}
-
-impl RemovalSlot<'_> {
-    fn purge_home(&mut self) -> Result<(), AgentError> {
-        if !std::mem::take(&mut self.purge) {
-            return Ok(());
-        }
-        let home = &self.inner.layout.home;
-        if home.exists() {
-            std::fs::remove_dir_all(home).map_err(|source| AgentError::Workspace {
-                what: "delete the removed agent's home",
-                source,
-            })?;
-        }
-        Ok(())
-    }
+    finished: bool,
 }
 
 impl Drop for RemovalSlot<'_> {
     fn drop(&mut self) {
-        self.inner.teardown("agent_removed");
-        if let Err(error) = self.purge_home() {
-            log::warn!("[embed][runtime] cancelled removal purge failed: {error}");
+        if !self.finished {
+            self.inner.teardown("agent_removed");
+            self.inner.defer_cleanup(self.purge);
         }
-        let mut agents = self
-            .runtime
-            .agents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if agents
-            .get(&self.inner.id)
-            .and_then(std::sync::Weak::upgrade)
-            .is_some_and(|current| Arc::ptr_eq(&current, &self.inner))
-        {
-            agents.remove(&self.inner.id);
+    }
+}
+
+struct PendingRemoval<'a> {
+    runtime: &'a Runtime,
+    id: String,
+    pending: super::PendingCleanup,
+    finished: bool,
+}
+
+impl Drop for PendingRemoval<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            crate::agent::mcp_cleanup::defer_pending(
+                Arc::clone(&self.runtime.agents),
+                self.id.clone(),
+                self.pending.clone(),
+                self.runtime.guard(),
+            );
         }
     }
 }
@@ -90,10 +83,26 @@ impl Runtime {
     /// [`CoreError::AgentRemoved`](crate::CoreError::AgentRemoved); its parked
     /// approvals are denied with resolution `agent_removed`; turns in
     /// flight end with the same error, waited on for up to ten seconds; its
-    /// state slots and MCP host are dropped and its context deregistered, so
+    /// state slots are cleared, its original MCP object is closed, and its context deregistered, so
     /// its cron jobs stay dormant. The id is free for reuse once cleanup ends.
     /// Cancelling an already-started removal still tears down the old instance
     /// and performs a requested purge before releasing its id.
+    /// A failed close returns [`AgentError::McpCleanup`] and leaves the id and
+    /// purge intent reserved. Detached cleanup makes at most three attempts on
+    /// the process executor. Call this method again to retry the captured owner,
+    /// including after the last agent handle was dropped. Runtime drop does
+    /// not execute the process signal's shutdown hooks.
+    ///
+    /// Each MCP attempt has a 30-second deadline; three detached attempts add
+    /// at most 750 ms of backoff. Filesystem purge and executor scheduling are
+    /// outside that wait bound. Failed or cancelled cleanup preserves an
+    /// ephemeral workspace when the runtime drops and logs its retained path.
+    /// That preservation is conservative for the rest of this runtime.
+    ///
+    /// The directory fence survives in this process if the original runtime's
+    /// retry record is lost. A new runtime cannot recover that record through
+    /// this method; there is no automatic durable retry or file reclamation.
+    /// Retained state then needs explicit host cleanup.
     ///
     /// Cancellation is cooperative: a tool already executing when the agent
     /// is removed, or a sub-agent it detached, may finish after this returns.
@@ -106,6 +115,30 @@ impl Runtime {
     }
 
     async fn remove(&self, id: &str, purge: bool) -> Result<(), AgentError> {
+        let pending = {
+            let mut agents = self
+                .agents
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            agents.pending.get_mut(id).map(|pending| {
+                pending.purge |= purge;
+                pending.clone()
+            })
+        };
+        if let Some(pending) = pending {
+            let mut retry = PendingRemoval {
+                runtime: self,
+                id: id.to_owned(),
+                pending,
+                finished: false,
+            };
+            if let Some(cleanup) = &retry.pending.cleanup {
+                cleanup.finish().await.map_err(AgentError::McpCleanup)?;
+            }
+            crate::agent::mcp_cleanup::finish_removal(&self.agents, id, &retry.pending)?;
+            retry.finished = true;
+            return Ok(());
+        }
         let inner = {
             let agents = self.agents.lock().unwrap_or_else(|e| e.into_inner());
             agents
@@ -120,9 +153,10 @@ impl Runtime {
             return Err(AgentError::UnknownId(id.to_string()));
         }
         let mut removal = RemovalSlot {
-            runtime: self,
+            _runtime: self,
             inner,
             purge,
+            finished: false,
         };
         let inner = &removal.inner;
         log::debug!("[embed][runtime] removing agent id={id} purge={purge}");
@@ -133,7 +167,10 @@ impl Runtime {
             );
         }
         inner.teardown("agent_removed");
-        removal.purge_home()?;
+        inner.reserve_cleanup(purge);
+        inner.finish_mcp_cleanup().await?;
+        inner.finish_removal(purge)?;
+        removal.finished = true;
         log::debug!("[embed][runtime] agent removed id={id}");
         Ok(())
     }

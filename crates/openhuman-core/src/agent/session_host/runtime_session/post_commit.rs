@@ -26,6 +26,45 @@ use std::time::{Duration, Instant};
 
 use tinyinference_llm::message::Message;
 
+pub(super) fn take_terminal_sidecar(
+    state: &std::sync::Arc<std::sync::Mutex<super::OpenHumanSessionState>>,
+    terminal: tinyagents_runtime::SessionTerminal,
+) -> Option<
+    std::sync::Arc<
+        std::sync::Mutex<crate::agent::tinyagents::host::run_context::SessionTurnSidecar>,
+    >,
+> {
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.terminals.push(terminal);
+    state.active_terminal_sidecar.take()
+}
+
+pub(super) async fn finalize_deferred_terminal(
+    sidecar: &std::sync::Mutex<crate::agent::tinyagents::host::run_context::SessionTurnSidecar>,
+    terminal: &tinyagents_runtime::SessionTerminal,
+) {
+    let (deferred, stop, turn) = {
+        let mut sidecar = sidecar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            sidecar.deferred_terminal.take(),
+            sidecar.stop.clone(),
+            (sidecar.model_calls as u32).max(1),
+        )
+    };
+    let Some(deferred) = deferred else {
+        return;
+    };
+    match terminal {
+        tinyagents_runtime::SessionTerminal::Completed(_) => deferred.finish(stop, turn).await,
+        tinyagents_runtime::SessionTerminal::Cancelled => deferred.finish_cancelled().await,
+        tinyagents_runtime::SessionTerminal::Failed(_) => deferred.finish_failed().await,
+    }
+}
+
 /// How long a new turn waits for the previous turn's deferred post-commit
 /// work before it proceeds anyway. Generous: the work is a local goal-store
 /// update. The bound only exists so a wedged store cannot wedge the thread.
@@ -61,6 +100,7 @@ pub(super) fn turn_iterations(sidecar_model_calls: usize, history: &[Message]) -
 /// return its handle. The caller can fence later work on the handle. Returns
 /// whether the completion was delivered.
 pub(super) async fn complete_then_defer<P, T>(
+    dispatch: &crate::core::runtime::DispatchCtx,
     publish: P,
     tail: T,
 ) -> (bool, tokio::task::JoinHandle<()>)
@@ -75,7 +115,7 @@ where
         elapsed_ms = elapsed_ms(started),
         "[session-runtime] post-commit: turn completion published"
     );
-    let handle = crate::core::runtime::spawn_scoped(async move {
+    let handle = dispatch.spawn(async move {
         let started = Instant::now();
         tail.await;
         tracing::debug!(
@@ -127,23 +167,28 @@ pub(super) struct TurnIdentity {
 /// finalize steps, with goal accounting deferred to a fenced background task.
 pub(super) async fn finalize_committed_turn(
     state: &std::sync::Mutex<super::OpenHumanSessionState>,
-    post_turn_hooks: &[std::sync::Arc<dyn crate::agent::hooks::PostTurnHook>],
+    post_turn_hooks: &[std::sync::Arc<dyn tinyagents_harness::host::LearningSink>],
     identity: TurnIdentity,
     receipt: tinyagents_runtime::CommitReceipt<crate::agent::tinyagents::host::OpenHumanRunContext>,
 ) {
     let commit_started = std::time::Instant::now();
+    // The turn's own context, taken before the receipt is dropped.
+    let dispatch = receipt.options.context.dispatch_ctx();
     let output = receipt.outcome.output.clone().unwrap_or_default();
     // Skips compaction checkpoints (user-role, not the user's words).
-    let input = crate::agent::tinyagents::last_user_message(&receipt.outcome.history)
+    let input = tinyagents_harness::summarization::last_user_message(&receipt.outcome.history)
         .map(crate::agent::message_convert::user_text_with_markers)
         .unwrap_or_default();
-    let sidecar = receipt
-        .options
-        .context
-        .session_sidecar
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let (sidecar, deferred_terminal) = {
+        let mut sidecar = receipt
+            .options
+            .context
+            .session_sidecar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let terminal = sidecar.deferred_terminal.take();
+        (sidecar.clone(), terminal)
+    };
     // This turn's model calls, not every assistant row of the
     // whole conversation (`turn_iterations`).
     let iterations = turn_iterations(sidecar.model_calls, &receipt.outcome.history);
@@ -157,32 +202,23 @@ pub(super) async fn finalize_committed_turn(
     );
     let usage = super::holistic_last_turn_usage(&sidecar);
     let interrupted = sidecar.hit_cap || receipt.outcome.interrupted;
-    let tool_calls = sidecar
-        .tool_outcomes
-        .iter()
-        .map(|outcome| crate::agent::hooks::ToolCallRecord {
-            name: outcome.name.clone(),
-            arguments: outcome.arguments.clone(),
-            success: outcome.success,
-            output_summary: crate::agent::hooks::sanitize_tool_output(
-                &outcome.content,
-                &outcome.name,
-                outcome.success,
-            ),
-            duration_ms: outcome.duration_ms,
-        })
-        .collect::<Vec<_>>();
-    let turn_duration_ms = sidecar
-        .duration
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or_default();
+    // This hook runs only after the runtime durably appended the turn. Emit
+    // OpenHuman's classified stop before the terminal journal flush, so native
+    // completion cannot overwrite a cancellation/timeout/stop or hide commit
+    // time from the exported span.
+    if let Some(terminal) = deferred_terminal {
+        terminal
+            .finish(sidecar.stop.clone(), (sidecar.model_calls as u32).max(1))
+            .await;
+    }
     // State the caller reads as soon as `run_turn` returns.
     let prelude = {
         let mut state = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.last_turn_hit_cap = interrupted;
-        state.last_turn_usage = Some(usage);
+        state.last_turn_usage = Some(usage.clone());
+        state.last_turn_iterations = iterations;
         state.prelude.clone()
     };
     // Completion first: `TurnCompleted` is the progress
@@ -211,6 +247,7 @@ pub(super) async fn finalize_committed_turn(
         }
     };
     let (_, pending) = complete_then_defer(
+        &receipt.options.context.dispatch_ctx(),
         super::progress::send_receipt_progress(&receipt, &input, &output, iterations),
         goal_accounting,
     )
@@ -233,19 +270,49 @@ pub(super) async fn finalize_committed_turn(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.pending_post_commit = Some(pending);
     }
-    crate::agent::hooks::fire_hooks(
-        post_turn_hooks,
-        crate::agent::hooks::TurnContext {
-            user_message: input,
-            assistant_response: output,
-            tool_calls,
-            turn_duration_ms,
-            session_id: Some(identity.session_id.clone()),
-            agent_id: Some(identity.agent_id),
-            entrypoint: Some(identity.channel),
-            iteration_count: iterations as usize,
-        },
-    );
+    let mut summary = tinyagents_harness::host::TurnSummary::new(
+        tinyagents_harness::ids::ThreadId::new(identity.session_id.clone()),
+        identity.agent_id,
+    )
+    .with_text(input, output)
+    .with_usage(tinyinference_llm::usage::Usage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+        cache_read_tokens: usage.cached_input_tokens,
+        ..Default::default()
+    });
+    for outcome in &sidecar.tool_outcomes {
+        use sha2::Digest;
+        let args = serde_json::to_vec(&outcome.arguments).unwrap_or_default();
+        summary.record_tool_outcome(tinyagents_harness::host::ToolOutcomeRecord {
+            name: outcome.name.clone(),
+            args_digest: format!("{:x}", sha2::Sha256::digest(args)),
+            success: outcome.success,
+            failure_class: (!outcome.success).then(|| {
+                tinyagents_harness::host::classify_tool_failure(&outcome.content).to_owned()
+            }),
+            duration_ms: outcome.duration_ms,
+        });
+    }
+    // `DispatchCtx::spawn` re-enters the exact CoreContext captured by this
+    // turn. Detached learning work must not fall back to another tenant.
+    for (index, hook) in post_turn_hooks.iter().enumerate() {
+        let hook = std::sync::Arc::clone(hook);
+        let summary = summary.clone();
+        let started = std::time::Instant::now();
+        dispatch.spawn(async move {
+            if let Err(error) = hook.on_turn_complete(&summary).await {
+                tracing::warn!(index, %error, "post-turn learning sink failed");
+            } else {
+                tracing::debug!(
+                    index,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "post-turn learning sink finished"
+                );
+            }
+        });
+    }
     tracing::debug!(
         session_id = %identity.session_id,
         elapsed_ms = elapsed_ms(commit_started),

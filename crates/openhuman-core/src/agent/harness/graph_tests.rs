@@ -63,7 +63,9 @@ async fn channel_turn_runs_through_the_graph() {
         MultimodalFileConfig::default(),
         None,
         None,
-        crate::agent::harness::SandboxMode::None,
+        tinyagents_definition::SandboxMode::None,
+        Default::default(),
+        Default::default(),
     )
     .await
     .expect("channel graph turn runs");
@@ -125,7 +127,9 @@ async fn channel_turn_pauses_on_ask_user_clarification() {
         MultimodalFileConfig::default(),
         None,
         None,
-        crate::agent::harness::SandboxMode::None,
+        tinyagents_definition::SandboxMode::None,
+        Default::default(),
+        Default::default(),
     )
     .await
     .expect("channel graph turn runs");
@@ -165,10 +169,10 @@ fn channel_current_images_are_available_to_vision_delegation() {
         context.attachment_placeholders.as_ref(),
         &vec!["[IMAGE:uploads/thread/image.png]".to_string()]
     );
-    assert!(crate::agent::attachments::should_forward_parent_images(
+    assert!(crate::attachments::should_forward_parent_images(
         "describe the image"
     ));
-    assert!(!crate::agent::attachments::should_forward_parent_images(
+    assert!(!crate::attachments::should_forward_parent_images(
         "[IMAGE:uploads/explicit.png]"
     ));
 }

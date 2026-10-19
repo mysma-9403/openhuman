@@ -1,18 +1,20 @@
 //! Notifications on the `tinystoragedrivers` document port.
 //!
-//! Used instead of `notifications/notifications.db` when the host configured
-//! a storage backend ([`crate::storage`]); the functions in `store.rs` pick it
-//! per call. Records live under the current call's storage scope (the acting
+//! Kept in the storage backend ([`crate::storage`]); the functions in
+//! `store.rs` open it per call, and the old `notifications/notifications.db`
+//! is read once by the importer ([`import_source`]). Records live under the current call's storage scope (the acting
 //! agent, `local` on a single-user host).
 //!
 //! # Layout
 //!
 //! | Collection | Document id | Holds |
 //! | --- | --- | --- |
-//! | `integration_notifications` | notification id | one ingested notification |
-//! | `notification_dedup` | hash of provider, account, title, body | when that content last arrived |
-//! | `notification_settings` | provider | one provider's settings |
-//! | `core_notifications` | event id | one persisted core notification event |
+//! | `notifications.integration` | notification id | one ingested notification |
+//! | `notifications.dedup` | hash of provider, account, title, body | when that content last arrived |
+//! | `notifications.settings` | provider | one provider's settings |
+//! | `notifications.core` | `Key::of([workspace, event id])` | one persisted core notification event |
+//!
+//! The shapes and the v1 -> v2 steps are in [`super::storage_schema`].
 //!
 //! Optional columns are left out of a document rather than stored as `null`,
 //! so "is unscored" is a missing field on every driver. `received_ms` (epoch
@@ -31,23 +33,19 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use tinystoragedrivers::{
-    CollectionSpec, ErrorKind, Filter, IndexSpec, Precondition, Query, Sort, Versioned,
-};
+use tinystoragedrivers::{CollectionSpec, ErrorKind, Filter, Precondition, Query, Sort, Versioned};
 
 use super::types::{
     CoreNotificationEvent, IntegrationNotification, NotificationSettings, NotificationStats,
     NotificationStatus,
 };
 use crate::config::Config;
-use crate::storage::documents::{compare_and_swap, text, Repo, CAS_ATTEMPTS};
-use crate::storage::local::{self, ImportPlan};
+use crate::storage::documents::{compare_and_swap, text, Repo};
 use crate::storage::{DocumentStore, DocumentStoreExt, StorageError};
 
-pub(super) const NOTIFICATIONS: &str = "integration_notifications";
-const DEDUP: &str = "notification_dedup";
-pub(super) const SETTINGS: &str = "notification_settings";
-pub(super) const CORE: &str = "core_notifications";
+pub(super) use super::storage_schema::{core_id, CORE, DEDUP, NOTIFICATIONS, SETTINGS};
+use super::storage_schema::{legacy_collections, specs};
+use crate::storage::schema_support::key_of;
 
 /// The `workspace` key of core notifications in the per-workspace default
 /// file (see [`current`]).
@@ -57,47 +55,67 @@ const DOMAIN: &str = "notifications::store";
 /// How long identical content counts as a duplicate.
 const DEDUP_WINDOW_SECS: i64 = 60;
 
+/// The legacy `notifications.db`, as the storage importer reads it.
+///
+/// Core notifications are keyed by workspace. The legacy table and the old
+/// per-file default both used the fixed [`LOCAL_WORKSPACE`] key; a backend
+/// that may serve several workspaces gets them re-filed under the real
+/// workspace's key, exactly as [`current`] does for new records
+/// ([`workspace_key_for`]).
+pub(crate) fn import_source() -> crate::storage::import::Source {
+    crate::storage::import::Source {
+        domain: "notifications",
+        owner: "notifications",
+        db: "notifications/notifications.db",
+        collections: legacy_collections,
+        read_legacy: |scratch, real| {
+            super::store_import::read_for(scratch, &workspace_key_for(real))
+        },
+        rekey: |mut record, config| {
+            if record.collection != super::storage_schema::LEGACY_CORE {
+                return record;
+            }
+            let prefix = super::store_import::legacy_core_id(LOCAL_WORKSPACE, "");
+            let Some(event_id) = record.id.strip_prefix(&prefix) else {
+                return record;
+            };
+            let workspace = workspace_key_for(config);
+            record.id = super::store_import::legacy_core_id(&workspace, event_id);
+            if let Some(doc) = record.doc.as_object_mut() {
+                doc.insert("workspace".into(), serde_json::json!(workspace));
+            }
+            record
+        },
+    }
+}
+
 fn collections() -> Vec<CollectionSpec> {
-    vec![
-        CollectionSpec::new(NOTIFICATIONS)
-            .index(IndexSpec::new("by_provider", ["provider", "received_ms"]))
-            .index(IndexSpec::new("by_status", ["status"])),
-        CollectionSpec::new(DEDUP),
-        CollectionSpec::new(SETTINGS),
-        CollectionSpec::new(CORE).index(IndexSpec::new(
-            "by_read",
-            ["workspace", "read", "timestamp_ms"],
-        )),
-    ]
+    specs()
 }
 
 fn workspace_key(path: &std::path::Path) -> String {
     format!("path:{}", hex::encode(path.as_os_str().as_encoded_bytes()))
 }
 
-/// The document store for this call: the host's configured backend or, by
-/// default, the document tables in `notifications.db` (the legacy tables
-/// imported on first open). `None` keeps the legacy tables.
-pub(super) fn current(config: &Config) -> Result<Option<Docs>> {
-    // An installed backend may be shared by several workspaces, so it keeps
-    // core notifications apart by workspace path. The default file lives in
-    // the workspace and moves with it, so it uses a fixed key: a renamed or
-    // restored workspace still finds its notifications.
-    let workspace = if crate::storage::installed().is_some() {
-        workspace_key(&config.workspace_dir)
-    } else {
-        LOCAL_WORKSPACE.to_string()
-    };
-    let plan = ImportPlan {
-        domain: DOMAIN,
-        tables: super::store::import::TABLES,
-        read: &|| super::store::import::read(config),
-    };
-    let db_path = super::store::db_path(config);
-    Ok(
-        local::repo(config, &db_path, DOMAIN, collections, &plan)?
-            .map(|repo| Docs(repo, workspace)),
-    )
+/// The `workspace` key core notifications are filed under for `config`.
+///
+/// A backend that is the workspace's own default (`sqlite:<workspace>/storage`,
+/// or the one opened lazily when none is installed) lives in the workspace and
+/// moves with it, so it uses a fixed key: a renamed or restored workspace
+/// still finds its notifications. Any other backend may serve several
+/// workspaces, so it keeps them apart by workspace path.
+pub(super) fn workspace_key_for(config: &Config) -> String {
+    let own_default = crate::storage::config::default_url(&config.workspace_dir);
+    match crate::storage::installed_url() {
+        Some(url) if url != own_default => workspace_key(&config.workspace_dir),
+        _ => LOCAL_WORKSPACE.to_string(),
+    }
+}
+
+/// The document store for this call: the storage backend, in the acting scope.
+pub(super) fn current(config: &Config) -> Result<Docs> {
+    let repo = Repo::current_for(&config.workspace_dir, DOMAIN, collections)?;
+    Ok(Docs(repo, workspace_key_for(config)))
 }
 
 fn status_of(raw: Option<&str>) -> NotificationStatus {
@@ -109,8 +127,8 @@ fn status_of(raw: Option<&str>) -> NotificationStatus {
     }
 }
 
-fn parse_time(raw: Option<&str>) -> Option<DateTime<Utc>> {
-    raw.and_then(|value| value.parse().ok())
+fn from_ms(ms: Option<i64>) -> Option<DateTime<Utc>> {
+    ms.and_then(DateTime::from_timestamp_millis)
 }
 
 pub(super) fn to_doc(n: &IntegrationNotification) -> Value {
@@ -120,7 +138,6 @@ pub(super) fn to_doc(n: &IntegrationNotification) -> Value {
     doc.insert("body".into(), json!(n.body));
     doc.insert("raw_payload".into(), json!(n.raw_payload.to_string()));
     doc.insert("status".into(), json!(n.status.as_str()));
-    doc.insert("received_at".into(), json!(n.received_at.to_rfc3339()));
     doc.insert(
         "received_ms".into(),
         json!(n.received_at.timestamp_millis()),
@@ -130,7 +147,10 @@ pub(super) fn to_doc(n: &IntegrationNotification) -> Value {
         ("importance_score", n.importance_score.map(|v| json!(v))),
         ("triage_action", n.triage_action.as_ref().map(|v| json!(v))),
         ("triage_reason", n.triage_reason.as_ref().map(|v| json!(v))),
-        ("scored_at", n.scored_at.map(|v| json!(v.to_rfc3339()))),
+        (
+            "scored_ms",
+            n.scored_at.map(|v| json!(v.timestamp_millis())),
+        ),
     ];
     for (field, value) in optional {
         if let Some(value) = value {
@@ -140,13 +160,22 @@ pub(super) fn to_doc(n: &IntegrationNotification) -> Value {
     Value::Object(doc)
 }
 
+/// The notification id a document id was built from (`Key::of` of it).
+fn notification_id_of(id: &str) -> String {
+    tinystoragedrivers::Key::new(id)
+        .ok()
+        .and_then(|key| key.split())
+        .and_then(|mut parts| (parts.len() == 1).then(|| parts.remove(0)))
+        .unwrap_or_else(|| id.to_string())
+}
+
 fn to_notification(stored: &Versioned<Value>) -> IntegrationNotification {
     let doc = &stored.doc;
     let raw_payload = text(doc, "raw_payload").map_or(Value::Null, |raw| {
         serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
     });
     IntegrationNotification {
-        id: stored.id.clone(),
+        id: notification_id_of(&stored.id),
         provider: text(doc, "provider").unwrap_or_default().to_string(),
         account_id: text(doc, "account_id").map(str::to_string),
         title: text(doc, "title").unwrap_or_default().to_string(),
@@ -159,14 +188,20 @@ fn to_notification(stored: &Versioned<Value>) -> IntegrationNotification {
         triage_action: text(doc, "triage_action").map(str::to_string),
         triage_reason: text(doc, "triage_reason").map(str::to_string),
         status: status_of(text(doc, "status")),
-        received_at: parse_time(text(doc, "received_at")).unwrap_or_else(Utc::now),
-        scored_at: parse_time(text(doc, "scored_at")),
+        received_at: from_ms(doc.get("received_ms").and_then(Value::as_i64))
+            .unwrap_or_else(Utc::now),
+        scored_at: from_ms(doc.get("scored_ms").and_then(Value::as_i64)),
     }
 }
 
 /// The dedup document id for one piece of content. Each part is length
 /// prefixed, so no two distinct tuples hash the same input.
-fn dedup_id(provider: &str, account_id: Option<&str>, title: &str, body: &str) -> String {
+pub(super) fn dedup_id(
+    provider: &str,
+    account_id: Option<&str>,
+    title: &str,
+    body: &str,
+) -> String {
     let mut hasher = Sha256::new();
     for part in [Some(provider), account_id, Some(title), Some(body)] {
         match part {
@@ -190,30 +225,22 @@ async fn claim_content(
     skip_recent: bool,
 ) -> Result<Option<Option<i64>>, StorageError> {
     let window_start = now_ms - DEDUP_WINDOW_SECS * 1000;
-    for _ in 0..CAS_ATTEMPTS {
-        let stored = docs.get(DEDUP, id).await?;
-        let last = stored
+    let repo = tinystoragedrivers::Repo::<Value>::new(docs, DEDUP)?;
+    let mut previous: Option<Option<i64>> = None;
+    repo.update(id, |current| {
+        let last = current
             .as_ref()
-            .and_then(|stored| stored.doc.get("last_ms"))
+            .and_then(|doc| doc.get("last_ms"))
             .and_then(Value::as_i64);
         if skip_recent && last.is_some_and(|last| last >= window_start) {
+            previous = None;
             return Ok(None);
         }
-        let precondition = stored
-            .as_ref()
-            .map_or(Precondition::Absent, Versioned::unchanged);
-        match docs
-            .put(DEDUP, id, json!({ "last_ms": now_ms }), precondition)
-            .await
-        {
-            Ok(_) => return Ok(Some(last)),
-            Err(error) if error.kind() == ErrorKind::Conflict => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Err(StorageError::conflict(format!(
-        "notification dedup {id} kept changing under {CAS_ATTEMPTS} attempts"
-    )))
+        previous = Some(last);
+        Ok(Some(json!({ "last_ms": now_ms })))
+    })
+    .await?;
+    Ok(previous)
 }
 
 /// Undoes a [`claim_content`] whose notification was never stored, so a retry
@@ -248,13 +275,6 @@ async fn release_content(
     if let Err(error) = outcome {
         tracing::warn!(%error, "[notifications::store] could not release dedup claim");
     }
-}
-
-/// The core-notification document id: the workspace is part of the key, since
-/// each workspace's events are persisted separately in the SQL store (one
-/// database per workspace) and event ids repeat across them.
-pub(super) fn core_id(workspace: &str, event_id: &str) -> String {
-    format!("{}:{workspace}/{event_id}", workspace.len())
 }
 
 /// The notification store over one scoped document handle.
@@ -356,12 +376,12 @@ impl Docs {
         reason: &str,
     ) -> Result<bool> {
         let (score, action, reason) = (f64::from(score), action.to_string(), reason.to_string());
-        let scored_at = Utc::now().to_rfc3339();
+        let scored_ms = Utc::now().timestamp_millis();
         self.set(id, move |next| {
             next["importance_score"] = json!(score);
             next["triage_action"] = json!(action);
             next["triage_reason"] = json!(reason);
-            next["scored_at"] = json!(scored_at);
+            next["scored_ms"] = json!(scored_ms);
         })
     }
 
@@ -424,7 +444,7 @@ impl Docs {
     }
 
     pub(super) fn upsert_settings(&self, settings: &NotificationSettings) -> Result<()> {
-        let id = settings.provider.clone();
+        let id = key_of(&settings.provider)?;
         let doc = json!({
             "enabled": settings.enabled,
             "importance_threshold": f64::from(settings.importance_threshold),
@@ -438,10 +458,11 @@ impl Docs {
     }
 
     pub(super) fn get_settings(&self, provider: &str) -> Result<NotificationSettings> {
-        let id = provider.to_string();
+        let id = key_of(provider)?;
+        let provider = provider.to_string();
         self.0.run(|docs| async move {
             let defaults = NotificationSettings {
-                provider: id.clone(),
+                provider: provider.clone(),
                 ..NotificationSettings::default()
             };
             let Some(stored) = docs.get(SETTINGS, &id).await? else {
@@ -461,7 +482,7 @@ impl Docs {
                     .get("route_to_orchestrator")
                     .and_then(Value::as_bool)
                     .unwrap_or(defaults.route_to_orchestrator),
-                provider: id,
+                provider,
             })
         })
     }
@@ -478,7 +499,6 @@ impl Docs {
                 .context("[notifications::store] serialize core notification failed")?,
             "timestamp_ms": event.timestamp_ms,
             "read": false,
-            "created_at": Utc::now().to_rfc3339(),
         });
         self.0.run(|docs| async move {
             match docs.put(CORE, &id, doc, Precondition::Absent).await {

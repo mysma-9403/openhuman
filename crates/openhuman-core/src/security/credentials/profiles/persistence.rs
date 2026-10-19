@@ -21,7 +21,7 @@ use super::{
 /// The secret the profiles live in on a storage backend
 /// ([`crate::storage::secrets`]): the same JSON as `auth-profiles.json`,
 /// encrypted as one secret in the acting agent's scope.
-const STORAGE_SECRET_NAME: &str = "file:auth-profiles.json";
+pub(crate) const STORAGE_SECRET_NAME: &str = "file:auth-profiles.json";
 
 impl AuthProfilesStore {
     pub(super) fn save_locked(&self, data: &AuthProfilesData) -> Result<()> {

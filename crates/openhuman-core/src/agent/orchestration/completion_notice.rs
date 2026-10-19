@@ -64,6 +64,11 @@ impl BackgroundAgentOutcome {
 /// The record label the host stamps on an awaiting-input pause.
 pub(crate) const AWAITING_INPUT_LABEL: &str = "awaiting_input";
 
+/// Prefix for internal router keys used by independently deliverable pause
+/// notices. The encoded task id follows the prefix; a unique suffix allows a
+/// resumed task to pause more than once.
+pub(crate) const AWAITING_INPUT_RECORD_PREFIX: &str = "\u{1}host-awaiting-input:";
+
 /// Renders a batch of finished background sub-agents as the single
 /// system-injected notice the parent agent reviews.
 #[derive(Clone, Copy, Debug, Default)]
@@ -126,6 +131,33 @@ fn escape_attribute(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Recover the real task id for display from a pause record's internal router
+/// key. The router needs a unique key per pause, while the user-facing result
+/// should keep identifying the resumable task by its ordinary id.
+fn display_task_id(record: &CompletionRecord) -> String {
+    if BackgroundAgentOutcome::of(record) != BackgroundAgentOutcome::AwaitingInput {
+        return record.task_id.clone();
+    }
+    let Some(encoded) = record
+        .task_id
+        .strip_prefix(AWAITING_INPUT_RECORD_PREFIX)
+        .and_then(|rest| rest.split_once(':').map(|(encoded, _)| encoded))
+    else {
+        return record.task_id.clone();
+    };
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let hex = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(hex, 16).ok()
+        })
+        .collect::<Option<Vec<_>>>();
+    bytes
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| record.task_id.clone())
+}
+
 /// Render each result with its outcome-specific tag. Shared by the normal
 /// delivery notice and by the undelivered fallback, so a result reads the same
 /// either way and a failure is never dressed up as a completion.
@@ -166,7 +198,7 @@ fn render_results(records: &[CompletionRecord]) -> String {
         }
         out.push_str(&format!(
             "\n<{tag} id=\"{}\" agent=\"{}\">\n{}\n</{tag}>\n",
-            escape_attribute(&record.task_id),
+            escape_attribute(&display_task_id(record)),
             escape_attribute(&record.agent_id),
             summary,
         ));

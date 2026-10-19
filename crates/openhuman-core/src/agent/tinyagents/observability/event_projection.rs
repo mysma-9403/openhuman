@@ -1,23 +1,23 @@
 //! [`EventListener`] implementation for [`OpenhumanEventBridge`] — projects
 //! each `tinyagents` [`AgentEvent`] onto an [`AgentProgress`] update (or a
-//! grep-friendly trace line for events with no UI surface), plus the
-//! prompt-cache layout diagnostic helper drained after a run.
-
-use std::sync::atomic::Ordering;
+//! grep-friendly trace lines for events with no UI surface.
 
 use tinyagents_harness::cache::CacheLayoutEvent;
 use tinyagents_harness::events::{AgentEvent, EventListener, EventRecord};
 
-use crate::agent::progress::AgentProgress;
+use crate::progress::AgentProgress;
 use tinytools::humanize_tool_name;
 
 use super::event_bridge::OpenhumanEventBridge;
 
 impl EventListener for OpenhumanEventBridge {
     fn on_event(&self, record: &EventRecord) {
+        if self.project_supplemental(record) {
+            return;
+        }
         match &record.event {
             AgentEvent::ModelStarted { .. } => {
-                let iteration = self.cursor.fetch_add(1, Ordering::SeqCst) + 1;
+                let iteration = tinyagents_harness::events::advance_iteration(&self.cursor);
                 match &self.scope {
                     None => self.send(AgentProgress::IterationStarted {
                         iteration,
@@ -129,7 +129,9 @@ impl EventListener for OpenhumanEventBridge {
             // `UsageRecorded` carries the authoritative per-call usage and fires
             // exactly once per model call; prefer it over `ModelCompleted`'s
             // optional usage to avoid double counting.
-            AgentEvent::UsageRecorded { usage } => self.record_usage(usage),
+            AgentEvent::UsageRecorded { usage } => {
+                self.record_usage(usage);
+            }
             // Per-call generation telemetry. `ModelCompleted` fires exactly once
             // per model call, after `UsageRecorded`, and is the only event
             // carrying the captured request messages (incl. the system prompt)
@@ -286,7 +288,9 @@ impl EventListener for OpenhumanEventBridge {
                     "[tinyagents] context compressed before model call"
                 );
             }
-            AgentEvent::Compacted { .. } => super::compaction_log::log_compacted(&record.event),
+            AgentEvent::Compacted { .. } => {
+                tinyagents_harness::events::log_compacted(&record.event)
+            }
             AgentEvent::UnknownToolCall {
                 call_id,
                 requested_name,
@@ -496,11 +500,10 @@ impl EventListener for OpenhumanEventBridge {
                 input,
                 output,
                 error,
-                // `started_at_ms`/`duration_ms`/`output_bytes` now ride the
-                // crate event (tinyagents 1.7 / tinyagents#18). The bridge
-                // still reads its richer side channels below to preserve current
-                // duration/size behavior; adopting crate fields directly is C4
-                // slice S1.
+                // `started_at_ms`/`duration_ms`/`output_bytes` ride the crate
+                // event, but the bridge reads the outcome-capture side channel
+                // below: it also carries the classified failure and the tool's
+                // structured metadata, which the crate event does not.
                 ..
             } => {
                 let iteration = self.iteration();
@@ -569,15 +572,15 @@ impl EventListener for OpenhumanEventBridge {
                 // An unknown tool is `NotFound` from the typed event itself
                 // (#6277), whatever the text sniff made of the echoed names.
                 let failure = if was_unknown {
-                    Some(crate::tools::status::describe(
-                        crate::tools::status::ToolFailureClass::NotFound,
+                    Some(tinytools::status::describe(
+                        tinytools::status::ToolFailureClass::NotFound,
                     ))
                 } else {
                     match outcome {
                         Some((_, f, ..)) => f,
                         None => error
                             .as_deref()
-                            .map(|text| crate::tools::status::classify(text, false)),
+                            .map(|text| tinytools::status::classify(text, false)),
                     }
                 };
                 // Recompute the label/detail with the REAL call arguments
@@ -637,6 +640,9 @@ impl EventListener for OpenhumanEventBridge {
             // without invoking the provider (deterministic internal runs only —
             // interactive chat never attaches a cache). Counters are additive; the
             // cost-footer DTO wiring is a follow-up (workstream 06).
+            AgentEvent::ToolProgressDetail {
+                call_id, message, ..
+            } => self.forward_tool_progress(call_id.as_str(), message),
             AgentEvent::CacheHit { call_id, key } => {
                 {
                     let mut s = self.state.lock().unwrap();

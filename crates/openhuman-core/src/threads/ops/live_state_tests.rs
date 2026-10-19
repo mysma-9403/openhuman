@@ -7,8 +7,8 @@
 //! env var at a fresh tempdir for the duration of the test.
 
 use super::*;
-use crate::agent::todos::ops::{TodoItem, TodoStatus};
 use crate::config::TEST_ENV_LOCK;
+use tinyagents_graph::todos::{TodoItem, TodoStatus};
 
 #[test]
 fn thread_live_state_request_parses_thread_id() {
@@ -63,9 +63,14 @@ async fn goal_get_reads_back_a_stored_goal() {
         .await
         .unwrap()
         .workspace_dir;
-    crate::agent::goals::store::set(&dir, "thread-goal-live", "ship it", Some(1000))
-        .await
-        .unwrap();
+    tinyagents_graph::goals::store::set(
+        &crate::storage::sessions::stores_or_ephemeral(&dir).kv,
+        "thread-goal-live",
+        "ship it",
+        Some(1000),
+    )
+    .await
+    .unwrap();
 
     let filled = goal_get(ThreadLiveStateRequest {
         thread_id: "thread-goal-live".to_string(),
@@ -96,12 +101,10 @@ async fn todos_get_reads_back_what_the_todo_tool_wrote() {
     let empty_json = empty.into_cli_compatible_json().unwrap();
     assert!(empty_json["data"]["todos"].as_array().unwrap().is_empty());
 
-    let scope = crate::agent::todos::ops::TodoScope::Session {
-        id: "thread-todos-live".to_string(),
-    };
-    crate::agent::todos::ops::replace(
-        &dir,
-        &scope,
+    let store = crate::storage::sessions::stores_or_ephemeral(&dir).kv;
+    tinyagents_graph::todos::store::replace(
+        &store,
+        "thread-todos-live",
         vec![TodoItem::with_status("write tests", TodoStatus::InProgress)],
     )
     .await

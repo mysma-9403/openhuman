@@ -120,7 +120,7 @@ pub mod server {
     }
 
     /// No-op: there is no voice server to start.
-    pub async fn start_if_enabled(_config: &Config) {}
+    pub async fn start_if_enabled(_ctx: &crate::core::runtime::DispatchCtx, _config: &Config) {}
 
     /// Always `None`: no global voice server exists.
     pub fn try_global_server() -> Option<Arc<VoiceServer>> {
@@ -168,7 +168,7 @@ pub mod dictation_listener {
     }
 
     /// No-op: no hotkey listener is started.
-    pub async fn start_if_enabled(_config: &Config) {}
+    pub async fn start_if_enabled(_ctx: &crate::core::runtime::DispatchCtx, _config: &Config) {}
 
     /// No-op: nothing to stop.
     pub async fn stop() {}
@@ -182,7 +182,7 @@ pub mod always_on {
     use crate::config::Config;
 
     /// No-op: always-on listening does not exist when voice is disabled.
-    pub async fn start_if_enabled(_config: &Config) {}
+    pub async fn start_if_enabled(_ctx: &crate::core::runtime::DispatchCtx, _config: &Config) {}
 
     /// No-op: nothing to stop.
     pub fn stop() {}
@@ -223,99 +223,11 @@ pub mod live {
         use crate::config::Config;
 
         /// Drop the upgraded socket immediately — live voice is compiled out.
-        pub async fn handle_live_voice_ws(_socket: WebSocket, _config: Arc<Config>) {}
-    }
-}
-
-// ---------------------------------------------------------------------------
-// reply_speech::{synthesize_reply, ReplySpeechOptions, ReplySpeechResult, ...}
-// ---------------------------------------------------------------------------
-
-pub mod reply_speech {
-    use serde::{Deserialize, Serialize};
-    use serde_json::Value;
-
-    use crate::config::Config;
-    use crate::core::Outcome;
-
-    /// One frame on the viseme timeline. Mirrors the real type.
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    pub struct VisemeFrame {
-        pub viseme: String,
-        pub start_ms: u64,
-        pub end_ms: u64,
-    }
-
-    /// Char-level timing frame. Mirrors the real type.
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    pub struct AlignmentFrame {
-        pub char: String,
-        pub start_ms: u64,
-        pub end_ms: u64,
-    }
-
-    /// Normalized TTS response. Mirrors the real type.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct ReplySpeechResult {
-        pub audio_base64: String,
-        pub audio_mime: String,
-        pub visemes: Vec<VisemeFrame>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub alignment: Option<Vec<AlignmentFrame>>,
-    }
-
-    /// Caller-tunable knobs. Mirrors the real type (fields + `Default`).
-    #[derive(Debug, Default, Clone)]
-    pub struct ReplySpeechOptions {
-        pub voice_id: Option<String>,
-        pub model_id: Option<String>,
-        pub output_format: Option<String>,
-        pub voice_settings: Option<Value>,
-    }
-
-    /// Disabled: reply-speech synthesis is unavailable when voice is compiled
-    /// out. Callers log the error and skip the spoken reply.
-    pub async fn synthesize_reply(
-        _config: &Config,
-        _text: &str,
-        _opts: &ReplySpeechOptions,
-    ) -> Result<Outcome<ReplySpeechResult>, String> {
-        Err(super::DISABLED_MSG.to_string())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// cloud_transcribe::{transcribe_cloud, CloudTranscribeOptions, ...}
-// (provided by the real voice host adapter)
-// ---------------------------------------------------------------------------
-
-pub mod cloud_transcribe {
-    use serde::{Deserialize, Serialize};
-
-    use crate::config::Config;
-    use crate::core::Outcome;
-
-    /// Caller-tunable knobs. Mirrors the real type (fields + `Default`).
-    #[derive(Debug, Default, Clone)]
-    pub struct CloudTranscribeOptions {
-        pub model: Option<String>,
-        pub language: Option<String>,
-        pub mime_type: Option<String>,
-        pub file_name: Option<String>,
-    }
-
-    /// Transcription result. Mirrors the real type.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct CloudTranscribeResult {
-        pub text: String,
-    }
-
-    /// Disabled: cloud STT is unavailable when voice is compiled out.
-    pub async fn transcribe_cloud(
-        _config: &Config,
-        _audio_base64: &str,
-        _opts: &CloudTranscribeOptions,
-    ) -> Result<Outcome<CloudTranscribeResult>, String> {
-        Err(super::DISABLED_MSG.to_string())
+        pub async fn handle_live_voice_ws(
+            _socket: WebSocket,
+            _ctx: crate::core::runtime::DispatchCtx,
+            _config: Arc<Config>,
+        ) {
+        }
     }
 }

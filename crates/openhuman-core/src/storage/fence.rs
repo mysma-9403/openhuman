@@ -57,9 +57,9 @@ use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
-use tinystoragedrivers::{Fence, Filter};
+use tinystoragedrivers::Fence;
 
-use super::lease::{LeaseStore, LEASE_COLLECTION};
+use super::lease::LeaseStore;
 use super::StorageError;
 
 /// Why a fenced write was refused.
@@ -194,20 +194,14 @@ impl LeaseFence {
     }
 
     /// The fence a storage driver enforces for this grant: the lease record
-    /// (where the lease store keeps it, [`LeaseStore::record_scope`]) must
+    /// (where the lease store keeps it, [`LeaseStore::driver_fence`]) must
     /// still name this node at this epoch, unreleased. `None` when the lease
     /// store keeps no record in the storage ports (file leases) or is gone;
     /// then only [`Self::check`] guards the write.
     pub fn driver_fence(&self) -> Option<Fence> {
-        let scope = self.leases.upgrade()?.record_scope()?;
-        Some(Fence::new(
-            scope,
-            LEASE_COLLECTION,
-            self.key.clone(),
-            Filter::eq("epoch", self.epoch)
-                .and(Filter::eq("owner", self.node.clone()))
-                .and(Filter::eq("released", false)),
-        ))
+        self.leases
+            .upgrade()?
+            .driver_fence(&self.key, &self.node, self.epoch)
     }
 
     /// The refusal for a write the storage driver fenced off

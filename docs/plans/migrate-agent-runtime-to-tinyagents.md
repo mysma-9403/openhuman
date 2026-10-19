@@ -278,7 +278,7 @@ OpenHuman dependencies.
 - `vendor/tinyagents/crates/tinyagents-registry/src/definition/` and tests.
 - `crates/openhuman-core/src/agent/harness/{definition*,builtin_definitions*,
   agent_graph.rs}`.
-- OpenHuman `agent/registry/` and host `definition_registry.rs`.
+- OpenHuman `agent_registry/` and host `definition_registry.rs`.
 
 **RED**
 

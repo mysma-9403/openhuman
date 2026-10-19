@@ -9,7 +9,7 @@ use crate::voice::{create_stt_provider, effective_stt_provider};
 use tinyinference_local::models as model_ids;
 use tinyinference_local::status::{LocalAiSpeechResult, LocalAiTtsResult};
 
-use super::LocalAiService;
+use tinyinference_local::service::LocalAiService;
 
 const LOG_PREFIX: &str = "[speech]";
 
@@ -63,8 +63,8 @@ pub async fn transcribe_with_prompt(
 
     let provider_name = effective_stt_provider(config);
     debug!(
-            "{LOG_PREFIX} configured STT dispatch provider={provider_name} path={audio_path} mime={mime}"
-        );
+        "{LOG_PREFIX} configured STT dispatch provider={provider_name} path={audio_path} mime={mime}"
+    );
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("failed to read audio file {audio_path}: {e}"))?;

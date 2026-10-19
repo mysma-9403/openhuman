@@ -13,7 +13,7 @@
 use crate::config::Config;
 use crate::core::Outcome;
 
-use super::super::module_client::{self as connectors, methods};
+use super::super::module_client::{self as connectors};
 use super::super::types::{
     ComposioActiveTriggersResponse, ComposioAvailableTriggersResponse,
     ComposioCreateTriggerRequest, ComposioCreateTriggerResponse, ComposioDisableTriggerRequest,
@@ -22,6 +22,7 @@ use super::super::types::{
     ComposioListGithubReposRequest, ComposioListTriggersRequest, ComposioTriggerHistoryResult,
 };
 use super::error_utils::{report_composio_op_error, OpResult};
+use tinyconnectors_bus::names::methods;
 
 pub async fn composio_list_github_repos(
     config: &Config,
@@ -156,7 +157,7 @@ pub async fn composio_enable_trigger(
             // settings screen, so its failures are mapped to something a person can
             // act on ("reconnect GitHub") rather than the provider's own wording.
             let classified: tinyconnectors_bus::ProviderError =
-                crate::modules::client::ModuleClient::new(config.clone())
+                crate::modules::client(config.clone())
                     .call(
                         "tinyconnectors",
                         methods::CLASSIFY_ERROR,
@@ -209,6 +210,7 @@ pub async fn composio_disable_trigger(
 }
 
 pub async fn composio_list_trigger_history(
+    ctx: &crate::core::runtime::DispatchCtx,
     config: &Config,
     limit: Option<usize>,
 ) -> OpResult<Outcome<ComposioTriggerHistoryResult>> {
@@ -228,7 +230,7 @@ pub async fn composio_list_trigger_history(
         "[composio] list_trigger_history failed: trigger archive owner unavailable".to_owned()
     })?;
     let history = store
-        .read(config, Some(requested_limit))
+        .read(ctx, config, Some(requested_limit))
         .await
         .map_err(|error| format!("[composio] list_trigger_history failed: {error}"))?;
     let count = history.entries.len();

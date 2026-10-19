@@ -7,7 +7,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{chat_completion, last_user_message, runtime_without_master_key, PointedTransport};
+use common::{chat_completion, last_user_message, runtime_without_master_key, PointedInference};
 use openhuman_core::cron::{self, AgentJobSpec, DeliveryConfig, Schedule};
 use openhuman_embed::profiles::ProfileCredentialKind;
 use openhuman_embed::{CronDelivery, CronReply, JobOrigin, ProfileRuntime, SaasConfig};
@@ -62,7 +62,7 @@ async fn scenario() {
         .with_priority(10)
         .mount(&inference)
         .await;
-    PointedTransport::install(&inference.uri());
+    PointedInference::install(&inference.uri());
     // The shared backend every sweeper would contend on.
     openhuman_core::storage::install(Arc::new(openhuman_core::storage::MemoryStorage::new()));
 
@@ -119,8 +119,11 @@ async fn scenario() {
 
     // Nothing is due yet; two sweepers race for each job once it is.
     assert_eq!(runtime.sweep_cron_at(chrono::Utc::now()).await.ran, 0);
-    let later = chrono::Utc::now() + chrono::Duration::hours(1);
-    let (a, b) = tokio::join!(runtime.sweep_cron_at(later), runtime.sweep_cron_at(later));
+    common::wait_until(soon).await;
+    let (a, b) = tokio::join!(
+        runtime.sweep_cron_at(chrono::Utc::now()),
+        runtime.sweep_cron_at(chrono::Utc::now())
+    );
     assert_eq!(a.ran + b.ran, 3, "each occurrence runs once: {a:?} {b:?}");
 
     let mut delivered: Vec<_> = recorder
@@ -138,6 +141,15 @@ async fn scenario() {
         })
         .collect();
     delivered.sort_by(|x, y| x.0.cmp(&y.0));
+    assert!(
+        recorder
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r.agent_id.is_none()),
+        "a profile's default agent is not named"
+    );
     let web = |user: &str| {
         Some(JobOrigin::Web {
             thread_id: format!("t-{user}"),
@@ -148,13 +160,13 @@ async fn scenario() {
         delivered,
         [
             (
-                "alice".into(),
+                Some("alice".into()),
                 Some("t-alice".into()),
                 "ran: alice".into(),
                 web("alice")
             ),
             (
-                "bob".into(),
+                Some("bob".into()),
                 Some("t-bob".into()),
                 "ran: bob".into(),
                 web("bob")
@@ -165,6 +177,6 @@ async fn scenario() {
 
     // One-shot jobs are gone; a later sweep finds nothing.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(runtime.sweep_cron_at(later).await.ran, 0);
+    assert_eq!(runtime.sweep_cron_at(chrono::Utc::now()).await.ran, 0);
     assert_eq!(recorder.0.lock().unwrap().len(), 2);
 }

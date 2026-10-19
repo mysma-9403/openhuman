@@ -2,12 +2,8 @@
 //! forbidden-path argument scan and a hard timeout.
 
 use crate::config::Config;
-use crate::cron::CronJob;
 use crate::security::SecurityPolicy;
-#[cfg(test)]
-use std::process::Stdio;
-#[cfg(test)]
-use tokio::time;
+use tinyflows_bus::schedule::types::CronJob;
 use tokio::time::Duration;
 
 pub(super) const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
@@ -26,7 +22,8 @@ pub(crate) async fn authorize_shell_command(
             .await
         {
             Ok(analysis) => analysis,
-            Err(_) => {
+            Err(e) => {
+                tracing::warn!(error = %e, "[cron:shell] command analysis unavailable");
                 #[cfg(test)]
                 {
                     if !config.modules.enabled {
@@ -124,11 +121,13 @@ pub(super) fn forbidden_path_argument(security: &SecurityPolicy, command: &str) 
 }
 
 pub(super) async fn run_job_command(
+    ctx: &crate::core::runtime::DispatchCtx,
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
 ) -> (bool, String) {
     run_job_command_with_timeout(
+        ctx,
         config,
         security,
         job,
@@ -138,6 +137,7 @@ pub(super) async fn run_job_command(
 }
 
 pub(super) async fn run_job_command_with_timeout(
+    ctx: &crate::core::runtime::DispatchCtx,
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
@@ -168,69 +168,35 @@ pub(super) async fn run_job_command_with_timeout(
         );
     }
 
-    #[cfg(test)]
+    // Cron keeps host execution semantics (the host's own network, no jail)
+    // and a pipeline's default exit status: retries are spent on it.
+    let output = match crate::sandbox::shell_exec::run_host(
+        ctx,
+        config,
+        &job.command,
+        &config.action_dir,
+        &config.workspace_dir,
+        std::collections::BTreeMap::new(),
+        timeout,
+        true,
+        None,
+    )
+    .await
     {
-        // Scheduler unit fixtures do not load a native TinyBox artifact. The
-        // production branch below always uses the module-owned process path;
-        // the released-artifact fixture covers that bus lifecycle directly.
-        let child = match crate::agent::platform_shell::build_tokio_command_preserving_pipe_status(
-            &job.command,
-        )
-        .current_dir(&config.action_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        {
-            Ok(child) => child,
-            Err(_) => return (false, "Command execution is unavailable.".to_owned()),
-        };
-        return match time::timeout(timeout, child.wait_with_output()).await {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let combined = format!(
-                    "status={}\nstdout:\n{}\nstderr:\n{}",
-                    output.status,
-                    stdout.trim(),
-                    stderr.trim()
-                );
-                (output.status.success(), combined)
-            }
-            Ok(Err(_)) => (false, "Command execution failed.".to_owned()),
-            Err(_) => (
-                false,
-                format!("job timed out after {}s", timeout.as_secs_f64()),
-            ),
-        };
-    }
-
-    #[cfg(not(test))]
-    {
-        let output = match crate::sandbox::native_jail::execute_passthrough(
-            config,
-            &job.command,
-            &config.action_dir,
-            timeout,
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(_) => return (false, "Command execution is unavailable.".to_owned()),
-        };
-        if output.timed_out {
-            return (
-                false,
-                format!("job timed out after {}s", timeout.as_secs_f64()),
-            );
-        }
-        let combined = format!(
-            "status=exit status: {}\nstdout:\n{}\nstderr:\n{}",
-            output.exit_code,
-            output.stdout.trim(),
-            output.stderr.trim()
+        Ok(output) => output,
+        Err(_) => return (false, "Command execution is unavailable.".to_owned()),
+    };
+    if output.timed_out {
+        return (
+            false,
+            format!("job timed out after {}s", timeout.as_secs_f64()),
         );
-        (output.success(), combined)
     }
+    let combined = format!(
+        "status=exit status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.exit_code,
+        output.stdout.trim(),
+        output.stderr.trim()
+    );
+    (output.success(), combined)
 }

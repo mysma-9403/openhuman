@@ -30,13 +30,17 @@ impl CoreContext {
             workspace_binding: RwLock::new(binding),
             domains: self.domains,
             tool_groups: self.tool_groups.clone(),
+            components: self.components,
             embedder_config: self.embedder_config.clone(),
+            latest_embedder_config: self.latest_embedder_config.as_ref().map(Arc::clone),
             user_skill_roots: self.user_skill_roots,
-            backend_transport: self.backend_transport.clone(),
+            extensions: self.extensions.clone(),
             turn_origin: self.turn_origin.clone(),
+            channel_thread: self.channel_thread.clone(),
             session_agent: Some(agent.to_string()),
             profile: self.profile.clone(),
             agent: parts,
+            bare: self.bare,
         })
     }
 }

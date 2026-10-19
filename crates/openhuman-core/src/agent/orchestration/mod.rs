@@ -19,7 +19,6 @@ pub mod agent_teams;
 pub(crate) mod background_completions;
 pub(crate) mod background_delivery;
 pub(crate) mod busy_guard;
-pub mod command_center;
 pub(crate) mod completion_notice;
 pub(crate) mod completion_owners;
 pub(crate) mod completion_target;
@@ -28,18 +27,15 @@ pub(crate) mod delivery_drain;
 pub use delegation::open_delegation_checkpointer;
 pub(crate) mod fleet_tools;
 mod ops;
+#[path = "parent_context/builder.rs"]
 pub(crate) mod parent_context;
-pub(crate) mod run_ledger_finalize;
 pub(crate) mod running_subagents;
-pub(crate) mod spawn_parallel_graph;
-pub mod subagent_control;
+pub(crate) mod spawn_parallel;
 pub(crate) mod subagent_events;
 pub(crate) mod subagent_sessions;
 pub mod tools;
 pub mod types;
-pub mod workflow_runs;
 pub mod worktree;
-mod worktree_schemas;
 
 #[cfg(test)]
 mod ops_tests;
@@ -52,10 +48,6 @@ mod background_completions_tenant_tests;
 #[path = "background_delivery_tenant_tests.rs"]
 mod background_delivery_tenant_tests;
 
-pub use agent_teams::{all_agent_team_controller_schemas, all_agent_team_registered_controllers};
-pub use command_center::{
-    all_command_center_controller_schemas, all_command_center_registered_controllers,
-};
 pub use ops::{AgentOrchestrationSession, OrchestrationError};
 
 /// Release the background-completion logs this process holds open. The core
@@ -63,19 +55,7 @@ pub use ops::{AgentOrchestrationSession, OrchestrationError};
 pub async fn release_background_completion_stores() -> usize {
     background_completions::release_all().await
 }
-pub use subagent_control::{
-    all_controller_schemas as all_subagent_control_controller_schemas,
-    all_registered_controllers as all_subagent_control_registered_controllers,
-};
 pub use types::{
-    AgentSnapshot, OrchestrationTaskStatus, SpawnAgentRequest, SpawnAgentResponse,
-    WaitAgentOptions, WaitAgentResponse,
-};
-pub use workflow_runs::{
-    all_workflow_run_controller_schemas, all_workflow_run_registered_controllers,
+    AgentSnapshot, SpawnAgentRequest, SpawnAgentResponse, WaitAgentOptions, WaitAgentResponse,
 };
 pub use worktree::OpenHumanWorktreeIsolation;
-pub use worktree_schemas::{
-    all_controller_schemas as all_worktree_controller_schemas,
-    all_registered_controllers as all_worktree_registered_controllers,
-};

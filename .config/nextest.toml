@@ -20,7 +20,19 @@ final-status-level = "fail"
 # a separate process.
 [test-groups]
 agent-harness-e2e = { max-threads = 1 }
+json-rpc-e2e = { max-threads = 1 }
+mcp-registry = { max-threads = 1 }
 
 [[profile.ci.overrides]]
-filter = 'binary(=agent_harness_e2e)'
+filter = 'binary(/^agent_harness_e2e$/)'
 test-group = 'agent-harness-e2e'
+
+# RPC bootstrap writes a fixed temporary token path across processes. Retain
+# the original serial contract of both resource-sensitive integration suites.
+[[profile.ci.overrides]]
+filter = 'binary(/^json_rpc_e2e$/)'
+test-group = 'json-rpc-e2e'
+
+[[profile.ci.overrides]]
+filter = 'binary(/^mcp_registry_multi_server$/)'
+test-group = 'mcp-registry'

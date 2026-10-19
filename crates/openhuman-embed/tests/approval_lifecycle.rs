@@ -306,10 +306,7 @@ impl Tool for RemovalTool {
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {}})
     }
-    async fn execute(
-        &self,
-        _: serde_json::Value,
-    ) -> anyhow::Result<openhuman_core::tools::ToolResult> {
+    async fn execute(&self, _: serde_json::Value) -> anyhow::Result<tinytools::ToolResult> {
         let _guard = BlockingDecisionDrop {
             barrier: self.barrier.clone(),
             dropping: self.dropping.clone(),
@@ -390,10 +387,15 @@ async fn removal_reserves_ids_until_cleanup_finishes(runtime: Arc<Runtime>, scra
         if cancel {
             removing.abort();
             assert!(removing.await.unwrap_err().is_cancelled());
-            assert!(
-                !home.exists(),
-                "cancelling removal still performs requested purge"
-            );
+            // Cancellation transfers the purge to the close task. It must not
+            // delete module-owned state before the module acknowledges close.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while home.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("deferred purge follows module close acknowledgment");
             barrier.release();
         } else {
             barrier.release();

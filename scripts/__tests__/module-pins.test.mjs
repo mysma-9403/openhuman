@@ -125,6 +125,26 @@ test("voice source release matches the artifact used for recording summaries", (
   );
 });
 
+test("search source release matches the loaded search artifact", () => {
+  const record = [...parseRecords(readRegistry()).values()].find(
+    (record) => record.id === "tinysearch",
+  );
+  assert.ok(record, "search adapter requires a registered module");
+  const source = readFileSync(join(REPO_ROOT, "vendor/tinysearch/Cargo.toml"), "utf8");
+  const version = source.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+  assert.equal(version, record.version, "search source must match its loaded artifact");
+});
+
+test("wallet source release matches the loaded wallet artifact", () => {
+  const record = [...parseRecords(readRegistry()).values()].find(
+    (record) => record.id === "tinywallet",
+  );
+  assert.ok(record, "wallet adapter requires a registered module");
+  const source = readFileSync(join(REPO_ROOT, "vendor/tinywallet/Cargo.toml"), "utf8");
+  const version = source.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+  assert.equal(version, record.version, "wallet source must match its loaded artifact");
+});
+
 // ── Registry parsing ──────────────────────────────────────────────────────────
 
 test("parses every record `ALL` lists out of the real registry", () => {
@@ -569,4 +589,17 @@ test("the submodule probe is not fooled by the superproject above it", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("a cfg attribute on an ALL element does not hide the record", () => {
+  const src = [
+    "pub const ALL: &[ModuleRecord] = &[",
+    "    TINYCOMPUTER,",
+    '    #[cfg(feature = "documents")]',
+    "    TINYDOCS,",
+    '    #[cfg(feature = "modules")] // loader only',
+    "    TINYBOX,",
+    "];",
+  ].join("\n");
+  assert.deepEqual(parseAllList(src), ["TINYCOMPUTER", "TINYDOCS", "TINYBOX"]);
 });

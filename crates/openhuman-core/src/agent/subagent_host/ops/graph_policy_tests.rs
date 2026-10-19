@@ -97,7 +97,7 @@ impl ChatModel<()> for SpawnAttemptProvider {
     }
 }
 
-const REFUSAL: &str = "refusing to register spawn/delegate tool";
+const REFUSAL: &str = "refused spawn tool on sub-agent";
 
 /// Runs one sub-agent turn whose parent surface carries `spawn_subagent`, with
 /// `allowed` deciding whether the allowlist readmits it. Returns
@@ -129,7 +129,7 @@ async fn run_with_spawn_tool_in_parent_surface(allowed: HashSet<String>) -> (boo
         vec![],
         allowed,
         10,
-        None,
+        (None, None),
         None,
         "researcher",
         "task-6157",
@@ -144,6 +144,7 @@ async fn run_with_spawn_tool_in_parent_surface(allowed: HashSet<String>) -> (boo
         "root-session__spawn_refusal",
         "mock-channel",
         AgentTokenjuiceCompression::Off,
+        None,
         None,
     )
     .await
@@ -213,6 +214,7 @@ fn mirrored_tool_results_are_hidden_from_the_worker_thread_chat() {
     let now = chrono::Utc::now().to_rfc3339();
     for id in ["worker-typed", "worker-recovered"] {
         store::ensure_thread(
+            &crate::core::runtime::DispatchCtx::ambient(),
             dir.clone(),
             CreateConversationThread {
                 id: id.to_string(),
@@ -231,6 +233,7 @@ fn mirrored_tool_results_are_hidden_from_the_worker_thread_chat() {
 
     // The typed path (`TranscriptEntry::ToolResults`), used on a normal run.
     mirror_worker_thread(
+        &crate::core::runtime::DispatchCtx::ambient(),
         &dir,
         "worker-typed",
         "researcher",
@@ -258,6 +261,7 @@ fn mirrored_tool_results_are_hidden_from_the_worker_thread_chat() {
 
     // The error-recovery path (`role: "tool"`), used when a run fails mid-turn.
     mirror_worker_thread_from_history(
+        &crate::core::runtime::DispatchCtx::ambient(),
         &dir,
         "worker-recovered",
         "researcher",
@@ -273,7 +277,12 @@ fn mirrored_tool_results_are_hidden_from_the_worker_thread_chat() {
     // failure names every path that is still painting a tool result as chat.
     let mut painted_as_user_chat: Vec<String> = Vec::new();
     for thread_id in ["worker-typed", "worker-recovered"] {
-        let rows = store::get_messages(dir.clone(), thread_id).unwrap();
+        let rows = store::get_messages(
+            &crate::core::runtime::DispatchCtx::ambient(),
+            dir.clone(),
+            thread_id,
+        )
+        .unwrap();
         assert!(
             rows.iter().any(|r| r.content == RAW),
             "{thread_id}: the mirror wrote no tool-result row to assert on"

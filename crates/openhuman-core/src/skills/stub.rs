@@ -21,15 +21,8 @@ use std::path::Path;
 use crate::core::all::RegisteredController;
 use crate::core::ControllerSchema;
 
-// ---------------------------------------------------------------------------
-// Type surface — re-exported from the ungated carve-out, NOT re-declared.
-// Mirrors the `pub use ops::*` → `pub use super::ops_types::{…}` chain that the
-// real build exposes at the `skills` root (`skills::Workflow`, etc.).
-// ---------------------------------------------------------------------------
-
-pub use super::ops_types::{
-    Workflow, WorkflowFrontmatter, WorkflowScope, MAX_WORKFLOW_RESOURCE_BYTES,
-};
+// Disabled discovery returns the same portable skill metadata as an enabled host.
+use tinyskills::Skill as Workflow;
 
 // ---------------------------------------------------------------------------
 // Discovery surface (mirrors `ops_discover::*` re-exported at the skills root)
@@ -51,13 +44,6 @@ pub fn load_workflow_metadata(_workspace_dir: &Path) -> Vec<Workflow> {
 /// inside the gated tree, and the one caller only logs it.
 pub fn install_bundled_skills(_workspace_dir: &Path) {
     log::debug!("[skills-stub] install_bundled_skills skipped (skills disabled)");
-}
-
-/// No-op success: with skills compiled out there is no skills directory to
-/// provision, and workspace bootstrap must not fail because of it.
-pub fn init_workflows_dir(_workspace_dir: &Path) -> Result<(), String> {
-    log::debug!("[skills-stub] init_workflows_dir skipped (skills disabled)");
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

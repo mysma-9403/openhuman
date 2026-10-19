@@ -73,36 +73,17 @@ fn subagent_mode_as_str_roundtrip() {
     assert_eq!(SubagentMode::Typed.as_str(), "typed");
 }
 
-#[test]
-fn append_subagent_role_contract_adds_role_and_brevity_rules() {
-    let rendered = append_subagent_role_contract("base prompt".to_string(), "researcher");
-    assert!(rendered.contains("## Sub-agent Role Contract"));
-    assert!(rendered.contains("You are a sub-agent working for a parent OpenHuman agent"));
-    assert!(rendered.contains("Keep your final response concise and synthesis-ready"));
-    assert!(rendered.contains("## Sub-agent Result Contract"));
-    assert!(rendered.contains("Evidence used"));
-    assert!(rendered.contains("Do not include facts in Answer that are not supported"));
-    assert!(rendered.contains("truncated, partial, or too large"));
-}
-
-#[test]
-fn append_subagent_role_contract_is_idempotent() {
-    let once = append_subagent_role_contract("base prompt".to_string(), "researcher");
-    let twice = append_subagent_role_contract(once.clone(), "researcher");
-    assert_eq!(once, twice, "contract suffix should only appear once");
-}
-
 #[tokio::test]
 async fn typed_mode_injects_current_date_and_time_into_user_message() {
     let provider = ScriptedProvider::new(vec![text_response("ok")]);
     let parent = make_parent(provider.clone(), vec![stub("file_read")]);
     let def = make_def_named_tools(&[]);
 
-    let _ = with_parent_context(parent, async {
+    let _ = (async {
         run_subagent(
             &def,
             "the actual task prompt",
-            SubagentRunOptions::default(),
+            with_parent(parent.clone(), SubagentRunOptions::default()),
         )
         .await
     })
@@ -128,11 +109,11 @@ async fn typed_mode_system_prompt_includes_subagent_role_contract() {
     let parent = make_parent(provider.clone(), vec![stub("file_read")]);
     let def = make_def_named_tools(&[]);
 
-    let _ = with_parent_context(parent, async {
+    let _ = (async {
         run_subagent(
             &def,
             "the actual task prompt",
-            SubagentRunOptions::default(),
+            with_parent(parent.clone(), SubagentRunOptions::default()),
         )
         .await
     })
@@ -145,13 +126,28 @@ async fn typed_mode_system_prompt_includes_subagent_role_contract() {
         .iter()
         .find(|m| m.role == "system")
         .expect("system message should be present");
-    assert!(system_msg.content.contains("## Sub-agent Role Contract"));
     assert!(system_msg
         .content
-        .contains("You are a sub-agent working for a parent OpenHuman agent"));
+        .contains("You are a subagent (depth 1) working for a parent agent, not the end user."));
     assert!(system_msg
         .content
-        .contains("Keep your final response concise and synthesis-ready"));
+        .contains("Your assignment: the actual task prompt"));
+    for heading in [
+        "Answer",
+        "Evidence used",
+        "Actions taken",
+        "Open uncertainties",
+        "Failed tool calls",
+        "Recommended next step",
+    ] {
+        assert!(
+            system_msg.content.contains(heading),
+            "missing {heading} heading"
+        );
+    }
+    assert!(system_msg
+        .content
+        .contains("Do not state unsupported facts; disclose truncated or partial tool results."));
 }
 
 #[tokio::test]
@@ -160,24 +156,28 @@ async fn typed_mode_returns_text_through_runner() {
     let parent = make_parent(provider.clone(), vec![stub("file_read")]);
     let def = make_def_named_tools(&[]);
 
-    let outcome = with_parent_context(parent, async {
+    let outcome = (async {
         run_subagent(
             &def,
             "summarise X",
-            SubagentRunOptions {
-                workspace_descriptor: None,
-                skill_filter_override: None,
-                context: None,
-                model_override: None,
-                task_id: Some("t1".into()),
-                thread_id: None,
-                run_context: Default::default(),
-                worker_thread_id: None,
-                initial_history: None,
-                checkpoint_dir: None,
-                worktree_action_dir: None,
-                run_queue: None,
-            },
+            with_parent(
+                parent.clone(),
+                SubagentRunOptions {
+                    workspace_descriptor: None,
+                    skill_filter_override: None,
+                    context: None,
+                    model_override: None,
+                    task_id: Some("t1".into()),
+                    thread_id: None,
+                    run_context: Default::default(),
+                    worker_thread_id: None,
+                    initial_history: None,
+                    checkpoint_dir: None,
+                    worktree_action_dir: None,
+                    run_queue: None,
+                    message_run_queue: None,
+                },
+            ),
         )
         .await
     })
@@ -212,8 +212,13 @@ async fn capped_no_progress_subagent_returns_incomplete_status() {
     let mut def = make_def_named_tools(&["file_read"]);
     def.max_iterations = 2;
 
-    let outcome = with_parent_context(parent, async {
-        run_subagent(&def, "read the file", SubagentRunOptions::default()).await
+    let outcome = (async {
+        run_subagent(
+            &def,
+            "read the file",
+            with_parent(parent.clone(), SubagentRunOptions::default()),
+        )
+        .await
     })
     .await
     .expect("a cap halt is still Ok (not Err)");
@@ -237,7 +242,7 @@ async fn run_queue_steer_lands_in_subagent_history() {
     // End-to-end proof that flipping the subagent loop's run-queue arg from
     // `None` to `Some(queue)` wires steering all the way through: a message
     // pushed to the queue before the run is drained by the steering forwarder
-    // in the child's turn (`run_turn_via_tinyagents_shared`) and appears as a
+    // in the child's turn (`TurnSpec::run`) and appears as a
     // `[User steering message]:` user turn in the exact request sent to the
     // provider. This is the mechanism behind the `steer_subagent` tool.
     let provider = ScriptedProvider::new(vec![text_response("acknowledged")]);
@@ -261,15 +266,18 @@ async fn run_queue_steer_lands_in_subagent_history() {
         )
         .await;
 
-    let outcome = with_parent_context(parent, async {
+    let outcome = (async {
         run_subagent(
             &def,
             "investigate the bug",
-            SubagentRunOptions {
-                task_id: Some("t-steer".into()),
-                run_queue: Some(run_queue),
-                ..Default::default()
-            },
+            with_parent(
+                parent.clone(),
+                SubagentRunOptions {
+                    task_id: Some("t-steer".into()),
+                    run_queue: Some(run_queue),
+                    ..Default::default()
+                },
+            ),
         )
         .await
     })
@@ -303,11 +311,11 @@ async fn typed_mode_no_memory_context_in_user_message() {
     let parent = make_parent(provider.clone(), vec![stub("file_read")]);
     let def = make_def_named_tools(&[]);
 
-    let _ = with_parent_context(parent, async {
+    let _ = (async {
         run_subagent(
             &def,
             "the actual task prompt",
-            SubagentRunOptions::default(),
+            with_parent(parent.clone(), SubagentRunOptions::default()),
         )
         .await
     })
@@ -337,13 +345,13 @@ async fn typed_mode_includes_memory_context_when_definition_allows_it() {
         "[Memory context]\n- prior fact: branch X failed\n".into(),
     ));
     let mut def = make_def_named_tools(&[]);
-    def.omit_memory_context = false;
+    def.extensions.omit_memory_context = false;
 
-    let _ = with_parent_context(parent, async {
+    let _ = (async {
         run_subagent(
             &def,
             "the actual task prompt",
-            SubagentRunOptions::default(),
+            with_parent(parent.clone(), SubagentRunOptions::default()),
         )
         .await
     })
@@ -379,24 +387,28 @@ async fn typed_mode_filters_tools_by_skill_filter() {
     let mut def = make_def_named_tools(&[]);
     def.tools = ToolScope::Wildcard;
 
-    let _ = with_parent_context(parent, async {
+    let _ = (async {
         run_subagent(
             &def,
             "lookup",
-            SubagentRunOptions {
-                workspace_descriptor: None,
-                skill_filter_override: Some("notion".into()),
-                context: None,
-                model_override: None,
-                task_id: None,
-                thread_id: None,
-                run_context: Default::default(),
-                worker_thread_id: None,
-                initial_history: None,
-                checkpoint_dir: None,
-                worktree_action_dir: None,
-                run_queue: None,
-            },
+            with_parent(
+                parent.clone(),
+                SubagentRunOptions {
+                    workspace_descriptor: None,
+                    skill_filter_override: Some("notion".into()),
+                    context: None,
+                    model_override: None,
+                    task_id: None,
+                    thread_id: None,
+                    run_context: Default::default(),
+                    worker_thread_id: None,
+                    initial_history: None,
+                    checkpoint_dir: None,
+                    worktree_action_dir: None,
+                    run_queue: None,
+                    message_run_queue: None,
+                },
+            ),
         )
         .await
     })
@@ -436,8 +448,13 @@ async fn typed_mode_executes_one_tool_then_returns() {
     // Allow the runner to call file_read.
     let def = make_def_named_tools(&["file_read"]);
 
-    let outcome = with_parent_context(parent, async {
-        run_subagent(&def, "read x", SubagentRunOptions::default()).await
+    let outcome = (async {
+        run_subagent(
+            &def,
+            "read x",
+            with_parent(parent.clone(), SubagentRunOptions::default()),
+        )
+        .await
     })
     .await
     .expect("runner should succeed");
@@ -472,8 +489,13 @@ async fn typed_mode_blocks_unallowed_tool_calls() {
     // Definition only allows file_read.
     let def = make_def_named_tools(&["file_read"]);
 
-    let outcome = with_parent_context(parent, async {
-        run_subagent(&def, "do thing", SubagentRunOptions::default()).await
+    let outcome = (async {
+        run_subagent(
+            &def,
+            "do thing",
+            with_parent(parent.clone(), SubagentRunOptions::default()),
+        )
+        .await
     })
     .await
     .expect("runner should succeed");
@@ -528,8 +550,13 @@ async fn subagent_emits_checkpoint_at_iteration_cap_instead_of_erroring() {
     let mut def = make_def_named_tools(&["file_read"]);
     def.max_iterations = 2;
 
-    let outcome = with_parent_context(parent, async {
-        run_subagent(&def, "keep reading forever", SubagentRunOptions::default()).await
+    let outcome = (async {
+        run_subagent(
+            &def,
+            "keep reading forever",
+            with_parent(parent.clone(), SubagentRunOptions::default()),
+        )
+        .await
     })
     .await
     .expect("hitting the iteration cap should return a checkpoint, not error");
@@ -555,8 +582,13 @@ async fn subagent_checkpoint_falls_back_to_deterministic_when_summary_empty() {
     let mut def = make_def_named_tools(&["file_read"]);
     def.max_iterations = 2;
 
-    let outcome = with_parent_context(parent, async {
-        run_subagent(&def, "keep reading forever", SubagentRunOptions::default()).await
+    let outcome = (async {
+        run_subagent(
+            &def,
+            "keep reading forever",
+            with_parent(parent.clone(), SubagentRunOptions::default()),
+        )
+        .await
     })
     .await
     .expect("empty summary should fall back, not error");
@@ -579,13 +611,20 @@ async fn runner_allows_spawn_at_max_depth() {
     let parent = make_parent(provider.clone(), vec![]);
     let def = make_def_named_tools(&[]);
 
-    let outcome = with_parent_context(parent, async {
+    let outcome = (async {
         with_run_depth(
             RunDepth {
                 depth: MAX_SPAWN_DEPTH - 1,
                 max_depth: MAX_SPAWN_DEPTH,
             },
-            async { run_subagent(&def, "x", SubagentRunOptions::default()).await },
+            async {
+                run_subagent(
+                    &def,
+                    "x",
+                    with_parent(parent.clone(), SubagentRunOptions::default()),
+                )
+                .await
+            },
         )
         .await
     })

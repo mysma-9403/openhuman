@@ -3,50 +3,56 @@ use super::*;
 /// The negative-probe cache (design correction, item 3): a definitive
 /// `provider_not_configured` result must be served from cache within the TTL
 /// exactly like a `"ready"` result, so an edit -> validate -> propose -> run
-/// authoring/run burst hits the mock backend once, not once per call (the judge's
+/// authoring/run burst probes the provider once, not once per call (the judge's
 /// live run observed 4 network round trips in a single ~80s turn before this
-/// fix). Uses a real local axum server (no real network) that counts requests
-/// so a cache hit is provable, not just plausible.
+/// fix). Uses a registered provider whose probe counts calls so a cache hit is
+/// provable, not just plausible.
 #[tokio::test]
 async fn cached_probe_inference_readiness_caches_a_negative_result() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::inference::registry::{register_chat_model, unregister_chat_model, ChatModelEntry};
+
+    let _guard = crate::inference::inference_test_guard_async().await;
     let tmp = TempDir::new().unwrap();
-    let mut config = test_config(&tmp);
+    let config = test_config(&tmp);
     seed_app_session_for_gate_test(&tmp);
 
+    // A registered managed provider whose readiness probe is counted and
+    // definitively rejects, standing in for the hosted backend's 400.
     let hit_count = std::sync::Arc::new(AtomicUsize::new(0));
     let counter = hit_count.clone();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    let app = axum::Router::new().route(
-        "/openai/v1/chat/completions",
-        axum::routing::post(move || {
-            let counter = counter.clone();
-            async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                use axum::response::IntoResponse;
-                (
-                    axum::http::StatusCode::BAD_REQUEST,
-                    axum::Json(json!({
-                        "success": false,
-                        "error": "API key not configured for provider",
-                        "errorCode": "BAD_REQUEST"
-                    })),
-                )
-                    .into_response()
-            }
-        }),
+    let probe: crate::inference::registry::ReadinessProbe =
+        std::sync::Arc::new(move |_role, _model, _config| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err("API key not configured for provider".to_string()) })
+        });
+    let base = crate::inference::registry_test_support::default_managed_entry(
+        crate::inference::provider::factory::PROVIDER_OPENHUMAN,
+    )
+    .expect("test default managed provider");
+    register_chat_model(
+        crate::inference::provider::factory::PROVIDER_OPENHUMAN,
+        ChatModelEntry {
+            probe: Some(probe),
+            ..base
+        },
     );
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve");
-    });
-    config.api_url = Some(format!("http://{addr}"));
+    struct Unregister;
+    impl Drop for Unregister {
+        fn drop(&mut self) {
+            unregister_chat_model(crate::inference::provider::factory::PROVIDER_OPENHUMAN);
+        }
+    }
+    let _unregister = Unregister;
 
     // First call: a real (mock) network round trip, definitively rejected.
-    let first = cached_probe_inference_readiness("summarization", &config).await;
+    let first = cached_probe_inference_readiness(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        "summarization",
+        &config,
+    )
+    .await;
     let err = first.expect_err("a confirmed provider-not-configured 400 must reject");
     assert!(
         err.to_ascii_lowercase()
@@ -61,7 +67,12 @@ async fn cached_probe_inference_readiness_caches_a_negative_result() {
 
     // Second call, same (role, config_path) key, well within the TTL: must be
     // served from cache — the mock server's hit count must NOT increase.
-    let second = cached_probe_inference_readiness("summarization", &config).await;
+    let second = cached_probe_inference_readiness(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        "summarization",
+        &config,
+    )
+    .await;
     assert!(
         second.is_err(),
         "the cached negative result must still be an Err"
@@ -244,6 +255,16 @@ fn connection_refs_fail_open_on_unavailable_connections_but_keep_mismatch() {
     assert!(errors[0].contains("tiktok"), "{}", errors[0]);
 }
 
+/// The mock-run argument preflight as `run_builder_gates` invokes it: the
+/// analysis is `tinyflows::preflight`'s, this pins the host's native slug prefix.
+async fn validate_required_arg_resolvability(graph: &WorkflowGraph) -> Vec<String> {
+    tinyflows::preflight::unresolvable_tool_args(
+        graph,
+        &[crate::flows::tinyflows::caps::NATIVE_TOOL_PREFIX],
+    )
+    .await
+}
+
 // ── validate_required_arg_resolvability (issue B18) ─────────────────────────
 //
 // `validate_tool_contracts`'s `missing_required_args` only proves an arg is
@@ -347,7 +368,10 @@ async fn mock_opaque_tool_call_upstream_ref_matches_native_and_composio_upstream
         ],
         "edges": []
     }));
-    let up = |expr: &str| mock_opaque_tool_call_upstream_ref(expr, &g, "sink").map(str::to_string);
+    let up = |expr: &str| {
+        tinyflows::preflight::mock_opaque_tool_call_upstream_ref(expr, &g, "sink")
+            .map(str::to_string)
+    };
     assert_eq!(
         up("=nodes.native_up.item.json.url").as_deref(),
         Some("native_up")

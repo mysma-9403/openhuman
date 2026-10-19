@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn catalog_mirrors_builtins() {
-    use crate::agent::registry::agents::BUILTINS;
+    use crate::agent_registry::agents::BUILTINS;
 
     for b in BUILTINS {
         let expected_uri = format!("openhuman://prompts/agents/{}", b.id);
@@ -78,7 +78,7 @@ fn read_resource_returns_minus_32002_for_unknown_uri() {
 
 #[test]
 fn read_resource_returns_content_for_each_subagent() {
-    use crate::agent::registry::agents::BUILTINS;
+    use crate::agent_registry::agents::BUILTINS;
     for b in BUILTINS {
         let uri = format!("openhuman://prompts/agents/{}", b.id);
         let result = read_resource(&uri)

@@ -9,7 +9,7 @@
 //! Business logic lives one directory per domain family under `src/`, listed
 //! below in the order they are declared (module declarations are kept
 //! alphabetical, with the `rpc` re-export sitting between `platform` and
-//! `runtime` — keep new modules sorted the same way): `agent`, `api`,
+//! `runtime` — keep new modules sorted the same way): `agent`, `agent_registry`, `api`, `artifacts`, `attachments`,
 //! `channels`, `config`, `core`, `cron`, `desktop`, `flows` (feature
 //! `flows`), `hooks`, `hosting` (feature `hosting`),
 //! `inference`, `integrations`,
@@ -53,7 +53,10 @@
 #![allow(dead_code)]
 
 pub mod agent;
-pub mod backend;
+pub mod agent_registry;
+pub mod agent_runs;
+pub mod artifacts;
+pub mod attachments;
 pub mod channels;
 pub mod commands;
 pub mod config;
@@ -72,11 +75,15 @@ pub mod mcp;
 pub mod media;
 pub mod memory;
 pub mod modules;
+pub mod plan_review;
 pub mod platform;
 pub mod profiles;
+pub mod progress;
+pub mod prompts;
 pub mod sandbox;
 pub mod search;
 pub mod security;
+pub mod sessions;
 pub mod skills;
 pub mod storage;
 #[cfg(feature = "e2e-test-support")]
@@ -85,6 +92,7 @@ pub mod threads;
 #[cfg(feature = "tinymemes")]
 pub mod tinymemes;
 pub mod tools;
+pub mod triage;
 pub mod util;
 pub mod voice;
 pub mod web3;

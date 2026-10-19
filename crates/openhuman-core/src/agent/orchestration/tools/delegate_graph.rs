@@ -1,17 +1,18 @@
-//! Tool: `delegate` — run a multi-stage, durable sub-agent delegation.
+//! Tool: `delegate_graph` — run a multi-stage, durable sub-agent delegation.
 //!
-//! Where `spawn_subagent` hands a sub-task to a single sub-agent turn, `delegate`
-//! drives the durable plan→execute⇄review→finalize graph
-//! ([`agent_orchestration::delegation::run_subagent_delegation`](crate::agent::orchestration::delegation::run_subagent_delegation)):
-//! the chosen agent first plans, then executes, then reviews its own work and
-//! revises up to `max_revisions` times before finalizing. The graph checkpoints
-//! its typed state to the session DB, so a crashed or paused run is resumable.
+//! Where `spawn_subagent` hands a sub-task to a single sub-agent turn,
+//! `delegate_graph` runs TinyAgents' resumable plan→execute⇄review→finalize
+//! tool. OpenHuman supplies the chosen agent, stage prompts, worker execution,
+//! checkpoints, and product result projection through
+//! [`run_subagent_delegation_with_parent_context`](crate::agent::orchestration::delegation::run_subagent_delegation_with_parent_context).
+//! Each stage is also
+//! registered with the shared subagent Jobs service.
 //!
 //! Use it for non-trivial sub-tasks that benefit from a self-review/revision
 //! loop; use `spawn_subagent` for a single focused hand-off.
 
-use crate::agent::harness::definition::AgentDefinitionRegistry;
 use crate::agent::orchestration::delegation::run_subagent_delegation_with_parent_context;
+use crate::agent_registry::host_definition::AgentDefinitionRegistry;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -90,6 +91,10 @@ impl DelegateGraphTool {
     }
 }
 
+#[cfg(test)]
+#[path = "delegate_graph_tests.rs"]
+mod tests;
+
 #[async_trait]
 impl Tool for DelegateGraphTool {
     fn name(&self) -> &str {
@@ -161,7 +166,10 @@ impl Tool for DelegateGraphTool {
         _options: ToolCallOptions,
         tool_context: Option<&dyn ToolRunContext>,
     ) -> anyhow::Result<ToolResult> {
-        let mut run_context = crate::agent::tinyagents::host::OpenHumanRunContext::new();
+        let mut run_context = crate::agent::tinyagents::host::OpenHumanRunContext::new().with_core(
+            crate::agent::tinyagents::host::run_context::dispatch_ctx_for_tool(tool_context)
+                .into_core(),
+        );
         run_context.thread_id = tool_context
             .and_then(ToolRunContext::thread_id)
             .map(ToOwned::to_owned);
@@ -199,11 +207,11 @@ impl DelegateGraphTool {
         };
         let agent_id = match args.get("agent_id").and_then(|v| v.as_str()) {
             Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-            _ => return Ok(ToolResult::error("delegate: `agent_id` is required.")),
+            _ => return Ok(ToolResult::error("delegate_graph: `agent_id` is required.")),
         };
         let task = match args.get("task").and_then(|v| v.as_str()) {
             Some(s) if !s.trim().is_empty() => s.to_string(),
-            _ => return Ok(ToolResult::error("delegate: `task` is required.")),
+            _ => return Ok(ToolResult::error("delegate_graph: `task` is required.")),
         };
         let max_revisions = args
             .get("max_revisions")
@@ -211,31 +219,39 @@ impl DelegateGraphTool {
             .map(|n| (n as usize).min(MAX_MAX_REVISIONS))
             .unwrap_or(DEFAULT_MAX_REVISIONS);
 
-        let registry = match AgentDefinitionRegistry::current() {
-            Some(reg) => reg,
-            None => {
-                return Ok(ToolResult::error(
-                    "delegate: agent definition registry not initialized.",
-                ));
-            }
-        };
+        // The live parent is the authority for this invocation. Looking only
+        // at `CoreContext::current()` can select another concurrent tenant's
+        // catalogue (or none at all) when callers execute the typed tool with
+        // an explicit parent carrier. Keep the process registry as the legacy
+        // fallback for contexts that do not carry an agent-local catalogue.
+        let registry =
+            match AgentDefinitionRegistry::for_core_context(run_context.dispatch_ctx().into_core())
+            {
+                Some(reg) => reg,
+                None => {
+                    return Ok(ToolResult::error(
+                        "delegate_graph: agent definition registry not initialized.",
+                    ));
+                }
+            };
         let definition = match registry.get(&agent_id) {
             Some(def) => def.clone(),
             None => {
                 return Ok(ToolResult::error(format!(
-                    "delegate: agent definition '{agent_id}' not found in registry."
+                    "delegate_graph: agent definition '{agent_id}' not found in registry."
                 )));
             }
         };
 
-        let config = match crate::config::ops::load_current_or_init().await {
-            Ok(cfg) => Arc::new(cfg),
-            Err(e) => {
-                return Ok(ToolResult::error(format!(
-                    "delegate: failed to load config: {e}"
-                )));
-            }
-        };
+        let config =
+            match crate::config::ops::load_current_or_init(&run_context.dispatch_ctx()).await {
+                Ok(cfg) => Arc::new(cfg),
+                Err(e) => {
+                    return Ok(ToolResult::error(format!(
+                        "delegate_graph: failed to load config: {e}"
+                    )));
+                }
+            };
 
         match run_subagent_delegation_with_parent_context(
             config,
@@ -249,27 +265,9 @@ impl DelegateGraphTool {
         )
         .await
         {
-            Ok(state) => {
-                if state.cancelled {
-                    return Ok(ToolResult::error(format!(
-                        "delegate cancelled for '{agent_id}'."
-                    )));
-                }
-                let final_output = state
-                    .final_output
-                    .unwrap_or_else(|| "(delegation produced no final output)".to_string());
-                let note = if state.revisions > 0 {
-                    " (after revision)"
-                } else {
-                    ""
-                };
-                Ok(ToolResult::success(format!(
-                    "[Delegated to {agent_id}{note}, {} review pass(es)]\n{final_output}",
-                    state.reviews.len()
-                )))
-            }
+            Ok(result) => Ok(result),
             Err(e) => Ok(ToolResult::error(format!(
-                "delegate failed for '{agent_id}': {e}"
+                "delegate_graph failed for '{agent_id}': {e}"
             ))),
         }
     }

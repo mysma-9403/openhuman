@@ -2,20 +2,19 @@
 //!
 //! PR1–PR3 shipped the durable team model, race-safe claiming, quality-gated
 //! completion, and the read-only board. They were entirely *store-only*: a
-//! claim flipped a row, nothing ran. This module makes a teammate actually
-//! **execute** — [`start_member_run`] atomically claims a task for a member,
-//! marks the member `active`, and spawns a background worker that drives a real
-//! sub-agent to completion, captures its output as the task's completion
-//! evidence, runs it through the existing quality gate, and returns the member
-//! to `idle`.
+//! claim flipped a row, nothing ran. This module adapts the owner
+//! `TeamService::start_member_with_started` to OpenHuman's actual sub-agent
+//! executor. The owner atomically claims and activates a member, returns an
+//! admission receipt, then keeps the same future through evidence validation,
+//! completion, and cleanup.
 //!
 //! ## Root parent context
 //!
 //! Like the workflow engine (#3375), the worker is spawned from a controller
 //! background task with no enclosing agent turn, so it builds a root
-//! [`ParentExecutionContext`] (shared [`build_root_parent`]) and runs inside
-//! [`with_parent_context`] — every nested `spawn_agent` then resolves a real
-//! provider / tools / memory.
+//! [`ParentExecutionContext`] (shared [`build_root_parent`]) and passes it to
+//! `spawn_agent` — every spawned worker then inherits a real provider / tools /
+//! memory.
 //!
 //! ## Message delivery boundary
 //!
@@ -27,27 +26,25 @@
 //! timeline or worker thread" criterion via both paths; a live inbox would be a
 //! separate orchestration-layer change.
 
-use std::sync::Arc;
-
 use anyhow::{anyhow, Result};
 use serde_json::json;
 
+use crate::agent::harness::ParentExecutionContext;
 use crate::agent::orchestration::parent_context::with_root_parent;
-use crate::agent::orchestration::{
-    AgentOrchestrationSession, OrchestrationTaskStatus, SpawnAgentRequest, WaitAgentOptions,
-};
 use crate::config::Config;
 use tinyagents_session::run_ledger::{
-    self, AgentTeamMemberStatus, AgentTeamTask, ClaimOutcome, RunEventAppend,
+    AgentTeamMember, AgentTeamMemberStatus, AgentTeamTask, RunEventAppend,
+};
+use {
+    crate::agent::orchestration::AgentOrchestrationSession,
+    crate::agent::orchestration::SpawnAgentRequest, crate::agent::orchestration::WaitAgentOptions,
+    tinyagents_tasks::OrchestrationTaskStatus,
 };
 
 use tinyagents_orchestration::teams::{
-    build_member_prompt, claimable_task, deliver_pending_messages, run_member_graph,
-    truncate_chars, MemberOutcome, SessionTeamLedger, TeamError,
+    build_member_prompt, claimable_task, deliver_pending_messages, truncate_chars,
+    SessionTeamLedger, TeamError, TeamMemberExecutor, TeamMemberStartError,
 };
-
-use crate::agent::tinyagents::observability::GraphTracingSink;
-
 const LOG_TARGET: &str = "agent_team_runtime";
 /// Fallback archetype when a member carries no explicit `agent_id`: the
 /// orchestrator, the one general-purpose agent with the full direct belt plus
@@ -91,6 +88,7 @@ pub enum StartMemberOutcome {
 /// unknown, or the member has nothing claimable. An unknown member surfaces as
 /// [`TeamError::UnknownMember`].
 pub async fn start_member_run(
+    ctx: &crate::core::runtime::DispatchCtx,
     config: &Config,
     team_id: &str,
     member_id: &str,
@@ -102,7 +100,8 @@ pub async fn start_member_run(
         "[agent_team_runtime] start.entry team={team_id} member={member_id} task={task_id:?}"
     );
 
-    let member = run_ledger::get_agent_team_member(&config.workspace_dir, member_id)?
+    let member = run_ledger::get_agent_team_member(&config.workspace_dir, member_id)
+        .await?
         .filter(|m| m.team_id == team_id)
         .ok_or_else(|| {
             anyhow!(TeamError::UnknownMember {
@@ -126,7 +125,7 @@ pub async fn start_member_run(
 
     // Resolve the target task: an explicit id, or the member's next claimable
     // ready task (unowned or owned-by-this-member, dependencies all done).
-    let tasks = run_ledger::list_agent_team_tasks(&config.workspace_dir, team_id)?;
+    let tasks = run_ledger::list_agent_team_tasks(&config.workspace_dir, team_id).await?;
     let target = match task_id {
         Some(tid) => match tasks.iter().find(|t| t.id == tid) {
             Some(t) => t.clone(),
@@ -138,125 +137,196 @@ pub async fn start_member_run(
         },
     };
 
-    // The team-run id doubles as the claim token (CAS guard) and the member's
-    // worker/run pointer surfaced to the UI.
-    let run_id = format!("teamrun-{}", uuid::Uuid::new_v4().simple());
-    let claimed = match run_ledger::claim_agent_team_task(
-        &config.workspace_dir,
-        team_id,
-        &target.id,
-        member_id,
-        &run_id,
-    )? {
-        ClaimOutcome::Claimed(task) => *task,
-        ClaimOutcome::AlreadyClaimed => return Ok(StartMemberOutcome::AlreadyClaimed),
-        ClaimOutcome::Blocked { unmet } => return Ok(StartMemberOutcome::Blocked { unmet }),
-        ClaimOutcome::UnknownTask => return Ok(StartMemberOutcome::UnknownTask),
+    let executor = HostTeamMemberExecutor {
+        ctx: ctx.clone(),
+        config: config.clone(),
+        team_id: team_id.to_string(),
+        member_id: member_id.to_string(),
+        model_override,
+        parent_override: None,
     };
+    start_member_with_executor(ctx, config, team_id, member_id, target, executor).await
+}
 
-    // Mark active synchronously so the polling UI reflects the running member
-    // before the (async) worker even starts.
-    run_ledger::mark_agent_team_member_running(
-        &config.workspace_dir,
-        team_id,
-        member_id,
-        &claimed.id,
-        &run_id,
-        &run_id,
-    )?;
-
-    let agent_id = member
-        .agent_id
-        .clone()
-        .unwrap_or_else(|| DEFAULT_TEAMMATE_AGENT_ID.to_string());
-    let cfg = config.clone();
+/// Run the owner admission path behind an immediate RPC receipt. Kept generic
+/// so tests can hold execution after the receipt and exercise the real host
+/// boundary without a model backend.
+async fn start_member_with_executor<E: TeamMemberExecutor + 'static>(
+    ctx: &crate::core::runtime::DispatchCtx,
+    config: &Config,
+    team_id: &str,
+    member_id: &str,
+    target: AgentTeamTask,
+    executor: E,
+) -> Result<StartMemberOutcome> {
+    // TinyAgents owns the claim, active transition, cleanup and completion.
+    // The receipt crosses back to this RPC as soon as the owner has durably
+    // admitted the run; the same owner future then continues executing it.
+    let ledger = crate::storage::sessions::require_ledger(&config.workspace_dir)
+        .map_err(|error| anyhow!("{error}"))?;
+    let service =
+        SessionTeamLedger::new(ledger).map(tinyagents_orchestration::teams::TeamService::new)?;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let mut started_tx = Some(started_tx);
     let team = team_id.to_string();
     let mem = member_id.to_string();
-    let task_for_loop = claimed.clone();
-    let rid = run_id.clone();
+    let task_id = target.id.clone();
+    let task_config = config.clone();
+    let service_task = service.clone();
     // The member loop drives real agent work on a fresh task, and task-locals
     // don't cross `tokio::spawn` — capture the caller's turn origin here so the
     // worker keeps the label the approval gate needs. Inherit-only: no origin
     // in scope means the worker stays unlabelled and fails closed as before.
-    let inherited_origin = crate::agent::turn_origin::capture();
-    crate::core::runtime::spawn_scoped(async move {
-        crate::agent::turn_origin::with_inherited_origin(
+    let inherited_origin = crate::security::turn_origin::capture();
+    ctx.spawn(async move {
+        let owner_result = crate::security::turn_origin::with_inherited_origin(
             inherited_origin,
-            run_member_loop(
-                &cfg,
+            service_task.start_member_with_started(
                 &team,
+                &task_id,
                 &mem,
-                &agent_id,
-                task_for_loop,
-                &rid,
-                model_override,
+                &executor,
+                false,
+                |started| {
+                    if let Some(sender) = started_tx.take() {
+                        let _ = sender.send(Ok(started));
+                    }
+                },
             ),
         )
         .await;
+        if let Err(error) = owner_result {
+            if let Some(sender) = started_tx.take() {
+                let _ = sender.send(Err(error));
+            } else {
+                log::error!(target: LOG_TARGET, "[agent_team_runtime] owner execution failed team={team} member={mem} task={task_id}: {error:#}");
+                record_failure_event(&task_config, &team, &mem, &task_id, &error.to_string()).await;
+            }
+        }
     });
 
-    log::debug!(
-        target: LOG_TARGET,
-        "[agent_team_runtime] start.spawned team={team_id} member={member_id} task={} run={run_id}",
-        claimed.id
-    );
+    let started = match started_rx.await {
+        Ok(Ok(started)) => started,
+        Ok(Err(error)) => {
+            if let Some(error) = error.downcast_ref::<TeamMemberStartError>() {
+                return Ok(match error {
+                    TeamMemberStartError::AlreadyClaimed { .. } => {
+                        StartMemberOutcome::AlreadyClaimed
+                    }
+                    TeamMemberStartError::AlreadyActive { .. } => StartMemberOutcome::AlreadyActive,
+                    TeamMemberStartError::Blocked { unmet, .. } => StartMemberOutcome::Blocked {
+                        unmet: unmet.clone(),
+                    },
+                    TeamMemberStartError::UnknownTask { .. } => StartMemberOutcome::UnknownTask,
+                    TeamMemberStartError::Other(_) => return Err(anyhow!("{error}")),
+                });
+            }
+            return Err(error);
+        }
+        Err(_) => return Err(anyhow!("team member start task exited before admission")),
+    };
+    let run_id = started.run_id;
+    let claimed = started.task;
+    log::debug!(target: LOG_TARGET, "[agent_team_runtime] start.spawned team={team_id} member={member_id} task={} run={run_id}", claimed.id);
     Ok(StartMemberOutcome::Started {
         run_id,
         task: Box::new(claimed),
     })
 }
 
-/// Build the root parent context, then drive the member's worker inside it.
-/// Engine-internal failures (config/agent build, spawn, wait) release the task
-/// and idle the member so the work is reclaimable; they are recorded, not
-/// propagated (there is no caller on the spawned task).
+/// Owner-provided executor: build the root parent context, then run the
+/// member's OpenHuman worker inside it. Returned errors let TinyAgents perform
+/// token-scoped release and idle cleanup.
+struct HostTeamMemberExecutor {
+    ctx: crate::core::runtime::DispatchCtx,
+    config: Config,
+    team_id: String,
+    member_id: String,
+    model_override: Option<String>,
+    parent_override: Option<ParentExecutionContext>,
+}
+
+#[async_trait::async_trait]
+impl TeamMemberExecutor for HostTeamMemberExecutor {
+    async fn execute(&self, member: &AgentTeamMember, task: &AgentTeamTask) -> Result<Vec<String>> {
+        let agent_id = member
+            .agent_id
+            .as_deref()
+            .unwrap_or(DEFAULT_TEAMMATE_AGENT_ID);
+        let run_id = member
+            .run_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("admitted team member has no run id"))?;
+        let worker_thread_id = member
+            .worker_thread_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("admitted team member has no worker thread id"))?;
+        run_member_loop(
+            &self.ctx,
+            &self.config,
+            &self.team_id,
+            &self.member_id,
+            agent_id,
+            task.clone(),
+            run_id,
+            worker_thread_id,
+            self.model_override.clone(),
+            self.parent_override.clone(),
+        )
+        .await
+    }
+}
+
 async fn run_member_loop(
+    ctx: &crate::core::runtime::DispatchCtx,
     config: &Config,
     team_id: &str,
     member_id: &str,
     agent_id: &str,
     task: AgentTeamTask,
     run_id: &str,
+    worker_thread_id: &str,
     model_override: Option<String>,
-) {
+    parent_override: Option<ParentExecutionContext>,
+) -> Result<Vec<String>> {
     // The member acts on memory as itself within the team: its node is
     // `team:<team>/agent:<agent>`, so members share the team's node and
     // never read each other's.
+    // The member acts on memory as itself, in its team: it rides the parent's
+    // host environment, so every run started from that parent keeps it.
     let identity = crate::memory::scope::MemoryIdentity::team_member(team_id, agent_id);
-    let member_turn = with_root_parent(config, "agent_team_runtime", "team", "teamrun", async {
-        drive_member(
-            config,
-            team_id,
-            member_id,
-            agent_id,
-            &task,
-            run_id,
-            model_override,
-        )
-        .await
-    });
-    let outcome = crate::memory::scope::within(identity, Box::pin(member_turn))
+    let member_turn = with_root_parent(
+        ctx,
+        parent_override,
+        config,
+        "agent_team_runtime",
+        "team",
+        "teamrun",
+        |mut parent| async {
+            parent.host_env.memory_identity = Some(identity);
+            drive_member(
+                config,
+                team_id,
+                member_id,
+                agent_id,
+                &task,
+                run_id,
+                worker_thread_id,
+                model_override,
+                parent,
+            )
+            .await
+        },
+    );
+    Box::pin(member_turn)
         .await
         // Flatten: outer Err = root-parent build failure, inner = drive_member result.
-        .unwrap_or_else(Err);
-
-    if let Err(err) = outcome {
-        log::error!(
-            target: LOG_TARGET,
-            "[agent_team_runtime] loop.failed team={team_id} member={member_id} task={} err={err}",
-            task.id
-        );
-        let _ = run_ledger::release_agent_team_task(&config.workspace_dir, team_id, &task.id);
-        let _ = run_ledger::mark_agent_team_member_idle(&config.workspace_dir, team_id, member_id);
-        record_failure_event(config, team_id, member_id, &task.id, &err.to_string());
-    }
+        .unwrap_or_else(Err)
 }
 
-/// Spawn the worker sub-agent for `task`, wait for it, and reconcile team state.
-///
-/// Returns `Err` only for engine-internal failures (spawn/wait), which the
-/// caller turns into a release + idle. A worker that runs but ends non-completed
-/// is handled here (release + idle + failure event) and returns `Ok`.
+/// Spawn the actual OpenHuman worker sub-agent and return its evidence to the
+/// TinyAgents team owner. Claiming, completion, and failed-run cleanup stay in
+/// `TeamService::start_member_with_started`.
 async fn drive_member(
     config: &Config,
     team_id: &str,
@@ -264,177 +334,78 @@ async fn drive_member(
     agent_id: &str,
     task: &AgentTeamTask,
     run_id: &str,
+    worker_thread_id: &str,
     model_override: Option<String>,
-) -> Result<()> {
-    let ledger = SessionTeamLedger::new(config.workspace_dir.clone());
+    parent: ParentExecutionContext,
+) -> Result<Vec<String>> {
+    let ledger = SessionTeamLedger::new(
+        crate::storage::sessions::require_ledger(&config.workspace_dir)
+            .map_err(|e| anyhow!("{e}"))?,
+    )?;
     let delivered = deliver_pending_messages(&ledger, team_id, member_id)?;
     let prompt = build_member_prompt(task, &delivered.messages);
 
     let session = AgentOrchestrationSession::new(format!("team-{team_id}-{member_id}"));
 
-    // ── Worker node effect: spawn the teammate sub-agent, wait for it, and
-    // classify the terminal outcome. Returns `Err` only for engine-internal
-    // spawn/wait failures (the caller releases + idles).
-    let run_worker = {
-        let session = session.clone();
-        let agent_id = agent_id.to_string();
-        let team_id = team_id.to_string();
-        let member_id = member_id.to_string();
-        let task_id = task.id.clone();
-        let run_id = run_id.to_string();
-        move || {
-            let session = session.clone();
-            let agent_id = agent_id.clone();
-            let prompt = prompt.clone();
-            let model = model_override.clone();
-            let team_id = team_id.clone();
-            let member_id = member_id.clone();
-            let task_id = task_id.clone();
-            let run_id = run_id.clone();
-            async move {
-                let resp = session
-                    .spawn_agent(SpawnAgentRequest {
-                        agent_id,
-                        prompt,
-                        model,
-                        metadata: [
-                            ("teamId".to_string(), team_id),
-                            ("memberId".to_string(), member_id),
-                            ("taskId".to_string(), task_id),
-                            ("teamRunId".to_string(), run_id),
-                        ]
-                        .into_iter()
-                        .collect(),
-                        ..Default::default()
-                    })
-                    .await
-                    .map_err(|e| anyhow!("spawn teammate worker failed: {e}"))?;
+    let resp = session
+        .spawn_agent(
+            parent,
+            SpawnAgentRequest {
+                agent_id: agent_id.to_string(),
+                prompt,
+                model: model_override,
+                metadata: [
+                    ("teamId".to_string(), team_id.to_string()),
+                    ("memberId".to_string(), member_id.to_string()),
+                    ("taskId".to_string(), task.id.clone()),
+                    ("teamRunId".to_string(), run_id.to_string()),
+                    (
+                        "teamWorkerThreadId".to_string(),
+                        worker_thread_id.to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| anyhow!("spawn teammate worker failed: {e}"))?;
 
-                let wait = session
-                    .wait_agents(WaitAgentOptions {
-                        orchestration_ids: vec![resp.orchestration_id.clone()],
-                        timeout_ms: None,
-                    })
-                    .await
-                    .map_err(|e| anyhow!("wait teammate worker failed: {e}"))?;
+    let wait = session
+        .wait_agents(WaitAgentOptions {
+            orchestration_ids: vec![resp.orchestration_id.clone()],
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|e| anyhow!("wait teammate worker failed: {e}"))?;
 
-                let snapshot = wait
-                    .agents
-                    .into_iter()
-                    .find(|a| a.orchestration_id == resp.orchestration_id)
-                    .ok_or_else(|| anyhow!("worker snapshot missing after wait"))?;
-
-                Ok(match snapshot.status {
-                    OrchestrationTaskStatus::Completed => MemberOutcome::Completed {
-                        output: snapshot.result_summary.unwrap_or_default(),
-                    },
-                    OrchestrationTaskStatus::Failed
-                    | OrchestrationTaskStatus::Cancelled
-                    | OrchestrationTaskStatus::CancelRequested
-                    | OrchestrationTaskStatus::TimedOut
-                    | OrchestrationTaskStatus::Abandoned => MemberOutcome::Failed {
-                        reason: snapshot
-                            .error
-                            .unwrap_or_else(|| "worker ended without completing".to_string()),
-                    },
-                    // `wait_agents` with no timeout only returns on terminal
-                    // status, so this is purely defensive — treat as a failure.
-                    other => MemberOutcome::Failed {
-                        reason: format!("worker returned non-terminal status {other:?}"),
-                    },
-                })
-            }
-        }
-    };
-
-    // ── Complete node effect: the teammate's own output is the completion
-    // evidence (the gate enforces dependency / claimant invariants but not
-    // additional evidence), then idle the member.
-    let on_complete = {
-        let config = config.clone();
-        let team_id = team_id.to_string();
-        let member_id = member_id.to_string();
-        let task_id = task.id.clone();
-        let run_id = run_id.to_string();
-        move |output: String| {
-            let config = config.clone();
-            let team_id = team_id.clone();
-            let member_id = member_id.clone();
-            let task_id = task_id.clone();
-            let run_id = run_id.clone();
-            async move {
-                let evidence = if output.trim().is_empty() {
-                    Vec::new()
-                } else {
-                    vec![format!(
-                        "run:{run_id} — {}",
-                        truncate_chars(output.trim(), EVIDENCE_MAX_CHARS)
-                    )]
-                };
-                let outcome = run_ledger::complete_agent_team_task(
-                    &config.workspace_dir,
-                    &team_id,
-                    &task_id,
-                    &member_id,
-                    &evidence,
-                    false,
-                )?;
-                log::debug!(
-                    target: LOG_TARGET,
-                    "[agent_team_runtime] drive.completed team={team_id} member={member_id} task={task_id} outcome={outcome:?}"
-                );
-                run_ledger::mark_agent_team_member_idle(
-                    &config.workspace_dir,
-                    &team_id,
-                    &member_id,
-                )?;
-                Ok(())
-            }
-        }
-    };
-
-    // ── Fail node effect: release the task (so it is reclaimable), idle the
-    // member, and record a failure event. Returns `Ok` (a ran-but-failed worker
-    // is a normal terminal outcome, not an engine error).
-    let on_failed = {
-        let config = config.clone();
-        let team_id = team_id.to_string();
-        let member_id = member_id.to_string();
-        let task_id = task.id.clone();
-        move |reason: String| {
-            let config = config.clone();
-            let team_id = team_id.clone();
-            let member_id = member_id.clone();
-            let task_id = task_id.clone();
-            async move {
-                log::warn!(
-                    target: LOG_TARGET,
-                    "[agent_team_runtime] drive.worker_failed team={team_id} member={member_id} task={task_id} reason={reason}"
-                );
-                run_ledger::release_agent_team_task(&config.workspace_dir, &team_id, &task_id)?;
-                run_ledger::mark_agent_team_member_idle(
-                    &config.workspace_dir,
-                    &team_id,
-                    &member_id,
-                )?;
-                record_failure_event(&config, &team_id, &member_id, &task_id, &reason);
-                Ok(())
-            }
-        }
-    };
-
-    run_member_graph(
-        Some(Arc::new(GraphTracingSink::new(format!(
-            "team:{team_id}:{member_id}"
-        )))),
-        run_worker,
-        on_complete,
-        on_failed,
-    )
-    .await
+    let snapshot = wait
+        .agents
+        .into_iter()
+        .find(|a| a.orchestration_id == resp.orchestration_id)
+        .ok_or_else(|| anyhow!("worker snapshot missing after wait"))?;
+    if snapshot.status != OrchestrationTaskStatus::Completed {
+        return Err(anyhow!(
+            "worker ended with status {:?}: {}",
+            snapshot.status,
+            snapshot
+                .error
+                .unwrap_or_else(|| "worker ended without completing".to_string())
+        ));
+    }
+    let output = snapshot.result_summary.unwrap_or_default();
+    Ok(if output.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "run:{run_id} — {}",
+            truncate_chars(output.trim(), EVIDENCE_MAX_CHARS)
+        )]
+    })
 }
 
-fn record_failure_event(
+async fn record_failure_event(
     config: &Config,
     team_id: &str,
     member_id: &str,
@@ -452,7 +423,56 @@ fn record_failure_event(
                 "reason": truncate_chars(reason, EVIDENCE_MAX_CHARS),
             }),
         },
-    );
+    )
+    .await;
+}
+
+/// Host-owned team-ledger reads and failure-event projection. Claiming,
+/// active-state transitions, completion and cleanup are owned by TinyAgents'
+/// `TeamService`.
+mod run_ledger {
+    use std::path::Path;
+
+    use anyhow::{anyhow, Result};
+
+    use super::{AgentTeamMember, AgentTeamTask, RunEventAppend};
+
+    fn ledger(
+        workspace_dir: &Path,
+    ) -> Result<std::sync::Arc<dyn tinyagents_session::run_ledger::RunLedgerStore>> {
+        crate::storage::sessions::require_ledger(workspace_dir).map_err(|e| anyhow!("{e}"))
+    }
+
+    pub(super) async fn get_agent_team_member(
+        workspace_dir: &Path,
+        member_id: &str,
+    ) -> Result<Option<AgentTeamMember>> {
+        ledger(workspace_dir)?
+            .get_agent_team_member(member_id)
+            .await
+            .map_err(|e| anyhow!("{e}"))
+    }
+
+    pub(super) async fn list_agent_team_tasks(
+        workspace_dir: &Path,
+        team_id: &str,
+    ) -> Result<Vec<AgentTeamTask>> {
+        ledger(workspace_dir)?
+            .list_agent_team_tasks(team_id)
+            .await
+            .map_err(|e| anyhow!("{e}"))
+    }
+
+    pub(super) async fn append_run_event(
+        workspace_dir: &Path,
+        event: RunEventAppend,
+    ) -> Result<()> {
+        ledger(workspace_dir)?
+            .append_run_event(event)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow!("{e}"))
+    }
 }
 
 #[cfg(test)]

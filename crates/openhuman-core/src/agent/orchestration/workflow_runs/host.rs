@@ -11,9 +11,13 @@ use tinyagents_orchestration::workflow::{
     WorkflowDefinition, WorkflowExecutor,
 };
 
-use crate::agent::harness::definition::{AgentDefinitionRegistry, SandboxMode, ToolScope};
-use crate::agent::orchestration::{
-    AgentOrchestrationSession, OrchestrationTaskStatus, SpawnAgentRequest, WaitAgentOptions,
+use crate::agent::harness::ParentExecutionContext;
+use crate::agent_registry::host_definition::AgentDefinitionRegistry;
+use tinyagents_definition::{SandboxMode, ToolScope};
+use {
+    crate::agent::orchestration::AgentOrchestrationSession,
+    crate::agent::orchestration::SpawnAgentRequest, crate::agent::orchestration::WaitAgentOptions,
+    tinyagents_tasks::OrchestrationTaskStatus,
 };
 
 /// Product policy deliberately remains in OpenHuman. The portable engine sees
@@ -50,6 +54,10 @@ pub(super) struct OpenHumanWorkflowExecutor {
     session: AgentOrchestrationSession,
     model_override: Option<String>,
     safety_tier: WorkflowSafetyTier,
+    /// The root parent execution context the children are spawned under.
+    /// `None` for an executor that only persists the initial run row and never
+    /// spawns (`start_workflow_run`'s `initialise`).
+    parent: Option<ParentExecutionContext>,
 }
 
 impl OpenHumanWorkflowExecutor {
@@ -57,11 +65,13 @@ impl OpenHumanWorkflowExecutor {
         run_id: &str,
         model_override: Option<String>,
         safety_tier: WorkflowSafetyTier,
+        parent: Option<ParentExecutionContext>,
     ) -> Self {
         Self {
             session: AgentOrchestrationSession::new(format!("workflow-engine-{run_id}")),
             model_override,
             safety_tier,
+            parent,
         }
     }
 
@@ -112,14 +122,22 @@ impl WorkflowExecutor for OpenHumanWorkflowExecutor {
                 "workflow cancelled before child spawn".to_owned(),
             ));
         }
+        let parent = self.parent.clone().ok_or_else(|| {
+            OrchestrationError(
+                "workflow child spawn requires a parent execution context".to_owned(),
+            )
+        })?;
         let response = self
             .session
-            .spawn_agent(SpawnAgentRequest {
-                agent_id: request.agent_id.clone(),
-                prompt: request.prompt,
-                model: self.model_override.clone(),
-                ..Default::default()
-            })
+            .spawn_agent(
+                parent,
+                SpawnAgentRequest {
+                    agent_id: request.agent_id.clone(),
+                    prompt: request.prompt,
+                    model: self.model_override.clone(),
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(|error| OrchestrationError(error.to_string()))?;
 

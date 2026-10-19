@@ -2,7 +2,7 @@
 mod common;
 use async_trait::async_trait;
 use openhuman_embed::providers::{ChatModel, ModelRequest, ModelResponse};
-use openhuman_embed::seams::{PostTurnHook, TurnContext};
+use openhuman_embed::seams::{LearningSink, TurnSummary};
 use openhuman_embed::{
     Access, AgentDefinitionSpec, AgentSpec, InMemorySessionStores, ModelDefaults, Provider,
     Runtime, RuntimeEventKind, SessionStoreProvider, StreamEvent,
@@ -25,16 +25,12 @@ impl ChatModel<()> for Model {
     }
 }
 struct Hook {
-    name: &'static str,
     seen: tokio::sync::mpsc::UnboundedSender<String>,
 }
 #[async_trait]
-impl PostTurnHook for Hook {
-    fn name(&self) -> &str {
-        self.name
-    }
-    async fn on_turn_complete(&self, ctx: &TurnContext) -> anyhow::Result<()> {
-        self.seen.send(ctx.agent_id.clone().unwrap_or_default())?;
+impl LearningSink for Hook {
+    async fn on_turn_complete(&self, ctx: &TurnSummary) -> tinyagents_harness::error::Result<()> {
+        self.seen.send(ctx.agent_id.clone()).unwrap();
         Ok(())
     }
 }
@@ -63,13 +59,10 @@ fn custom_models_local_hooks_session_stores_and_events_stay_scoped() {
                     top_p: Some(0.8),
                     ..Default::default()
                 })
-                .post_turn_hook(Arc::new(Hook {
-                    name: "global",
-                    seen: global_tx,
-                }))
                 .build()
                 .await
                 .unwrap();
+            runtime.post_turn_hook("global", Some(Arc::new(Hook { seen: global_tx })));
             let mut events = runtime.events();
             let store_a = Arc::new(InMemorySessionStores::new());
             let store_b = Arc::new(InMemorySessionStores::new());
@@ -82,13 +75,10 @@ fn custom_models_local_hooks_session_stores_and_events_stay_scoped() {
                 .agent(
                     AgentSpec::new("a")
                         .definition(definition())
-                        .session_store(store_a.clone())
-                        .post_turn_hook(Arc::new(Hook {
-                            name: "local",
-                            seen: hook_tx,
-                        })),
+                        .session_store(store_a.clone()),
                 )
                 .unwrap();
+            a.post_turn_hook("local", Some(Arc::new(Hook { seen: hook_tx })));
             let b = runtime
                 .agent(
                     AgentSpec::new("b")

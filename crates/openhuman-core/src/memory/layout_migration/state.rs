@@ -1,137 +1,89 @@
-//! The migration's state on disk, `<workspace>/memory/layout_migration.json`.
+//! The migration's `layout_migration` value in the memory state KV store.
+//! The first read imports the legacy `<workspace>/memory/layout_migration.json`.
 //!
-//! Written whole after every page, through a temporary file and a rename,
-//! so a crash leaves the previous state or the new one, never a torn file.
+//! Written whole after every page, so a crash leaves the previous state or
+//! the new one, never a torn value.
+//! The state itself is `tinymemory_tools::layout_migration::MigrationState`.
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use tinymemory_tools::layout_migration::{Error, Result};
 
+use super::{MigrationState, MigrationStateStore};
 use crate::memory::error::{MemoryError, MemoryResult};
 
-/// Where the migration is.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Phase {
-    /// Not started.
-    #[default]
-    Idle,
-    /// Copying the legacy tree, page by page.
-    Copying,
-    /// Stopped where it was: paused by the scheduler, out of credits, or the
-    /// engine unreachable. Resumes from the cursor.
-    Paused,
-    /// Every item it could copy is copied and verified.
-    Copied,
-    /// Removing the legacy copies of what was moved.
-    Cleaning,
-    /// The legacy tree holds nothing that was moved; what is left there (if
-    /// anything) is in `failures` or `incomplete`.
-    Cleaned,
-}
+const STATE: &str = "layout_migration";
 
-/// An item that could not be copied.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Failure {
-    /// Its id in the legacy tree.
-    pub id: String,
-    /// Why (an error code, never content).
-    pub reason: String,
-}
-
-/// The migration's progress.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct MigrationState {
-    /// Where it is.
-    pub phase: Phase,
-    /// The legacy export cursor of the next page; `None` before the first.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
-    /// Items copied and confirmed readable in the per-user tree.
-    pub copied: u64,
-    /// Of those, items the per-user tree already held (a resumed page).
-    pub replayed: u64,
-    /// Items that could not be copied.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub failures: Vec<Failure>,
-    /// Items the legacy tree holds only part of (a chunked document missing
-    /// a piece).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub incomplete: Vec<String>,
-    /// Why it is paused.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// Cleanup has started, so a pause resumes it, not the copy.
-    #[serde(default)]
-    pub cleaning: bool,
-    /// Reads and writes moved to the per-user tree.
-    #[serde(default)]
-    pub switched: bool,
-    /// The catch-up copy after the switch is done.
-    #[serde(default)]
-    pub caught_up: bool,
-    /// The user agreed to take a legacy tree other accounts may share.
-    #[serde(default)]
-    pub takeover: bool,
-    /// Extra catch-up passes made because the import ended with its last
-    /// batch not confirmed listed (see `job::run`).
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub rechecks: u32,
-    /// Those passes are over (one moved nothing new, or the most were made).
-    /// The import's flag stays set, so cleanup keeps forgetting by id.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub rechecked: bool,
-}
-
-fn is_zero(n: &u32) -> bool {
-    *n == 0
-}
-
-/// The state file of `workspace_dir`.
+/// Whether a migration state exists in `workspace_dir`: the migration has
+/// begun there (a state that cannot be read counts: it was begun).
 #[must_use]
-pub fn path(workspace_dir: &Path) -> PathBuf {
-    workspace_dir.join("memory").join("layout_migration.json")
+pub fn exists(workspace_dir: &Path) -> bool {
+    crate::memory::state_store::load_strict::<serde_json::Value>(workspace_dir, STATE)
+        .map(|state| state.is_some())
+        .unwrap_or(true)
+}
+
+/// The migration state kept in one workspace.
+#[derive(Debug, Clone)]
+pub struct StateKvMigrationStore {
+    workspace_dir: PathBuf,
+}
+
+/// Backwards-compatible name for [`StateKvMigrationStore`].
+#[deprecated(note = "use StateKvMigrationStore; it persists through the memory state KV port")]
+pub type FileStateStore = StateKvMigrationStore;
+
+impl StateKvMigrationStore {
+    /// The store of `workspace_dir`.
+    #[must_use]
+    pub fn new(workspace_dir: &Path) -> Self {
+        Self {
+            workspace_dir: workspace_dir.to_path_buf(),
+        }
+    }
+}
+
+impl MigrationStateStore for StateKvMigrationStore {
+    fn load(&self) -> Result<MigrationState> {
+        load(&self.workspace_dir).map_err(|error| Error::State(detail(error)))
+    }
+
+    fn save(&self, state: &MigrationState) -> Result<()> {
+        save(&self.workspace_dir, state).map_err(|error| Error::State(detail(error)))
+    }
+}
+
+fn detail(error: MemoryError) -> String {
+    match error {
+        MemoryError::Engine(message) => message,
+        other => other.to_string(),
+    }
 }
 
 /// The saved state, or a fresh one when none was saved.
 ///
 /// # Errors
 ///
-/// A state file that cannot be read or parsed: the migration must not start
-/// over and copy everything again on a damaged file.
+/// A state that cannot be read or parsed: the migration must not start
+/// over and copy everything again on a damaged value.
 pub fn load(workspace_dir: &Path) -> MemoryResult<MigrationState> {
-    let file = path(workspace_dir);
-    match std::fs::read(&file) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
-            MemoryError::Engine(format!("layout migration state unreadable: {error}"))
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(MigrationState::default()),
-        Err(error) => Err(MemoryError::Engine(format!(
-            "layout migration state unreadable: {error}"
-        ))),
-    }
+    crate::memory::state_store::load_strict(workspace_dir, STATE)
+        .map(Option::unwrap_or_default)
+        .map_err(|error| {
+            MemoryError::Engine(format!("layout migration state unreadable: {error:#}"))
+        })
 }
 
-/// Saves `state` whole: a temporary file, synced, then renamed over the old.
+/// Saves `state` whole (one storage write, so a crash leaves the previous
+/// state or the new one).
 ///
 /// # Errors
 ///
-/// When the file cannot be written.
+/// When the state cannot be written.
 pub fn save(workspace_dir: &Path, state: &MigrationState) -> MemoryResult<()> {
-    let file = path(workspace_dir);
-    let write = || -> std::io::Result<()> {
-        if let Some(dir) = file.parent() {
-            crate::memory::files::create_private_dir_all(dir)?;
-        }
-        let temp = file.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(state).map_err(std::io::Error::other)?;
-        let mut out = crate::memory::files::create_private(&temp)?;
-        std::io::Write::write_all(&mut out, &bytes)?;
-        out.sync_all()?;
-        std::fs::rename(&temp, &file)
-    };
-    write()
-        .map_err(|error| MemoryError::Engine(format!("layout migration state not saved: {error}")))
+    crate::memory::state_store::save(workspace_dir, STATE, state).map_err(|error| {
+        MemoryError::Engine(format!("layout migration state not saved: {error:#}"))
+    })
 }
 
 #[cfg(test)]

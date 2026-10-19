@@ -1,20 +1,20 @@
 //! Sentinels for "a component this call needs is not available", and their
 //! classifiers.
 //!
-//! Each one marks a condition that is decided once — no backend transport in
-//! this build, a rejected API key, a native module that failed to load — and
+//! Each one marks a condition that is decided once — no hosted backend
+//! registered in this build, a rejected API key, a native module that failed
+//! to load — and
 //! then handed back to every caller. Re-reporting it per call carries no new
 //! signal, so [`super::expected_error_kind`] demotes all of them.
 
 /// Sentinel prefix on the error string a backend-touching call returns when
-/// the core has no [`BackendTransport`](crate::backend::transport::BackendTransport)
-/// installed. `backend::client::flatten_authed_error` and the integrations client
-/// build their message from this constant; [`is_backend_unavailable_message`]
+/// no backend connection is
+/// installed. The hosted layer builds its message from this constant; [`is_backend_unavailable_message`]
 /// classifies it as [`super::ExpectedErrorKind::BackendUnavailable`].
 pub const BACKEND_UNAVAILABLE_PREFIX: &str = "BACKEND_UNAVAILABLE:";
 
 /// Sentinel prefix on the error string a backend call returns when the backend
-/// rejects the stored TinyHumans API key (`backend::client::flatten_authed_error`).
+/// rejects the stored TinyHumans API key.
 /// [`super::expected_error_kind`] demotes it: the fix is a new key, not a code
 /// change.
 pub const API_KEY_REJECTED_PREFIX: &str = "API_KEY_REJECTED:";
@@ -49,7 +49,7 @@ pub fn is_backend_unavailable_message(msg: &str) -> bool {
 /// - `MODULE_CALL_REPORTED:` — the shared client already emitted a sanitized
 ///   report; product callers must not report its returned error again;
 ///
-/// - [`crate::tools::status::MODULE_FAULT_MARKER`] — every terminal load
+/// - [`tinytools::status::MODULE_FAULT_MARKER`] — every terminal load
 ///   failure from `modules::ops` and tinybus' `load_first_admitted` carries it;
 /// - `module '<id>' could not be loaded` — the load wording itself, for a
 ///   caller that rewrapped the reason without the marker;
@@ -82,7 +82,7 @@ pub fn is_module_unavailable_message(msg: &str) -> bool {
             && msg.contains(": ai.tinyhumans.tinybus.Error.Failed: "));
     connector_output
         || msg.contains("MODULE_CALL_REPORTED:")
-        || msg.contains(crate::tools::status::MODULE_FAULT_MARKER)
+        || msg.contains(tinytools::status::MODULE_FAULT_MARKER)
         || (lower.contains("module '") && lower.contains("could not be loaded"))
         || (lower.contains("module '")
             && lower.contains("is unavailable: modules are disabled in configuration"))

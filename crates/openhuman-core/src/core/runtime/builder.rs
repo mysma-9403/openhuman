@@ -27,6 +27,7 @@ use crate::config::Config;
 use crate::core::runtime::context::CoreContext;
 use crate::core::types::HostKind;
 
+pub use super::components::ComponentSet;
 pub use super::domain_set::DomainSet;
 
 /// Selects which background services and transports a [`CoreRuntime`] runs.
@@ -168,7 +169,7 @@ pub struct CoreBuilder {
     host: Option<String>,
     port: Option<u16>,
     config: Option<crate::config::Config>,
-    backend_transport: Option<std::sync::Arc<dyn crate::backend::transport::BackendTransport>>,
+    extensions: crate::core::slots::Extensions,
 }
 
 impl CoreBuilder {
@@ -184,26 +185,17 @@ impl CoreBuilder {
             host: None,
             port: None,
             config: None,
-            backend_transport: None,
+            extensions: crate::core::slots::Extensions::new(),
         }
     }
 
-    /// Bind the transport this core's handlers reach the hosted TinyHumans
-    /// backend through (see [`crate::backend::transport`]).
-    ///
-    /// Optional: without it the core resolves the process-global transport
-    /// installed with
-    /// [`install_backend_transport`](crate::backend::transport::install_backend_transport),
-    /// and with neither every backend-touching call degrades to a typed
-    /// "backend unavailable" error while agents, memory, tools and RPC keep
-    /// working. Library hosts that build one runtime per process prefer this
-    /// builder form; the desktop shell and CLI, which boot the core through
-    /// `openhuman_rpc::host`, install the global.
-    pub fn backend_transport(
-        mut self,
-        transport: std::sync::Arc<dyn crate::backend::transport::BackendTransport>,
-    ) -> Self {
-        self.backend_transport = Some(transport);
+    /// Binds hook registrations (see [`crate::core::slots`]) to the context
+    /// this builder creates, ahead of any process-wide registration. Fill an
+    /// [`Extensions`](crate::core::slots::Extensions) with
+    /// [`HookSlot::register_in`](crate::core::slots::HookSlot::register_in)
+    /// and pass it here; derived per-agent contexts inherit it.
+    pub fn extensions(mut self, extensions: crate::core::slots::Extensions) -> Self {
+        self.extensions = extensions;
         self
     }
 
@@ -348,9 +340,14 @@ impl CoreBuilder {
             self.domains,
             self.tool_groups.clone(),
             self.config,
-            self.backend_transport,
         )
         .await?;
+        ctx.extensions().merge_from(&self.extensions);
+
+        let components = config
+            .as_ref()
+            .map(|c| ComponentSet::from_config(&c.components))
+            .unwrap_or_else(ComponentSet::all);
 
         // Retired scheduled jobs must be pruned before `build()` exposes
         // in-process RPC or agent turns. Running this from `serve()` is too
@@ -375,7 +372,7 @@ impl CoreBuilder {
         Ok(CoreRuntime {
             ctx,
             config,
-            services: self.services,
+            services: components.narrow_services(self.services),
             has_operator_token,
             host: self.host,
             port: self.port,
@@ -433,8 +430,9 @@ impl CoreRuntime {
     ) -> Result<serde_json::Value, String> {
         log::trace!("[core-runtime] invoke_in method={method}");
         CoreContext::scope(
-            ctx,
+            Arc::clone(&ctx),
             crate::core::invoke::invoke_method(
+                crate::core::runtime::DispatchCtx::new(ctx),
                 crate::core::invoke::default_state(),
                 method,
                 params,
@@ -485,7 +483,11 @@ impl CoreRuntime {
     /// to stop either: the user runs Ollama / LM Studio / MLX themselves and
     /// OpenHuman never spawns it.
     pub async fn exit_cleanup(&self) {
-        if let Err(error) = crate::integrations::composio::trigger_history::close_global().await {
+        if let Err(error) = crate::integrations::composio::trigger_history::close_global(
+            &crate::core::runtime::DispatchCtx::new(Arc::clone(&self.ctx)),
+        )
+        .await
+        {
             log::warn!("[composio][history] archive shutdown failed: {error}");
         }
         log::debug!("[core] shutdown: exit cleanup done (no owned local runtime to stop)");

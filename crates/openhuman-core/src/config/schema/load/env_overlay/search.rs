@@ -4,7 +4,7 @@
 use crate::config::schema::load::env::parse_env_bool;
 use crate::config::schema::load::env::EnvLookup;
 use crate::config::schema::{
-    Config, SearchPresentation, SearchProviderSettings, SearchRoute, MANAGED_SEARCH_PROVIDERS,
+    Config, PresentationMode, ProviderRoute, SearchProviderSettings, MANAGED_SEARCH_PROVIDERS,
     SEARCH_PROVIDERS, SEARCH_ROLES,
 };
 
@@ -97,9 +97,10 @@ impl Config {
             let mut providers = std::collections::BTreeMap::new();
             for entry in names.split(',').map(str::trim).filter(|e| !e.is_empty()) {
                 let (name, route) = match entry.split_once(':') {
-                    Some((name, route)) => {
-                        (name.trim().to_ascii_lowercase(), SearchRoute::parse(route))
-                    }
+                    Some((name, route)) => (
+                        name.trim().to_ascii_lowercase(),
+                        ProviderRoute::parse(route),
+                    ),
                     None => (entry.to_ascii_lowercase(), None),
                 };
                 if name == "managed" {
@@ -114,9 +115,9 @@ impl Config {
                     continue;
                 }
                 let default_route = if MANAGED_SEARCH_PROVIDERS.contains(&name.as_str()) {
-                    SearchRoute::Managed
+                    ProviderRoute::Backend
                 } else {
-                    SearchRoute::Direct
+                    ProviderRoute::Direct
                 };
                 providers.insert(
                     name,
@@ -157,11 +158,13 @@ impl Config {
             }));
         }
         if let Some(value) = env.get_any(&["OPENHUMAN_GEMINI_ROUTE"]) {
-            log::warn!("[config][search] OPENHUMAN_GEMINI_ROUTE is deprecated; use OPENHUMAN_SEARCH_ROUTES=gemini=<route>");
+            log::warn!(
+                "[config][search] OPENHUMAN_GEMINI_ROUTE is deprecated; use OPENHUMAN_SEARCH_ROUTES=gemini=<route>"
+            );
             routes.push(("gemini".into(), value));
         }
         for (provider, route) in routes {
-            match SearchRoute::parse(&route) {
+            match ProviderRoute::parse(&route) {
                 Some(route)
                     if SEARCH_PROVIDERS.contains(&provider.as_str())
                         && self.search.providers.contains_key(&provider) =>
@@ -196,7 +199,7 @@ impl Config {
             }
         }
         if let Some(mode) = env.get_any(&["OPENHUMAN_SEARCH_PRESENTATION"]) {
-            match SearchPresentation::parse(&mode) {
+            match PresentationMode::parse(&mode) {
                 Some(mode) => self.search.presentation = mode,
                 None => {
                     log::warn!("[config][search] ignoring OPENHUMAN_SEARCH_PRESENTATION='{mode}'")
@@ -204,7 +207,9 @@ impl Config {
             }
         }
         if env.contains("OPENHUMAN_PARALLEL_ROUTE") {
-            log::warn!("[config][search] managed Parallel is no longer offered; OPENHUMAN_PARALLEL_ROUTE is ignored (Parallel uses your own key)");
+            log::warn!(
+                "[config][search] managed Parallel is no longer offered; OPENHUMAN_PARALLEL_ROUTE is ignored (Parallel uses your own key)"
+            );
         }
         if let Some(key) = env.get_any(&["OPENHUMAN_PARALLEL_API_KEY", "PARALLEL_API_KEY"]) {
             if !key.trim().is_empty() {

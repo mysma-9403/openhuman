@@ -1,6 +1,6 @@
 //! Tests for the connector module client.
 
-use super::{methods, module_config, MODULE_ID};
+use super::{methods, module_config, module_config_with_proxy, MODULE_ID};
 use crate::config::schema::{COMPOSIO_MODE_BACKEND, COMPOSIO_MODE_DIRECT};
 use crate::config::Config;
 use crate::modules::registry;
@@ -67,9 +67,7 @@ fn every_member_this_host_names_is_one_the_module_serves() {
 
 /// A config with no backend session and no stored key.
 fn bare_config() -> Config {
-    let mut config = Config::default();
-    config.composio.enabled = true;
-    config
+    Config::default()
 }
 
 #[test]
@@ -87,31 +85,71 @@ fn direct_mode_takes_the_api_key_from_the_config_file() {
     assert!(blob.get("state_dir").is_some());
 }
 
+/// Removes the direct-base overrides for a test's duration and restores them.
+/// The route blob's destination (and so whether a proxy applies to it) follows
+/// them, and other tests point them at a loopback mock while they hold
+/// `TEST_ENV_LOCK`.
+struct DirectBaseScrub(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl DirectBaseScrub {
+    fn new() -> Self {
+        let vars = [
+            "OPENHUMAN_COMPOSIO_DIRECT_BASE_V2",
+            "OPENHUMAN_COMPOSIO_DIRECT_BASE_V3",
+        ];
+        Self(
+            vars.into_iter()
+                .map(|name| {
+                    let old = std::env::var_os(name);
+                    std::env::remove_var(name);
+                    (name, old)
+                })
+                .collect(),
+        )
+    }
+}
+
+impl Drop for DirectBaseScrub {
+    fn drop(&mut self) {
+        for (name, old) in self.0.drain(..) {
+            if let Some(value) = old {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+}
+
 #[test]
 fn direct_mode_hands_the_module_the_hosts_proxy_policy() {
     // Part of the route description, so a proxy change reconfigures the module.
     use crate::config::schema::{ProxyConfig, ProxyScope};
-    use crate::config::{runtime_proxy_config, set_runtime_proxy_config};
 
+    // The destination follows the direct-base env overrides; keep any other
+    // test's loopback override out of this one.
     let _env = crate::config::TEST_ENV_LOCK.blocking_lock();
+    let _scrub = DirectBaseScrub::new();
+
     let mut config = bare_config();
     config.composio.mode = COMPOSIO_MODE_DIRECT.to_string();
     config.composio.api_key = Some("sk-from-file".to_string());
 
-    let previous = runtime_proxy_config();
-    set_runtime_proxy_config(ProxyConfig {
-        enabled: true,
-        https_proxy: Some("http://127.0.0.1:3128".into()),
-        no_proxy: vec!["localhost".into()],
-        // Scoped to Composio so no other test's loopback request is proxied.
-        scope: ProxyScope::Services,
-        services: vec!["tool.composio".into()],
-        ..ProxyConfig::default()
-    });
-    let proxied = module_config(&config).expect("resolves");
-    set_runtime_proxy_config(ProxyConfig::default());
-    let plain = module_config(&config).expect("resolves");
-    set_runtime_proxy_config(previous);
+    // The policy is passed in rather than installed as the process-global
+    // runtime proxy: every config load republishes that global, so installing
+    // it here raced any concurrent test that loads a config.
+    let proxied = module_config_with_proxy(
+        &config,
+        &ProxyConfig {
+            enabled: true,
+            https_proxy: Some("http://127.0.0.1:3128".into()),
+            no_proxy: vec!["localhost".into()],
+            // Scoped to Composio so no other test's loopback request is proxied.
+            scope: ProxyScope::Services,
+            services: vec!["tool.composio".into()],
+            ..ProxyConfig::default()
+        },
+    )
+    .expect("resolves");
+    let plain = module_config_with_proxy(&config, &ProxyConfig::default()).expect("resolves");
 
     assert_eq!(proxied["transport"]["proxy_url"], "http://127.0.0.1:3128");
     assert_eq!(proxied["transport"]["no_proxy"][0], "localhost");
@@ -165,6 +203,7 @@ fn an_unknown_mode_fails_loudly_and_names_the_alternatives() {
 fn an_empty_mode_is_treated_as_the_backend_default() {
     // `serde(default)` already gives "backend" for a missing field, but a
     // literal empty string in TOML would otherwise be rejected.
+    crate::integrations::composio::test_backend_route::register();
     let mut config = bare_config();
     config.composio.mode = String::new();
 
@@ -175,7 +214,20 @@ fn an_empty_mode_is_treated_as_the_backend_default() {
 }
 
 #[test]
+fn the_backend_route_is_unavailable_without_a_registered_target() {
+    let mut config = bare_config();
+    config.composio.mode = COMPOSIO_MODE_BACKEND.to_string();
+
+    let error = module_config(&config).expect_err("no proxy target is registered");
+    assert!(
+        error.starts_with(crate::core::observability::BACKEND_UNAVAILABLE_PREFIX),
+        "{error}"
+    );
+}
+
+#[test]
 fn the_backend_route_needs_a_session() {
+    crate::integrations::composio::test_backend_route::register();
     let mut config = bare_config();
     config.composio.mode = COMPOSIO_MODE_BACKEND.to_string();
 
@@ -246,4 +298,67 @@ fn direct_auth_refusals_preserve_the_provider_status_and_prevent_duplicate_repor
     assert!(crate::core::observability::is_module_unavailable_message(
         &message
     ));
+}
+
+#[test]
+fn a_host_pinned_credential_outranks_the_mode_and_the_store() {
+    let mut config = bare_config();
+    config.composio.mode = COMPOSIO_MODE_BACKEND.into();
+    config.composio.pin_host_credential(
+        crate::config::ComposioHostCredential::direct("ck_pinned")
+            .entity_id("tenant-7")
+            .base_urls("http://127.0.0.1:1/v2", "http://127.0.0.1:1/v3"),
+    );
+    let route = module_config(&config).expect("pinned credential names a route");
+    assert_eq!(route["route"], "direct");
+    assert_eq!(route["api_key"], "ck_pinned");
+    assert_eq!(route["entity_id"], "tenant-7");
+    assert_eq!(route["base_url"], "http://127.0.0.1:1/v3");
+}
+
+#[test]
+fn the_offered_toolkit_lists_reach_the_module_in_its_load_blob() {
+    let mut config = bare_config();
+    config.composio.mode = COMPOSIO_MODE_DIRECT.into();
+    config.composio.api_key = Some("ck_test".into());
+    config.composio.offered_toolkits_allow = vec!["gmail".into(), "slack".into()];
+    config.composio.offered_toolkits_deny = vec!["slack".into()];
+
+    let blob = module_config(&config).expect("direct mode with a key resolves");
+    assert_eq!(
+        blob["offered_toolkits"],
+        serde_json::json!({ "allow": ["gmail", "slack"], "deny": ["slack"] })
+    );
+    // And the module parses it as its policy: deny wins over allow.
+    let policy: tinyconnectors_bus::vocabulary::OfferedToolkits =
+        serde_json::from_value(blob["offered_toolkits"].clone()).expect("the module's own shape");
+    assert!(policy.permits("gmail"));
+    assert!(!policy.permits("slack"));
+}
+
+#[test]
+fn an_unconfigured_route_still_carries_the_offered_toolkit_policy() {
+    let mut config = bare_config();
+    config.composio.offered_toolkits_deny = vec!["twitter".into()];
+    // No session and no key: no route can be named, but the load blob the
+    // module falls back to must not drop the operator's policy.
+    assert!(module_config(&config).is_err());
+    let fallback = super::ops::module_config_for_test(&config, MODULE_ID);
+    assert_eq!(
+        fallback["offered_toolkits"]["deny"],
+        serde_json::json!(["twitter"])
+    );
+}
+
+#[test]
+fn offered_toolkits_default_to_unrestricted_and_parse_from_toml() {
+    let defaults = Config::default();
+    assert!(defaults.composio.offered_toolkits_allow.is_empty());
+    assert!(defaults.composio.offered_toolkits_deny.is_empty());
+    let parsed: Config = toml::from_str(
+        "[composio]\noffered_toolkits_allow = [\"gmail\"]\noffered_toolkits_deny = [\"slack\"]\n",
+    )
+    .expect("config parses");
+    assert_eq!(parsed.composio.offered_toolkits_allow, ["gmail"]);
+    assert_eq!(parsed.composio.offered_toolkits_deny, ["slack"]);
 }

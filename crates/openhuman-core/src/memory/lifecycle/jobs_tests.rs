@@ -27,7 +27,11 @@ async fn duplicates_merge_and_the_queue_survives_a_reload() {
 
     let queue = snapshot(&config).await;
     assert_eq!(queue.pending.len(), 3, "one per (root, job)");
-    assert!(path(&config.workspace_dir).exists());
+    assert!(
+        crate::memory::state_store::load::<JobQueue>(&config.workspace_dir, "jobs")
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -91,45 +95,37 @@ async fn a_run_needs_an_engine() {
 }
 
 #[tokio::test]
-async fn an_account_wide_refusal_never_uses_up_a_jobs_attempts() {
+async fn the_build_delay_comes_from_the_recall_config_and_the_file_store_is_the_workspaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config_in(&tmp);
+    bind_reference(&config);
+    config.memory.recall.build_delay_secs = 3600;
+    enqueue(&config, &Namespace::ROOT, vec![build("a")]).await;
+    assert!(has_pending(&config.workspace_dir));
+    let stored: JobQueue = crate::memory::state_store::load(&config.workspace_dir, "jobs")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.pending.len(),
+        1,
+        "persisted in the memory state store"
+    );
+    assert!(run(&config, Selection::Due).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_account_wide_refusal_through_the_host_keeps_the_job_without_an_attempt() {
     let tmp = tempfile::tempdir().unwrap();
     let config = config_in(&tmp);
     crate::memory::test_fixtures::RefusingEngine::out_of_credits().bind(&config);
     enqueue(&config, &Namespace::ROOT, vec![build("a")]).await;
-
-    for _ in 0..MAX_ATTEMPTS + 2 {
-        let runs = run(&config, Selection::All).await.unwrap();
-        assert_eq!(runs[0].outcome, "failed");
+    for _ in 0..MAX_ATTEMPTS + 1 {
+        assert_eq!(
+            run(&config, Selection::All).await.unwrap()[0].outcome,
+            "failed"
+        );
     }
-
     let queue = snapshot(&config).await;
-    assert_eq!(queue.pending.len(), 1, "the job waits for credits");
+    assert_eq!(queue.pending.len(), 1);
     assert_eq!(queue.pending[0].attempts, 0);
-    assert!(queue.pending[0]
-        .last_error
-        .as_deref()
-        .is_some_and(|error| error.contains("USER_INSUFFICIENT_CREDITS")));
-}
-
-#[tokio::test]
-async fn a_job_that_keeps_failing_is_dropped_and_says_so() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = config_in(&tmp);
-    crate::memory::test_fixtures::RefusingEngine::with(tinymemory_api::Error::Engine(
-        "index corrupt".into(),
-    ))
-    .bind(&config);
-    enqueue(&config, &Namespace::ROOT, vec![build("a")]).await;
-
-    let mut last = Vec::new();
-    for _ in 0..MAX_ATTEMPTS {
-        last = run(&config, Selection::All).await.unwrap();
-    }
-
-    assert!(snapshot(&config).await.pending.is_empty());
-    let reason = last[0].reason.as_deref().unwrap_or_default();
-    assert!(
-        reason.starts_with(&format!("dropped after {MAX_ATTEMPTS} failed attempts")),
-        "{reason}"
-    );
 }

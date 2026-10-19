@@ -1,5 +1,5 @@
 //! Removing an agent from a running runtime: its turns end, its parked
-//! approvals are denied, its context and MCP host are released, its id is
+//! approvals are denied, its context and MCP client cleanup complete, its id is
 //! free again, and the runtime's agent cap counts only live agents.
 
 mod common;
@@ -14,8 +14,8 @@ use openhuman_core::core::events::DomainEvent;
 use openhuman_core::core::runtime::AgentContextRegistry;
 use openhuman_core::security::AutonomyLevel;
 use openhuman_embed::{
-    Access, Agent, AgentDefinitionSpec, AgentError, AgentSpec, AgentTurnOrigin, CoreError, Runtime,
-    ToolScopeSpec, TrustedAccess, Workspace,
+    Access, Agent, AgentDefinitionSpec, AgentError, AgentSpec, AgentTurnOrigin, CoreError,
+    HostTurnTools, Runtime, Tool, ToolScopeSpec, TrustedAccess, Workspace,
 };
 
 fn supervised(scratch: &std::path::Path) -> Access {
@@ -30,16 +30,40 @@ fn supervised(scratch: &std::path::Path) -> Access {
         .trust(scratch.display().to_string(), TrustedAccess::ReadWrite)
 }
 
+/// The lifecycle test needs an acting tool that parks at the real approval
+/// gate, independently of native TinyBox shell analysis and artifact loading.
+struct WriteMarker(std::path::PathBuf);
+
+#[async_trait::async_trait]
+impl Tool for WriteMarker {
+    fn name(&self) -> &str {
+        "write_marker"
+    }
+    fn description(&self) -> &str {
+        "Write the fixture marker after approval"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    fn permission_level(&self) -> tinytools::PermissionLevel {
+        tinytools::PermissionLevel::Write
+    }
+    fn external_effect(&self) -> bool {
+        true
+    }
+    async fn execute(&self, _: serde_json::Value) -> anyhow::Result<tinytools::ToolResult> {
+        std::fs::write(&self.0, "approved")?;
+        Ok(tinytools::ToolResult::success("marker written"))
+    }
+}
+
 async fn parking_agent(
     runtime: &Runtime,
     id: &str,
     scratch: &std::path::Path,
 ) -> (Agent, wiremock::MockServer) {
     let file = scratch.join(format!("{id}-wrote"));
-    let call = tool_call_completion(
-        "shell",
-        &serde_json::json!({ "command": format!("touch {}", file.display()) }).to_string(),
-    );
+    let call = tool_call_completion("write_marker", "{}");
     let provider = scripted_provider(vec![call], &format!("{id}-done")).await;
     let agent = runtime
         .agent(
@@ -48,8 +72,11 @@ async fn parking_agent(
                 .access(supervised(scratch))
                 .definition(
                     AgentDefinitionSpec::new()
-                        .tools(ToolScopeSpec::Named(vec!["shell".to_string()])),
-                ),
+                        .tools(ToolScopeSpec::Named(vec!["write_marker".into()])),
+                )
+                .tools(move |_| {
+                    HostTurnTools::advertised(vec![Box::new(WriteMarker(file.clone()))])
+                }),
         )
         .expect("agent instantiates");
     (agent, provider)
@@ -145,6 +172,7 @@ fn removing_an_agent_releases_everything_it_held() {
             );
             for owner in [None, Some("closing")] {
                 assert!(openhuman_core::security::approval::rpc::approval_decide(
+                    &openhuman_core::core::runtime::DispatchCtx::process_default(),
                     &closing_request.request_id,
                     openhuman_embed::ApprovalDecision::ApproveOnce,
                     owner,
@@ -157,7 +185,10 @@ fn removing_an_agent_releases_everything_it_held() {
             removed(closing_turn.await.unwrap(), "closing");
             assert!(!scratch.path().join("closing-wrote").exists());
             assert!(gate
-                .list_pending_for_agent(Some("closing"))
+                .list_pending_for_agent(
+                    &openhuman_core::core::runtime::DispatchCtx::ambient(),
+                    Some("closing")
+                )
                 .unwrap()
                 .is_empty());
 
@@ -227,14 +258,14 @@ fn removing_an_agent_releases_everything_it_held() {
                 Duration::from_secs(10),
                 openhuman_core::core::runtime::CoreContext::scope(
                     old_context,
-                    openhuman_core::agent::turn_origin::with_origin(
+                    openhuman_core::security::turn_origin::with_origin(
                         AgentTurnOrigin::WebChat {
                             thread_id: "late-lifecycle-thread".into(),
                             client_id: "late-lifecycle-client".into(),
                             request_id: None,
                         },
                         gate.intercept_forced(
-                            "shell",
+                            "write_marker",
                             "late removal registration",
                             serde_json::json!({}),
                         ),
@@ -261,7 +292,7 @@ fn removing_an_agent_releases_everything_it_held() {
                         agent_id,
                         ..
                     }) if request_id == request.request_id => {
-                        break (decision, resolution, agent_id)
+                        break (decision, resolution, agent_id);
                     }
                     Some(_) => {}
                     None => panic!("bus closed"),
@@ -275,7 +306,7 @@ fn removing_an_agent_releases_everything_it_held() {
                 "the context left the registry, so its cron jobs stay dormant"
             );
             assert!(
-                openhuman_core::mcp::host::take_agent_host(&workspace_dir, "parker").is_none(),
+                openhuman_core::mcp::host::take_agent_cleanup(&workspace_dir, "parker").is_none(),
                 "no MCP host is kept for a removed agent"
             );
             removed(parker.turn("again").send().await, "parker");

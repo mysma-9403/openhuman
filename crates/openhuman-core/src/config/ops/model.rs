@@ -1,9 +1,10 @@
 //! Model/provider config operations: AI providers, memory, runtime, local AI, Composio.
 
 use crate::config::Config;
+use crate::core::runtime::DispatchCtx;
 use crate::core::Outcome;
 
-use super::loader::{load_config_with_timeout, snapshot_config_json};
+use super::loader::snapshot_config_json;
 
 #[derive(Debug, Clone, Default)]
 pub struct ModelSettingsPatch {
@@ -427,7 +428,7 @@ pub async fn apply_model_settings(
 
     complete_byok_route(config, &explicit_role_pins);
 
-    config.save().await.map_err(|e| e.to_string())?;
+    config.save().await.map_err(super::config_save_error)?;
     let snapshot = snapshot_config_json(config)?;
     Ok(Outcome::new(
         snapshot,
@@ -440,9 +441,10 @@ pub async fn apply_model_settings(
 
 /// Loads the configuration, applies model settings updates, and saves it.
 pub async fn load_and_apply_model_settings(
+    ctx: &DispatchCtx,
     update: ModelSettingsPatch,
 ) -> Result<Outcome<serde_json::Value>, String> {
-    let mut config = load_config_with_timeout().await?;
+    let mut config = ctx.load_config().await?;
     apply_model_settings(&mut config, update).await
 }
 
@@ -472,7 +474,7 @@ pub async fn apply_memory_settings(
     if let Some(dimensions) = update.embedding_dimensions {
         config.memory.embedding_dimensions = dimensions;
     }
-    config.save().await.map_err(|e| e.to_string())?;
+    config.save().await.map_err(super::config_save_error)?;
     let snapshot = snapshot_config_json(config)?;
     Ok(Outcome::new(
         snapshot,
@@ -485,9 +487,10 @@ pub async fn apply_memory_settings(
 
 /// Loads the configuration, applies memory settings updates, and saves it.
 pub async fn load_and_apply_memory_settings(
+    ctx: &DispatchCtx,
     update: MemorySettingsPatch,
 ) -> Result<Outcome<serde_json::Value>, String> {
-    let mut config = load_config_with_timeout().await?;
+    let mut config = ctx.load_config().await?;
     apply_memory_settings(&mut config, update).await
 }
 
@@ -530,7 +533,7 @@ pub async fn apply_runtime_settings(
             (None, effort) => config.runtime.reasoning_effort = effort,
         }
     }
-    config.save().await.map_err(|e| e.to_string())?;
+    config.save().await.map_err(super::config_save_error)?;
     let snapshot = snapshot_config_json(config)?;
     Ok(Outcome::new(
         snapshot,
@@ -543,9 +546,10 @@ pub async fn apply_runtime_settings(
 
 /// Loads the configuration, applies runtime settings updates, and saves it.
 pub async fn load_and_apply_runtime_settings(
+    ctx: &DispatchCtx,
     update: RuntimeSettingsPatch,
 ) -> Result<Outcome<serde_json::Value>, String> {
-    let mut config = load_config_with_timeout().await?;
+    let mut config = ctx.load_config().await?;
     apply_runtime_settings(&mut config, update).await
 }
 
@@ -607,7 +611,7 @@ pub async fn apply_local_ai_settings(
             }
         );
     }
-    config.save().await.map_err(|e| e.to_string())?;
+    config.save().await.map_err(super::config_save_error)?;
     let snapshot = snapshot_config_json(config)?;
     Ok(Outcome::new(
         snapshot,
@@ -620,9 +624,10 @@ pub async fn apply_local_ai_settings(
 
 /// Loads the configuration, applies local-AI settings updates, and saves it.
 pub async fn load_and_apply_local_ai_settings(
+    ctx: &DispatchCtx,
     update: LocalAiSettingsPatch,
 ) -> Result<Outcome<serde_json::Value>, String> {
-    let mut config = load_config_with_timeout().await?;
+    let mut config = ctx.load_config().await?;
     apply_local_ai_settings(&mut config, update).await
 }
 
@@ -645,7 +650,7 @@ pub async fn apply_composio_trigger_settings(
         );
         config.composio.triage_disabled_toolkits = toolkits;
     }
-    config.save().await.map_err(|e| e.to_string())?;
+    config.save().await.map_err(super::config_save_error)?;
     let snapshot = snapshot_config_json(config)?;
     Ok(Outcome::new(
         snapshot,
@@ -658,15 +663,18 @@ pub async fn apply_composio_trigger_settings(
 
 /// Loads the configuration, applies composio trigger settings, and saves it.
 pub async fn load_and_apply_composio_trigger_settings(
+    ctx: &DispatchCtx,
     update: ComposioTriggerSettingsPatch,
 ) -> Result<Outcome<serde_json::Value>, String> {
-    let mut config = load_config_with_timeout().await?;
+    let mut config = ctx.load_config().await?;
     apply_composio_trigger_settings(&mut config, update).await
 }
 
 /// Reads the current composio trigger-triage settings.
-pub async fn get_composio_trigger_settings() -> Result<Outcome<serde_json::Value>, String> {
-    let config = load_config_with_timeout().await?;
+pub async fn get_composio_trigger_settings(
+    ctx: &DispatchCtx,
+) -> Result<Outcome<serde_json::Value>, String> {
+    let config = ctx.load_config().await?;
     let result = serde_json::json!({
         "triage_disabled": config.composio.triage_disabled,
         "triage_disabled_toolkits": config.composio.triage_disabled_toolkits,
@@ -677,18 +685,20 @@ pub async fn get_composio_trigger_settings() -> Result<Outcome<serde_json::Value
     ))
 }
 
-/// Resolve the hosted backend URL through the installed backend transport,
-/// which excludes local or third-party inference overrides that must never
-/// receive OpenHuman session credentials. `None` when no transport is
-/// installed (no hosted backend).
+/// The control-plane URL the host's config enricher resolved onto
+/// `config.resolved_endpoints`. The enricher excludes local or third-party
+/// inference overrides that must never receive OpenHuman session
+/// credentials. `None` when no enricher is registered (no hosted backend).
 pub(crate) fn resolve_backend_api_url(config: &Config) -> Option<String> {
-    crate::backend::base_url(&config.api_url).ok()
+    config.resolved_endpoints.control_plane_url.clone()
 }
 
 /// Resolves the effective backend API URL from configuration or defaults;
 /// `api_url` is `null` when the core has no hosted backend.
-pub async fn load_and_resolve_api_url() -> Result<Outcome<serde_json::Value>, String> {
-    let config = load_config_with_timeout().await?;
+pub async fn load_and_resolve_api_url(
+    ctx: &DispatchCtx,
+) -> Result<Outcome<serde_json::Value>, String> {
+    let config = ctx.load_config().await?;
     let resolved = resolve_backend_api_url(&config);
     Ok(Outcome::new(
         serde_json::json!({ "api_url": resolved }),

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, RwLock};
 
-use crate::skills::ops_types::{Workflow, TRUST_MARKER};
+use {crate::skills::ops_types::TRUST_MARKER, tinyskills::Skill as Workflow};
 
 use super::scan::{discover_filtered, ALL_ROOT_KINDS, WORKFLOW_ROOT_KINDS};
 
@@ -31,31 +31,6 @@ pub(crate) fn invalidate_workflow_metadata_cache() {
         cache.clear();
         METADATA_GENERATION.fetch_add(1, Ordering::SeqCst);
     }
-}
-
-/// Initialize the legacy skills directory in the specified workspace.
-///
-/// Creates `<workspace>/skills/` and a placeholder `README.md` so the folder
-/// is visible to the user. New-style skills should live under
-/// `<workspace>/.openhuman/skills/` instead, but this directory is kept for
-/// backward compatibility.
-pub fn init_workflows_dir(workspace_dir: &Path) -> Result<(), String> {
-    let skills_dir = workspace_dir.join("skills");
-    std::fs::create_dir_all(&skills_dir).map_err(|e| {
-        format!(
-            "failed to create skills directory {}: {e}",
-            skills_dir.display()
-        )
-    })?;
-
-    let readme_path = skills_dir.join("README.md");
-    if !readme_path.exists() {
-        let content = "# Skills\n\nPut one skill per directory under this folder.\n";
-        std::fs::write(&readme_path, content)
-            .map_err(|e| format!("failed to write {}: {e}", readme_path.display()))?;
-    }
-
-    Ok(())
 }
 
 /// The home directory skill discovery scans for user-scope roots
@@ -90,13 +65,17 @@ pub fn discovery_home_dir() -> Option<PathBuf> {
 // keep until v0.66 (review after 2027-01-11): this is the cached, ambient-user
 // discovery entry point; discover_workflows alone omits those host semantics.
 pub fn load_workflow_metadata(workspace_dir: &Path) -> Vec<Workflow> {
+    if !crate::skills::skills_component_enabled() {
+        log::debug!("[skills][discover] load_workflow_metadata -> [] ([components] skills off)");
+        return Vec::new();
+    }
     let trusted = is_workspace_trusted(workspace_dir);
     let home = discovery_home_dir();
     let key = (
         workspace_dir.to_path_buf(),
         home.clone(),
         trusted,
-        crate::core::runtime::current_tenant().ok(),
+        crate::core::runtime::DispatchCtx::ambient().tenant().ok(),
     );
     if let Ok(cache) = METADATA_CACHE.read() {
         if let Some(workflows) = cache.get(&key) {

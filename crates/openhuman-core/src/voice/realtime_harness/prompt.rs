@@ -3,7 +3,7 @@
 //! (content-free, answerable, read-back), and picking the spoken text out of
 //! a streamed progress event.
 
-use crate::agent::progress::AgentProgress;
+use crate::progress::AgentProgress;
 use serde_json::Value;
 
 /// Instruction prefix used for "speak-back": when a deferred result is ready, the

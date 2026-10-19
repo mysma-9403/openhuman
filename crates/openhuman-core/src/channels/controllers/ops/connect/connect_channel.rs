@@ -1,12 +1,12 @@
 //! Module-owned connection preparation, followed by host credential custody
 //! and configuration persistence.
-use super::super::types::ChannelConnectionResult;
 use super::shared::credential_provider;
 use crate::config::Config;
 use crate::core::Outcome;
-use crate::modules::client::{ModuleCallError, ModuleClient};
 use crate::security::credentials;
 use serde_json::Value;
+use tinybus::module::ModuleCallError;
+use tinychannels_bus::controllers::ChannelConnectionResult;
 use tinychannels_bus::module_controller::{ChannelConfigUpdate, PreparedChannelConnection};
 use tinychannels_bus::{ChannelAuthMode, ChannelControllerRequest, HttpProxyPolicy};
 
@@ -31,7 +31,7 @@ pub async fn connect_channel(
         HttpProxyPolicy::default()
     };
     let prepared = crate::modules::channel_controller::prepare_connection(
-        &ModuleClient::new(config.clone()),
+        &crate::modules::client(config.clone()),
         ChannelControllerRequest::PrepareConnect {
             config: config.channels_config.clone(),
             channel: channel_id.to_owned(),
@@ -113,10 +113,13 @@ pub(crate) async fn persist_prepared_connection(
                     persisted.channels_config.yuanbao = Some(*value);
                 }
             }
-            persisted
-                .save()
-                .await
-                .map_err(|error| format!("failed to persist {channel_id} config.toml: {error}"))?;
+            persisted.save().await.map_err(|error| {
+                crate::config::ops::config_save_error_with_context(
+                    error,
+                    &format!("failed to persist {channel_id} config.toml"),
+                    false,
+                )
+            })?;
         }
     }
     let log = if local_only {
@@ -149,7 +152,7 @@ fn update_matches_scope(
 }
 
 fn malformed() -> String {
-    ModuleClient::report_malformed_reply("tinychannels");
+    crate::modules::report::malformed_reply("tinychannels");
     ModuleCallError::ModuleFault.to_string()
 }
 

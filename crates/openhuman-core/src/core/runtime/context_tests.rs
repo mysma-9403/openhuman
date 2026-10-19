@@ -9,13 +9,17 @@ fn ctx(dir: &str) -> Arc<CoreContext> {
         }))),
         domains: crate::core::runtime::DomainSet::full(),
         tool_groups: Default::default(),
+        components: Default::default(),
         embedder_config: None,
+        latest_embedder_config: None,
         user_skill_roots: true,
-        backend_transport: None,
+        extensions: Default::default(),
         turn_origin: None,
+        channel_thread: None,
         session_agent: None,
         profile: None,
         agent: Default::default(),
+        bare: false,
     })
 }
 
@@ -42,13 +46,17 @@ fn ctx_with_config(config: crate::config::Config) -> Arc<CoreContext> {
         }))),
         domains: crate::core::runtime::DomainSet::full(),
         tool_groups: Default::default(),
+        components: Default::default(),
         embedder_config: Some(config),
+        latest_embedder_config: None,
         user_skill_roots: true,
-        backend_transport: None,
+        extensions: Default::default(),
         turn_origin: None,
+        channel_thread: None,
         session_agent: None,
         profile: None,
         agent: Default::default(),
+        bare: false,
     })
 }
 
@@ -380,13 +388,17 @@ fn degraded_context_rejects_workspace_bound_stores() {
         }))),
         domains: crate::core::runtime::DomainSet::full(),
         tool_groups: Default::default(),
+        components: Default::default(),
         embedder_config: None,
+        latest_embedder_config: None,
         user_skill_roots: true,
-        backend_transport: None,
+        extensions: Default::default(),
         turn_origin: None,
+        channel_thread: None,
         session_agent: None,
         profile: None,
         agent: Default::default(),
+        bare: false,
     };
 
     // `workspace_dir()` is the gate every workspace-bound store goes

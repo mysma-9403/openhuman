@@ -21,7 +21,7 @@
 //
 //   1. Every record in `ALL` sits on the tag its `version` names, unless it is
 //      declared in module-pin-exemptions.json with the exact drift it has.
-//   2. Every record in `ALL` is accounted for by the pin map below. A module
+//   2. Every record in `ALL` is accounted for by the shared module pin inventory. A module
 //      added without a decision here fails the gate rather than silently
 //      escaping it. Six vendored crates landed between 2026-08-20 and -27; a
 //      guard that enumerated today's modules would already be behind.
@@ -66,30 +66,8 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(process.argv[2] ?? join(HERE, "..", ".."));
 
-// Record id -> the submodule that is the source of truth for its version.
-//
-// `submodule: null` means "this record has no submodule of its own", and needs a
-// reason. It is NOT an exemption from drift. The two runtime providers below are
-// released from their own repositories on their own version line, so their
-// version cannot equal a submodule tag; `provider` instead checks them against
-// scripts/ci/module-provider-pins.json (their release, and the commit of
-// `builtAgainst` that release was built from, which must be the host's pin).
-const PIN_MAP = {
-  tinysearch: { submodule: "vendor/tinysearch" },
-  tinycomputer: { submodule: "vendor/tinycomputer" },
-  tinybox: { submodule: "vendor/tinybox" },
-  tinychannels: { submodule: "vendor/tinychannels" },
-  tinyhosts: { submodule: "vendor/tinyhosts" },
-  tinydocs: { submodule: "vendor/tinydocs" },
-  tinywallet: { submodule: "vendor/tinywallet" },
-  tinyjuice: { submodule: "vendor/tinyjuice" },
-  tinyvoice: { submodule: "vendor/tinyvoice" },
-  tinymcp: { submodule: "vendor/tinymcp" },
-  tinyconnectors: { submodule: "vendor/tinyconnectors" },
-  tinybox: { submodule: "vendor/tinybox" },
-  tinychannels: { submodule: "vendor/tinychannels" },
-  tinyhosts: { submodule: "vendor/tinyhosts" },
-};
+// The fetch bootstrap imports this same inventory without running the gate.
+import { PIN_MAP } from "../lib/module-pin-inventory.mjs";
 
 const failures = [];
 const notes = [];
@@ -308,7 +286,9 @@ if (failures.length > 0) {
     "Why this gate exists: a module is pinned twice — as a submodule (the contract this\n" +
       "build compiles against) and as a version+digest in modules/registry.rs (the artifact\n" +
       "loaded at runtime). When they disagree the build is green and the failure lands on a\n" +
-      "user's machine. openhuman#5727.\n",
+      "user's machine. openhuman#5727.\n" +
+      "To fix a drift: node scripts/modules/release-and-repin.mjs <id> (see also\n" +
+      "scripts/modules/pin-status.mjs for the local view).\n",
   );
   process.exit(1);
 }

@@ -160,6 +160,40 @@ pub(crate) fn storage_master_key() -> Result<[u8; KEY_LEN], String> {
     }
 }
 
+/// Whether the storage master key can be resolved without minting a new one:
+/// an operator key (env), a host key source, an already loaded key, or an
+/// existing workspace key file (a host source only when it holds a key). A layout migration that deletes the plaintext
+/// credential files only imports them when this holds, because a key minted
+/// by an offline tool would not match the one the desktop later loads.
+pub(crate) fn storage_master_key_resolvable() -> bool {
+    let env_set =
+        |name: &str| std::env::var_os(name).is_some_and(|v| !v.to_string_lossy().trim().is_empty());
+    // Cached outcomes first: a loaded key answers yes, and a denied keychain
+    // is not asked again this session.
+    if matches!(MASTER_KEY.get(), Some(Ok(Some(_)))) {
+        return true;
+    }
+    let configured = env_set(MASTER_KEY_ENV) || env_set(MASTER_KEY_FILE_ENV);
+    // A configured key or a denied keychain skips the host probe entirely.
+    let host_skipped = configured || HOST_KEY_UNAVAILABLE.get().is_some();
+    let dir = crate::security::secret_storage::store::workspace_dir_for_file_backend();
+    resolvable(
+        false,
+        configured,
+        // A host source counts only when it already holds the key (an empty
+        // one would have a key minted into it by the load), and is read last.
+        !host_skipped
+            && key_source::installed_master_key_source()
+                .is_some_and(|source| matches!(source.load(), Ok(Some(_)))),
+        dir.join("keyring/master.key").is_file(),
+    )
+}
+
+/// The pure decision behind [`storage_master_key_resolvable`].
+pub(crate) fn resolvable(loaded: bool, env: bool, host: bool, key_file: bool) -> bool {
+    loaded || env || host || key_file
+}
+
 /// Runs `init` at most once per `cell` and reports its outcome on every call.
 ///
 /// A configuration error is stored in the cell rather than leaving it empty
@@ -317,10 +351,15 @@ pub struct EncryptedFileBackend {
     workspace_dir: PathBuf,
 }
 
+/// The encrypted secrets file a backend rooted at `workspace_dir` keeps.
+pub(crate) fn secrets_file(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(SECRETS_FILENAME)
+}
+
 impl EncryptedFileBackend {
     pub fn new(workspace_dir: &Path) -> Self {
         Self {
-            path: workspace_dir.join(SECRETS_FILENAME),
+            path: secrets_file(workspace_dir),
             workspace_dir: workspace_dir.to_path_buf(),
         }
     }

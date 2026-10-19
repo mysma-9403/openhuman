@@ -300,7 +300,10 @@ async fn run(nodes: usize, steps: Vec<Op>) -> Result<(), TestCaseError> {
             (Some(s), Some(m)) => {
                 prop_assert_eq!(&s.owner, &name(m.owner), "step {}", step);
                 prop_assert_eq!(s.epoch, m.epoch, "step {}", step);
-                prop_assert_eq!(s.expires_at_ms, m.expires_at_ms, "step {}", step);
+                // A released record's expiry is moot (it never excludes).
+                if !m.released {
+                    prop_assert_eq!(s.expires_at_ms, m.expires_at_ms, "step {}", step);
+                }
                 prop_assert_eq!(s.released, m.released, "step {}", step);
             }
             _ => prop_assert!(

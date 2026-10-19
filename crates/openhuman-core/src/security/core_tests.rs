@@ -1,13 +1,10 @@
 use super::*;
-use crate::security::{AutonomyLevel, PairingGuard, SecretStore, SecurityPolicy};
+use crate::security::{AutonomyLevel, SecretStore, SecurityPolicy};
 
 #[test]
-fn reexported_policy_and_pairing_types_are_usable() {
+fn reexported_policy_is_usable() {
     let policy = SecurityPolicy::default();
     assert_eq!(policy.autonomy, AutonomyLevel::Supervised);
-
-    let (guard, _) = PairingGuard::new(false, &[]);
-    assert!(!guard.require_pairing());
 }
 
 #[test]

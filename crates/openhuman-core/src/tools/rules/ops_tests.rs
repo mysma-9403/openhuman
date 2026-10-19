@@ -2,14 +2,15 @@ use super::*;
 
 use std::sync::Arc;
 
-use crate::agent::harness::definition::AgentDefinition;
+use crate::agent_registry::host_definition::AgentDefinition;
 use crate::config::Config;
 use tinytools::ToolRuleSet;
 
 use tinytools::{Surface, ToolSubject};
 
 fn definition(id: &str) -> AgentDefinition {
-    crate::agent::harness::builtin_definitions::all()
+    crate::agent_registry::agents::load_builtins()
+        .expect("built-ins load")
         .into_iter()
         .next()
         .map(|mut def| {

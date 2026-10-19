@@ -39,7 +39,7 @@ impl crate::agent::host_agents::HostAgentResolver for FlowsHost {
             return None;
         }
         let mut definition =
-            crate::agent::harness::definition::AgentDefinitionRegistry::builtins_only()
+            crate::agent_registry::host_definition::AgentDefinitionRegistry::builtins_only()
                 .get("orchestrator")
                 .cloned()
                 .unwrap();

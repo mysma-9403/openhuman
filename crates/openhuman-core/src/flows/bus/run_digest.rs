@@ -6,13 +6,13 @@
 use crate::config::Config;
 use crate::core::events::DomainEvent;
 use crate::flows::store;
-use crate::flows::{flow_meta, flow_tag, FlowRun};
 use crate::memory::types::{ForgetParams, ItemsListParams, MAX_LIMIT};
 use crate::memory::{MemoryError, MemoryResult};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tinybus::EventHandler;
 use tinymemory_api::{ItemKind, MetaFilter, StoreItem};
+use {crate::flows::flow_meta, crate::flows::flow_tag, tinyflows_catalog::FlowRun};
 
 /// Bounds a post-run memory digest to a compact, LLM-cheap size — a single
 /// run's summary must never dominate a later `flow_memory_recall`.
@@ -59,9 +59,15 @@ impl FlowRunDigestSubscriber {
         Self { config }
     }
 
-    async fn handle_finished(&self, flow_id: &str, run_id: &str, status: &str) {
+    async fn handle_finished(
+        &self,
+        ctx: crate::core::runtime::DispatchCtx,
+        flow_id: &str,
+        run_id: &str,
+        status: &str,
+    ) {
         // As the flow's owner: its own configuration (`super::owner`).
-        let config = super::owner::config_for_scope(&self.config);
+        let config = super::owner::config_for_scope(&ctx, &self.config);
         if status != "completed" && status != "completed_with_warnings" {
             tracing::trace!(target: "flows", %flow_id, %run_id, %status, "[flows] digest: ignoring non-success terminal status");
             return;
@@ -191,11 +197,12 @@ impl EventHandler<DomainEvent> for FlowRunDigestSubscriber {
         } = event
         {
             // Settle the run as the agent its flow belongs to (`super::owner`).
-            super::owner::as_owner(
-                &self.config,
-                flow_id,
-                self.handle_finished(flow_id, run_id, status),
-            )
+            // `FlowRunFinished` carries no tenant: the host's own, and in SaaS
+            // none (the run is then not settled here).
+            let host = crate::core::runtime::DispatchCtx::host_default();
+            super::owner::as_owner(&host, &self.config, flow_id, |ctx| {
+                self.handle_finished(ctx, flow_id, run_id, status)
+            })
             .await;
         }
     }

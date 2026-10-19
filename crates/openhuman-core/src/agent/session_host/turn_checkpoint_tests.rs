@@ -37,7 +37,7 @@ fn the_deterministic_checkpoint_reproduces_each_result_body() {
 #[test]
 fn checkpoint_records_keep_the_captured_tool_failure_status_and_body() {
     let records = results_from_tool_outcomes(&[
-        crate::agent::tinyagents::ToolCallOutcome {
+        tinyagents_harness::turn_outcome::ToolCallOutcome {
             call_id: "call-ok".into(),
             name: "read_file".into(),
             arguments: serde_json::Value::Null,
@@ -45,7 +45,7 @@ fn checkpoint_records_keep_the_captured_tool_failure_status_and_body() {
             content: "configuration found".into(),
             duration_ms: 0,
         },
-        crate::agent::tinyagents::ToolCallOutcome {
+        tinyagents_harness::turn_outcome::ToolCallOutcome {
             call_id: "call-failed".into(),
             name: "apply_patch".into(),
             arguments: serde_json::Value::Null,
@@ -59,6 +59,21 @@ fn checkpoint_records_keep_the_captured_tool_failure_status_and_body() {
     assert!(rendered.contains("`read_file` — ok"));
     assert!(rendered.contains("`apply_patch` — failed"));
     assert!(rendered.contains("permission denied"));
+}
+
+/// Keep OpenHuman's quoted checkpoint format stable while TinyAgents owns
+/// the generic selection and budget walk.
+#[test]
+fn tool_result_renderer_preserves_the_openhuman_block_format() {
+    let rendered = render_tool_results(
+        &[result("read_file", true, "first line\nsecond line")],
+        CHECKPOINT_TOTAL_CHARS,
+    );
+
+    assert_eq!(
+        rendered,
+        "\n- `read_file` — ok\n  > first line\n  > second line\n"
+    );
 }
 
 /// Over the budget the checkpoint starts later rather than truncating every
@@ -221,20 +236,6 @@ fn the_final_answer_instruction_carries_the_records_and_the_stop_note() {
     let halted = final_answer_instruction(Some(STOP_NOTE), false, &records);
     assert!(halted.contains(&format!("<stop_note>\n{STOP_NOTE}\n</stop_note>")));
     assert!(halted.contains("  > no direct download"));
-}
-
-/// The check is read by its conclusion: the last standalone verdict token wins,
-/// a word that merely contains one is not a verdict, and no verdict is unclear.
-#[test]
-fn the_close_verdict_is_the_last_standalone_verdict_token() {
-    assert_eq!(parse_close_verdict("ACCEPT"), CloseVerdict::Accept);
-    assert_eq!(parse_close_verdict("reject."), CloseVerdict::Reject);
-    assert_eq!(
-        parse_close_verdict("It could ACCEPT, but rule 1 applies.\nREJECT"),
-        CloseVerdict::Reject
-    );
-    assert_eq!(parse_close_verdict("UNACCEPTABLE"), CloseVerdict::Unclear);
-    assert_eq!(parse_close_verdict(""), CloseVerdict::Unclear);
 }
 
 /// The check prompt holds the request, the records and the candidate, so the

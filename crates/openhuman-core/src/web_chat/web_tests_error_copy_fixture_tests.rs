@@ -8,7 +8,7 @@
 //! (web_chat regex list, triage whole-word list, loop-guard billing list).
 
 use super::*;
-use crate::agent::triage::evaluator::{classify_error, ArmError};
+use crate::triage::evaluator::{classify_error, ArmError};
 use crate::web_chat::WebChannelEvent;
 use regex::Regex;
 

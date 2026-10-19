@@ -74,7 +74,7 @@ fn referenced_child_graph(workflow_id: &str) -> Value {
 }
 
 fn structurally_valid_graph(value: Value) -> WorkflowGraph {
-    let graph = migrate_and_deserialize_graph(value).expect("graph should deserialize");
+    let graph = tinyflows::migrate::deserialize_graph(value).expect("graph should deserialize");
     tinyflows::validate::validate(&graph).expect("fixture should be structurally valid");
     graph
 }
@@ -243,7 +243,7 @@ fn http_summary(name: &str, scheme: &str) -> HttpCredentialSummary {
 // ── Flow Scout suggestion lifecycle ──────────────────────────────────────────
 
 fn seed_suggestion(config: &Config, id: &str) {
-    let s = crate::flows::FlowSuggestion {
+    let s = tinyflows_catalog::FlowSuggestion {
         id: id.to_string(),
         title: format!("Idea {id}"),
         one_liner: "does a thing".to_string(),
@@ -254,7 +254,7 @@ fn seed_suggestion(config: &Config, id: &str) {
         suggested_slugs: vec![],
         build_prompt: "Build a workflow…".to_string(),
         confidence: 0.5,
-        status: crate::flows::SuggestionStatus::New,
+        status: tinyflows_catalog::SuggestionStatus::New,
         created_at: "2026-07-05T00:00:00Z".to_string(),
         source_run_id: None,
     };
@@ -672,10 +672,3 @@ mod tool_contract_and_wiring_warnings_tests;
 mod triggers_and_resume_tests;
 #[path = "ops_validate_warnings_and_connections_tests.rs"]
 mod validate_warnings_and_connections_tests;
-
-#[test]
-fn the_boot_sweep_leaves_shared_backends_alone() {
-    use super::run_management::{boot_sweep_plan, BootSweepPlan};
-    assert_eq!(boot_sweep_plan(false), BootSweepPlan::EveryScope);
-    assert_eq!(boot_sweep_plan(true), BootSweepPlan::Nothing);
-}

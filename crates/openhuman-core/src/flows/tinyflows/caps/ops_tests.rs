@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent::prompts::types::IntegrationConnection;
 use crate::integrations::composio::{ComposioExecuteResponse, ConnectedIntegration};
-use crate::skills::types::{ToolContent, ToolResult};
+use tinytools::{ToolContent, ToolResult};
 
 fn integration(
     toolkit: &str,
@@ -46,7 +46,7 @@ fn policy(level: crate::security::AutonomyLevel) -> SecurityPolicy {
 // ── Codex P1: Prompt-tier decisions must escalate past a workflow's own
 // require_approval=false default, never silently auto-allow ────────────
 
-use crate::agent::turn_origin::{AgentTurnOrigin, TrustedAutomationSource};
+use crate::security::turn_origin::{AgentTurnOrigin, TrustedAutomationSource};
 
 fn workflow_origin(job_id: &str, require_approval: bool) -> AgentTurnOrigin {
     AgentTurnOrigin::TrustedAutomation {

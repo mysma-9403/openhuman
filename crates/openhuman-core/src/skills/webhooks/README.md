@@ -79,7 +79,7 @@ Note that nothing in the production startup path currently constructs a `Webhook
 - `crate::core::{ControllerSchema, FieldSchema, TypeSchema}`: RPC schema types.
 - `crate::core::observability::report_error`: error reporting for body-decode / agent-trigger failures.
 - `crate::platform::socket::global_socket_manager`: obtain the `WebhookRouter` (stored on the socket manager) and `emit` responses over the socket.
-- `crate::agent::triage`: `TriggerEnvelope`, `run_triage`, `apply_decision`, `TriageOutcome` for agent-tunnel routing and `trigger_agent`.
+- `crate::triage`: `TriggerEnvelope`, `run_triage`, `apply_decision`, `TriageOutcome` for agent-tunnel routing and `trigger_agent`.
 - `crate::config::{Config, rpc::load_config_with_timeout}`: config for local webhook routing operations.
 - `crate::rpc::RpcOutcome`: handler return contract.
 
@@ -93,7 +93,7 @@ Note that nothing in the production startup path currently constructs a `Webhook
 
 ## Notes / gotchas
 
-- Direct skill dispatch is not implemented: a `skill`-kind tunnel returns `501`. Real handling exists only for `echo` and `agent` kinds (the QuickJS skill runtime was removed; see `gitbooks/developing/architecture.md`).
+- Direct skill dispatch is not implemented: a `skill`-kind tunnel returns `501`. Real handling exists only for `echo` and `agent` kinds (the QuickJS skill runtime was removed; see `docs/gitbooks/en/developing/architecture.md`).
 - `route()` deliberately resolves only `target_kind == "skill"` registrations; echo/agent registrations are matched via `registration()` in the bus, not `route()`.
 - Agent tunnels respond `202` immediately and complete asynchronously: the spawned task emits the final `webhook:response` itself to avoid blocking the broadcast dispatch task during LLM calls.
 - `register_agent` stores `agent_id` for observability and rebind validation only; per the docstring the triage evaluator selects the target agent dynamically regardless of the pinned value.
@@ -104,6 +104,6 @@ Note that nothing in the production startup path currently constructs a `Webhook
 ## Further reading
 
 - [Parent module (`skills`)](../README.md)
-- [MCP servers and skills](../../../../../gitbooks/features/integrations/mcp-and-skills.md)
+- [MCP servers and skills](../../../../../docs/gitbooks/en/features/integrations/mcp-and-skills.md)
 - [tinyskills submodule](../../../../../vendor/tinyskills/README.md)
-- [Agent harness architecture](../../../../../gitbooks/developing/architecture/agent-harness.md)
+- [Agent harness architecture](../../../../../docs/gitbooks/en/developing/architecture/agent-harness.md)

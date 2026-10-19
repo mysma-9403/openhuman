@@ -14,10 +14,10 @@
 //! cannot satisfy the assertion accidentally.
 
 const ORCHESTRATOR_TOML: &str =
-    include_str!("../../crates/openhuman-core/src/agent/registry/agents/orchestrator/agent.toml");
+    include_str!("../../crates/openhuman-core/src/agent_registry/agents/orchestrator/agent.toml");
 
 const PRESENTATION_AGENT_TOML: &str = include_str!(
-    "../../crates/openhuman-core/src/agent/registry/agents/presentation_agent/agent.toml"
+    "../../crates/openhuman-core/src/agent_registry/agents/presentation_agent/agent.toml"
 );
 
 const TOOLPACK_REGISTRY: &str =

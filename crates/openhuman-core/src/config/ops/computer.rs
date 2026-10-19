@@ -2,9 +2,10 @@
 //! rescue models the module runs a task with.
 
 use crate::config::{ComputerConfig, Config, DecisionModel};
+use crate::core::runtime::DispatchCtx;
 use crate::core::Outcome;
 
-use super::loader::{load_config_with_timeout, snapshot_config_json};
+use super::loader::snapshot_config_json;
 
 /// A partial update to `[computer]`. An empty model string restores the
 /// module's default.
@@ -81,7 +82,7 @@ pub async fn apply_computer_settings(
         max_rescues = ?config.computer.max_rescues,
         "[config] computer settings updated"
     );
-    config.save().await.map_err(|e| e.to_string())?;
+    config.save().await.map_err(super::config_save_error)?;
     let snapshot = snapshot_config_json(config)?;
     Ok(Outcome::new(
         snapshot,
@@ -94,9 +95,10 @@ pub async fn apply_computer_settings(
 
 /// Load the configuration, update `[computer]`, and save it.
 pub async fn load_and_apply_computer_settings(
+    ctx: &DispatchCtx,
     update: ComputerSettingsPatch,
 ) -> Result<Outcome<serde_json::Value>, String> {
-    let mut config = load_config_with_timeout().await?;
+    let mut config = ctx.load_config().await?;
     apply_computer_settings(&mut config, update).await
 }
 

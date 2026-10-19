@@ -16,30 +16,19 @@
 //! resulting transcript back out, so a turn can run on the `tinyagents`
 //! agent-loop while callers keep speaking the row vocabulary.
 
-use tinyinference_llm::message::{ContentBlock, ImageRef, MediaRef, Message, UserMessage};
-use tinyinference_llm::tool::ToolCall as TaToolCall;
-use tinytools_agent::dialect::{
-    DialectMessage, DialectResponse, DialectRole, ToolDialect, ToolResultEntry, TranscriptEntry,
-};
-
-use crate::inference::provider::ChatResponse;
-use tinyagents_runtime::transcript::reasoning_from_content;
 #[cfg(test)]
 use tinyagents_runtime::transcript::{
     message_to_display_transcript as message_to_chat_message,
-    message_to_native_transcript as message_to_native_chat_message, REASONING_EXT_KEY,
+    message_to_native_transcript as message_to_native_chat_message, reasoning_from_content,
+    REASONING_EXT_KEY,
 };
 use tinyagents_session::transcript::TranscriptMessage;
+use tinyinference_llm::message::{ContentBlock, ImageRef, MediaRef, Message, UserMessage};
+use tinyinference_llm::tool::ToolCall as TaToolCall;
+use tinytools_agent::dialect::{DialectMessage, DialectRole, ToolDialect, TranscriptEntry};
 
 /// Convert the host provider response at its boundary into the canonical
 /// dialect input. The dialect crate owns all parsing after this field-wise map.
-pub(crate) fn dialect_response_from_provider(response: &ChatResponse) -> DialectResponse {
-    DialectResponse {
-        text: response.text.clone(),
-        tool_calls: response.tool_calls.clone(),
-    }
-}
-
 /// Replay typed conversation entries through a canonical dialect and return
 /// the provider's typed rows (a native tool round keeps its calls and call ids
 /// in fields, never packed into `content`).
@@ -99,17 +88,17 @@ pub(crate) fn chat_message_to_message(msg: &TranscriptMessage) -> Message {
 /// [`user_text_with_markers`] gives back exactly the text that came in. Text
 /// without a ready marker is a plain text message, byte for byte.
 pub(crate) fn user_message_from_text(text: &str) -> Message {
-    if !crate::agent::attachments::parse(text).1.is_empty() {
+    if !crate::attachments::parse(text).1.is_empty() {
         let mut content = Vec::new();
-        for segment in crate::agent::attachments::segments(text) {
+        for segment in crate::attachments::segments(text) {
             let attachment = match segment {
-                crate::agent::attachments::Segment::Text(text) => {
+                crate::attachments::Segment::Text(text) => {
                     if let Message::User(user) = user_message_from_text(&text) {
                         content.extend(user.content);
                     }
                     continue;
                 }
-                crate::agent::attachments::Segment::Attachment(file) => file,
+                crate::attachments::Segment::Attachment(file) => file,
             };
             content.push(ContentBlock::Text(attachment.description()));
             let media = MediaRef::Path {
@@ -136,44 +125,7 @@ pub(crate) fn user_message_from_text(text: &str) -> Message {
         return Message::User(UserMessage { content });
     }
 
-    const PREFIX: &str = "[IMAGE:";
-    if !text.contains(PREFIX) {
-        return Message::user(text);
-    }
-    let mut blocks: Vec<ContentBlock> = Vec::new();
-    let mut pending = String::new();
-    let mut rest = text;
-    let mut images = 0usize;
-    while let Some(start) = rest.find(PREFIX) {
-        let after = &rest[start + PREFIX.len()..];
-        let Some(end) = after.find(']') else {
-            break;
-        };
-        let payload = after[..end].trim();
-        if is_provider_ready_image_reference(payload) {
-            pending.push_str(&rest[..start]);
-            if !pending.is_empty() {
-                blocks.push(ContentBlock::Text(std::mem::take(&mut pending)));
-            }
-            blocks.push(ContentBlock::Image(ImageRef {
-                url: payload.to_string(),
-                mime_type: data_uri_mime(payload),
-            }));
-            images += 1;
-        } else {
-            pending.push_str(&rest[..start + PREFIX.len() + end + 1]);
-        }
-        rest = &after[end + 1..];
-    }
-    if images == 0 {
-        return Message::user(text);
-    }
-    pending.push_str(rest);
-    if !pending.is_empty() {
-        blocks.push(ContentBlock::Text(pending));
-    }
-    log::debug!("[agent][message_convert] stored {images} image attachment(s) as typed parts");
-    Message::User(UserMessage { content: blocks })
+    tinyagents_runtime::transcript::user_message_from_text(text)
 }
 
 /// The inverse of [`user_message_from_text`]: a user message's text with each
@@ -191,10 +143,8 @@ pub(crate) fn user_text_with_markers(msg: &Message) -> String {
 /// Build the content blocks for a user turn, lifting any `[IMAGE:…]` markers out
 /// of the text into typed [`ContentBlock::Image`] blocks.
 ///
-/// By the time a user message reaches this bridge the multimodal pipeline has
-/// already rehydrated and normalized every attachment into an inline
-/// `[IMAGE:data:<mime>;base64,…]` marker (see
-/// [`crate::agent::multimodal::prepare_messages_for_provider`]).
+/// The TinyAgents media request wrapper resolves marker references on a
+/// disposable provider request after this bridge turns them into typed blocks.
 /// Leaving those buried in a single [`ContentBlock::Text`] ships the base64 to
 /// the model as literal text, so vision models never actually see the image —
 /// PNG screenshots fail outright and JPEGs get guessed at (#5359). Splitting the
@@ -205,89 +155,18 @@ pub(crate) fn user_text_with_markers(msg: &Message) -> String {
 /// Blocks are emitted in **source order** — prose and images interleave as the
 /// user wrote them, so a caption stays next to its image. A marker whose payload
 /// is empty or malformed is kept verbatim as text. Local references are
-/// resolved by the host model decorator before provider serialization.
+/// resolved through TinyAgents' owner wrapper and OpenHuman's authorized
+/// source resolver before provider serialization. If no
+/// marker is lifted, the owner helper keeps the original text (including
+/// whitespace around an empty or malformed marker); this also removes the old
+/// host helper's incidental trimming of that text.
 fn user_content_blocks(text: String) -> Vec<ContentBlock> {
-    if !crate::agent::attachments::parse(&text).1.is_empty() {
+    if !crate::attachments::parse(&text).1.is_empty() {
         if let Message::User(user) = user_message_from_text(&text) {
             return user.content;
         }
     }
-
-    const PREFIX: &str = "[IMAGE:";
-    // Fast path: no markers → unchanged single text block (byte-for-byte).
-    if !text.contains(PREFIX) {
-        return vec![ContentBlock::Text(text)];
-    }
-
-    fn flush_text(pending: &mut String, blocks: &mut Vec<ContentBlock>) {
-        let trimmed = pending.trim();
-        if !trimmed.is_empty() {
-            blocks.push(ContentBlock::Text(trimmed.to_string()));
-        }
-        pending.clear();
-    }
-
-    let mut blocks: Vec<ContentBlock> = Vec::new();
-    let mut pending = String::new();
-    let mut images = 0usize;
-    let mut rest = text.as_str();
-
-    while let Some(start) = rest.find(PREFIX) {
-        pending.push_str(&rest[..start]);
-        let after = &rest[start + PREFIX.len()..];
-        let Some(end) = after.find(']') else {
-            // Unterminated marker — keep the remainder verbatim as text.
-            pending.push_str(&rest[start..]);
-            rest = "";
-            break;
-        };
-        let payload = after[..end].trim();
-        if is_provider_ready_image_reference(payload) {
-            // Preserve source order: flush the prose seen so far, then the image.
-            flush_text(&mut pending, &mut blocks);
-            blocks.push(ContentBlock::Image(ImageRef {
-                url: payload.to_string(),
-                mime_type: data_uri_mime(payload),
-            }));
-            images += 1;
-        } else {
-            // Not provider-ready (bare path / un-normalized marker) — keep the
-            // whole `[IMAGE:…]` marker verbatim as text.
-            pending.push_str(&rest[start..start + PREFIX.len() + end + 1]);
-        }
-        rest = &after[end + 1..];
-    }
-    pending.push_str(rest);
-    flush_text(&mut pending, &mut blocks);
-
-    if images > 0 {
-        log::debug!(
-            "[agent][message_convert] lifted {images} image attachment(s) from user text into content blocks"
-        );
-    }
-    // A whitespace-only, image-less remainder still needs a block to stay a
-    // valid user turn.
-    if blocks.is_empty() {
-        blocks.push(ContentBlock::Text(text));
-    }
-    blocks
-}
-
-/// A nonempty legacy image reference. Local paths remain typed and are
-/// resolved under host policy on the ephemeral provider request.
-fn is_provider_ready_image_reference(reference: &str) -> bool {
-    !reference.trim().is_empty()
-}
-
-/// Extract the MIME type from a `data:<mime>;base64,…` URI, if present.
-///
-/// Best-effort: the provider layer also reads the type straight from the `data:`
-/// URI, so a non-`data:` reference (e.g. an `http(s)` URL) simply carries
-/// `None` and is forwarded as-is.
-fn data_uri_mime(reference: &str) -> Option<String> {
-    let rest = reference.strip_prefix("data:")?;
-    let mime = rest.split([';', ',']).next()?.trim();
-    (!mime.is_empty()).then(|| mime.to_string())
+    tinyagents_runtime::transcript::user_content_blocks(text)
 }
 
 /// Rebuild a harness [`TaToolCall`] from a row's [`TranscriptToolCall`] (whose
@@ -305,12 +184,6 @@ pub(crate) fn messages_to_history(messages: &[Message]) -> Vec<TranscriptMessage
         .collect()
 }
 
-// The product dialect stores provider reasoning in passthrough metadata.
-fn reasoning_extra_metadata(content: &[ContentBlock]) -> Option<serde_json::Value> {
-    reasoning_from_content(content)
-        .map(|reasoning| serde_json::json!({ tinyagents_runtime::transcript::REASONING_EXT_KEY: reasoning }))
-}
-
 /// Convert a harness transcript into typed dialect entries, preserving
 /// assistant tool-call structure (`AssistantToolCalls`) and tool results
 /// (`ToolResults`) instead of flattening tool calls to text.
@@ -319,66 +192,7 @@ fn reasoning_extra_metadata(content: &[ContentBlock]) -> Option<serde_json::Valu
 /// shape a single assistant tool-call round produces), matching the legacy
 /// `turn_engine_adapter` persistence.
 pub(crate) fn messages_to_conversation(messages: &[Message]) -> Vec<TranscriptEntry> {
-    let mut out: Vec<TranscriptEntry> = Vec::new();
-    let mut pending: Vec<ToolResultEntry> = Vec::new();
-
-    fn flush(out: &mut Vec<TranscriptEntry>, pending: &mut Vec<ToolResultEntry>) {
-        if !pending.is_empty() {
-            out.push(TranscriptEntry::ToolResults(std::mem::take(pending)));
-        }
-    }
-    fn chat(
-        role: DialectRole,
-        content: String,
-        extra_metadata: Option<serde_json::Value>,
-    ) -> TranscriptEntry {
-        TranscriptEntry::Chat(DialectMessage::new(role, content).with_metadata(extra_metadata))
-    }
-
-    for msg in messages {
-        match msg {
-            Message::Tool(t) => {
-                pending.push(ToolResultEntry {
-                    tool_call_id: t.tool_call_id.clone(),
-                    content: msg.text(),
-                    trusted_verbatim: false,
-                });
-            }
-            Message::System(_) => {
-                flush(&mut out, &mut pending);
-                out.push(chat(DialectRole::System, msg.text(), None));
-            }
-            Message::User(_) => {
-                flush(&mut out, &mut pending);
-                out.push(chat(DialectRole::User, msg.text(), None));
-            }
-            Message::Assistant(a) => {
-                flush(&mut out, &mut pending);
-                if a.tool_calls.is_empty() {
-                    out.push(chat(
-                        DialectRole::Assistant,
-                        msg.text(),
-                        reasoning_extra_metadata(&a.content),
-                    ));
-                } else {
-                    let text = msg.text();
-                    out.push(TranscriptEntry::AssistantToolCalls {
-                        text: (!text.is_empty()).then_some(text),
-                        tool_calls: a.tool_calls.iter().map(ta_call_to_oh_call).collect(),
-                        reasoning_content: reasoning_from_content(&a.content),
-                        extra_metadata: reasoning_extra_metadata(&a.content),
-                    });
-                }
-            }
-            // Host-side out-of-band record; not part of the persisted
-            // conversation and never provider input.
-            Message::Custom(c) => {
-                log::trace!("[message_convert] dropping custom message kind={}", c.kind);
-            }
-        }
-    }
-    flush(&mut out, &mut pending);
-    out
+    tinyagents_runtime::transcript::messages_to_conversation(messages)
 }
 
 /// Presentation projection of a runtime session's messages, as returned by

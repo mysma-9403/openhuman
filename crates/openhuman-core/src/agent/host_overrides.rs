@@ -7,10 +7,10 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use crate::agent::hooks::{PostTurnHook, ToolHook};
+use crate::agent::tinyagents::host::OpenHumanRunContext;
+use tinyagents_harness::host::LearningSink;
+use tinyagents_hooks::tool::ToolHook;
 use tinyinference_llm::model::ChatModel;
-
-pub use tinyagents_harness::cancel::CancellationToken;
 
 /// Runtime or agent host adapters, shared by every context derived from it.
 #[derive(Default)]
@@ -21,14 +21,19 @@ pub struct HostOverrides {
     pub parent: Option<Arc<HostOverrides>>,
     /// Approval registration barrier owned by this agent instance.
     pub approval_scope: Option<Arc<crate::security::approval::ApprovalScope>>,
-    post_turn_hooks: RwLock<BTreeMap<String, Arc<dyn PostTurnHook>>>,
-    tool_hooks: RwLock<BTreeMap<String, Arc<dyn ToolHook>>>,
+    post_turn_hooks: RwLock<BTreeMap<String, Arc<dyn LearningSink>>>,
+    tool_hooks: RwLock<BTreeMap<String, Arc<dyn ToolHook<OpenHumanRunContext>>>>,
     /// Native inference used by this agent instead of config-routed inference.
     pub model: Option<Arc<dyn ChatModel<()>>>,
     /// Role-specific native models; absent roles use `model` or config routing.
     pub role_models: BTreeMap<String, Arc<dyn ChatModel<()>>>,
     /// The agent's durable session store, ahead of the runtime's store.
-    pub session_store: Option<Arc<dyn crate::agent::session_store::SessionStoreProvider>>,
+    pub session_store: Option<Arc<dyn tinyagents_session::port::SessionStoreProvider>>,
+    /// The tools the agent's definition names, when its scope is a named
+    /// list: what lets an embedded agent have one of the
+    /// [`OPERATOR_ADMITTABLE`](crate::profiles::tools::OPERATOR_ADMITTABLE)
+    /// tools although its domain family is off.
+    pub named_tools: Option<Arc<std::collections::HashSet<String>>>,
 }
 
 impl std::fmt::Debug for HostOverrides {
@@ -53,6 +58,14 @@ impl HostOverrides {
         })
     }
 
+    /// The named tool scope of this agent, or of the nearest parent that has
+    /// one.
+    pub fn named_tools(&self) -> Option<Arc<std::collections::HashSet<String>>> {
+        self.named_tools
+            .clone()
+            .or_else(|| self.parent.as_ref().and_then(|parent| parent.named_tools()))
+    }
+
     /// Resolve the instance barrier inherited by derived turn contexts.
     pub fn approval_scope(&self) -> Option<Arc<crate::security::approval::ApprovalScope>> {
         self.approval_scope
@@ -61,7 +74,7 @@ impl HostOverrides {
     }
 
     /// Add or replace an agent-local post-turn hook by name; `None` removes it.
-    pub fn post_turn_hook(&self, name: &str, hook: Option<Arc<dyn PostTurnHook>>) {
+    pub fn post_turn_hook(&self, name: &str, hook: Option<Arc<dyn LearningSink>>) {
         let mut hooks = self
             .post_turn_hooks
             .write()
@@ -73,7 +86,7 @@ impl HostOverrides {
     }
 
     /// Add or replace an agent-local tool hook by name; `None` removes it.
-    pub fn tool_hook(&self, name: &str, hook: Option<Arc<dyn ToolHook>>) {
+    pub fn tool_hook(&self, name: &str, hook: Option<Arc<dyn ToolHook<OpenHumanRunContext>>>) {
         let mut hooks = self
             .tool_hooks
             .write()
@@ -85,7 +98,7 @@ impl HostOverrides {
     }
 
     /// Snapshot the agent-local post-turn hooks for a new session.
-    pub fn post_turn_hooks(&self) -> Vec<Arc<dyn PostTurnHook>> {
+    pub fn post_turn_hooks(&self) -> Vec<Arc<dyn LearningSink>> {
         let mut hooks = self
             .parent
             .as_ref()
@@ -102,7 +115,7 @@ impl HostOverrides {
     }
 
     /// Snapshot the agent-local tool hooks for a new turn.
-    pub fn tool_hooks(&self) -> Vec<Arc<dyn ToolHook>> {
+    pub fn tool_hooks(&self) -> Vec<Arc<dyn ToolHook<OpenHumanRunContext>>> {
         let mut hooks = self
             .parent
             .as_ref()
@@ -125,21 +138,6 @@ impl HostOverrides {
             .cloned()
             .or_else(|| self.model.clone())
     }
-}
-
-tokio::task_local! { static TURN_CANCELLATION: CancellationToken; }
-
-/// Run a turn with a caller-owned cancellation token, shared with child runs.
-pub async fn with_cancellation<F: std::future::Future>(
-    token: CancellationToken,
-    future: F,
-) -> F::Output {
-    TURN_CANCELLATION.scope(token, future).await
-}
-
-/// The caller's token, or a fresh token for entrypoints without one.
-pub fn current_cancellation() -> CancellationToken {
-    TURN_CANCELLATION.try_with(Clone::clone).unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -12,12 +12,13 @@ use std::sync::Arc;
 use tinyagents_graph::goals::{GoalTool, GoalToolKind, GoalUpdateHook};
 use tinytools::Tool;
 
-use super::{goal_to_value, store, ThreadGoal};
+use super::goal_to_value;
+use tinyagents_graph::goals::ThreadGoal;
 
 /// The model-facing goal tools for `workspace_dir`, each publishing
 /// `DomainEvent::ThreadGoalUpdated` after a write.
 pub fn goal_tools(workspace_dir: &Path) -> Vec<Box<dyn Tool>> {
-    let goal_store = store::goals_store(workspace_dir);
+    let goal_store = crate::storage::sessions::stores_or_ephemeral(workspace_dir).kv;
     let hook: GoalUpdateHook = Arc::new(publish_goal_updated);
     GoalToolKind::MODEL_FACING
         .into_iter()

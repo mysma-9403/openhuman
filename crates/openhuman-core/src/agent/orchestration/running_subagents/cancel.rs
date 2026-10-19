@@ -9,7 +9,7 @@ use tinyagents_harness::ids::TaskId;
 
 use tinyagents_orchestration::subagent::FinishedOutcome;
 
-use super::registry::registry;
+use super::registry::{control_admits, registry};
 use super::resolve::task_id_for_session_in_workspace;
 use super::task_ledger::record_cancelled;
 
@@ -28,66 +28,136 @@ pub(crate) struct CancelledSubagent {
     /// "Cancel" still finds it; the caller must not rewrite that outcome as a
     /// user cancellation, and reports it instead.
     pub(crate) already_finished: Option<FinishedOutcome>,
+    /// The selected durable driver row when a paused child needs host-side
+    /// terminal projection (its driver callback already returned on pause).
+    pub(crate) driver_pause:
+        Option<crate::agent::orchestration::subagent_sessions::DriverTaskCancellation>,
+    /// TinyAgents' awaited completion handler owns terminal delivery for this
+    /// driver-backed child; the RPC handler must not publish a duplicate.
+    pub(crate) driver_managed: bool,
 }
 
 /// Abort and drop the sub-agent with `task_id`, returning its metadata so the
 /// caller can deliver a "cancelled" notice into the parent chat. Returns `None`
 /// if no such sub-agent is registered (already finished, or unknown id).
 ///
-/// Unlike the parent-session-owned steering and close paths, this is keyed by
-/// `task_id` alone with no ownership check — it backs the user-facing "Cancel"
-/// affordance, and the desktop user owns every sub-agent in their own core.
-pub(crate) fn cancel_by_task(task_id: &str) -> Option<CancelledSubagent> {
-    let cancelled = registry().cancel_trusted(&TaskId::new(task_id)).ok()?;
-    // `AwaitingUser` is paused, not finished: cancelling it is a real cancel.
-    let already_finished = cancelled.status.finished_outcome();
-    let metadata = cancelled.metadata;
-    if already_finished.is_none() {
-        record_cancelled(&metadata.workspace_dir, task_id);
+/// User controls check the captured profile in SaaS. The desktop user retains
+/// authority over every sub-agent in their own core.
+pub(crate) fn cancel_by_task(
+    ctx: &crate::core::runtime::DispatchCtx,
+    task_id: &str,
+) -> Option<CancelledSubagent> {
+    cancel_by_task_with_workspace_reason(ctx, task_id, None, None)
+        .ok()
+        .flatten()
+}
+
+/// Cancel with an optional user-provided reason for the driver-owned
+/// completion callback. Store failures are returned so the RPC does not report
+/// an unknown task when its durable selector could not be read.
+pub(crate) fn cancel_by_task_with_workspace_reason(
+    ctx: &crate::core::runtime::DispatchCtx,
+    task_id: &str,
+    fallback_workspace: Option<&Path>,
+    reason: Option<&str>,
+) -> Result<Option<CancelledSubagent>, String> {
+    let id = TaskId::new(task_id);
+    if let Ok(snapshot) = registry().snapshot_trusted(&id) {
+        if !control_admits(ctx, &snapshot.metadata) {
+            return Ok(None);
+        }
+        let Ok(cancelled) = registry().cancel(&id, &snapshot.owner_id) else {
+            return Ok(None);
+        };
+        // `AwaitingUser` is paused, not finished: cancelling it is a real cancel.
+        let already_finished = cancelled.status.finished_outcome();
+        let metadata = cancelled.metadata;
+        if already_finished.is_none() {
+            record_cancelled(ctx, &metadata.workspace_dir, task_id);
+        }
+        log::debug!(
+            "[running_subagents] cancel_by_task task_id={} agent_id={} parent_thread_id={:?} live_entries={}",
+            task_id,
+            metadata.agent_id,
+            metadata.parent_thread_id,
+            registry()
+                .len()
+                .expect("detached task registry lock poisoned")
+        );
+        return Ok(Some(CancelledSubagent {
+            agent_id: metadata.agent_id,
+            parent_session: metadata.parent_session,
+            subagent_session_id: metadata.subagent_session_id,
+            workspace_dir: metadata.workspace_dir,
+            parent_thread_id: metadata.parent_thread_id,
+            already_finished,
+            driver_pause: None,
+            driver_managed: false,
+        }));
     }
-    log::debug!(
-        "[running_subagents] cancel_by_task task_id={} agent_id={} parent_thread_id={:?} live_entries={}",
-        task_id,
-        metadata.agent_id,
-        metadata.parent_thread_id,
-        registry()
-            .len()
-            .expect("detached task registry lock poisoned")
+
+    let workspace_dir = match ctx.resolved() {
+        Some(context) => context.workspace_dir().ok(),
+        None if !crate::core::runtime::is_saas() => fallback_workspace.map(Path::to_path_buf),
+        None => None,
+    };
+    let Some(workspace_dir) = workspace_dir else {
+        return Ok(None);
+    };
+    let store = crate::agent::orchestration::subagent_sessions::SubagentSessionStore::new(
+        workspace_dir.clone(),
     );
-    Some(CancelledSubagent {
-        agent_id: metadata.agent_id,
-        parent_session: cancelled.owner_id,
-        subagent_session_id: metadata.subagent_session_id,
-        workspace_dir: metadata.workspace_dir,
-        parent_thread_id: metadata.parent_thread_id,
-        already_finished,
-    })
+    let jobs = crate::core::runtime::slot_for::<
+        tinyagents_orchestration::subagent::SubAgentJobRegistry,
+    >(ctx);
+    let selected = crate::agent::orchestration::subagent_sessions::cancel_driver_job_by_task(
+        &store,
+        &workspace_dir.join(".openhuman/subagent_checkpoints"),
+        &jobs,
+        task_id,
+        reason,
+    )?;
+    let driver_pause = selected
+        .as_ref()
+        .filter(|selected| selected.was_paused)
+        .cloned();
+    Ok(selected.map(|selected| CancelledSubagent {
+        agent_id: selected.agent_id,
+        parent_session: selected.parent_session,
+        subagent_session_id: Some(selected.subagent_session_id),
+        workspace_dir: selected.workspace_dir,
+        parent_thread_id: selected.parent_thread_id,
+        already_finished: selected.already_finished,
+        driver_pause,
+        driver_managed: true,
+    }))
 }
 
 pub(crate) fn cancel_by_session_in_workspace(
+    ctx: &crate::core::runtime::DispatchCtx,
     subagent_session_id: &str,
     parent_session: &str,
     workspace_dir: &Path,
 ) -> Option<CancelledSubagent> {
     let task_id =
-        task_id_for_session_in_workspace(subagent_session_id, parent_session, workspace_dir)
+        task_id_for_session_in_workspace(ctx, subagent_session_id, parent_session, workspace_dir)
             .ok()?;
-    cancel_by_task(&task_id)
+    cancel_by_task(ctx, &task_id)
 }
 
 /// Abort and drop every running sub-agent whose parent chat thread is
 /// `thread_id`. Called when that thread is deleted so detached children don't
 /// keep running (and later try to deliver) against a thread that no longer
 /// exists. Returns the number of sub-agents cancelled.
-pub(crate) fn cancel_for_thread(thread_id: &str) -> usize {
-    let own = caller_workspace();
+pub(crate) fn cancel_for_thread(ctx: &crate::core::runtime::DispatchCtx, thread_id: &str) -> usize {
+    let own = caller_workspace(ctx);
     let cancelled = registry()
         .cancel_where(|metadata| {
-            metadata.parent_thread_id.as_deref() == Some(thread_id) && own.admits(metadata)
+            metadata.parent_thread_id.as_deref() == Some(thread_id) && own.admits(ctx, metadata)
         })
         .expect("detached task registry lock poisoned");
     for entry in &cancelled {
-        record_cancelled(&entry.metadata.workspace_dir, entry.task_id.as_str());
+        record_cancelled(ctx, &entry.metadata.workspace_dir, entry.task_id.as_str());
     }
     let count = cancelled.len();
     log::debug!(
@@ -110,17 +180,20 @@ pub(crate) fn cancel_for_thread(thread_id: &str) -> usize {
 /// recorded: delivering one would start a fresh system turn on the thread,
 /// which is exactly what Stop is meant to prevent. Returns the cancelled task
 /// ids.
-pub(crate) fn stop_for_thread(thread_id: &str) -> Vec<String> {
-    let own = caller_workspace();
+pub(crate) fn stop_for_thread(
+    ctx: &crate::core::runtime::DispatchCtx,
+    thread_id: &str,
+) -> Vec<String> {
+    let own = caller_workspace(ctx);
     let cancelled = registry()
         .cancel_where(|metadata| {
-            metadata.parent_thread_id.as_deref() == Some(thread_id) && own.admits(metadata)
+            metadata.parent_thread_id.as_deref() == Some(thread_id) && own.admits(ctx, metadata)
         })
         .expect("detached task registry lock poisoned");
     let mut task_ids = Vec::with_capacity(cancelled.len());
     for entry in cancelled {
         let task_id = entry.task_id.as_str().to_string();
-        record_cancelled(&entry.metadata.workspace_dir, &task_id);
+        record_cancelled(ctx, &entry.metadata.workspace_dir, &task_id);
         if let Some(subagent_session_id) = entry.metadata.subagent_session_id.as_deref() {
             let store = crate::agent::orchestration::subagent_sessions::SubagentSessionStore::new(
                 entry.metadata.workspace_dir.clone(),
@@ -142,6 +215,27 @@ pub(crate) fn stop_for_thread(thread_id: &str) -> Vec<String> {
         }
         task_ids.push(task_id);
     }
+    if let Some(core_context) = ctx.resolved() {
+        if let Ok(workspace_dir) = core_context.workspace_dir() {
+            let jobs = crate::core::runtime::slot_for::<
+                tinyagents_orchestration::subagent::SubAgentJobRegistry,
+            >(ctx);
+            let driver_stopped =
+                crate::agent::orchestration::subagent_sessions::cancel_driver_jobs_for_thread(
+                    &crate::agent::orchestration::subagent_sessions::SubagentSessionStore::new(
+                        workspace_dir.clone(),
+                    ),
+                    &workspace_dir,
+                    &jobs,
+                    thread_id,
+                );
+            for task_id in driver_stopped {
+                if !task_ids.contains(&task_id) {
+                    task_ids.push(task_id);
+                }
+            }
+        }
+    }
     log::info!(
         "[running_subagents] stop_for_thread thread_id={} cancelled={} live_entries={}",
         thread_id,
@@ -159,16 +253,16 @@ pub(crate) fn stop_for_thread(thread_id: &str) -> Vec<String> {
 /// [`super::super::background_completions`] and drop any straggler completion
 /// that wins the cooperative-abort race. Headless sub-agents (no parent thread)
 /// are still aborted but contribute no id.
-pub(crate) fn cancel_all() -> Vec<String> {
-    let own = caller_workspace();
+pub(crate) fn cancel_all(ctx: &crate::core::runtime::DispatchCtx) -> Vec<String> {
+    let own = caller_workspace(ctx);
     let cancelled = registry()
-        .cancel_where(|metadata| own.admits(metadata))
+        .cancel_where(|metadata| own.admits(ctx, metadata))
         .expect("detached task registry lock poisoned");
     let count = cancelled.len();
     let mut thread_ids: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for entry in cancelled {
-        record_cancelled(&entry.metadata.workspace_dir, entry.task_id.as_str());
+        record_cancelled(ctx, &entry.metadata.workspace_dir, entry.task_id.as_str());
         if let Some(thread_id) = entry.metadata.parent_thread_id {
             if seen.insert(thread_id.clone()) {
                 thread_ids.push(thread_id);
@@ -197,20 +291,21 @@ pub(crate) enum CallerWorkspace {
 }
 
 impl CallerWorkspace {
-    pub(crate) fn admits(&self, metadata: &super::registry::RunningSubagentMetadata) -> bool {
+    pub(crate) fn admits(
+        &self,
+        ctx: &crate::core::runtime::DispatchCtx,
+        metadata: &super::registry::RunningSubagentMetadata,
+    ) -> bool {
         match self {
             Self::All => true,
-            Self::Only(dir) => metadata.workspace_dir == *dir,
+            Self::Only(dir) => metadata.workspace_dir == *dir && control_admits(ctx, metadata),
             Self::Nothing => false,
         }
     }
 }
 
-pub(crate) fn caller_workspace() -> CallerWorkspace {
-    caller_workspace_in(
-        crate::core::runtime::is_saas(),
-        crate::core::runtime::tenant::context_in(true).as_deref(),
-    )
+pub(crate) fn caller_workspace(ctx: &crate::core::runtime::DispatchCtx) -> CallerWorkspace {
+    caller_workspace_in(crate::core::runtime::is_saas(), ctx.resolved().as_deref())
 }
 
 /// [`caller_workspace`] as a function of the mode and the task's own scope.

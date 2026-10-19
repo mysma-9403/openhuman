@@ -1,7 +1,7 @@
 //! Operator adapters installed once, before the SaaS profile host boots.
 
 use super::{ProfileError, ProfileRuntimeBuilder, SaasConfig};
-use crate::seams::{ToolHook, ToolHookContext};
+use crate::seams::{OpenHumanRunContext, ToolHook, ToolHookContext};
 use crate::{
     HostTools, HostTurnTools, PermissionFuture, PermissionLevel, ToolScopeSpec, TurnContext,
 };
@@ -12,7 +12,7 @@ use std::sync::Arc;
 pub(super) struct ProfileHostOptions {
     tools: Option<HostTools>,
     scope: Option<ToolScopeSpec>,
-    permission: Option<Arc<dyn ToolHook>>,
+    permission: Option<Arc<dyn ToolHook<OpenHumanRunContext>>>,
     channels: HashMap<String, PermissionLevel>,
     memory: Option<Arc<dyn tinymemory_api::MemoryEngine>>,
     system_prompt: Option<String>,
@@ -28,7 +28,7 @@ impl ProfileHostOptions {
             Some(ToolScopeSpec::Wildcard) => {
                 return Err(ProfileError::Boot(
                     "profile tools require a named or host-only scope".into(),
-                ))
+                ));
             }
             Some(ToolScopeSpec::Named(names)) => Some(names.into_iter().collect()),
             _ => None,

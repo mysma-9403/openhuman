@@ -2,6 +2,7 @@
 //! update, including the save-time verification of a custom endpoint.
 
 use crate::config::Config;
+use crate::core::runtime::DispatchCtx;
 use crate::core::Outcome;
 use crate::security::credentials::AuthService;
 
@@ -193,16 +194,16 @@ pub async fn get_settings(config: &Config) -> Result<Outcome<serde_json::Value>,
 /// the embedding signature any more (memory v2 engines embed server-side), so a
 /// change applies directly.
 pub async fn update_settings(
+    ctx: &DispatchCtx,
     provider: Option<String>,
     model: Option<String>,
     dimensions: Option<usize>,
     custom_endpoint: Option<String>,
     rate_limit_per_min: Option<u32>,
 ) -> Result<Outcome<serde_json::Value>, String> {
-    use crate::config::ops as config_rpc;
-    use crate::inference::embedding_host::format_embedding_signature;
+    use tinyinference_embeddings::format_embedding_signature;
 
-    let mut config = config_rpc::load_config_with_timeout().await?;
+    let mut config = ctx.load_config().await?;
 
     // Upgrade-in-place for users whose endpoint predates the retained Custom
     // profile: if they disable or switch away now, capture the active profile
@@ -288,10 +289,10 @@ pub async fn update_settings(
                 // auth vs wrong-model vs unreachable failures (issue #5017).
                 let reject_code = reject.error;
                 tracing::warn!(
-                        provider = effective_provider.as_str(),
-                        reject_code,
-                        "{LOG_PREFIX} update_settings rejected — embeddings endpoint failed verification"
-                    );
+                    provider = effective_provider.as_str(),
+                    reject_code,
+                    "{LOG_PREFIX} update_settings rejected — embeddings endpoint failed verification"
+                );
                 // Right-feedback (issue #3761): the probe failed. If the
                 // endpoint lists its served models and the requested id
                 // isn't among them, the cause is almost certainly a name
@@ -310,27 +311,27 @@ pub async fn update_settings(
                 if let Some(ep) = listed_endpoint {
                     let api_key = resolve_api_key(&config, "custom");
                     tracing::debug!(
-                            provider = effective_provider.as_str(),
-                            requested = new_model.as_str(),
-                            "{LOG_PREFIX} update_settings: probing endpoint /models for served-id guidance"
-                        );
+                        provider = effective_provider.as_str(),
+                        requested = new_model.as_str(),
+                        "{LOG_PREFIX} update_settings: probing endpoint /models for served-id guidance"
+                    );
                     match fetch_served_model_ids(ep, &api_key).await {
                         Ok(served) => match check_requested_model_served(&new_model, &served) {
                             Some(better) => {
                                 tracing::warn!(
-                                        provider = effective_provider.as_str(),
-                                        requested = new_model.as_str(),
-                                        served = served.len(),
-                                        "{LOG_PREFIX} update_settings: model not in served list — returning name-mismatch guidance"
-                                    );
+                                    provider = effective_provider.as_str(),
+                                    requested = new_model.as_str(),
+                                    served = served.len(),
+                                    "{LOG_PREFIX} update_settings: model not in served list — returning name-mismatch guidance"
+                                );
                                 return Ok(model_rejection_outcome(better));
                             }
                             None => {
                                 tracing::debug!(
-                                        provider = effective_provider.as_str(),
-                                        served = served.len(),
-                                        "{LOG_PREFIX} update_settings: requested model is served (or list empty) — keeping generic verification error"
-                                    );
+                                    provider = effective_provider.as_str(),
+                                    served = served.len(),
+                                    "{LOG_PREFIX} update_settings: requested model is served (or list empty) — keeping generic verification error"
+                                );
                             }
                         },
                         Err(e) => {
@@ -353,12 +354,12 @@ pub async fn update_settings(
             let detected_dims = final_probe_dims(&new_model, new_dims, probe_actual_dims);
             if detected_dims != new_dims {
                 tracing::info!(
-                        provider = effective_provider.as_str(),
-                        model = new_model.as_str(),
-                        requested = new_dims,
-                        detected = detected_dims,
-                        "{LOG_PREFIX} update_settings auto-detected custom embedding dimension from probe"
-                    );
+                    provider = effective_provider.as_str(),
+                    model = new_model.as_str(),
+                    requested = new_dims,
+                    detected = detected_dims,
+                    "{LOG_PREFIX} update_settings auto-detected custom embedding dimension from probe"
+                );
                 new_dims = detected_dims;
                 new_sig = format_embedding_signature(&new_provider, &new_model, new_dims);
                 sig_changed = new_sig != old_sig;
@@ -404,7 +405,10 @@ pub async fn update_settings(
         }
     }
 
-    config.save().await.map_err(|e| e.to_string())?;
+    config
+        .save()
+        .await
+        .map_err(crate::config::ops::config_save_error)?;
 
     tracing::info!(
         provider = config.memory.embedding_provider.as_str(),

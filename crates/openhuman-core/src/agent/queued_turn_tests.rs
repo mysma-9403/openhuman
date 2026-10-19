@@ -1,7 +1,7 @@
 use super::*;
 
 fn marker(name: &str) -> String {
-    super::super::attachments::Attachment {
+    crate::attachments::Attachment {
         path: "uploads/thread/id/file.zip".into(),
         name: name.into(),
         mime: "application/zip".into(),
@@ -42,7 +42,7 @@ fn mixed_markers_keep_source_order() {
 
 #[test]
 fn invalid_durable_reference_stays_literal() {
-    let invalid = super::super::attachments::Attachment {
+    let invalid = crate::attachments::Attachment {
         path: "../escape.zip".into(),
         name: "escape.zip".into(),
         mime: "application/zip".into(),

@@ -13,6 +13,16 @@ use super::types::{
     SubagentSessionStore, SubagentSessionUpsert,
 };
 
+#[path = "ops_driver.rs"]
+mod driver;
+#[cfg(test)]
+use driver::record_cancel_reason;
+pub use driver::{
+    cancel_driver_job_by_task, cancel_driver_job_for_observed_session,
+    cancel_driver_jobs_for_thread, mark_driver_pause_cancelled, resolve_lifecycle_key,
+    DriverTaskCancellation,
+};
+
 pub fn normalize_task_key(input: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
@@ -105,6 +115,14 @@ pub fn upsert_running(
         .find(|session| session.subagent_session_id == session_id)
         .cloned()
     {
+        if let Some(reuse) = reuse {
+            if existing.status == DurableSubagentStatus::Closed
+                || existing.current_task_id != reuse.current_task_id
+                || existing.lifecycle_key != reuse.lifecycle_key
+            {
+                return Err("stale reusable sub-agent session changed during upsert".into());
+            }
+        }
         existing
     } else {
         DurableSubagentSession {
@@ -120,6 +138,7 @@ pub fn upsert_running(
             task_key: upsert.selector.task_key.clone(),
             task_title: upsert.task_title.clone(),
             current_task_id: None,
+            lifecycle_key: None,
             status: DurableSubagentStatus::Running,
             reusable: true,
             latest_history: None,
@@ -135,6 +154,7 @@ pub fn upsert_running(
     session.worker_thread_id = upsert.worker_thread_id.or(session.worker_thread_id);
     session.display_name = upsert.display_name.or(session.display_name);
     session.current_task_id = Some(upsert.task_id);
+    session.lifecycle_key = upsert.lifecycle_key.or(session.lifecycle_key);
     session.status = DurableSubagentStatus::Running;
     session.reusable = true;
     session.latest_error = None;
@@ -154,8 +174,7 @@ pub fn mark_finished(
     run_status: &SubagentRunStatus,
     history: Vec<TranscriptMessage>,
 ) -> Result<(), String> {
-    let updated = update_session(store, subagent_session_id, |session, now| {
-        session.current_task_id = Some(task_id.to_string());
+    let updated = update_session_for_task(store, subagent_session_id, task_id, |session, now| {
         session.status = DurableSubagentStatus::from_run_status(run_status);
         session.latest_history = Some(history);
         session.latest_error = None;
@@ -177,8 +196,7 @@ pub fn mark_failed(
     task_id: &str,
     error: String,
 ) -> Result<(), String> {
-    let updated = update_session(store, subagent_session_id, |session, now| {
-        session.current_task_id = Some(task_id.to_string());
+    let updated = update_session_for_task(store, subagent_session_id, task_id, |session, now| {
         session.status = DurableSubagentStatus::Failed;
         session.latest_error = Some(error);
         session.updated_at = now.clone();
@@ -200,6 +218,42 @@ pub fn close(store: &SubagentSessionStore, subagent_session_id: &str) -> Result<
         session.updated_at = now.clone();
         session.last_used_at = now;
     })
+}
+
+/// Closes a session only if it still contains the lifecycle snapshot that the
+/// caller observed and cancelled. `false` means a concurrent reuse or close
+/// won the race and this stale request did not alter the newer row.
+pub fn close_if_current(
+    store: &SubagentSessionStore,
+    observed: &DurableSubagentSession,
+) -> Result<bool, String> {
+    let _guard = store_write_lock()
+        .lock()
+        .map_err(|_| "subagent session store lock poisoned".to_string())?;
+    let mut sessions = store.load()?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let Some(session) = sessions
+        .iter_mut()
+        .find(|session| session.subagent_session_id == observed.subagent_session_id)
+    else {
+        return Ok(false);
+    };
+    if session.parent_session != observed.parent_session
+        || session.parent_thread_id != observed.parent_thread_id
+        || session.current_task_id != observed.current_task_id
+        || session.lifecycle_key != observed.lifecycle_key
+    {
+        return Ok(false);
+    }
+    if session.status == DurableSubagentStatus::Closed {
+        return Ok(true);
+    }
+    session.status = DurableSubagentStatus::Closed;
+    session.reusable = false;
+    session.updated_at = now.clone();
+    session.last_used_at = now;
+    store.save(&sessions)?;
+    Ok(true)
 }
 
 pub fn list_for_parent(
@@ -249,6 +303,39 @@ where
         .iter_mut()
         .find(|session| session.subagent_session_id == subagent_session_id)
     {
+        update(session, now);
+        store.save(&sessions)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Apply a terminal write only while it still belongs to the current task.
+/// The check and write share the store lock so a late completion cannot
+/// overwrite a reused session or revive one that has already been closed.
+fn update_session_for_task<F>(
+    store: &SubagentSessionStore,
+    subagent_session_id: &str,
+    task_id: &str,
+    update: F,
+) -> Result<bool, String>
+where
+    F: FnOnce(&mut DurableSubagentSession, String),
+{
+    let _guard = store_write_lock()
+        .lock()
+        .map_err(|_| "subagent session store lock poisoned".to_string())?;
+    let mut sessions = store.load()?;
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(session) = sessions
+        .iter_mut()
+        .find(|session| session.subagent_session_id == subagent_session_id)
+    {
+        if session.status == DurableSubagentStatus::Closed
+            || session.current_task_id.as_deref() != Some(task_id)
+        {
+            return Ok(false);
+        }
         update(session, now);
         store.save(&sessions)?;
         return Ok(true);

@@ -23,11 +23,13 @@
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 
-use crate::agent::debug::prompt_size::{render_text, PromptSizeReport};
-use crate::agent::debug::{
+use crate::agent_registry::host_definition::AgentDefinitionRegistry;
+use crate::core::agent_cli::debug::prompt_size::{render_text, PromptSizeReport};
+use crate::core::agent_cli::debug::{
     dump_agent_prompt, dump_all_agent_prompts, write_prompt_dumps, DumpPromptOptions, DumpedPrompt,
 };
-use crate::agent::harness::definition::AgentDefinitionRegistry;
+
+pub(crate) mod debug;
 
 /// Entry point for `openhuman agent <subcommand>`.
 pub fn run_agent_command(args: &[String]) -> Result<()> {
@@ -295,7 +297,9 @@ fn parse_dump_all_flags(args: &[String]) -> Result<DumpAllFlags> {
                 i += 1;
             }
             "-h" | "--help" => {
-                println!("Usage: openhuman agent dump-all --out <dir> [--workspace <path>] [--model <name>] [-v]");
+                println!(
+                    "Usage: openhuman agent dump-all --out <dir> [--workspace <path>] [--model <name>] [-v]"
+                );
                 println!();
                 println!("Render every registered agent's turn-1 system prompt into <dir>.");
                 std::process::exit(0);
@@ -466,7 +470,10 @@ fn run_dump_prompt(args: &[String]) -> Result<()> {
         // and splitting the header onto stderr the way `print_human` does
         // would make `> turn.txt` drop the byte counts that give the payload
         // its meaning.
-        print!("{}", crate::agent::debug::render_wire_dump(&dumped));
+        print!(
+            "{}",
+            crate::core::agent_cli::debug::render_wire_dump(&dumped)
+        );
     } else if flags.json {
         print_json(&dumped, flags.with_tools)?;
     } else {
@@ -588,7 +595,9 @@ fn run_list(args: &[String]) -> Result<()> {
             "-h" | "--help" => {
                 println!("Usage: openhuman agent list [--workspace <path>] [--json] [-v]");
                 println!();
-                println!("  List every built-in agent plus any custom `<workspace>/agents/*.toml` overrides.");
+                println!(
+                    "  List every built-in agent plus any custom `<workspace>/agents/*.toml` overrides."
+                );
                 return Ok(());
             }
             other => return Err(anyhow!("unknown list arg: {other}")),
@@ -626,11 +635,11 @@ fn run_list(args: &[String]) -> Result<()> {
             );
             obj.insert(
                 "omit_safety_preamble".into(),
-                serde_json::Value::Bool(def.omit_safety_preamble),
+                serde_json::Value::Bool(def.extensions.omit_safety_preamble),
             );
             obj.insert(
                 "omit_identity".into(),
-                serde_json::Value::Bool(def.omit_identity),
+                serde_json::Value::Bool(def.extensions.omit_identity),
             );
             arr.push(serde_json::Value::Object(obj));
         }
@@ -660,7 +669,9 @@ fn print_agent_help() {
     println!();
     println!("Usage:");
     println!("  openhuman agent list [--workspace <path>] [--json]");
-    println!("  openhuman agent dump-prompt --agent <id> [--workspace <path>] [--model <name>] [--with-tools] [--wire] [--json] [-v]");
+    println!(
+        "  openhuman agent dump-prompt --agent <id> [--workspace <path>] [--model <name>] [--with-tools] [--wire] [--json] [-v]"
+    );
     println!("  openhuman agent dump-all --out <dir> [--workspace <path>] [--model <name>] [-v]");
     println!("  openhuman agent prompt-size [--agent <id>] [--workspace <path>] [--json] [-v]");
     println!();

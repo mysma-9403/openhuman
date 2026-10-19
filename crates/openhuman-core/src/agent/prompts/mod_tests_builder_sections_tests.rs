@@ -1,4 +1,5 @@
 use super::*;
+use tinytools_agent::dialect::ToolCallFormat;
 
 #[test]
 fn prompt_builder_assembles_sections() {
@@ -164,8 +165,6 @@ fn identity_section_creates_missing_workspace_files() {
         include_str!("SOUL.md"),
         "seeded SOUL.md must be the checked-in template verbatim"
     );
-
-    let _ = std::fs::remove_dir_all(workspace);
 }
 
 #[test]
@@ -238,7 +237,7 @@ fn current_datetime_line_is_fresh_local_stamp() {
     // The per-turn stamp carries a parseable local date, IANA zone (or the
     // `UTC` fallback), a UTC offset, and the weekday — everything the model
     // needs to localize a greeting without a tool call (#3602).
-    let line = super::super::current_datetime_line(None);
+    let line = crate::prompts::current_datetime_line(None);
     let rest = line
         .strip_prefix("Current Date & Time: ")
         .unwrap_or_else(|| panic!("stamp must start with canonical prefix: {line}"));
@@ -259,7 +258,7 @@ fn current_datetime_line_is_fresh_local_stamp() {
 /// does not know falls back to the device stamp rather than echoing it.
 #[test]
 fn current_datetime_line_is_stamped_in_the_users_zone() {
-    let line = super::super::current_datetime_line(Some("Pacific/Chatham"));
+    let line = crate::prompts::current_datetime_line(Some("Pacific/Chatham"));
     let now = chrono::Utc::now().with_timezone(&chrono_tz::Pacific::Chatham);
     assert!(line.contains(" Pacific/Chatham ("), "{line}");
     assert!(
@@ -268,7 +267,7 @@ fn current_datetime_line_is_stamped_in_the_users_zone() {
     );
     assert!(line.contains(&now.format("%Y-%m-%d").to_string()), "{line}");
 
-    let line = super::super::current_datetime_line(Some("Not/AZone"));
+    let line = crate::prompts::current_datetime_line(Some("Not/AZone"));
     assert!(!line.contains("Not/AZone"), "{line}");
 }
 

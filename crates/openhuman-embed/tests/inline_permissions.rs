@@ -28,9 +28,9 @@ impl Tool for Probe {
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{}})
     }
-    async fn execute(&self, _: Value) -> anyhow::Result<openhuman_core::tools::ToolResult> {
+    async fn execute(&self, _: Value) -> anyhow::Result<tinytools::ToolResult> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(openhuman_core::tools::ToolResult::success("ran"))
+        Ok(tinytools::ToolResult::success("ran"))
     }
 }
 #[test]
@@ -84,7 +84,7 @@ async fn scenario() {
                 Box::pin(async move {
                     decision
                         .await
-                        .unwrap_or_else(|_| ToolHookDecision::Deny("UI closed".into()))
+                        .unwrap_or_else(|_| ToolHookDecision::deny("UI closed"))
                 })
             }),
         )
@@ -92,7 +92,7 @@ async fn scenario() {
     let other = runtime
         .agent(
             spec("other", &other_provider, other_calls.clone())
-                .can_use_tool(|_| Box::pin(async { ToolHookDecision::Proceed })),
+                .can_use_tool(|_| Box::pin(async { ToolHookDecision::default() })),
         )
         .unwrap();
     let first = tokio::spawn(agent.turn("needs approval").send());
@@ -111,7 +111,7 @@ async fn scenario() {
     other.run("independent worker").await.unwrap();
     assert_eq!(other_calls.load(Ordering::SeqCst), 1);
     answer
-        .send(ToolHookDecision::Deny("human refused".into()))
+        .send(ToolHookDecision::deny("human refused"))
         .unwrap();
     assert!(
         first.await.unwrap().is_err(),
@@ -121,13 +121,11 @@ async fn scenario() {
     let second = tokio::spawn(
         agent
             .turn("turn-specific refusal")
-            .can_use_tool(|_| {
-                Box::pin(async { ToolHookDecision::Deny("turn narrowed authority".into()) })
-            })
+            .can_use_tool(|_| Box::pin(async { ToolHookDecision::deny("turn narrowed authority") }))
             .send(),
     );
     let (_, answer) = received.recv().await.unwrap();
-    answer.send(ToolHookDecision::Proceed).unwrap();
+    answer.send(ToolHookDecision::default()).unwrap();
     assert!(
         second.await.unwrap().is_err(),
         "turn denial unexpectedly succeeded"
@@ -135,7 +133,7 @@ async fn scenario() {
     assert_eq!(calls.load(Ordering::SeqCst), 0, "turn policy was skipped");
     let third = tokio::spawn(agent.turn("next turn").send());
     let (_, answer) = received.recv().await.unwrap();
-    answer.send(ToolHookDecision::Proceed).unwrap();
+    answer.send(ToolHookDecision::default()).unwrap();
     third.await.unwrap().unwrap();
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -185,9 +183,9 @@ async fn repeated_permissions(runtime: &Runtime) {
                     HostTurnTools::advertised(vec![Box::new(Probe(tool_calls.clone()))])
                 })
                 .can_use_tool(|_| {
-                    Box::pin(async { ToolHookDecision::Deny("first policy refused".into()) })
+                    Box::pin(async { ToolHookDecision::deny("first policy refused") })
                 })
-                .can_use_tool(|_| Box::pin(async { ToolHookDecision::Proceed })),
+                .can_use_tool(|_| Box::pin(async { ToolHookDecision::default() })),
         )
         .unwrap();
     assert!(agent.run("perform probe").await.is_err());

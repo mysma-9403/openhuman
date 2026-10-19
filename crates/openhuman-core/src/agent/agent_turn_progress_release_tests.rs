@@ -33,10 +33,7 @@ async fn clearing_progress_after_a_turn_closes_the_receiver() {
         // The turn's own events are still delivered, then the channel closes.
         let mut saw_completed = false;
         while let Some(event) = rx.recv().await {
-            saw_completed |= matches!(
-                event,
-                crate::agent::progress::AgentProgress::TurnCompleted { .. }
-            );
+            saw_completed |= matches!(event, crate::progress::AgentProgress::TurnCompleted { .. });
         }
         assert!(saw_completed, "turn must still report TurnCompleted");
     }

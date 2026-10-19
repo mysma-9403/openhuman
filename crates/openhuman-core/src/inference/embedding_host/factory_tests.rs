@@ -112,7 +112,7 @@ fn config_aware_factory_builds_managed_provider() {
 /// construct successfully. This is the build-side smoke check; the *binding*
 /// proof (that `config.local_ai.base_url` is the URL actually used) is
 /// [`config_aware_factory_ollama_embeds_against_config_base_url`] below —
-/// `create_embedding_provider_with_config` returns `Box<dyn EmbeddingProvider>`,
+/// `create_embedding_provider_with_config` returns `Box<dyn EmbeddingModel>`,
 /// whose trait surface is `name`/`model_id`/`dimensions`/`embed`, so there is
 /// no `base_url()` accessor to assert against here.
 #[test]
@@ -188,7 +188,7 @@ async fn config_aware_factory_ollama_embeds_against_config_base_url() {
             .expect("ollama provider builds with a config base_url");
 
     let vectors = provider
-        .embed(&["binding probe"])
+        .embed(&["binding probe".to_string()])
         .await
         .expect("factory-built ollama embedder must reach the config base_url");
     assert_eq!(vectors.first().map(|v| v.len()).unwrap_or(0), 3);
@@ -282,172 +282,9 @@ async fn default_embedder_honors_configured_local_provider() {
     assert_eq!(provider.model_id(), "bge-m3");
     assert_eq!(provider.dimensions(), 3);
     let vectors = provider
-        .embed(&["default factory endpoint probe"])
+        .embed(&["default factory endpoint probe".to_string()])
         .await
         .expect("default factory must reach the configured Ollama endpoint");
     assert_eq!(vectors.first().map(|v| v.len()), Some(3));
     assert_eq!(*hit.count.lock().unwrap(), 1);
-}
-
-/// End-to-end binding proof (#5356): a provider built **through
-/// `create_embedding_provider_with_config`** must authenticate with the
-/// `app-session` token stored under the *config* credential scope. A local
-/// mock stands in for the cloud backend (no external network) and captures
-/// the bearer it receives. A regression to `OpenHumanCloudEmbedding::new(None,
-/// None, true, …)` would resolve the token from `default_state_dir()` — a
-/// different directory with no token — and fail with "No backend session"
-/// before any request, so this test fails if the factory ignores `config`.
-#[tokio::test]
-async fn factory_managed_provider_authenticates_with_config_scoped_token() {
-    use std::sync::{Arc, Mutex};
-
-    use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
-
-    // Mock cloud embeddings backend at {BACKEND_URL}/openai/v1/embeddings.
-    #[derive(Clone, Default)]
-    struct Captured {
-        auth: Arc<Mutex<Option<String>>>,
-    }
-    let captured = Captured::default();
-    let app = Router::new()
-        .route(
-            "/openai/v1/embeddings",
-            post(
-                |State(cap): State<Captured>,
-                 headers: HeaderMap,
-                 Json(_body): Json<serde_json::Value>| async move {
-                    *cap.auth.lock().unwrap() = headers
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_owned);
-                    Json(serde_json::json!({
-                        "object": "list",
-                        "data": [{ "object": "embedding", "index": 0, "embedding": [0.1_f32, 0.2, 0.3] }],
-                        "model": "voyage-3-large",
-                    }))
-                },
-            ),
-        )
-        .with_state(captured.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    // The app-session token lives ONLY under the config credential scope.
-    let tmp = TempDir::new().unwrap();
-    let config = test_config(&tmp);
-    AuthService::from_config(&config)
-        .store_provider_token(
-            APP_SESSION_PROVIDER,
-            "default",
-            "sess-scoped-5356",
-            HashMap::new(),
-            true,
-        )
-        .unwrap();
-
-    // The managed base URL comes from the backend transport, which (the
-    // `cfg(test)` plain one here) honours `config.api_url`: point it at the mock.
-    let config = Config {
-        api_url: Some(base.clone()),
-        ..config
-    };
-    let provider =
-        create_embedding_provider_with_config(&config, "managed", "voyage-3-large", 3, "", None)
-            .expect("managed provider builds via config-aware factory");
-
-    // Embed: the lazy bearer resolver reads the config scope, finds the
-    // token, and authenticates to the mock.
-    let vectors = provider
-        .embed(&["binding probe"])
-        .await
-        .expect("factory-built managed provider must resolve the config-scoped token and embed");
-    assert_eq!(vectors.first().map(|v| v.len()).unwrap_or(0), 3);
-    assert_eq!(
-        captured.auth.lock().unwrap().as_deref(),
-        Some("Bearer sess-scoped-5356"),
-        "managed provider must authenticate with the token from the config scope"
-    );
-}
-
-/// #5501 regression: the memory client's inline embedder is built through
-/// [`default_embedding_provider_with_config`], which MUST authenticate with
-/// the `app-session` token under the *config* credential scope — the same
-/// scope "Test connection" uses. The removed pre-fix keyless constructor
-/// resolved `default_state_dir()` with
-/// encryption forced on, so a signed-in user's ingested documents embedded
-/// with "No backend session" and persisted vector-less while the connection
-/// test still passed. A local mock stands in for the cloud backend (no
-/// network) and captures the bearer it receives; a regression back to the
-/// keyless constructor resolves a scope with no token and never reaches it.
-#[tokio::test]
-async fn default_provider_with_config_authenticates_with_config_scoped_token() {
-    use std::sync::{Arc, Mutex};
-
-    use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
-
-    #[derive(Clone, Default)]
-    struct Captured {
-        auth: Arc<Mutex<Option<String>>>,
-    }
-    let captured = Captured::default();
-    let app = Router::new()
-        .route(
-            "/openai/v1/embeddings",
-            post(
-                |State(cap): State<Captured>,
-                 headers: HeaderMap,
-                 Json(_body): Json<serde_json::Value>| async move {
-                    *cap.auth.lock().unwrap() = headers
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_owned);
-                    // The embedder validates returned dims against the
-                    // requested default, so the mock must echo that width.
-                    let embedding = vec![0.1_f32; DEFAULT_CLOUD_EMBEDDING_DIMENSIONS];
-                    Json(serde_json::json!({
-                        "object": "list",
-                        "data": [{ "object": "embedding", "index": 0, "embedding": embedding }],
-                        "model": DEFAULT_CLOUD_EMBEDDING_MODEL,
-                    }))
-                },
-            ),
-        )
-        .with_state(captured.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    // The app-session token lives ONLY under the config credential scope.
-    let tmp = TempDir::new().unwrap();
-    let config = test_config(&tmp);
-    AuthService::from_config(&config)
-        .store_provider_token(
-            APP_SESSION_PROVIDER,
-            "default",
-            "sess-default-5501",
-            HashMap::new(),
-            true,
-        )
-        .unwrap();
-
-    let config = Config {
-        api_url: Some(base.clone()),
-        ..config
-    };
-    let provider = default_embedding_provider_with_config(&config);
-
-    let vectors = provider
-        .embed(&["binding probe"])
-        .await
-        .expect("config-scoped default embedder must resolve the app-session token and embed");
-    assert_eq!(
-        vectors.first().map(|v| v.len()).unwrap_or(0),
-        DEFAULT_CLOUD_EMBEDDING_DIMENSIONS
-    );
-    assert_eq!(
-        captured.auth.lock().unwrap().as_deref(),
-        Some("Bearer sess-default-5501"),
-        "the memory client's default embedder must authenticate with the config-scoped token"
-    );
 }

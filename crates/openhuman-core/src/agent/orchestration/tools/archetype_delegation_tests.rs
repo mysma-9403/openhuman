@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::harness::definition::AgentDefinitionRegistry;
+use crate::agent_registry::host_definition::AgentDefinitionRegistry;
 
 fn sample_tool() -> ArchetypeDelegationTool {
     ArchetypeDelegationTool {
@@ -147,7 +147,8 @@ fn prompt_documents_the_stripped_envelope_fields() {
     // resume a paused worker. The unadvertised hand-off fields must NOT be
     // taught there any more: a prompt naming fields the schema does not offer
     // sends the model arguments it cannot see.
-    const ORCHESTRATOR_PROMPT: &str = include_str!("../../registry/agents/orchestrator/prompt.md");
+    const ORCHESTRATOR_PROMPT: &str =
+        include_str!("../../../agent_registry/agents/orchestrator/prompt.md");
 
     for needle in ["blocking: true", "continue_subagent"] {
         assert!(

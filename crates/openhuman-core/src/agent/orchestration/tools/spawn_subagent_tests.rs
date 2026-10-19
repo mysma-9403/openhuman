@@ -10,6 +10,7 @@ fn sample_outcome(output: &str) -> SubagentRunOutcome {
         output: output.to_string(),
         elapsed: Duration::from_millis(120),
         iterations: 3,
+        failure_cause: None,
         mode: SubagentMode::Typed,
         status: SubagentRunStatus::Completed,
         final_history: Vec::new(),
@@ -96,6 +97,7 @@ fn persist_worker_thread_creates_thread_with_tasks_label_and_messages() {
     let temp = TempDir::new().expect("tempdir");
     let outcome = sample_outcome("the answer is 42");
     let thread_id = persist_worker_thread(
+        &crate::core::runtime::DispatchCtx::ambient(),
         temp.path(),
         "task_manager_agent",
         "draft a long research plan",
@@ -105,7 +107,11 @@ fn persist_worker_thread_creates_thread_with_tasks_label_and_messages() {
 
     assert!(thread_id.starts_with("worker-"));
 
-    let threads = conversations::list_threads(temp.path().to_path_buf()).expect("list threads");
+    let threads = conversations::list_threads(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        temp.path().to_path_buf(),
+    )
+    .expect("list threads");
     let worker = threads
         .iter()
         .find(|t| t.id == thread_id)
@@ -113,8 +119,12 @@ fn persist_worker_thread_creates_thread_with_tasks_label_and_messages() {
     assert!(worker.labels.contains(&"tasks".to_string()));
     assert!(worker.title.starts_with("draft a long research plan"));
 
-    let messages =
-        conversations::get_messages(temp.path().to_path_buf(), &thread_id).expect("messages");
+    let messages = conversations::get_messages(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        temp.path().to_path_buf(),
+        &thread_id,
+    )
+    .expect("messages");
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].sender, "user");
     assert_eq!(messages[0].content, "draft a long research plan");

@@ -11,7 +11,7 @@ A hook is a script you own. OpenHuman runs it at a set moment, such as before a 
 
 The contract matches [Cursor's](https://cursor.com/docs/hooks): the same file name, event names, stdin envelope, stdout decision and exit codes. A hook script written for either host runs on the other unchanged.
 
-> "Hook" has a second, unrelated meaning in this codebase: the in-process Rust traits in `crates/openhuman-core/src/agent/hooks.rs`. An embedding host installs those by compiling against the core. This page is about the file-based kind.
+> "Hook" has a second, unrelated meaning in this codebase: the in-process Rust contracts from `tinyagents-hooks`. Embedding hosts register those through `openhuman-embed`. This page is about the file-based kind.
 
 ## The file
 
@@ -102,7 +102,7 @@ Every field is optional. Each event honors the subset it defines:
 | `preToolUse` | before any tool | `permission`, `updated_input`, `agent_message` |
 | `postToolUse` | after a tool succeeded | `additional_context` |
 | `postToolUseFailure` | after a tool failed | - |
-| `beforeShellExecution` | before `shell` / `node_exec` / ... | `permission`, `agent_message` |
+| `beforeShellExecution` | before `shell` | `permission`, `agent_message` |
 | `afterShellExecution` | after one completed | - |
 | `beforeReadFile` | before `file_read` / `read_diff` | `permission` |
 | `afterFileEdit` | after `file_write` / `edit` / `apply_patch` | - |
@@ -214,6 +214,6 @@ Both need `chmod +x`.
 
 ## Implementation
 
-The engine and the whole `hooks.json` contract live upstream in `tinyagents_runtime::command_hooks`. That covers the types, the file and its layering, the matcher, running one hook (stdin, timeout, exit codes), selection, ordering and aggregation, the context envelope, and follow-ups.
+The engine and the whole `hooks.json` contract live upstream in `tinyagents_hooks::command`. That covers the types, the file and its layering, the matcher, running one hook (stdin, timeout, exit codes), selection, ordering and aggregation, the context envelope, and follow-ups.
 
-`crates/openhuman-core/src/hooks/` holds the host half: `bridge` (mounts the engine on the harness's tool and turn paths), `ops` (moments with no existing path), `host`, `schemas` (the RPC surface) and `prompt_eval`. The `README.md` beside the code is the authoritative split.
+`crates/openhuman-core/src/hooks/` holds the host half: `ops` (runtime lifecycle), `host`, `schemas` (the RPC surface) and `prompt_eval`. The `README.md` beside the code is the authoritative split.

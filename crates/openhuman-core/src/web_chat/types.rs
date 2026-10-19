@@ -197,7 +197,7 @@ pub(crate) struct WebChatParams {
     /// ignored (logged), not rejected.
     #[serde(default)]
     pub(super) run_mode: Option<String>,
-    /// Optional reasoning effort for this thread (`agent::tinyagents::reasoning`).
+    /// Optional reasoning effort for this thread (`inference::reasoning`).
     /// Omitted leaves the thread's prior choice; `"default"` clears it.
     #[serde(default)]
     pub(super) reasoning_effort: Option<String>,

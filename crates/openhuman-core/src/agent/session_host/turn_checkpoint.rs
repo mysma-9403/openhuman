@@ -1,3 +1,5 @@
+use tinyagents_harness::middleware::wrap_harness_instruction;
+
 /// Instruction appended (as a synthetic user turn) to the provider
 /// messages when a turn hits the tool-call iteration cap. Asks the model
 /// to wrap up with a resumable checkpoint instead of letting the turn die.
@@ -114,40 +116,30 @@ call a tool. Answer instead, and you will be asked to conclude next.";
 /// One completed tool call, carrying enough of its **actual output** to stand
 /// in for an answer (issue #6014).
 ///
-/// Deliberately not [`ToolCallRecord`](crate::agent::hooks::ToolCallRecord), and the difference is a contract rather
+/// Deliberately not the harness's `ToolOutcomeRecord`, and the difference is a contract rather
 /// than a convenience: that type's `output_summary` is produced by
-/// [`sanitize_tool_output`](crate::agent::hooks::sanitize_tool_output),
+/// the harness's failure classification,
 /// which by design "never contains raw tool output or PII" and renders a
 /// success as `"{tool}: ok (N chars)"`. It feeds the learning pipeline, where
 /// stripping payloads is the point. A checkpoint the user reads has the
 /// opposite requirement — it is a substitute for the answer the turn ran out
 /// of room to give — so it needs the content that type exists to remove.
-/// Widening `ToolCallRecord` would have carried raw payloads into every
+/// Widening the harness outcome record would have carried raw payloads into every
 /// learning record as a side effect.
-pub(crate) struct CheckpointToolResult {
-    /// The tool that ran.
-    pub(crate) name: String,
-    /// Whether it reported success.
-    pub(crate) success: bool,
-    /// Its raw output, truncated at the call site to [`CHECKPOINT_RESULT_CHARS`].
-    pub(crate) content: String,
-}
+pub(crate) type CheckpointToolResult = tinyagents_harness::close::CloseToolResult;
 
 /// Convert the typed boundary capture into the narrow record shape used by
 /// both the model-grounded close and deterministic fallbacks.  The harness's
 /// transcript messages do not preserve a tool-result error flag, so this must
 /// use [`ToolCallOutcome`] rather than trying to infer success from prose.
 pub(crate) fn results_from_tool_outcomes(
-    outcomes: &[crate::agent::tinyagents::ToolCallOutcome],
+    outcomes: &[tinyagents_harness::turn_outcome::ToolCallOutcome],
 ) -> Vec<CheckpointToolResult> {
-    outcomes
-        .iter()
-        .map(|outcome| CheckpointToolResult {
-            name: outcome.name.clone(),
-            success: outcome.success,
-            content: truncate_chars(&outcome.content, CHECKPOINT_RESULT_CHARS),
-        })
-        .collect()
+    tinyagents_harness::close::results_from_tool_outcomes_with_options(
+        outcomes,
+        CHECKPOINT_RESULT_CHARS,
+        "… [truncated]",
+    )
 }
 
 /// How much of one tool result the deterministic checkpoint reproduces.
@@ -227,50 +219,33 @@ pub(crate) fn build_deterministic_checkpoint(
 /// result backwards (see [`CHECKPOINT_TOTAL_CHARS`] for why newest first) and
 /// disclosing how many earlier results were left out.
 pub(crate) fn render_tool_results(results: &[CheckpointToolResult], total_budget: usize) -> String {
-    // Render each block before choosing, so the budget is charged what
-    // the checkpoint will actually contain (CodeRabbit on #6068). Walking
-    // `r.content` alone undercounts by the per-result header and the `"  > "`
-    // on every line — a newline-heavy result costs well over its body, and
-    // several of them overran the limit while the walk believed it had room.
-    let blocks: Vec<String> = results
-        .iter()
-        .map(|r| {
-            let status = if r.success { "ok" } else { "failed" };
-            let mut block = format!("\n- `{}` — {}\n", r.name, status);
-            for line in r.content.lines() {
-                block.push_str("  > ");
-                block.push_str(line);
-                block.push('\n');
-            }
-            block
-        })
-        .collect();
-    // Choose how far back the budget reaches by walking from the newest
-    // result, then render in the original order — a checkpoint read
-    // backwards is harder to follow than one that simply starts later.
-    let mut budget = total_budget;
-    let mut first_shown = results.len();
-    for (idx, block) in blocks.iter().enumerate().rev() {
-        let cost = block.chars().count();
-        if cost > budget && idx + 1 < results.len() {
-            // The newest result is always shown, however long, so a single
-            // oversized payload cannot empty the checkpoint entirely; every
-            // earlier one has to fit what is left.
-            break;
-        }
-        budget = budget.saturating_sub(cost);
-        first_shown = idx;
-    }
-    let mut out = String::new();
-    if first_shown > 0 {
-        out.push_str(&format!(
-            "\n_({first_shown} earlier tool result(s) omitted for length — the most recent are shown.)_\n"
-        ));
-    }
-    for block in &blocks[first_shown..] {
-        out.push_str(block);
-    }
-    out
+    tinyagents_harness::close::render_tool_results_with_options(
+        results,
+        tinyagents_harness::close::CloseResultRenderOptions {
+            per_result_cap: CHECKPOINT_RESULT_CHARS,
+            truncation_marker: "… [truncated]",
+            total_budget,
+            render_block: |result: &CheckpointToolResult| {
+                let status = if result.success { "ok" } else { "failed" };
+                let mut block = format!("\n- `{}` — {}\n", result.name, status);
+                for line in result.content.lines() {
+                    block.push_str("  > ");
+                    block.push_str(line);
+                    block.push('\n');
+                }
+                block
+            },
+            omitted_notice: |count| {
+                if count == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "\n_({count} earlier tool result(s) omitted for length — the most recent are shown.)_\n"
+                    )
+                }
+            },
+        },
+    )
 }
 
 /// Budget for the tool records a closing message is grounded in and checked
@@ -320,7 +295,7 @@ will read."
 /// It rides in as a bare user-role message, so a model that reads it as
 /// operator content deliberates about it aloud and quotes it back. The closing
 /// directives forbid the three shapes that reached a user's screen; the frame
-/// [`wrap_harness_instruction`] adds is what makes it structurally distinct
+/// [`wrap_harness_instruction`] (tinyagents-harness) adds is what makes it structurally distinct
 /// from the conversation in the first place.
 pub(crate) const FINAL_ANSWER_INSTRUCTION: &str = concat!(
     "You have finished using tools for this turn but have not yet written a reply to the user. ",
@@ -349,15 +324,6 @@ The harness stopped this turn early because its tool calls stopped making progre
 kept repeating the same step. Its stop note is written for you, not for the user, so explain it in your own \
 words rather than repeating it, and describe each call as the tool records show it:";
 
-/// Frame a harness directive so the model can tell it from operator content,
-/// the way `<stop_note>` and `<tool_records>` already mark their spans.
-pub(crate) fn wrap_harness_instruction(instruction: &str) -> String {
-    format!(
-        "<harness_instruction>\n{}\n</harness_instruction>",
-        instruction.trim()
-    )
-}
-
 /// Shortest span, in words, that counts as a quotation of harness text.
 ///
 /// Long enough that the floor cannot be cleared by ordinary English — the
@@ -375,7 +341,7 @@ const MIN_QUOTED_WORDS: usize = 10;
 /// the closed set of strings it injects, and neither is correct output on any
 /// path, so there is nothing to gain from narrowing the set to the path that
 /// ran.
-fn harness_instruction_needles(stop_reason: Option<&str>) -> Vec<String> {
+pub(crate) fn harness_instruction_needles(stop_reason: Option<&str>) -> Vec<String> {
     let mut sources = vec![
         FINAL_ANSWER_INSTRUCTION,
         TRUNCATED_ANSWER_INSTRUCTION,
@@ -386,21 +352,7 @@ fn harness_instruction_needles(stop_reason: Option<&str>) -> Vec<String> {
     if let Some(reason) = stop_reason {
         sources.push(reason);
     }
-    sources
-        .iter()
-        .flat_map(|source| source.split(['.', '\n']))
-        .map(normalize_for_quote_match)
-        .filter(|span| span.split_whitespace().count() >= MIN_QUOTED_WORDS)
-        .collect()
-}
-
-/// Lowercase and collapse runs of whitespace, so a quotation is recognised
-/// through re-wrapping, indentation or a change of case.
-fn normalize_for_quote_match(text: &str) -> String {
-    text.split_whitespace()
-        .map(|word| word.to_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ")
+    tinyagents_harness::close::harness_instruction_needles(&sources, MIN_QUOTED_WORDS)
 }
 
 /// Whether `candidate` reproduces a span of the harness directives or the stop
@@ -410,10 +362,9 @@ fn normalize_for_quote_match(text: &str) -> String {
 /// strings, and reproducing either is never the right reply, so this runs
 /// before the model-backed verification and cannot fail open on it.
 pub(crate) fn quotes_harness_instruction(candidate: &str, stop_reason: Option<&str>) -> bool {
-    let normalized = normalize_for_quote_match(candidate);
-    harness_instruction_needles(stop_reason)
-        .iter()
-        .any(|needle| normalized.contains(needle.as_str()))
+    let needles = harness_instruction_needles(stop_reason);
+    let phrases: Vec<&str> = needles.iter().map(String::as_str).collect();
+    tinyagents_harness::close::quotes_harness_instruction(candidate, &phrases)
 }
 
 /// Why a closing message cannot be shown, worded for the one corrective
@@ -533,30 +484,6 @@ pub(crate) fn close_verification_prompt(user_request: &str, records: &str, reply
         },
         reply.trim(),
     )
-}
-
-/// The check call's verdict on a closing message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CloseVerdict {
-    Accept,
-    Reject,
-    /// Neither word found (or the call failed). The reply is unverified, so the
-    /// caller does not ship it and uses the deterministic fallback instead.
-    Unclear,
-}
-
-/// Read the verdict from the check call's text: the **last** standalone
-/// `ACCEPT`/`REJECT` token wins, so a model that reasons aloud before its
-/// answer is read by its conclusion, and `UNACCEPTABLE` is not an `ACCEPT`.
-pub(crate) fn parse_close_verdict(text: &str) -> CloseVerdict {
-    text.split(|c: char| !c.is_ascii_alphabetic())
-        .filter_map(|token| match token.to_ascii_uppercase().as_str() {
-            "ACCEPT" => Some(CloseVerdict::Accept),
-            "REJECT" => Some(CloseVerdict::Reject),
-            _ => None,
-        })
-        .next_back()
-        .unwrap_or(CloseVerdict::Unclear)
 }
 
 /// Build a deterministic final answer from this turn's tool results.

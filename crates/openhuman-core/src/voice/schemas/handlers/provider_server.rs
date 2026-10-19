@@ -1,8 +1,8 @@
 //! Handlers for provider settings, model listing, provider testing, and server lifecycle.
 
+use crate::core::runtime::DispatchCtx;
 use serde_json::{Map, Value};
 
-use crate::config::rpc as config_rpc;
 use crate::core::all::ControllerFuture;
 
 use crate::voice::schemas::helpers::{
@@ -18,10 +18,13 @@ use crate::voice::schemas::params::{
 // Provider configuration handlers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn handle_voice_set_providers(params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_voice_set_providers(
+    ctx: DispatchCtx,
+    params: Map<String, Value>,
+) -> ControllerFuture {
     Box::pin(async move {
         let p = deserialize_params::<SetProvidersParams>(params)?;
-        let mut config = config_rpc::load_config_with_timeout().await?;
+        let mut config = ctx.load_config().await?;
 
         if let Some(stt) = p
             .stt_provider
@@ -60,7 +63,10 @@ pub(crate) fn handle_voice_set_providers(params: Map<String, Value>) -> Controll
             config.local_ai.tts_voice_id = voice.to_string();
         }
 
-        config.save().await.map_err(|e| e.to_string())?;
+        config
+            .save()
+            .await
+            .map_err(crate::config::ops::config_save_error)?;
         log::debug!(
             "[voice-factory] persisted providers stt={} tts={} stt_model={} tts_voice={}",
             config.local_ai.stt_provider,
@@ -79,6 +85,7 @@ pub(crate) fn handle_voice_set_providers(params: Map<String, Value>) -> Controll
 }
 
 pub(crate) fn handle_voice_update_provider_settings(
+    ctx: DispatchCtx,
     params: Map<String, Value>,
 ) -> ControllerFuture {
     Box::pin(async move {
@@ -89,7 +96,7 @@ pub(crate) fn handle_voice_update_provider_settings(
         use tinyinference_voice::external_tts::TtsApiStyle;
 
         let p = deserialize_params::<VoiceUpdateProviderSettingsParams>(params)?;
-        let mut config = config_rpc::load_config_with_timeout().await?;
+        let mut config = ctx.load_config().await?;
 
         if let Some(providers) = p.voice_providers {
             let mut new_entries = Vec::with_capacity(providers.len());
@@ -196,7 +203,10 @@ pub(crate) fn handle_voice_update_provider_settings(
             }
         }
 
-        config.save().await.map_err(|e| e.to_string())?;
+        config
+            .save()
+            .await
+            .map_err(crate::config::ops::config_save_error)?;
 
         log::debug!(
             "[voice-factory] persisted voice provider settings: {} providers, stt={:?}, tts={:?}",
@@ -232,10 +242,13 @@ pub(crate) fn handle_voice_update_provider_settings(
     })
 }
 
-pub(crate) fn handle_voice_list_models(params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_voice_list_models(
+    ctx: DispatchCtx,
+    params: Map<String, Value>,
+) -> ControllerFuture {
     Box::pin(async move {
         let p = deserialize_params::<VoiceListModelsParams>(params)?;
-        let config = config_rpc::load_config_with_timeout().await?;
+        let config = ctx.load_config().await?;
         let provider_id = p.provider_id.trim();
         let capability = p.capability.as_deref().unwrap_or("both");
 
@@ -297,10 +310,13 @@ pub(crate) fn handle_voice_list_models(params: Map<String, Value>) -> Controller
     })
 }
 
-pub(crate) fn handle_voice_test_provider(params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_voice_test_provider(
+    ctx: DispatchCtx,
+    params: Map<String, Value>,
+) -> ControllerFuture {
     Box::pin(async move {
         let p = deserialize_params::<VoiceTestProviderParams>(params)?;
-        let config = config_rpc::load_config_with_timeout().await?;
+        let config = ctx.load_config().await?;
         let start = std::time::Instant::now();
 
         log::debug!(
@@ -413,12 +429,15 @@ pub(crate) fn handle_voice_test_provider(params: Map<String, Value>) -> Controll
 // Voice server lifecycle handlers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn handle_voice_server_start(params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_voice_server_start(
+    ctx: DispatchCtx,
+    params: Map<String, Value>,
+) -> ControllerFuture {
     Box::pin(async move {
-        use crate::voice::hotkey::ActivationMode;
         use crate::voice::server::{global_server, VoiceServerConfig};
+        use tinyvoice_bus::hotkey::ActivationMode;
 
-        let config = config_rpc::load_config_with_timeout().await?;
+        let config = ctx.load_config().await?;
 
         let hotkey = params
             .get("hotkey")
@@ -479,9 +498,10 @@ pub(crate) fn handle_voice_server_start(params: Map<String, Value>) -> Controlle
         let server = global_server(server_config);
         let config_clone = config.clone();
         let server_for_err = server.clone();
+        let run_ctx = ctx.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = server.run(&config_clone).await {
+            if let Err(e) = server.run(&run_ctx, &config_clone).await {
                 log::warn!("[voice_server] server exited with error: {e}");
                 server_for_err.set_last_error(&e).await;
             }
@@ -499,7 +519,10 @@ pub(crate) fn handle_voice_server_start(params: Map<String, Value>) -> Controlle
     })
 }
 
-pub(crate) fn handle_voice_server_stop(_params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_voice_server_stop(
+    _ctx: DispatchCtx,
+    _params: Map<String, Value>,
+) -> ControllerFuture {
     Box::pin(async move {
         if let Some(server) = crate::voice::server::try_global_server() {
             server.stop().await;
@@ -511,7 +534,7 @@ pub(crate) fn handle_voice_server_stop(_params: Map<String, Value>) -> Controlle
             let status = crate::voice::server::VoiceServerStatus {
                 state: crate::voice::server::ServerState::Stopped,
                 hotkey: String::new(),
-                activation_mode: crate::voice::hotkey::ActivationMode::Push,
+                activation_mode: tinyvoice_bus::hotkey::ActivationMode::Push,
                 transcription_count: 0,
                 last_error: None,
             };
@@ -520,7 +543,10 @@ pub(crate) fn handle_voice_server_stop(_params: Map<String, Value>) -> Controlle
     })
 }
 
-pub(crate) fn handle_voice_server_status(_params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_voice_server_status(
+    _ctx: DispatchCtx,
+    _params: Map<String, Value>,
+) -> ControllerFuture {
     Box::pin(async move {
         if let Some(server) = crate::voice::server::try_global_server() {
             let status = server.status().await;
@@ -529,7 +555,7 @@ pub(crate) fn handle_voice_server_status(_params: Map<String, Value>) -> Control
             let status = crate::voice::server::VoiceServerStatus {
                 state: crate::voice::server::ServerState::Stopped,
                 hotkey: String::new(),
-                activation_mode: crate::voice::hotkey::ActivationMode::Push,
+                activation_mode: tinyvoice_bus::hotkey::ActivationMode::Push,
                 transcription_count: 0,
                 last_error: None,
             };
@@ -542,7 +568,10 @@ pub(crate) fn handle_voice_server_status(_params: Map<String, Value>) -> Control
 // Overlay STT notify handler
 // ---------------------------------------------------------------------------
 
-pub(crate) fn handle_overlay_stt_notify(params: Map<String, Value>) -> ControllerFuture {
+pub(crate) fn handle_overlay_stt_notify(
+    _ctx: DispatchCtx,
+    params: Map<String, Value>,
+) -> ControllerFuture {
     Box::pin(async move {
         let p = deserialize_params::<OverlaySttNotifyParams>(params)?;
         log::debug!(

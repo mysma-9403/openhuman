@@ -4,12 +4,15 @@
 //! controllers (e.g., memory, skills, config) and providing a unified
 //! interface for both the CLI and RPC layers to invoke them.
 
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, OnceLock, RwLock},
+};
 
 use serde_json::{Map, Value};
 
+use crate::core::runtime::DispatchCtx;
 use crate::core::ControllerSchema;
 
 /// A pinned, boxed future returned by a controller handler.
@@ -17,8 +20,10 @@ pub type ControllerFuture = Pin<Box<dyn Future<Output = Result<Value, String>> +
 
 /// A function pointer type for controller handlers.
 ///
-/// Handlers take a map of parameters and return a [`ControllerFuture`].
-pub type ControllerHandler = fn(Map<String, Value>) -> ControllerFuture;
+/// Handlers take the call's explicit [`DispatchCtx`] and a map of parameters,
+/// and return a [`ControllerFuture`]. The transport that accepted the call
+/// builds the context; the registry passes it through untouched.
+pub type ControllerHandler = fn(DispatchCtx, Map<String, Value>) -> ControllerFuture;
 
 /// A function pointer type for domain-specific CLI handlers.
 pub type CliHandler = fn(&[String]) -> anyhow::Result<()>;
@@ -47,6 +52,10 @@ impl RegisteredController {
 }
 
 pub use super::domain_group::DomainGroup;
+mod components_gate;
+mod validate;
+pub use components_gate::disabled_component_for_method;
+use validate::validate_registry;
 
 /// A [`RegisteredController`] tagged with the [`DomainGroup`] it belongs to.
 ///
@@ -352,30 +361,29 @@ fn build_registered_controllers() -> Vec<GroupedController> {
         DomainGroup::Desktop,
         crate::desktop::dashboard::all_dashboard_registered_controllers(),
     );
-    // MCP client subsystem: Smithery registry browser, local server install/connect, tool dispatch
     push(
         &mut controllers,
         DomainGroup::Mcp,
-        crate::mcp::registry::all_mcp_registry_registered_controllers(),
+        crate::mcp::all_registered_controllers(),
     );
     // Agent definition and prompt inspection
     push(
         &mut controllers,
         DomainGroup::Agent,
-        crate::agent::all_agent_registered_controllers(),
+        crate::agent_runs::all_agent_registered_controllers(),
     );
     // Read-only agent run replay + status over the durable journal/status seams
     // (agent_run_events / agent_run_status / agent_runs_active).
     push(
         &mut controllers,
         DomainGroup::Agent,
-        crate::agent::tinyagents::replay::all_agent_replay_registered_controllers(),
+        crate::agent_runs::replay::all_agent_replay_registered_controllers(),
     );
     // User-facing agent registry: defaults, enablement, custom agents, tool policy.
     push(
         &mut controllers,
         DomainGroup::Agent,
-        crate::agent::registry::all_agent_registry_registered_controllers(),
+        crate::agent_registry::all_agent_registry_registered_controllers(),
     );
     // System and process health monitoring
     push(
@@ -436,19 +444,19 @@ fn build_registered_controllers() -> Vec<GroupedController> {
     push(
         &mut controllers,
         DomainGroup::Agent,
-        crate::agent::plan_review::all_plan_review_registered_controllers(),
+        crate::plan_review::all_plan_review_registered_controllers(),
     );
     // Per-thread Plan/Build run mode (agent.set_run_mode / agent.get_run_mode)
     push(
         &mut controllers,
         DomainGroup::Agent,
-        crate::agent::tinyagents::run_mode::all_registered_controllers(),
+        crate::threads::run_mode::all_registered_controllers(),
     );
     // Agent-generated artifact storage, retrieval, and lifecycle management
     push(
         &mut controllers,
         DomainGroup::Agent,
-        crate::agent::artifacts::all_artifacts_registered_controllers(),
+        crate::artifacts::all_artifacts_registered_controllers(),
     );
     // Read-only command palette listing: built-ins merged with skills.list /
     // flows.list (C5). Tagged `Agent` rather than a new `DomainGroup` variant
@@ -660,6 +668,9 @@ fn build_registered_controllers() -> Vec<GroupedController> {
         DomainGroup::Desktop,
         crate::desktop::notifications::all_notifications_registered_controllers(),
     );
+    // Storage layout v1 -> v2 migration, status and restore
+    #[rustfmt::skip]
+    push(&mut controllers, DomainGroup::Config, crate::storage::layout::schemas::all_registered_controllers());
     // Mobile device pairing and management
     push(
         &mut controllers,
@@ -670,43 +681,19 @@ fn build_registered_controllers() -> Vec<GroupedController> {
     push(
         &mut controllers,
         DomainGroup::Agent,
-        crate::agent::session_db::all_session_db_registered_controllers(),
+        crate::sessions::all_session_db_registered_controllers(),
     );
     // One-time legacy session import into TinyAgents stores
     push(
         &mut controllers,
         DomainGroup::Agent,
-        crate::agent::session_import::all_session_import_registered_controllers(),
+        crate::storage::import::all_session_import_registered_controllers(),
     );
-    // Background agent command center — read-only grouped view over the run ledger
+    // Background agent command center, workflow runs, teams, worktrees, and subagent controls.
     push(
         &mut controllers,
         DomainGroup::Agent,
-        crate::agent::orchestration::all_command_center_registered_controllers(),
-    );
-    // Durable dynamic workflow runs — definitions + read surface over the run ledger
-    push(
-        &mut controllers,
-        DomainGroup::Agent,
-        crate::agent::orchestration::all_workflow_run_registered_controllers(),
-    );
-    // Durable agent-team coordination — teams, members, dependency-aware task claiming, messaging
-    push(
-        &mut controllers,
-        DomainGroup::Agent,
-        crate::agent::orchestration::all_agent_team_registered_controllers(),
-    );
-    // Git-worktree isolation manager — list / status / diff / remove worker worktrees (#3376)
-    push(
-        &mut controllers,
-        DomainGroup::Agent,
-        crate::agent::orchestration::all_worktree_registered_controllers(),
-    );
-    // User-driven cancel of detached background sub-agents (#3711)
-    push(
-        &mut controllers,
-        DomainGroup::Agent,
-        crate::agent::orchestration::all_subagent_control_registered_controllers(),
+        crate::agent_runs::all_orchestration_registered_controllers(),
     );
     // SaaS operator plane: provision and inspect user profiles.
     push(
@@ -796,12 +783,14 @@ pub fn namespace_description(namespace: &str) -> Option<&'static str> {
         "agent" => Some("Per-thread agent run-mode control (Plan vs Build)."),
         "ai" => Some("Agent-generated artifact storage, retrieval, and lifecycle management."),
         "app_state" => Some("Expose core-owned app shell state for frontend polling."),
-        "profiles" => Some("SaaS operator plane: provision and inspect the profile serving each user."),
+        "profiles" => {
+            Some("SaaS operator plane: provision and inspect the profile serving each user.")
+        }
         "auth" => Some("Manage app session and provider credentials."),
         "agent_experience" => Some("Local procedural experience capture and retrieval for agents."),
         "channels" => Some("Channel definitions, connections, and lifecycle management."),
         "composio" => Some(
-            "Composio OAuth integrations proxied via the backend — toolkits, connections, tools, and actions."
+            "Composio OAuth integrations proxied via the backend — toolkits, connections, tools, and actions.",
         ),
         "config" => Some("Read and update persisted runtime configuration."),
         "connectivity" => Some(
@@ -809,12 +798,13 @@ pub fn namespace_description(namespace: &str) -> Option<&'static str> {
         ),
         "cron" => Some("Manage scheduled jobs and run history."),
         "flows" => Some("Create, store, and run automation workflows."),
-        "dashboard" => Some(
-            "Operator-facing dashboard aggregations: per-model health comparison rows.",
-        ),
+        "dashboard" => {
+            Some("Operator-facing dashboard aggregations: per-model health comparison rows.")
+        }
         "mcp_clients" => Some(
             "Browse the MCP registries, declare the user's servers in one mcp.json document, manage their connections and credentials, and expose their tools to the agent.",
         ),
+        "mcp_ui" => Some("Serve MCP tool widgets their documents and run their tool calls."),
         "decrypt" => Some("Decrypt secure values managed by secret storage."),
         "doctor" => Some("Run diagnostics for workspace and runtime health."),
         "hooks" => Some(
@@ -822,16 +812,26 @@ pub fn namespace_description(namespace: &str) -> Option<&'static str> {
         ),
         "encrypt" => Some("Encrypt secure values managed by secret storage."),
         "health" => Some("Process and component health snapshots."),
-        "inference" => Some("Connect to configured text, vision, and embedding inference runtimes."),
-        "javascript" => Some("First-class JavaScript runtime bridge for listing and dispatching tools."),
+        "inference" => {
+            Some("Connect to configured text, vision, and embedding inference runtimes.")
+        }
+        "javascript" => {
+            Some("First-class JavaScript runtime bridge for listing and dispatching tools.")
+        }
         "security" => Some("Security policy and autonomy guardrail metadata."),
         "service" => Some("Desktop service lifecycle management."),
         "session_import" => {
             Some("One-time import of legacy session transcripts into TinyAgents stores.")
         }
-        "skill_registry" => Some("Browse, search, install, and uninstall skills from remote registries (OpenHuman, Hermes, OpenClaw)."),
-        "skill_runtime" => Some("Run installed skills, inspect run logs, and resolve Node/Python skill runtimes."),
-        "skills" => Some("Discovered SKILL.md skills (discovery, parse, install, run) and their resources."),
+        "skill_registry" => Some(
+            "Browse, search, install, and uninstall skills from remote registries (OpenHuman, Hermes, OpenClaw).",
+        ),
+        "skill_runtime" => {
+            Some("Run installed skills, inspect run logs, and resolve Node/Python skill runtimes.")
+        }
+        "skills" => {
+            Some("Discovered SKILL.md skills (discovery, parse, install, run) and their resources.")
+        }
         "socket" => Some("Backend Socket.IO bridge controls."),
         "memory" => Some(
             "Memory v2: engine selection, recall, fetch, learn, forget, conversations, document sources, context.md and v1 import.",
@@ -851,16 +851,18 @@ pub fn namespace_description(namespace: &str) -> Option<&'static str> {
         "tool_registry" => Some(
             "Read-only discovery for MCP stdio tools and controller-backed tools, including routes, schemas, version, allowed agents, and health.",
         ),
-        "test" => Some(
-            "E2E test support — wipe sidecar state in-place between specs.",
-        ),
-        "wallet" => Some("Local wallet onboarding status and derived multi-chain account metadata."),
+        "test" => Some("E2E test support — wipe sidecar state in-place between specs."),
+        "wallet" => {
+            Some("Local wallet onboarding status and derived multi-chain account metadata.")
+        }
         "web3_swap" => Some("Single-chain crypto swaps via deBridge, built on the local wallet."),
-        "web3_bridge" => Some("Cross-chain crypto bridges via deBridge DLN, built on the local wallet."),
+        "web3_bridge" => {
+            Some("Cross-chain crypto bridges via deBridge DLN, built on the local wallet.")
+        }
         "web3_dapp" => Some("Generic EVM dapp contract calls signed by the local wallet."),
-        "provider_surfaces" => Some(
-            "Local-first assistive surfaces for provider events, respond queues, and drafts.",
-        ),
+        "provider_surfaces" => {
+            Some("Local-first assistive surfaces for provider events, respond queues, and drafts.")
+        }
         "voice" => Some("Speech-to-text and text-to-speech using local models."),
         "webhooks" => {
             Some("Webhook tunnel registrations and captured request/response debug logs.")
@@ -876,6 +878,7 @@ pub fn namespace_description(namespace: &str) -> Option<&'static str> {
         "devices" => Some(
             "Paired mobile device management — pairing channel creation, listing, and revocation.",
         ),
+        "storage" => Some("Storage layout v1 to v2 migration, schema status and restore."),
         "subsystems" => Some(
             "Kernel subsystem slots and their bound drivers: class, health, contract version, and advertised capabilities.",
         ),
@@ -1135,122 +1138,6 @@ fn kind(matches: bool, expected: &'static str) -> Result<(), TypeMismatch> {
     matches.then_some(()).ok_or(TypeMismatch::Kind(expected))
 }
 
-/// Attempts to invoke a registered RPC method by name.
-///
-/// Checks both the agent-facing controller registry and the internal-only registry,
-/// so internal-only write paths (e.g. the MCP write-audit list) are routable
-/// even though they are not included in agent tool listings.
-///
-/// Returns `None` if the method is not found in either registry.
-pub async fn try_invoke_registered_rpc(
-    method: &str,
-    params: Map<String, Value>,
-) -> Option<Result<Value, String>> {
-    let view = registry_view();
-    let grouped = view
-        .iter()
-        .chain(internal_registry().iter())
-        .find(|g| g.controller.rpc_method_name() == method)?;
-
-    // DomainSet gate (#4796): a method whose group is disabled under the ambient
-    // context reports as an unknown method (`None`) — the same result a caller
-    // gets for a genuinely-unregistered method, so a gated domain's controllers
-    // are indistinguishable from absent. Enforced HERE (dispatch), not in
-    // schema/validation lookups, to avoid a validate/dispatch split.
-    if !visible(grouped) {
-        log::debug!(
-            "[rpc][domain-gate] method '{method}' suppressed — group {:?} disabled or method \
-             outside the user surface in the active scope",
-            grouped.group
-        );
-        return None;
-    }
-
-    let handler = grouped.controller.handler;
-
-    // Establish the ambient CoreContext for the duration of the handler so
-    // `CoreContext::current()` resolves inside handler bodies (Phase 2).
-    // `current()` inherits an already-active scope (so a handler that dispatches
-    // a nested RPC stays in the same tenant context) and otherwise resolves to
-    // the process default. Before any context is built (some unit tests) it is
-    // `None` and the handler runs unscoped.
-    //
-    // The scoped future is re-boxed back into a `ControllerFuture` so the
-    // concrete `TaskLocalFuture` type does not escape into this fn's future —
-    // without the type erasure the `Send` auto-trait solver overflows on the
-    // largest handler futures (E0275).
-    use crate::core::runtime::context::CoreContext;
-    let fut = handler(params);
-    let scoped: ControllerFuture = match CoreContext::current() {
-        Some(ctx) => Box::pin(CoreContext::scope(ctx, fut)),
-        None => fut,
-    };
-    Some(scoped.await)
-}
-
-/// Validates the consistency of the controller registry.
-///
-/// The registry is the single source of truth: each [`RegisteredController`]
-/// carries its own schema, and [`all_controller_schemas`] derives the public
-/// list. No separate declaration can drift from handlers (Phase 2).
-///
-/// Ensures that:
-/// - There are no duplicate controllers or RPC methods.
-/// - Namespaces and functions are not empty.
-/// - Required input names are unique within a controller.
-fn validate_registry(registered: &[GroupedController]) -> Result<(), String> {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    let mut errors: Vec<String> = Vec::new();
-    let mut registered_keys = BTreeSet::new();
-    let mut registered_rpc_methods = BTreeSet::new();
-
-    for grouped in registered {
-        let controller = &grouped.controller;
-        let schema = &controller.schema;
-        let key = format!("{}.{}", schema.namespace, schema.function);
-        if !registered_keys.insert(key.clone()) {
-            errors.push(format!("duplicate registered controller `{key}`"));
-        }
-
-        let rpc_method = controller.rpc_method_name();
-        if !registered_rpc_methods.insert(rpc_method.clone()) {
-            errors.push(format!("duplicate registered rpc method `{rpc_method}`"));
-        }
-
-        if schema.namespace.trim().is_empty() {
-            errors.push(format!(
-                "invalid registered controller `{key}`: namespace must not be empty"
-            ));
-        }
-        if schema.function.trim().is_empty() {
-            errors.push(format!(
-                "invalid registered controller `{key}`: function must not be empty"
-            ));
-        }
-
-        let mut required_inputs = BTreeSet::new();
-        let mut required_dupes: BTreeMap<String, usize> = BTreeMap::new();
-        for input in schema.inputs.iter().filter(|input| input.required) {
-            if !required_inputs.insert(input.name.to_string()) {
-                *required_dupes.entry(input.name.to_string()).or_default() += 1;
-            }
-        }
-        for (name, _) in required_dupes {
-            errors.push(format!(
-                "duplicate required input `{name}` in `{}`",
-                schema.method_name()
-            ));
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct HttpMethodSchemaDefinition {
     pub method: String,
@@ -1327,6 +1214,10 @@ pub(crate) fn assert_schema_controller_parity(
         "expected a `{known_function}` controller schema to be registered",
     );
 }
+
+#[path = "all_invoke.rs"]
+mod invoke_registered;
+pub use invoke_registered::try_invoke_registered_rpc;
 
 #[cfg(test)]
 #[path = "all_tests.rs"]

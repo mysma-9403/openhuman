@@ -4,21 +4,19 @@
 //!
 //! ## Where the logic lives
 //!
-//! The wallet engine — balances, the prepare/confirm/execute flow, the per-chain
-//! signing choreography and the agent tools — lives in
-//! `tinywallet_web3::crypto`. This module is the host adapter over it:
+//! The wallet engine — balances, the prepare/confirm/execute flow, signing,
+//! transaction encoding, provider interaction, and agent tools — lives in the
+//! compiled TinyWallet module. This module holds host configuration, custody,
+//! approvals, product RPC adapters, and module lifecycle:
 //!
 //! - [`ops`] — setup, status, recovery-phrase reveal and `secret_material`
 //!   (keyring, consent, credentials). Stays here: it is the host's state.
-//! - [`execution`] — the engine's operations wrapped in the controller
-//!   contract's `Outcome`.
-//! - [`endpoints`] — the `OPENHUMAN_WALLET_RPC_*` / `OPENHUMAN_SOLANA_CLUSTER`
-//!   environment resolution the engine's `RpcEndpoints` seam asks.
-//! - [`transport`] / [`rpc`] — the host `Transport` seam: endpoint resolution,
-//!   URL redaction and error classification over the shared `reqwest` client.
+//! - [`execution`] — typed module operations adapted to product controller
+//!   responses.
+//! - [`endpoints`] / [`rpc`] — host endpoint configuration and guarded,
+//!   credential-aware transport callbacks.
 //! - `schemas` — the controllers, with their RPC namespace strings.
-//! - The seam implementations and the process-wide engine are in
-//!   [`crate::web3::seams`].
+//! - [`crate::modules::wallet_service`] owns the native module service lifetime.
 //!
 //! ## Compile-time gate (`web3` feature)
 //!
@@ -47,17 +45,11 @@ pub(crate) mod rpc;
 
 #[cfg(feature = "web3")]
 mod schemas;
-/// The wallet agent tools, re-exported from `tinywallet-web3`. The host builds
-/// them over the process-wide engine in `tools/ops.rs`.
-#[cfg(feature = "web3")]
-pub mod tools;
-/// The host side of the wallet primitives' `Transport` seam — endpoint resolution,
-/// failover and redaction stay here, where the config lives.
-#[cfg(feature = "web3")]
-pub(crate) mod transport;
-
 #[cfg(all(test, feature = "web3"))]
 pub(crate) mod test_support;
+/// Wallet agent tool adapters over the declarations in `tinywallet-bus`.
+#[cfg(feature = "web3")]
+pub mod tools;
 
 #[cfg(feature = "web3")]
 pub use endpoints::solana_cluster;
@@ -73,7 +65,9 @@ pub use execution::{
 pub(crate) use ops::secret_material;
 #[cfg(feature = "web3")]
 pub use ops::{
-    reveal_recovery_phrase, setup, status, RevealRecoveryPhraseResult, WalletAccount, WalletChain,
+    derive_recovery_material, generate_recovery_phrase, reveal_recovery_phrase, setup, status,
+    validate_recovery_phrase, GeneratedRecoveryPhrase, RecoveryPhraseValidation,
+    RevealRecoveryPhraseResult, WalletAccount, WalletChain, WalletRecoveryMaterial,
     WalletSetupParams, WalletSetupSource, WalletStatus, WALLET_NOT_CONFIGURED_MESSAGE,
 };
 #[cfg(feature = "web3")]
@@ -82,11 +76,8 @@ pub use schemas::{
     all_wallet_registered_controllers, schemas, wallet_schemas,
 };
 #[cfg(feature = "web3")]
-pub use tinywallet_web3::crypto::abi::encode_erc20_transfer;
-#[cfg(feature = "web3")]
-pub use tinywallet_web3::crypto::defaults::{
-    evm_asset_catalog, explorer_tx_url, EvmNetwork, RpcSource, SolanaCluster,
-    WalletAssetDefinition, WalletNetworkDefaults,
+pub use tinywallet_bus::wire::{
+    EvmNetwork, RpcSource, SolanaCluster, WalletAssetDefinition, WalletNetworkDefaults,
 };
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 // Self-test for the CI lane flow: scripts/ci/self-hosted/{lanes-plan,lanes}.mjs
 // (run by ci-fast.yml / ci-fast-hosted.yml through ci-lanes.yml).
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,7 +21,6 @@ import {
   PrioritySemaphore,
   processTable,
   treeRssMiB,
-  sccacheSummary,
   Runner,
   defaultHeavySlots,
   foldLine,
@@ -44,6 +44,21 @@ const ciLanes = fs.readFileSync(
 const ALL = Object.fromEntries(Object.keys(AREA_ENV).map((k) => [k, true]));
 const NONE = Object.fromEntries(Object.keys(AREA_ENV).map((k) => [k, false]));
 const EX63_ENV = { CI_SCRATCH_DIR: "/scratch" };
+
+test("EX63 verifies preinstalled tools before cache setup and validation", () => {
+  const privateJob = ciLanes.slice(
+    ciLanes.indexOf("  ex63:"),
+    ciLanes.indexOf("  plan:"),
+  );
+  const verify = privateJob.indexOf("- name: Verify private runner contract");
+  const cache = privateJob.indexOf("- name: Setup Tinymold");
+  const detect = privateJob.indexOf("- name: Detect changed areas");
+  const start = privateJob.indexOf("- name: Start lanes");
+  assert.ok(verify >= 0 && cache > verify && detect > cache && start > detect);
+  assert.match(privateJob, /bash scripts\/ci\/self-hosted\/verify-runner\.sh/);
+  assert.doesNotMatch(privateJob, /setup-python|apt-get|JQ_SHA256|sccache/);
+  assert.match(privateJob, /Save Tinymold cache[\s\S]*continue-on-error: true/);
+});
 
 const plans = () => [
   buildPlan({ profile: "ex63", areas: ALL, env: EX63_ENV }),
@@ -164,9 +179,14 @@ test("core doctests remain outside PR coverage; embed doctests and tui tests run
     assert.equal(cov.env.OH_COV_TUI, "1");
     const runs = allRuns(plan).join("\n");
     assert.doesNotMatch(runs, /cargo test -p openhuman --doc/);
-    assert.doesNotMatch(runs, /cargo test -p openhuman-(embed|tinyhumans)\b(?! --doc)/);
+    assert.doesNotMatch(
+      runs,
+      /cargo test -p openhuman-(embed|tinyhumans)\b(?! --doc)/,
+    );
     assert.match(runs, /cargo test -p openhuman-embed --doc/);
-    const doc = plan.lanes.find(l => l.name === "rust-lint").checks.find(c => c.name === "embed-rustdoc");
+    const doc = plan.lanes
+      .find((l) => l.name === "rust-lint")
+      .checks.find((c) => c.name === "embed-rustdoc");
     assert.equal(doc.env.RUSTDOCFLAGS, "-D warnings");
     assert.match(doc.run, /cargo doc -p openhuman-embed --no-deps/);
     assert.match(runs, /node scripts\/run-embed-examples.mjs/);
@@ -182,14 +202,16 @@ test("the complete suites run, not subsets", () => {
   assert.match(runs, /bash scripts\/ci\/rust-coverage\.sh/);
   assert.match(
     runs,
-    /cargo llvm-cov --no-rustc-wrapper --manifest-path crates\/openhuman-app\/Cargo\.toml/,
+    /cargo llvm-cov nextest .*--manifest-path crates\/openhuman-app\/Cargo\.toml/,
   );
 });
 
 test("the lane plan retains the shared CI checks", () => {
   const shared = [
-    "cargo fmt --all -- --check",
+    "cargo fmt --manifest-path Cargo.toml --package openhuman --package openhuman-cli --package openhuman-embed --package openhuman-modules-linked --package openhuman-rpc --package openhuman-tinyhumans --package openhuman-tui -- --check",
     "node scripts/ci/check-openhuman-rust-layout.mjs",
+    "node scripts/ci/check-storage-owner.mjs",
+    "node scripts/ci/check-storage-schema.mjs",
     "pnpm agent:runtime-boundary",
     "pnpm rust:ignored-tests",
     "bash scripts/check-linux-tls-dependencies.sh",
@@ -231,6 +253,9 @@ test("untouched areas leave only the always-on gates", () => {
     "static:orch-ip-gate",
     "static:feature-forwarding",
     "static:crate-chain",
+    "static:process-statics",
+    "static:module-source",
+    "static:storage-bypass",
     "static:module-pins",
     "static:submodule-monotonic",
   ]);
@@ -257,6 +282,7 @@ test("the storage area arms only the storage-drivers lane, with the sqlite and f
       [
         "storage-drivers:storage-e2e",
         "storage-drivers:storage-lib-tests",
+        "storage-drivers:cron-module-tests",
         "storage-drivers:storage-session-store-tests",
       ],
       profile,
@@ -267,6 +293,9 @@ test("the storage area arms only the storage-drivers lane, with the sqlite and f
         "static:orch-ip-gate",
         "static:feature-forwarding",
         "static:crate-chain",
+        "static:process-statics",
+        "static:module-source",
+        "static:storage-bypass",
         "static:module-pins",
         "static:submodule-monotonic",
       ],
@@ -340,16 +369,27 @@ test("hosted matrix only spins up groups with active lanes", () => {
   assert.equal(pester.find((g) => g.group === "pester").container, "");
 });
 
-test("ex63 needs a scratch dir and gives every Rust lane its own target dir under it", () => {
-  assert.throws(
-    () => buildPlan({ profile: "ex63", areas: ALL, env: {} }),
-    /CI_SCRATCH_DIR/,
-  );
+test("private lanes reuse checkout targets, preserve mold through RUSTFLAGS resets, and omit wrappers", () => {
   const plan = buildPlan({ profile: "ex63", areas: ALL, env: EX63_ENV });
-  const dirs = plan.lanes.map((l) => l.targetDir).filter(Boolean);
-  assert.equal(new Set(dirs).size, dirs.length);
-  for (const d of dirs) assert.match(d, /^\/scratch\/target\//);
-  // hosted keeps cargo's default target dirs (restored by rust-cache).
+  const rust = plan.lanes.filter((l) => l.heavy != null);
+  assert.equal(
+    new Set(rust.filter((l) => l.name !== "rust-cov").map((l) => l.targetDir))
+      .size,
+    1,
+  );
+  for (const lane of rust) {
+    assert.match(lane.targetDir, /^target\/ci-private-/);
+    assert.equal(
+      lane.env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER,
+      "/usr/local/bin/rust-mold-linker",
+    );
+    assert.equal(lane.env.RUSTC_WRAPPER, undefined);
+    assert.equal(lane.env.RUSTC_WORKSPACE_WRAPPER, undefined);
+  }
+  assert.notEqual(
+    rust.find((l) => l.name === "rust-cov").targetDir,
+    rust.find((l) => l.name === "rust-lint").targetDir,
+  );
   assert.ok(
     buildPlan({ profile: "hosted", areas: ALL }).lanes.every(
       (l) => !l.targetDir,
@@ -357,43 +397,127 @@ test("ex63 needs a scratch dir and gives every Rust lane its own target dir unde
   );
 });
 
-test("instrumented coverage uses sccache on ex63 and no wrapper on hosted", () => {
-  for (const plan of plans()) {
-    const ex63 = plan.profile === "ex63";
-    const cov = plan.lanes.find((l) => l.name === "rust-cov");
-    assert.equal(cov.env.RUSTC_WRAPPER, ex63 ? "sccache" : undefined);
-    const tauriCov = plan.lanes
-      .find((l) => l.name === "tauri")
-      .checks.find((c) => c.name === "tauri-coverage");
-    assert.equal(tauriCov.env.RUSTC_WRAPPER, ex63 ? "sccache" : undefined);
-    // The linker flag always goes: llvm-cov sets RUSTFLAGS itself.
-    assert.match(
-      tauriCov.run,
-      ex63 ? /^unset RUSTFLAGS &&/ : /^unset RUSTFLAGS RUSTC_WRAPPER &&/,
-    );
-    assert.match(tauriCov.run, /--no-rustc-wrapper/);
+test("private gates-off, storage, and Tauri execute equivalent coverage suites with nextest", () => {
+  const plan = buildPlan({ profile: "ex63", areas: ALL, env: EX63_ENV });
+  for (const name of ["rust-gates-off", "storage-drivers", "tauri"]) {
+    for (const c of plan.lanes
+      .find((l) => l.name === name)
+      .checks.filter((c) => /cargo (test|llvm-cov)/.test(c.run))) {
+      assert.match(c.run, /cargo llvm-cov nextest/);
+      assert.match(c.run, /--no-tests=fail/);
+      // Pinned cargo-llvm-cov 0.9.1 rejects combining these two flags;
+      // --no-report already preserves previous instrumentation profiles.
+      assert.doesNotMatch(c.run, /--no-clean(?:\s|$)/);
+      assert.match(c.run, /--lcov --output-path ci-out\/lcov\//);
+      assert.match(c.run, /--no-report .*\|\| rc=\$\?; cargo llvm-cov report/);
+      assert.match(c.run, /exit "\$rc"$/);
+    }
   }
+  const checks = Object.fromEntries(
+    plan.lanes.flatMap((l) => l.checks.map((c) => [c.name, c])),
+  );
+  assert.match(
+    checks["gate-contract-tests-features"].run,
+    /--features modules,mcp,e2e-test-support/,
+  );
+  assert.match(checks["gate-contract-tests-features"].run, /--test-threads=1/);
+  assert.match(checks["cron-module-tests"].run, /--test-threads=1/);
+  assert.equal(
+    checks["storage-e2e"].env.NEXTEST_EXPECTED_TARGETS,
+    "ci-out/nextest/storage-e2e-expected-targets.txt",
+  );
+  for (const target of [
+    ...checks["storage-e2e"].run.matchAll(/--test (\S+)/g),
+  ].map((match) => match[1])) {
+    assert.ok(
+      checks["storage-e2e"].run.includes(`'${target}'`),
+      `expected inventory includes ${target}`,
+    );
+  }
+  assert.match(
+    checks["storage-lib-tests"].run,
+    /not test\(cron::bus_host::tests::\)/,
+  );
+  assert.equal(
+    checks["tauri-coverage"].env.CARGO_BUILD_TARGET_DIR,
+    "target/ci-private-coverage",
+  );
 });
 
-test("sccache summary reports hit rate and the store in use", () => {
-  assert.equal(sccacheSummary(null), null);
+test("private auxiliary coverage reports after failed tests and preserves the failure", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lane-coverage-report-"));
+  const cargo = path.join(dir, "cargo");
+  const calls = path.join(dir, "calls");
+  fs.writeFileSync(
+    cargo,
+    '#!/bin/sh\necho "$*" >> "$CARGO_CALLS"\nif [ "$1" = metadata ]; then echo \"{\\\"packages\\\":[]}\"; fi\nif [ "$2" = nextest ]; then exit 17; fi\nexit 0\n',
+    { mode: 0o755 },
+  );
+  const plan = buildPlan({ profile: "ex63", areas: ALL, env: EX63_ENV });
+  const check = plan.lanes.find((l) => l.name === "storage-drivers").checks[0];
+  const result = spawnSync("bash", ["-o", "pipefail", "-c", check.run], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      PATH: `${dir}:${process.env.PATH}`,
+      CARGO_CALLS: calls,
+      NEXTEST_REPORT_DIR: path.join(dir, "reports"),
+      NEXTEST_EXPECTED_TARGETS: path.join(dir, "expected-targets"),
+    },
+  });
+  assert.equal(result.status, 17);
   assert.equal(
-    sccacheSummary({
-      stats: {
-        cache_hits: { counts: { Rust: 30 } },
-        cache_misses: { counts: { Rust: 10 } },
+    fs
+      .readFileSync(path.join(dir, "expected-targets"), "utf8")
+      .trim()
+      .split("\n").length,
+    11,
+  );
+  const commands = fs.readFileSync(calls, "utf8").trim().split("\n");
+  assert.equal(commands.length, 3);
+  assert.match(commands[0], /^metadata /);
+  assert.match(commands[1], /^llvm-cov nextest /);
+  assert.match(commands[2], /^llvm-cov report /);
+  const tauri = plan.lanes.find((l) => l.name === "tauri");
+  assert.match(
+    tauri.checks.find((c) => c.name === "build-tauri").run,
+    /cargo build .*--bin OpenHuman/,
+  );
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("private runner serializes independent lanes after failures even when parallelism is requested", async () => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), "lanes-private-"));
+  fs.mkdirSync(path.join(out, "logs"));
+  const check = (name, run) => ({ name, run, when: true, needs: [] });
+  const plan = {
+    profile: "ex63",
+    lanes: [
+      {
+        name: "first",
+        checks: [
+          check("fails", "exit 1"),
+          check("continues", "echo continued"),
+        ],
       },
-      cache_location: "webdav, name: , prefix: /",
-    }),
-    "sccache (shared store): 30 Rust hits, 10 misses (75%).",
+      { name: "second", checks: [check("independent", "echo independent")] },
+    ],
+  };
+  const runner = new Runner(plan, { out, maxParallel: 8 });
+  assert.equal(runner.maxParallel, 1);
+  const lanes = await runner.run();
+  assert.equal(lanes[0].checks[0].status, "failure");
+  assert.equal(lanes[0].checks[1].status, "success");
+  assert.equal(lanes[1].checks[0].status, "success");
+  assert.ok(
+    Date.parse(lanes[1].checks[0].start) >= Date.parse(lanes[0].checks[1].end),
   );
   assert.equal(
-    sccacheSummary({
-      stats: { cache_hits: { counts: {} }, cache_misses: { counts: {} } },
-      cache_location: 'Local disk: "/cache/sccache"',
-    }),
-    "sccache (slot disk): 0 Rust hits, 0 misses.",
+    new Runner({ ...plan, profile: "hosted" }, { out, maxParallel: 8 })
+      .maxParallel,
+    8,
   );
+  fs.rmSync(out, { recursive: true, force: true });
 });
 
 test("area flags are read strictly from CI_AREA_*", () => {
@@ -593,7 +717,7 @@ test("runner: heavy lanes wait for a slot, light lanes never do", async () => {
   fs.mkdirSync(path.join(out, "logs"));
   const check = (name) => ({ name, run: "sleep 0.2", when: true, needs: [] });
   const plan = {
-    profile: "ex63",
+    profile: "hosted",
     lanes: [
       { name: "h1", heavy: 0, active: true, checks: [check("x")] },
       { name: "h2", heavy: 1, active: true, checks: [check("x")] },
@@ -660,18 +784,366 @@ test("module boundaries run for Rust and scripts changes in both profiles", () =
         areas: { ...NONE, [area]: true },
         env: profile === "ex63" ? EX63_ENV : {},
       });
-      const check = plan.lanes.flatMap(lane => lane.checks).find(check => check.name === "module-boundaries");
+      const check = plan.lanes
+        .flatMap((lane) => lane.checks)
+        .find((check) => check.name === "module-boundaries");
       assert.equal(check.when, true, `${profile}:${area}`);
-      assert.equal(check.run, "bash scripts/ci-cancel-aware.sh node scripts/ci/check-module-boundaries.mjs");
+      assert.equal(
+        check.run,
+        "bash scripts/ci-cancel-aware.sh node scripts/ci/check-module-boundaries.mjs",
+      );
     }
   }
 });
 
-
 test("module boundary policy and checker changes arm their own scripts lane", () => {
-  const filters = fs.readFileSync(path.join(repoRoot, ".github/ci-paths-filter.yml"), "utf8");
+  const filters = fs.readFileSync(
+    path.join(repoRoot, ".github/ci-paths-filter.yml"),
+    "utf8",
+  );
   const scripts = filters.split(/^scripts:\s*$/m)[1].split(/^\S[^\n]*:/m)[0];
-  for (const file of ["scripts/ci/check-module-boundaries.mjs", "scripts/ci/module-boundaries.json"]) {
-    assert.ok(scripts.includes(`'${file}'`), `${file} must arm the scripts area`);
+  for (const file of [
+    "scripts/ci/rust-coverage.sh",
+    "scripts/ci/fetch-submodule-tags.sh",
+  ]) {
+    assert.ok(
+      scripts.includes(`'${file}'`),
+      `${file} must run its regressions`,
+    );
   }
+  for (const file of [
+    "scripts/ci/check-module-boundaries.mjs",
+    "scripts/ci/module-boundaries.json",
+  ]) {
+    assert.ok(
+      scripts.includes(`'${file}'`),
+      `${file} must arm the scripts area`,
+    );
+  }
+});
+
+test("process-static policy and checker changes arm their own scripts lane", () => {
+  const filters = fs.readFileSync(
+    path.join(repoRoot, ".github/ci-paths-filter.yml"),
+    "utf8",
+  );
+  const scripts = filters.split(/^scripts:\s*$/m)[1].split(/^\S[^\n]*:/m)[0];
+  for (const file of [
+    "scripts/ci/rust-coverage.sh",
+    "scripts/ci/fetch-submodule-tags.sh",
+  ]) {
+    assert.ok(
+      scripts.includes(`'${file}'`),
+      `${file} must run its regressions`,
+    );
+  }
+  for (const file of [
+    "scripts/ci/check-process-statics.mjs",
+    "scripts/ci/check-crate-chain.mjs",
+    "scripts/ci/process-statics.json",
+  ]) {
+    assert.ok(
+      scripts.includes(`'${file}'`),
+      `${file} must arm the scripts area`,
+    );
+  }
+});
+
+test("process-static scan uses cancellation supervision in both profiles", () => {
+  for (const profile of ["hosted", "ex63"]) {
+    const plan = buildPlan({
+      profile,
+      areas: NONE,
+      env: profile === "ex63" ? EX63_ENV : {},
+    });
+    const check = plan.lanes
+      .flatMap((lane) => lane.checks)
+      .find((check) => check.name === "process-statics");
+    assert.equal(
+      check.run,
+      "bash scripts/ci-cancel-aware.sh node scripts/ci/check-process-statics.mjs",
+    );
+  }
+});
+
+test("private frontend tools have an explicit 4 GiB Node heap while hosted keeps its default", () => {
+  for (const plan of plans()) {
+    const frontend = plan.lanes.find((lane) => lane.name === "frontend");
+    if (plan.profile === "ex63") {
+      assert.equal(frontend.env.NODE_OPTIONS, "--max-old-space-size=4096");
+      const probe = spawnSync(
+        process.execPath,
+        [
+          "-e",
+          "console.log(require('node:v8').getHeapStatistics().heap_size_limit)",
+        ],
+        {
+          env: { ...process.env, NODE_OPTIONS: frontend.env.NODE_OPTIONS },
+          encoding: "utf8",
+        },
+      );
+      assert.equal(probe.status, 0, probe.stderr);
+      const limit = Number(probe.stdout.trim());
+      assert.ok(
+        limit >= 4096 * 1024 * 1024 && limit < 4352 * 1024 * 1024,
+        `actual V8 heap limit ${limit}`,
+      );
+    } else {
+      assert.equal(frontend.env.NODE_OPTIONS, undefined);
+    }
+  }
+});
+
+test("private CI executes the coverage-disabled Composio stack regression once without instrumentation", () => {
+  for (const plan of plans()) {
+    const lint = plan.lanes.find((lane) => lane.name === "rust-lint");
+    const checks = lint.checks.filter(
+      (check) => check.name === "composio-stack-regression-uninstrumented",
+    );
+    if (plan.profile === "ex63") {
+      assert.equal(checks.length, 1);
+      assert.equal(checks[0].when, true);
+      assert.match(
+        checks[0].run,
+        /bash scripts\/ci\/nextest-coverage\.sh composio-stack-uninstrumented cargo nextest run --profile ci --no-tests=fail --no-fail-fast/,
+      );
+      assert.match(
+        checks[0].run,
+        /-p openhuman-cli --features "\$\(bash scripts\/ci\/product-features\.sh --core\)" --test composio_list_tools_stack_overflow_regression$/,
+      );
+      assert.doesNotMatch(checks[0].run, /llvm-cov|--no-default-features/);
+      assert.equal(lint.targetDir, "target/ci-private-build");
+    } else {
+      assert.equal(checks.length, 0);
+    }
+  }
+  const unrelated = buildPlan({ profile: "ex63", areas: NONE, env: EX63_ENV });
+  assert.ok(
+    unrelated.lanes
+      .flatMap((lane) => lane.checks)
+      .filter(
+        (check) => check.name === "composio-stack-regression-uninstrumented",
+      )
+      .every((check) => !check.when),
+  );
+  const source = fs.readFileSync(
+    path.join(
+      repoRoot,
+      "tests/composio_list_tools_stack_overflow_regression.rs",
+    ),
+    "utf8",
+  );
+  assert.match(source, /#!\[cfg\(not\(coverage\)\)\]/);
+  assert.doesNotMatch(source, /^\s*#\[ignore/m);
+});
+
+test("nextest validation helpers arm Rust validation and script regressions on their own", () => {
+  const filters = fs.readFileSync(
+    path.join(repoRoot, ".github/ci-paths-filter.yml"),
+    "utf8",
+  );
+  for (const area of ["rust-core", "rust-tauri", "storage", "scripts"]) {
+    const block = filters
+      .split(new RegExp(`^${area}:\\s*$`, "m"))[1]
+      .split(/^\S[^\n]*:/m)[0];
+    assert.ok(
+      block.includes("'scripts/ci/self-hosted/**'"),
+      `${area} covers guest verifier, linkage verifier and image pin changes`,
+    );
+    for (const file of [
+      ".config/nextest.toml",
+      "scripts/ci/nextest-coverage.sh",
+      "scripts/ci/nextest-report.mjs",
+    ]) {
+      assert.ok(block.includes(`'${file}'`), `${file} must arm ${area}`);
+    }
+  }
+  const scripts = filters.split(/^scripts:\s*$/m)[1].split(/^\S[^\n]*:/m)[0];
+  for (const file of [
+    "scripts/ci/rust-coverage.sh",
+    "scripts/ci/fetch-submodule-tags.sh",
+  ]) {
+    assert.ok(
+      scripts.includes(`'${file}'`),
+      `${file} must run its regressions`,
+    );
+  }
+  assert.ok(
+    scripts.includes("'scripts/lib/**'"),
+    "module-pin-inventory.mjs is covered by the shared script library glob",
+  );
+});
+
+test("private coverage pools profiles for every Rust configuration without changing hosted or ordinary builds", () => {
+  for (const plan of plans()) {
+    const coverage = [];
+    for (const lane of plan.lanes)
+      for (const check of lane.checks) {
+        const env = { ...lane.env, ...check.env };
+        if (
+          check.name === "rust-core-coverage" ||
+          check.run.includes("cargo llvm-cov nextest")
+        ) {
+          coverage.push(check.name);
+          assert.equal(
+            env.LLVM_PROFILE_FILE_NAME,
+            plan.profile === "ex63" ? "openhuman-%8m.profraw" : undefined,
+            `${plan.profile}:${check.name}`,
+          );
+        } else if (
+          /cargo (?:build|clippy|check|test|nextest run)/.test(check.run)
+        ) {
+          assert.equal(
+            env.LLVM_PROFILE_FILE_NAME,
+            undefined,
+            `${plan.profile}:${check.name} is uninstrumented`,
+          );
+        }
+      }
+    if (plan.profile === "ex63") assert.equal(coverage.length, 8);
+  }
+});
+
+test("private release cleanup follows successful examples and names only the ordinary release profile", () => {
+  for (const plan of plans()) {
+    const lint = plan.lanes.find((lane) => lane.name === "rust-lint");
+    const cleanupIndex = lint.checks.findIndex(
+      (check) => check.name === "release-example-cleanup",
+    );
+    if (plan.profile === "hosted") {
+      assert.equal(cleanupIndex, -1);
+      continue;
+    }
+    const examplesIndex = lint.checks.findIndex(
+      (check) => check.name === "embed-offline-examples",
+    );
+    assert.equal(cleanupIndex, examplesIndex + 1);
+    const cleanup = lint.checks[cleanupIndex];
+    assert.equal(cleanup.when, true);
+    assert.deepEqual(cleanup.needs, ["embed-offline-examples"]);
+    assert.equal(
+      cleanup.run,
+      "bash scripts/ci-cancel-aware.sh cargo clean --profile release --target-dir target/ci-private-build",
+    );
+    assert.doesNotMatch(
+      cleanup.run,
+      /ci-private-coverage|tinymold|--profile dev|rm /,
+    );
+  }
+});
+
+test("failed offline examples block release cleanup while independent Rust validation continues", async () => {
+  const plan = buildPlan({ profile: "ex63", areas: ALL, env: EX63_ENV });
+  const lint = plan.lanes.find((lane) => lane.name === "rust-lint");
+  const cleanup = lint.checks.find(
+    (check) => check.name === "release-example-cleanup",
+  );
+  assert.ok(cleanup);
+  const out = fs.mkdtempSync(
+    path.join(os.tmpdir(), "release-cleanup-dependency-"),
+  );
+  try {
+    fs.mkdirSync(path.join(out, "logs"));
+    const checks = [
+      { name: "embed-offline-examples", when: true, needs: [], run: "exit 1" },
+      cleanup,
+      { name: "independent", when: true, needs: [], run: "echo continued" },
+    ];
+    const result = await new Runner(
+      { profile: "ex63", lanes: [{ name: "rust-lint", checks }] },
+      { out, maxParallel: 1 },
+    ).run();
+    assert.deepEqual(
+      result[0].checks.map((check) => check.status),
+      ["failure", "blocked", "success"],
+    );
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test("private ordinary Rust builds keep line tables while coverage and hosted profiles remain unchanged", () => {
+  for (const plan of plans()) {
+    for (const lane of plan.lanes.filter((lane) => lane.heavy != null)) {
+      const expected =
+        lane.name === "rust-cov"
+          ? "0"
+          : plan.profile === "ex63"
+            ? "line-tables-only"
+            : undefined;
+      assert.equal(
+        lane.env.CARGO_PROFILE_DEV_DEBUG,
+        expected,
+        `${plan.profile}:${lane.name}`,
+      );
+      assert.equal(
+        lane.env.CARGO_PROFILE_TEST_DEBUG,
+        undefined,
+        "test inherits the dev profile without a separate override",
+      );
+      assert.equal(
+        lane.env.CARGO_PROFILE_RELEASE_DEBUG,
+        undefined,
+        "release keeps the manifest profile",
+      );
+      for (const check of lane.checks) {
+        const env = { ...lane.env, ...check.env };
+        const coverage =
+          check.name === "rust-core-coverage" ||
+          check.run.includes("cargo llvm-cov nextest") ||
+          check.name === "tauri-coverage";
+        if (coverage)
+          assert.equal(
+            env.CARGO_PROFILE_DEV_DEBUG,
+            "0",
+            `${plan.profile}:${check.name} keeps coverage debug=0`,
+          );
+        if (plan.profile === "ex63" && lane.name === "rust-lint")
+          assert.equal(
+            env.CARGO_PROFILE_DEV_DEBUG,
+            "line-tables-only",
+            check.name,
+          );
+        assert.equal(env.CARGO_PROFILE_TEST_DEBUG, undefined);
+        assert.equal(env.CARGO_PROFILE_RELEASE_DEBUG, undefined);
+      }
+    }
+  }
+});
+
+test("storage-bypass runs under cancellation supervision in both profiles", () => {
+  for (const profile of ["hosted", "ex63"]) {
+    const plan = buildPlan({
+      profile,
+      areas: NONE,
+      env: profile === "ex63" ? EX63_ENV : {},
+    });
+    const check = plan.lanes
+      .flatMap((lane) => lane.checks)
+      .find((check) => check.name === "storage-bypass");
+    assert.equal(check.when, true);
+    assert.equal(
+      check.run,
+      "bash scripts/ci-cancel-aware.sh node scripts/ci/check-storage-bypass.mjs",
+    );
+  }
+});
+
+test("storage checker and debt policy changes arm their own scripts lane", () => {
+  const filters = fs.readFileSync(
+    path.join(repoRoot, ".github/ci-paths-filter.yml"),
+    "utf8",
+  );
+  const scripts = filters.split(/^scripts:\s*$/m)[1].split(/^\S[^\n]*:/m)[0];
+  for (const pattern of [
+    "scripts/ci/check-storage-bypass.mjs",
+    "scripts/ci/check-crate-chain.mjs",
+    "scripts/ci/storage-bypass-debt.mjs",
+    "scripts/ci/storage-bypass*.json",
+    "scripts/ci/storage-bypass*.md",
+  ])
+    assert.ok(
+      scripts.includes(`'${pattern}'`),
+      `${pattern} must arm the scripts area`,
+    );
 });

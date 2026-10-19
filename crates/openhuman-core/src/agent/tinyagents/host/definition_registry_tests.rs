@@ -1,4 +1,5 @@
 use super::*;
+use tinyagents_definition::{ModelSpec, SubagentEntry};
 
 /// Extract the materialized allowlist, failing if projection widens to wildcard.
 trait NamedToolScope {
@@ -13,7 +14,7 @@ impl NamedToolScope for tinyagents_definition::ToolScope {
         }
     }
 }
-use crate::agent::registry::types::{AgentRegistryEntry, AgentRegistrySource, AgentSubagentPolicy};
+use crate::agent_registry::types::{AgentRegistryEntry, AgentRegistrySource, AgentSubagentPolicy};
 
 fn builtins() -> OpenHumanDefinitionRegistry {
     OpenHumanDefinitionRegistry::builtins_only()
@@ -127,8 +128,8 @@ async fn delegates_for_drops_tier_illegal_children() {
 
 #[tokio::test]
 async fn a_worker_parent_authorizes_nothing() {
-    // `validate_tier_hierarchy` hard-fails a worker that lists any agent
-    // id, so the authorized set must be empty rather than the raw list.
+    // The upstream definition set rejects worker-to-agent delegation, and the
+    // runtime registry still must not authorize any worker children.
     let registry = registry_of(vec![
         synthetic("leaf", AgentTier::Worker, &["a_worker"]),
         synthetic("a_worker", AgentTier::Worker, &[]),
@@ -150,19 +151,15 @@ async fn a_worker_parent_authorizes_nothing() {
 }
 
 #[tokio::test]
-async fn authorized_delegates_agree_with_boot_time_validation() {
-    // Cross-check against the host's own boot validator over the real
-    // built-in set: every id `delegates_for` returns must be one
-    // `validate_tier_hierarchy` accepts (it accepts the whole builtin
-    // catalogue, so nothing may be dropped there).
+async fn authorized_delegates_are_declared_by_builtins() {
+    // The upstream DefinitionSet validates the built-in hierarchy during
+    // loading. This test checks the host registry's authorization view.
     let builtin_defs =
-        crate::agent::registry::agents::load_builtins().expect("built-in TOML must parse");
-    crate::agent::registry::agents::validate_tier_hierarchy(&builtin_defs)
-        .expect("built-ins satisfy the hierarchy");
+        crate::agent_registry::agents::load_builtins().expect("built-in TOML must parse");
 
     let registry = builtins();
     for def in &builtin_defs {
-        let declared = declared_subagent_ids(def);
+        let declared = def.allowed_subagent_ids();
         let authorized = registry
             .delegates_for(&def.id)
             .await
@@ -231,12 +228,12 @@ fn projected_model_preserves_inherit_exact_and_hint_routing() {
 
 #[test]
 fn skills_wildcard_entries_are_not_agent_ids() {
-    use crate::agent::harness::definition::SkillsWildcard;
+    use tinyagents_definition::SkillsWildcard;
     let mut def = synthetic("lead", AgentTier::Chat, &["a_worker"]);
     def.subagents.push(SubagentEntry::Skills(SkillsWildcard {
         skills: "*".to_string(),
     }));
-    assert_eq!(declared_subagent_ids(&def), vec!["a_worker".to_string()]);
+    assert_eq!(def.allowed_subagent_ids(), vec!["a_worker".to_string()]);
 }
 
 #[test]

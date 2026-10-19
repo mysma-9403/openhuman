@@ -302,13 +302,18 @@ impl EventHandler<DomainEvent> for ProactiveMessageSubscriber {
                     // agent turn that produced the result, whose tool calls
                     // must remain subject to the cron effect restriction.
                     let automation_source =
-                        crate::agent::turn_origin::TrustedAutomationSource::Background;
-                    let (outcome, request_id) = crate::agent::turn_origin::with_origin(
-                        crate::agent::turn_origin::AgentTurnOrigin::TrustedAutomation {
+                        crate::security::turn_origin::TrustedAutomationSource::Background;
+                    let (outcome, request_id) = crate::security::turn_origin::with_origin(
+                        crate::security::turn_origin::AgentTurnOrigin::TrustedAutomation {
                             job_id: source.clone(),
                             source: automation_source,
                         },
-                        gate.intercept_audited("channels.proactive_send", &summary, redacted),
+                        gate.intercept_audited(
+                            &Default::default(),
+                            "channels.proactive_send",
+                            &summary,
+                            redacted,
+                        ),
                     )
                     .await;
                     match outcome {

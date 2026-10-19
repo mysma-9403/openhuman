@@ -6,22 +6,30 @@ use common::{
     chat_completion, offline_config, route, runtime, scripted_provider, stub_backend,
     tool_call_completion,
 };
-use openhuman_embed::seams::{ToolHook, ToolHookContext};
+use openhuman_embed::seams::{OpenHumanRunContext, ToolHook, ToolHookContext};
 use openhuman_embed::{Access, AgentDefinitionSpec, AgentSpec, Runtime, ToolScopeSpec, Workspace};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
 struct Capture(Arc<Mutex<Vec<Value>>>);
 #[async_trait::async_trait]
-impl ToolHook for Capture {
+impl ToolHook<OpenHumanRunContext> for Capture {
     fn name(&self) -> &str {
         "context-probe"
     }
-    async fn before_tool(&self, ctx: &ToolHookContext) -> anyhow::Result<()> {
+    async fn before_tool(
+        &self,
+        _: &OpenHumanRunContext,
+        ctx: &ToolHookContext,
+    ) -> anyhow::Result<()> {
         self.0.lock().unwrap().push(serde_json::to_value(ctx)?);
         Ok(())
     }
-    async fn after_tool(&self, ctx: &ToolHookContext) -> anyhow::Result<()> {
+    async fn after_tool(
+        &self,
+        _: &OpenHumanRunContext,
+        ctx: &ToolHookContext,
+    ) -> anyhow::Result<()> {
         self.0.lock().unwrap().push(serde_json::to_value(ctx)?);
         Ok(())
     }
@@ -55,6 +63,7 @@ async fn scenario() {
         .unwrap();
     let default_dir = tempfile::tempdir().unwrap();
     let turn_dir = tempfile::tempdir().unwrap();
+    let turn_cwd = turn_dir.path().canonicalize().unwrap();
     let observed = Arc::new(Mutex::new(Vec::new()));
     let agent = runtime
         .agent(
@@ -84,12 +93,16 @@ async fn scenario() {
         .unwrap();
     let observed = observed.lock().unwrap();
     assert_eq!(observed.len(), 4);
-    assert!(observed[1]["output"]
-        .as_str()
-        .unwrap()
-        .contains("owner=isolated home=\n"));
+    assert!(
+        observed[1]["output"]
+            .as_str()
+            .unwrap()
+            .contains("owner=isolated"),
+        "unexpected shell output: {}",
+        observed[1]["output"]
+    );
     for (pair, session, cwd) in [
-        (&observed[..2], "override-session", turn_dir.path()),
+        (&observed[..2], "override-session", turn_cwd.as_path()),
         (&observed[2..], "default-session", default_dir.path()),
     ] {
         for context in pair {

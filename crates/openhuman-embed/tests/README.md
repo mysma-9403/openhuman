@@ -29,7 +29,7 @@ record types preserve populated persisted JSON, including metadata and lineage.
 
 | File | What it proves |
 | --- | --- |
-| [`common/mod.rs`](common/mod.rs) | Shared helpers: `runtime()`, `offline_config()`, `provider(reply)`, `stub_backend()`, `chat_completion`, `tool_call_completion`, `echo_inference()` with `PointedTransport` (managed inference to a mock), and request inspectors (`chat_requests`, `tool_names`, `tool_results`, `last_user_message`). |
+| [`common/mod.rs`](common/mod.rs) | Shared helpers: `runtime()`, `offline_config()`, `provider(reply)`, `stub_backend()`, `chat_completion`, `tool_call_completion`, `echo_inference()` with `PointedInference` (managed inference to a mock), and request inspectors (`chat_requests`, `tool_names`, `tool_results`, `last_user_message`). |
 | [`facades.rs`](facades.rs) | The runtime-free curated facades (`artifacts`, `chat_surface`, `identity`, `config` helpers, `modules`), the compile-status constants and `schema_for_rpc_method`. |
 | [`seams_runtime.rs`](seams_runtime.rs) | A controller extension is invokable after a real `build()`, a `live_policy` is applied after boot, and hooks are removed on drop while the extension outlives the runtime. |
 | [`harness_embed.rs`](harness_embed.rs) | A `Harness` runs a real turn with no transport and no background services, routes it to the mock provider, and binds nothing. |
@@ -38,7 +38,7 @@ record types preserve populated persisted JSON, including metadata and lineage.
 | [`attached_tools.rs`](attached_tools.rs) | `Agent::attach_tools` sources survive clones and session resume, and name collisions are refused. |
 | [`composio_agents.rs`](composio_agents.rs) | Two agents with their own `ComposioHostCredential` reach Composio with their own key only. |
 | [`memory_facade.rs`](memory_facade.rs) | `Runtime::memory` over TinyMemory's in-memory reference engine keeps two tenant roots apart. |
-| [`saas_profiles.rs`](saas_profiles.rs) | A `ProfileRuntime` (SaaS mode, in-process): two users on thread `t1` see only their own messages and ride their own credential, a held `ProfileHandle` keeps its profile from release, a relayed Telegram message lands on the user's `channel:` thread with its `channel_outbound` reply on that user's events only, and the process refuses any other core afterwards. Inference is `common::echo_inference` behind `common::PointedTransport`. |
+| [`saas_profiles.rs`](saas_profiles.rs) | A `ProfileRuntime` (SaaS mode, in-process): two users on thread `t1` see only their own messages and ride their own credential, a held `ProfileHandle` keeps its profile from release, a relayed Telegram message lands on the user's `channel:` thread with its `channel_outbound` reply on that user's events only, and the process refuses any other core afterwards. Inference is `common::echo_inference` behind `common::PointedInference`. |
 | [`host_only_tools.rs`](host_only_tools.rs) | Host tools declare read-only requirements through Embed's `ToolPolicy`; the exact host catalog is advertised and built-in shell/write calls are refused. |
 | [`structured_turns.rs`](structured_turns.rs) | Host-owned document tools preserve structured response shape, usage, budgets and untrusted-input restrictions across the tool loop. |
 | [`completion_routing.rs`](completion_routing.rs) | Ordered endpoint fallback, bounded 2x/4x truncation retries, final unpinned gateway routing, images and accounting across all attempts. |
@@ -48,6 +48,7 @@ record types preserve populated persisted JSON, including metadata and lineage.
 | [`turn_observers.rs`](turn_observers.rs) | Terminal error privacy, explicit input capture, and exactly one terminal callback on dispatch failure. |
 | [`observed_turns.rs`](observed_turns.rs) | Actual model and host-tool observations survive the core runtime task hop; payloads require consent; actual model, finish reason and reasoning usage. |
 | [`public_api.rs`](public_api.rs) | Compile-time check that the host-facing types and signatures stay exported. |
+| [`turn_steering.rs`](turn_steering.rs) | A steer sent during a plain chat turn's only model call is applied after the draft answer and earns one more call in the same turn; a steer queued before send reaches the first call; a steer after the turn ended is refused with its text; a cancelled turn hands an undelivered steer back. |
 | [`turn_cancellation.rs`](turn_cancellation.rs) | Cancellation before send, during inference and during a builtin shell command; repeated requests and agent reuse. |
 | [`process_cancellation.rs`](process_cancellation.rs) | On Linux, dropping a command future kills its shell descendants. |
 | `inline_permissions.rs` | An inline UI decision precedes execution; concurrent agents and one-turn denials stay isolated. |
@@ -74,6 +75,6 @@ existing one, and reuse [`common/`](common/) for mocks.
 
 ## Further reading
 
-- [`gitbooks/developing/embedding.md`](../../../gitbooks/developing/embedding.md): embedding the core in another product.
-- [`gitbooks/developing/testing-strategy.md`](../../../gitbooks/developing/testing-strategy.md): testing strategy.
+- [`docs/gitbooks/en/developing/embedding.md`](../../../docs/gitbooks/en/developing/embedding.md): embedding the core in another product.
+- [`docs/gitbooks/en/developing/testing-strategy.md`](../../../docs/gitbooks/en/developing/testing-strategy.md): testing strategy.
 - [`crates/openhuman-embed/README.md`](../README.md): the openhuman-embed crate README.

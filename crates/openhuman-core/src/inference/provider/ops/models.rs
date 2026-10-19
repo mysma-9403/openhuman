@@ -22,27 +22,20 @@ use tinyinference_llm::providers::openai::codex::{
 
 mod catalog_listing;
 mod local_runtime;
-mod managed_provider;
 mod openrouter;
 use tinyinference_llm::catalog::{
+    append_query_param, endpoint_hosts_models_listing, is_openrouter_provider,
     merge_openai_codex_model_hints, parse_models_response, ModelInfo,
 };
 
 #[cfg(test)]
 use catalog_listing::resolve_local_runtime_key;
 
-pub use catalog_listing::{
-    append_query_param, list_configured_models, list_configured_models_from_config,
-};
+pub use catalog_listing::{list_configured_models, list_configured_models_from_config};
 pub use local_runtime::synthesize_local_runtime_entry;
-pub use openrouter::is_openrouter_provider;
 
 // Cross-submodule wiring: each submodule reaches these through `use super::*;`
 // (mirrors the pre-split `include!`-shared scope).
-use managed_provider::{
-    managed_401_means_signed_out, managed_session_attaches, synthesize_managed_entry,
-    url_is_credential_safe,
-};
 use openrouter::validate_openrouter_api_key;
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::tinyagents::middleware::repeated_failure::RepeatedToolFailureMiddleware;
 
 const FETCH_403: &str =
     "HTTP 403 Forbidden from example.test; the site refused the request. Try another source.";
@@ -12,15 +13,16 @@ const FETCH_503: &str = "HTTP 503 Service Unavailable from example.test; the ser
 /// Run one failing `tool` call with `url` and `error` through the breaker.
 async fn fail_call(
     mw: &RepeatedToolFailureMiddleware,
+    context: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
     id: &str,
     tool: &str,
     arguments: serde_json::Value,
     error: &str,
 ) {
     let mut call = TaToolCall::new(id, tool, arguments);
-    mw.before_tool(&mut ctx(), &(), &mut call).await.unwrap();
+    mw.before_tool(context, &(), &mut call).await.unwrap();
     let mut result = failing_result(tool, error);
-    mw.after_tool(&mut ctx(), &(), &invocation(id, tool), &mut result)
+    mw.after_tool(context, &(), &invocation(id, tool), &mut result)
         .await
         .unwrap();
 }
@@ -34,8 +36,10 @@ async fn one_blocked_website_does_not_stop_the_run() {
     let handle = SteeringHandle::allow_all();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mw = RepeatedToolFailureMiddleware::new(handle.clone(), 3, slot.clone());
+    let mut context = ctx();
     fail_call(
         &mw,
+        &mut context,
         "blocked-1",
         "web_fetch",
         fetch_args("https://example.test/a"),
@@ -51,10 +55,12 @@ async fn repeated_refusals_from_one_host_stop_the_run_after_the_budget() {
     let handle = SteeringHandle::allow_all();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mw = RepeatedToolFailureMiddleware::new(handle.clone(), 3, slot.clone());
+    let mut context = ctx();
     // Different pages of one host: a new path must not reset the count.
     for (id, path) in [("r1", "a"), ("r2", "b")] {
         fail_call(
             &mw,
+            &mut context,
             id,
             "web_fetch",
             fetch_args(&format!("https://example.test/{path}")),
@@ -65,6 +71,7 @@ async fn repeated_refusals_from_one_host_stop_the_run_after_the_budget() {
     assert_eq!(drain_pause_count(&handle), 0);
     fail_call(
         &mw,
+        &mut context,
         "r3",
         "web_fetch",
         fetch_args("https://example.test/c?q=3"),
@@ -83,6 +90,7 @@ async fn refusals_from_different_hosts_are_counted_separately() {
     let handle = SteeringHandle::allow_all();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mw = RepeatedToolFailureMiddleware::new(handle.clone(), 3, slot.clone());
+    let mut context = ctx();
     for (id, host) in [
         ("h1", "a.test"),
         ("h2", "b.test"),
@@ -91,6 +99,7 @@ async fn refusals_from_different_hosts_are_counted_separately() {
     ] {
         fail_call(
             &mw,
+            &mut context,
             id,
             "web_fetch",
             fetch_args(&format!("https://{host}/page")),
@@ -106,9 +115,11 @@ async fn a_good_fetch_from_a_host_clears_its_refusal_count() {
     let handle = SteeringHandle::allow_all();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mw = RepeatedToolFailureMiddleware::new(handle.clone(), 3, slot.clone());
+    let mut context = ctx();
     for id in ["c1", "c2"] {
         fail_call(
             &mw,
+            &mut context,
             id,
             "web_fetch",
             fetch_args("https://example.test/a"),
@@ -117,17 +128,18 @@ async fn a_good_fetch_from_a_host_clears_its_refusal_count() {
         .await;
     }
     let mut call = TaToolCall::new("c-ok", "web_fetch", fetch_args("https://example.test/open"));
-    mw.before_tool(&mut ctx(), &(), &mut call).await.unwrap();
+    mw.before_tool(&mut context, &(), &mut call).await.unwrap();
     let mut ok = tool_result(
         "web_fetch",
         "status=200 url=https://example.test/open\nhello",
     );
-    mw.after_tool(&mut ctx(), &(), &invocation("c-ok", "web_fetch"), &mut ok)
+    mw.after_tool(&mut context, &(), &invocation("c-ok", "web_fetch"), &mut ok)
         .await
         .unwrap();
     for id in ["c3", "c4"] {
         fail_call(
             &mw,
+            &mut context,
             id,
             "web_fetch",
             fetch_args("https://example.test/b"),
@@ -148,8 +160,10 @@ async fn a_credentialed_endpoint_is_steered_off_then_stopped() {
     let handle = SteeringHandle::allow_all();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mw = RepeatedToolFailureMiddleware::new(handle.clone(), 3, slot.clone());
+    let mut context = ctx();
     fail_call(
         &mw,
+        &mut context,
         "cred-1",
         "composio_execute",
         serde_json::json!({"endpoint": "github/repos", "account_id": "acct-1"}),
@@ -162,7 +176,7 @@ async fn a_credentialed_endpoint_is_steered_off_then_stopped() {
         "first refusal steers, not stops"
     );
     assert!(slot.lock().unwrap().is_none());
-    let nudges = mw.take_pending_nudges();
+    let nudges = drain_nudge_messages(&mw, &mut context).await;
     assert_eq!(nudges.len(), 1, "{nudges:?}");
     assert!(
         nudges[0].contains("`composio_execute` tool cannot be used"),
@@ -170,6 +184,7 @@ async fn a_credentialed_endpoint_is_steered_off_then_stopped() {
     );
     fail_call(
         &mw,
+        &mut context,
         "cred-2",
         "composio_execute",
         serde_json::json!({"endpoint": "github/repos", "account_id": "acct-1"}),
@@ -238,32 +253,4 @@ fn web_fetch_failure_scope_is_the_host_not_the_page() {
         scope("web_fetch", &fetch_args("https://example.test/a")),
         scope("web_fetch", &fetch_args("https://other.test/a"))
     );
-}
-
-#[test]
-fn fetched_site_status_reads_only_the_web_fetch_error_shape() {
-    let status = super::super::fetched_site::fetched_site_status;
-    assert_eq!(status(FETCH_403), Some(403));
-    assert_eq!(status(FETCH_429), Some(429));
-    assert_eq!(status(FETCH_404), Some(404));
-    assert_eq!(status(FETCH_503), Some(503));
-    assert_eq!(
-        status("  HTTP 403 Forbidden from 127.0.0.1; the site refused it."),
-        Some(403)
-    );
-    // Bare statuses, other tools' wording, success codes, and the shape
-    // buried mid-text are not the shape.
-    for text in [
-        "HTTP 403 Forbidden",
-        "HTTP 403",
-        "403 Forbidden",
-        "Gmail API error: 403 insufficient scopes",
-        "Command failed (exit 1)\nHTTP 403 Forbidden from example.test; x",
-        "HTTP 2000 Weird from example.test; x",
-        "HTTP 200 OK from example.test; x",
-        "HTTP 403 Forbidden from ; x",
-        "HTTP 403 Forbidden from example.test no semicolon",
-    ] {
-        assert_eq!(status(text), None, "{text}");
-    }
 }

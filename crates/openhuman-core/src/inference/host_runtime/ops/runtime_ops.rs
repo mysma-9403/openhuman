@@ -7,7 +7,10 @@ use chrono::Utc;
 use crate::config::Config;
 use crate::core::Outcome;
 use crate::inference::host_runtime as local_ai;
-use crate::inference::{LocalAiSpeechResult, LocalAiStatus, LocalAiTtsResult};
+use {
+    tinyinference_local::status::LocalAiSpeechResult, tinyinference_local::status::LocalAiStatus,
+    tinyinference_local::status::LocalAiTtsResult,
+};
 
 use super::turn_guards::enforce_user_prompt_or_reject;
 
@@ -102,7 +105,7 @@ pub async fn local_ai_vision_prompt(
 
     let service = local_ai::global(config);
     let runtime = crate::inference::local_runtime_config(config);
-    let Some(_permit) = crate::cron::scheduler_gate::wait_for_capacity().await else {
+    let Some(_permit) = crate::platform::llm_gate::wait_for_capacity().await else {
         return Err("local AI vision inference is paused while signed out".to_string());
     };
     let output = service

@@ -2,7 +2,8 @@
 //! and the ranker tests (one slot for the whole process) serialize on a lock.
 
 use super::*;
-use openhuman_core::agent::hooks::{ToolHookContext, TurnContext};
+use tinyagents_harness::host::TurnSummary;
+use tinyagents_hooks::tool::ToolHookContext;
 use tinytools::{RankCandidate, RankContext, RankError, RankHit, ToolRanker};
 
 static RANKER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -25,14 +26,12 @@ impl ToolRanker for NamedRanker {
     }
 }
 
-struct NamedPostTurn(&'static str);
+struct PostTurn(&'static str);
 
 #[async_trait::async_trait]
-impl PostTurnHook for NamedPostTurn {
-    fn name(&self) -> &str {
-        self.0
-    }
-    async fn on_turn_complete(&self, _ctx: &TurnContext) -> anyhow::Result<()> {
+impl LearningSink for PostTurn {
+    async fn on_turn_complete(&self, _ctx: &TurnSummary) -> tinyagents_harness::error::Result<()> {
+        let _ = self.0;
         Ok(())
     }
 }
@@ -42,26 +41,25 @@ struct NamedToolHook(&'static str);
 #[test]
 fn live_replacement_and_removal_update_builder_hooks_and_restore_predecessors() {
     let name = "seams-live-builder-hook";
-    let original: Arc<dyn PostTurnHook> = Arc::new(NamedPostTurn(name));
+    let original: Arc<dyn LearningSink> = Arc::new(PostTurn(name));
     replace_embedder_post_turn_hook(name, Some(original.clone()));
+    let builder_hook: Arc<dyn LearningSink> = Arc::new(PostTurn(name));
     let mut seams = HostSeams {
-        post_turn_hooks: vec![Arc::new(NamedPostTurn(name))],
+        post_turn_hooks: vec![builder_hook.clone()],
         ..Default::default()
     }
     .install()
     .unwrap();
-    seams.post_turn_hook(
-        name,
-        Some(Arc::new(NamedPostTurn("different-diagnostic-name"))),
-    );
-    assert_eq!(post_turn_marker(name), Some(1));
-    assert_eq!(post_turn_marker("different-diagnostic-name"), None);
+    assert!(post_turn_hook_is_registered(&builder_hook));
+    let live_hook: Arc<dyn LearningSink> = Arc::new(PostTurn("live"));
+    seams.post_turn_hook(name, Some(live_hook.clone()));
+    assert!(Arc::ptr_eq(
+        &embedder_post_turn_hook_named(name).unwrap(),
+        &live_hook
+    ));
     seams.post_turn_hook(name, None);
     assert!(Arc::ptr_eq(
-        &embedder_post_turn_hooks()
-            .into_iter()
-            .find(|hook| hook.name() == name)
-            .unwrap(),
+        &embedder_post_turn_hook_named(name).unwrap(),
         &original
     ));
     seams.tool_hook(
@@ -76,25 +74,31 @@ fn live_replacement_and_removal_update_builder_hooks_and_restore_predecessors() 
         .iter()
         .any(|hook| hook.name() == "seams-live-tool"));
     drop(seams);
+    assert!(!post_turn_hook_is_registered(&builder_hook));
     assert!(Arc::ptr_eq(
-        &embedder_post_turn_hooks()
-            .into_iter()
-            .find(|hook| hook.name() == name)
-            .unwrap(),
+        &embedder_post_turn_hook_named(name).unwrap(),
         &original
     ));
     replace_embedder_post_turn_hook(name, None);
 }
 
 #[async_trait::async_trait]
-impl ToolHook for NamedToolHook {
+impl ToolHook<OpenHumanRunContext> for NamedToolHook {
     fn name(&self) -> &str {
         self.0
     }
-    async fn before_tool(&self, _context: &ToolHookContext) -> anyhow::Result<()> {
+    async fn before_tool(
+        &self,
+        _: &OpenHumanRunContext,
+        _context: &ToolHookContext,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn after_tool(&self, _context: &ToolHookContext) -> anyhow::Result<()> {
+    async fn after_tool(
+        &self,
+        _: &OpenHumanRunContext,
+        _context: &ToolHookContext,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -103,13 +107,10 @@ fn ranker_kind() -> Option<&'static str> {
     installed_tool_ranker().map(|ranker| ranker.kind())
 }
 
-/// How many hooks of `name` are registered, `None` for zero.
-fn post_turn_marker(name: &str) -> Option<u8> {
-    let count = embedder_post_turn_hooks()
+fn post_turn_hook_is_registered(hook: &Arc<dyn LearningSink>) -> bool {
+    embedder_post_turn_hooks()
         .iter()
-        .filter(|hook| hook.name() == name)
-        .count();
-    u8::try_from(count).ok().filter(|count| *count > 0)
+        .any(|registered| Arc::ptr_eq(registered, hook))
 }
 
 #[test]
@@ -165,69 +166,68 @@ fn a_ranker_replaced_after_build_is_left_alone() {
 fn persisted_seams_survive_the_guard() {
     let _lock = RANKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_tool_ranker();
+    let persisted_hook: Arc<dyn LearningSink> = Arc::new(PostTurn("persisted"));
     HostSeams {
         tool_ranker: Some(Arc::new(NamedRanker("seams-persisted"))),
-        post_turn_hooks: vec![Arc::new(NamedPostTurn("seams-persisted-hook"))],
+        post_turn_hooks: vec![persisted_hook.clone()],
         ..HostSeams::default()
     }
     .install()
     .expect("install")
     .persist();
     assert_eq!(ranker_kind(), Some("seams-persisted"));
-    assert_eq!(post_turn_marker("seams-persisted-hook"), Some(1));
+    assert!(post_turn_hook_is_registered(&persisted_hook));
     clear_tool_ranker();
-    replace_embedder_post_turn_hook("seams-persisted-hook", None);
 }
 
 #[test]
 fn post_turn_hooks_are_removed_and_a_replaced_one_restored() {
-    replace_embedder_post_turn_hook(
-        "seams-replaced-hook",
-        Some(Arc::new(NamedPostTurn("seams-replaced-hook"))),
-    );
+    let original: Arc<dyn LearningSink> = Arc::new(PostTurn("original"));
+    replace_embedder_post_turn_hook("seams-replaced-hook", Some(original.clone()));
+    let replaced_hook: Arc<dyn LearningSink> = Arc::new(PostTurn("builder replaced"));
+    let new_hook: Arc<dyn LearningSink> = Arc::new(PostTurn("builder new"));
     let seams = HostSeams {
-        post_turn_hooks: vec![
-            Arc::new(NamedPostTurn("seams-replaced-hook")),
-            Arc::new(NamedPostTurn("seams-new-hook")),
-        ],
+        post_turn_hooks: vec![replaced_hook.clone(), new_hook.clone()],
         ..HostSeams::default()
     }
     .install()
     .expect("install");
-    // Replaced, not duplicated.
-    assert_eq!(post_turn_marker("seams-replaced-hook"), Some(1));
-    assert_eq!(post_turn_marker("seams-new-hook"), Some(1));
+    assert!(post_turn_hook_is_registered(&replaced_hook));
+    assert!(post_turn_hook_is_registered(&new_hook));
+    assert!(Arc::ptr_eq(
+        &embedder_post_turn_hook_named("seams-replaced-hook").unwrap(),
+        &original
+    ));
 
     drop(seams);
-    assert_eq!(post_turn_marker("seams-new-hook"), None, "ours removed");
-    assert_eq!(
-        post_turn_marker("seams-replaced-hook"),
-        Some(1),
-        "predecessor restored"
-    );
+    assert!(!post_turn_hook_is_registered(&replaced_hook));
+    assert!(!post_turn_hook_is_registered(&new_hook));
+    assert!(Arc::ptr_eq(
+        &embedder_post_turn_hook_named("seams-replaced-hook").unwrap(),
+        &original
+    ));
     replace_embedder_post_turn_hook("seams-replaced-hook", None);
 }
 
 #[test]
-fn same_named_hooks_unwind_newest_first() {
-    let original: Arc<dyn PostTurnHook> = Arc::new(NamedPostTurn("seams-dup-hook"));
+fn builder_hooks_unwind_and_restore_the_named_global_hook() {
+    let original: Arc<dyn LearningSink> = Arc::new(PostTurn("seams-dup-hook"));
     replace_embedder_post_turn_hook("seams-dup-hook", Some(Arc::clone(&original)));
+    let first: Arc<dyn LearningSink> = Arc::new(PostTurn("first builder"));
+    let second: Arc<dyn LearningSink> = Arc::new(PostTurn("second builder"));
     let seams = HostSeams {
-        post_turn_hooks: vec![
-            Arc::new(NamedPostTurn("seams-dup-hook")),
-            Arc::new(NamedPostTurn("seams-dup-hook")),
-        ],
+        post_turn_hooks: vec![first.clone(), second.clone()],
         ..HostSeams::default()
     }
     .install()
     .expect("install");
-    assert_eq!(post_turn_marker("seams-dup-hook"), Some(1));
+    assert!(post_turn_hook_is_registered(&first));
+    assert!(post_turn_hook_is_registered(&second));
 
     drop(seams);
-    let restored = embedder_post_turn_hooks()
-        .into_iter()
-        .find(|hook| hook.name() == "seams-dup-hook")
-        .expect("a hook under the name");
+    assert!(!post_turn_hook_is_registered(&first));
+    assert!(!post_turn_hook_is_registered(&second));
+    let restored = embedder_post_turn_hook_named("seams-dup-hook").expect("a hook under the name");
     assert!(
         Arc::ptr_eq(&restored, &original),
         "the original is back, not the runtime's first hook"
@@ -243,7 +243,7 @@ fn a_hook_replaced_after_build_is_left_alone() {
     }
     .install()
     .expect("install");
-    let later: Arc<dyn ToolHook> = Arc::new(NamedToolHook("seams-late-hook"));
+    let later: Arc<dyn ToolHook<OpenHumanRunContext>> = Arc::new(NamedToolHook("seams-late-hook"));
     replace_embedder_tool_hook("seams-late-hook", Some(Arc::clone(&later)));
 
     drop(seams);
@@ -287,7 +287,7 @@ fn a_live_policy_waits_for_the_core_to_boot() {
 fn builder_options_collect_into_the_seams() {
     let builder = RuntimeBuilder::new()
         .tool_ranker(Arc::new(NamedRanker("seams-builder")))
-        .post_turn_hook(Arc::new(NamedPostTurn("seams-builder-hook")))
+        .post_turn_hook(Arc::new(PostTurn("seams-builder-hook")))
         .tool_hook(Arc::new(NamedToolHook("seams-builder-tool")))
         .live_policy(Arc::new(SecurityPolicy::default()));
     assert!(builder.seams.tool_ranker.is_some());

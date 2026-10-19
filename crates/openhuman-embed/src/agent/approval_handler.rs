@@ -1,8 +1,8 @@
 //! Callback-based approvals, using the same agent-scoped gate as polling.
 use crate::{ApprovalDecision, Approvals, CancellationToken, PendingApproval};
-use openhuman_core::core::bus::{EventHandler, SubscriptionHandle, BUS};
 use openhuman_core::core::events::DomainEvent;
 use std::sync::Arc;
+use {openhuman_core::core::bus::BUS, tinybus::EventHandler, tinybus::SubscriptionHandle};
 
 /// Decide an agent's sanitized pending permission request asynchronously.
 #[async_trait::async_trait]
@@ -27,6 +27,7 @@ impl ApprovalSubscription {
         handler: Arc<dyn ApprovalHandler>,
         removed: tokio::sync::watch::Receiver<bool>,
         lifecycle: Arc<super::lifecycle::ApprovalState>,
+        core: Option<std::sync::Weak<openhuman_core::core::runtime::CoreContext>>,
     ) -> Self {
         let cancellation = CancellationToken::new();
         let subscriber = Arc::new(Handler {
@@ -35,6 +36,7 @@ impl ApprovalSubscription {
             cancellation: cancellation.clone(),
             removed,
             lifecycle,
+            core,
         });
         Self {
             _subscription: BUS.subscribe(subscriber),
@@ -48,6 +50,7 @@ struct Handler {
     cancellation: CancellationToken,
     removed: tokio::sync::watch::Receiver<bool>,
     lifecycle: Arc<super::lifecycle::ApprovalState>,
+    core: Option<std::sync::Weak<openhuman_core::core::runtime::CoreContext>>,
 }
 #[async_trait::async_trait]
 impl EventHandler<DomainEvent> for Handler {
@@ -66,8 +69,12 @@ impl EventHandler<DomainEvent> for Handler {
         if agent_id.as_deref() != Some(&self.agent_id) || *self.removed.borrow() {
             return;
         }
-        let approvals =
-            Approvals::new(&self.agent_id, self.removed.clone(), self.lifecycle.clone());
+        let approvals = Approvals::new(
+            &self.agent_id,
+            self.removed.clone(),
+            self.lifecycle.clone(),
+            self.core.clone(),
+        );
         let Ok(pending) = approvals.pending() else {
             return;
         };

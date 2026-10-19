@@ -9,8 +9,8 @@ use super::dirs::{default_action_dir, resolve_action_dir, ConfigResolutionSource
 use super::env::EnvLookup;
 use super::impl_load::migration_source;
 use super::migrate::{
-    migrate_cloud_provider_slugs, migrate_legacy_inference_url, migrate_legacy_memory_backend,
-    migrate_legacy_memory_sources, migrate_search_settings,
+    migrate_cloud_provider_slugs, migrate_components, migrate_legacy_inference_url,
+    migrate_legacy_memory_backend, migrate_legacy_memory_sources, migrate_search_settings,
 };
 use super::secrets::decrypt_config_secrets;
 use anyhow::Result;
@@ -174,6 +174,7 @@ impl Config {
         migrate_legacy_inference_url(&mut config);
         let migration_raw = migration_source(&config_path, &contents).await;
         migrate_legacy_memory_backend(&mut config, &migration_raw);
+        migrate_components(&mut config, &migration_raw);
         migrate_cloud_provider_slugs(&mut config);
         migrate_search_settings(&mut config);
         migrate_legacy_memory_sources(&mut config);
@@ -306,10 +307,22 @@ pub(super) async fn save_recovered(
     config: &Config,
     source: &dyn super::source::ConfigSource,
 ) -> Result<()> {
-    config.save().await?;
-    if source.label() == "document" {
-        let file = super::source::FileConfigSource::new(&config.config_path);
-        Box::pin(config.save_to(&file)).await?;
+    let document_result = config.save().await;
+    if source.label() != "document" {
+        return document_result;
     }
-    Ok(())
+
+    // The corrupted primary file has already been moved aside. Restore its
+    // bootstrap tables even when this node loses the document CAS race; a
+    // later boot still needs the storage URL to reach the shared backend.
+    let file = super::source::FileConfigSource::new(&config.config_path);
+    let file_result = Box::pin(config.save_file_export(&file)).await;
+    match (document_result, file_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(document_error), Ok(())) => Err(document_error),
+        (Ok(()), Err(file_error)) => Err(file_error),
+        (Err(document_error), Err(file_error)) => Err(file_error.context(format!(
+            "document persistence also failed: {document_error:#}"
+        ))),
+    }
 }

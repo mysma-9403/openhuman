@@ -7,6 +7,7 @@ async fn setup() -> (tempfile::TempDir, crate::config::Config) {
     config.workspace_dir = temp.path().join("internal");
     config.action_dir = temp.path().join("acting");
     conversations::blocking::ensure_thread(
+        crate::core::runtime::DispatchCtx::ambient(),
         config.workspace_dir.clone(),
         conversations::CreateConversationThread {
             id: "uploads".into(),
@@ -26,9 +27,16 @@ async fn setup() -> (tempfile::TempDir, crate::config::Config) {
 async fn append_with_test_config(
     request: AppendConversationMessageRequest,
     config: &crate::config::Config,
-    origin: Option<&crate::agent::turn_origin::AgentTurnOrigin>,
+    origin: Option<&crate::security::turn_origin::AgentTurnOrigin>,
 ) -> Result<Outcome<ApiEnvelope<ConversationMessageRecord>>, ThreadsError> {
-    message_append_with_config(request, config, origin, &config.workspace_dir).await
+    message_append_with_config(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        request,
+        config,
+        origin,
+        &config.workspace_dir,
+    )
+    .await
 }
 
 fn request(id: &str, content: &str, sender: &str) -> AppendConversationMessageRequest {
@@ -65,7 +73,7 @@ async fn user_append_stages_original_strips_upload_bytes_and_reuses_returned_con
     .value
     .data
     .unwrap();
-    let (_, files) = crate::agent::attachments::parse(&first.content);
+    let (_, files) = crate::attachments::parse(&first.content);
     assert_eq!(files.len(), 1);
     assert_eq!(
         tokio::fs::read(config.action_dir.join(&files[0].path))
@@ -90,20 +98,18 @@ async fn user_append_stages_original_strips_upload_bytes_and_reuses_returned_con
         .data
         .unwrap();
     assert_eq!(second.content, first.content);
-    let staged = crate::agent::attachments::stage_turn(
-        &second.content,
-        Some(&config),
-        None,
-        Some("uploads"),
-        None,
+    let staged =
+        crate::attachments::stage_turn(&second.content, Some(&config), None, Some("uploads"), None)
+            .await
+            .unwrap();
+    assert_eq!(staged, first.content);
+    let persisted = conversations::blocking::get_messages(
+        crate::core::runtime::DispatchCtx::ambient(),
+        config.workspace_dir.clone(),
+        "uploads".into(),
     )
     .await
     .unwrap();
-    assert_eq!(staged, first.content);
-    let persisted =
-        conversations::blocking::get_messages(config.workspace_dir.clone(), "uploads".into())
-            .await
-            .unwrap();
     assert_eq!(persisted.len(), 2);
     assert!(!serde_json::to_string(&persisted)
         .unwrap()
@@ -138,18 +144,20 @@ async fn rejected_upload_never_appends_a_message() {
             .await
             .is_err()
     );
-    assert!(
-        conversations::blocking::get_messages(config.workspace_dir.clone(), "uploads".into())
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(conversations::blocking::get_messages(
+        crate::core::runtime::DispatchCtx::ambient(),
+        config.workspace_dir.clone(),
+        "uploads".into()
+    )
+    .await
+    .unwrap()
+    .is_empty());
 }
 
 #[tokio::test]
 async fn external_origin_cannot_reuse_an_existing_attachment_marker() {
     let (_temp, config) = setup().await;
-    let staged = crate::agent::attachments::stage_turn(
+    let staged = crate::attachments::stage_turn(
         "[IMAGE:data:image/png;base64,iVBORw0KGgo=]",
         Some(&config),
         None,
@@ -158,7 +166,7 @@ async fn external_origin_cannot_reuse_an_existing_attachment_marker() {
     )
     .await
     .unwrap();
-    let origin = crate::agent::turn_origin::AgentTurnOrigin::ExternalChannel {
+    let origin = crate::security::turn_origin::AgentTurnOrigin::ExternalChannel {
         sender_name: None,
         channel: "test".into(),
         sender: None,
@@ -171,12 +179,14 @@ async fn external_origin_cannot_reuse_an_existing_attachment_marker() {
             .await
             .is_err()
     );
-    assert!(
-        conversations::blocking::get_messages(config.workspace_dir, "uploads".into())
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(conversations::blocking::get_messages(
+        crate::core::runtime::DispatchCtx::ambient(),
+        config.workspace_dir,
+        "uploads".into()
+    )
+    .await
+    .unwrap()
+    .is_empty());
 }
 
 #[tokio::test]
@@ -212,6 +222,7 @@ async fn append_uses_host_persistence_workspace_separate_from_rpc_config() {
     let (temp, config) = setup().await;
     let persistence_dir = temp.path().join("host-thread-store");
     conversations::blocking::ensure_thread(
+        crate::core::runtime::DispatchCtx::ambient(),
         persistence_dir.clone(),
         conversations::CreateConversationThread {
             id: "uploads".into(),
@@ -227,6 +238,7 @@ async fn append_uses_host_persistence_workspace_separate_from_rpc_config() {
     .unwrap();
 
     message_append_with_config(
+        &crate::core::runtime::DispatchCtx::ambient(),
         request("host-store", "saved in host workspace", "assistant"),
         &config,
         None,
@@ -235,16 +247,22 @@ async fn append_uses_host_persistence_workspace_separate_from_rpc_config() {
     .await
     .unwrap();
 
-    let persisted = conversations::blocking::get_messages(persistence_dir, "uploads".into())
-        .await
-        .unwrap();
+    let persisted = conversations::blocking::get_messages(
+        crate::core::runtime::DispatchCtx::ambient(),
+        persistence_dir,
+        "uploads".into(),
+    )
+    .await
+    .unwrap();
     assert_eq!(persisted.len(), 1);
-    assert!(
-        conversations::blocking::get_messages(config.workspace_dir, "uploads".into())
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(conversations::blocking::get_messages(
+        crate::core::runtime::DispatchCtx::ambient(),
+        config.workspace_dir,
+        "uploads".into()
+    )
+    .await
+    .unwrap()
+    .is_empty());
 }
 
 #[tokio::test]
@@ -258,10 +276,47 @@ async fn poster_only_user_metadata_is_rejected_before_persistence() {
     assert!(append_with_test_config(upload, &config, None)
         .await
         .is_err());
-    assert!(
-        conversations::blocking::get_messages(config.workspace_dir.clone(), "uploads".into())
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(conversations::blocking::get_messages(
+        crate::core::runtime::DispatchCtx::ambient(),
+        config.workspace_dir.clone(),
+        "uploads".into()
+    )
+    .await
+    .unwrap()
+    .is_empty());
+}
+
+#[tokio::test]
+async fn raw_append_stages_in_the_bound_thread_folder() {
+    let (temp, config) = setup().await;
+    let folder = temp.path().join("project");
+    std::fs::create_dir_all(&folder).unwrap();
+    let folder = folder.canonicalize().unwrap();
+    conversations::blocking::ensure_thread(
+        crate::core::runtime::DispatchCtx::ambient(),
+        config.workspace_dir.clone(),
+        conversations::CreateConversationThread {
+            id: "bound".into(),
+            title: "Bound".into(),
+            created_at: "2026-10-04T00:00:00Z".into(),
+            parent_thread_id: None,
+            labels: None,
+            personality_id: None,
+            working_dir: Some(folder.to_string_lossy().into_owned()),
+        },
+    )
+    .await
+    .unwrap();
+    let mut raw = request("raw", "[IMAGE:data:image/png;base64,iVBORw0KGgo=]", "user");
+    raw.thread_id = "bound".into();
+    let staged = append_with_test_config(raw, &config, None)
+        .await
+        .unwrap()
+        .value
+        .data
+        .unwrap();
+    let (_, files) = crate::attachments::parse(&staged.content);
+    assert_eq!(files.len(), 1);
+    assert!(folder.join(&files[0].path).is_file());
+    assert!(!config.action_dir.join("uploads").exists());
 }

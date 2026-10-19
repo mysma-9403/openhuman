@@ -87,7 +87,11 @@ impl ChatModel<()> for ScriptedProvider {
         } else {
             guard.remove(0)
         };
-        Ok(crate::agent::tinyagents::model::native_model_response_for_request(&response, &request))
+        Ok(
+            crate::inference::provider::model::native_model_response_for_request(
+                &response, &request,
+            ),
+        )
     }
 }
 

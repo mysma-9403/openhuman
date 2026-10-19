@@ -29,6 +29,7 @@ fn document_source_keyed(
         Scope::new(scope).unwrap(),
         keys,
         FileConfigSource::new(file),
+        super::DocumentBackendIdentity::Test(Arc::new(())),
     )
 }
 
@@ -120,7 +121,11 @@ async fn a_document_holds_no_plaintext_and_no_bootstrap_tables() {
         .unwrap();
 
     let docs = Arc::clone(scoped(&storage, "alice").documents());
-    let stored = docs.get("config", "alice").await.unwrap().unwrap();
+    let stored = docs
+        .get("config.documents", "alice")
+        .await
+        .unwrap()
+        .unwrap();
     let raw = serde_json::to_string(&stored.doc).unwrap();
     assert!(raw.contains("enc2:"), "{raw}");
     for leaked in ["sk-very-secret", "mongodb", "default_model", "[storage]"] {
@@ -146,11 +151,16 @@ async fn a_document_does_not_decrypt_under_another_scope_or_master_key() {
     // Another scope's data key cannot open alice's ciphertext even when the
     // sealed value is copied across (per-scope key derivation).
     let docs = Arc::clone(scoped(&storage, "alice").documents());
-    let sealed = docs.get("config", "alice").await.unwrap().unwrap().doc;
+    let sealed = docs
+        .get("config.documents", "alice")
+        .await
+        .unwrap()
+        .unwrap()
+        .doc;
     let bob_docs = Arc::clone(scoped(&storage, "bob").documents());
     bob_docs
         .put(
-            "config",
+            "config.documents",
             "bob",
             sealed,
             tinystoragedrivers::Precondition::None,
@@ -191,7 +201,7 @@ async fn a_document_read_takes_its_bootstrap_tables_from_the_file() {
     let key = keys(1).data_key(&Scope::new("alice").unwrap()).unwrap();
     let sealed = crypto::encrypt_enc2(&key, b"[storage]\nurl = \"evil\"\n").unwrap();
     docs.put(
-        "config",
+        "config.documents",
         "alice",
         serde_json::json!({ "toml_enc": sealed }),
         tinystoragedrivers::Precondition::None,
@@ -277,6 +287,60 @@ async fn config_save_and_reload_use_the_document_on_a_shared_backend() {
 }
 
 #[tokio::test]
+async fn stale_document_config_snapshot_returns_conflict_instead_of_overwriting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = MemoryStorage::new();
+    let _forced = ForcedDocumentSource::new(
+        scoped(&storage, "tenant-a"),
+        Scope::new("tenant-a").unwrap(),
+        keys(3),
+    );
+    let path = tmp.path().join("config.toml");
+    let initial = config_at(tmp.path(), "initial");
+    initial.save().await.unwrap();
+    let mut first = Config::load_from_config_path(&path, &tmp.path().join("workspace"))
+        .await
+        .unwrap();
+    let mut stale = Config::load_from_config_path(&path, &tmp.path().join("workspace"))
+        .await
+        .unwrap();
+    first.default_model = Some("first".into());
+    stale.output_language = Some("fr".into());
+    first.save().await.unwrap();
+    first.default_temperature = 0.25;
+    first.save().await.unwrap();
+
+    let error = stale.save().await.unwrap_err();
+    let storage_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tinystoragedrivers::StorageError>())
+        .expect("CAS failure retains the typed storage error");
+    assert_eq!(
+        storage_error.kind(),
+        tinystoragedrivers::ErrorKind::Conflict
+    );
+    let _ = error;
+    let rpc_error = crate::config::ops::apply_autonomy_settings(
+        &mut stale,
+        crate::config::ops::AutonomySettingsPatch {
+            enabled: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    let rpc_error = crate::core::StructuredRpcError::decode(&rpc_error)
+        .expect("config RPC boundary exposes a structured conflict");
+    assert_eq!(rpc_error.data.unwrap()["kind"], "ConfigConflict");
+    let loaded = Config::load_from_config_path(&path, &tmp.path().join("workspace"))
+        .await
+        .unwrap();
+    assert_eq!(loaded.default_model.as_deref(), Some("first"));
+    assert_eq!(loaded.default_temperature, 0.25);
+    assert_ne!(loaded.output_language.as_deref(), Some("fr"));
+}
+
+#[tokio::test]
 async fn without_a_shared_backend_config_stays_on_the_file() {
     // No forced scope and no installed backend: the file source.
     let tmp = tempfile::tempdir().unwrap();
@@ -350,7 +414,7 @@ async fn a_present_but_malformed_document_is_an_error_not_absence() {
     let source = document_source(&storage, "alice", &file);
     let docs = Arc::clone(scoped(&storage, "alice").documents());
     docs.put(
-        "config",
+        "config.documents",
         "alice",
         serde_json::json!({ "toml_enc": 123 }),
         tinystoragedrivers::Precondition::None,
@@ -378,7 +442,7 @@ async fn a_document_that_does_not_parse_is_an_error_and_leaves_the_bootstrap_fil
     let key = keys(3).data_key(&Scope::new("tenant-a").unwrap()).unwrap();
     let sealed = crypto::encrypt_enc2(&key, b"default_model = 5\n").unwrap();
     docs.put(
-        "config",
+        "config.documents",
         "tenant-a",
         serde_json::json!({ "toml_enc": sealed }),
         tinystoragedrivers::Precondition::None,
@@ -513,11 +577,14 @@ async fn a_document_save_refuses_process_key_secrets_it_cannot_open() {
         "{error:#}"
     );
     let docs = Arc::clone(scoped(&storage, "tenant-a").documents());
-    docs.ensure_collection(&tinystoragedrivers::CollectionSpec::new("config"))
+    docs.ensure_collection(&tinystoragedrivers::CollectionSpec::new("config.documents"))
         .await
         .unwrap();
     assert!(
-        docs.get("config", "tenant-a").await.unwrap().is_none(),
+        docs.get("config.documents", "tenant-a")
+            .await
+            .unwrap()
+            .is_none(),
         "nothing was written over the shared document"
     );
 }
@@ -545,4 +612,11 @@ async fn a_recovered_file_fallback_rewrites_the_bootstrap_file_too() {
     let body = source.read().await.unwrap();
     assert!(body.from_document);
     assert!(body.contents.contains("recovered"));
+
+    // The auxiliary bootstrap-file export must not erase the document
+    // revision captured by the first successful save.
+    config.save().await.unwrap();
 }
+
+#[path = "concurrency_tests.rs"]
+mod concurrency_tests;

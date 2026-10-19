@@ -1,7 +1,7 @@
 //! Session transcript identity, locator and metadata construction.
 
 use super::super::types::OpenHumanSessionHost;
-use crate::agent::session_store::transcripts_or_files;
+use crate::storage::sessions::transcripts_or_files;
 use std::sync::Arc;
 use tinyagents_session::transcript::TranscriptMeta;
 
@@ -21,8 +21,10 @@ impl OpenHumanSessionHost {
         }
         self.session_history_locator_memo
             .get_or_init(|| {
-                let session_agent_id =
-                    crate::agent::session_store::current_agent_key_or(&self.agent_definition_id);
+                let session_agent_id = crate::storage::sessions::current_agent_key_or(
+                    &self.dispatch_ctx(),
+                    &self.agent_definition_id,
+                );
                 transcripts_or_files(&session_agent_id, &self.workspace_dir)
             })
             .clone()

@@ -6,7 +6,7 @@
 //! ## Provider-string grammar
 //!
 //! ```text
-//! "openhuman"                    → OpenHumanBackendModel; model = config.default_model
+//! "openhuman"                    → the registered managed chat model; model = config.default_model
 //! "cloud" / missing              → primary_cloud; legacy custom inference_url wins when
 //!                                  primary still points at OpenHuman after migration
 //! "ollama:<model>[@<temp>]"      → local Ollama at config.local_ai.base_url
@@ -30,9 +30,10 @@
 //! - [`primary_cloud`] — `primary_cloud` / legacy `inference_url` resolution.
 //! - [`access_gates`] — privacy-mode, session, and egress chokepoints.
 //! - [`credentials`] — auth-profile key lookup for cloud slugs.
-//! - [`managed_backend`] — the managed OpenHuman backend model.
+//! - [`managed_backend`] — the managed provider resolution (tier pinning, privacy gate, egress) in front of the registered chat model.
 //! - [`local_runtime`] — Ollama / LM Studio / MLX / OMLX / local-openai.
 //! - [`cloud_slug`] — `<slug>:<model>` BYOK cloud providers.
+//! - [`cloud_spec`] — `CloudProviderCreds` → `ProviderSpec` → `ProviderRegistry`.
 //! - [`subprocess_providers`] — Claude Agent SDK and Claude Code CLI.
 //! - [`chat_model`] — the one-shot `create_chat_model*` entry points.
 //! - [`turn_model`] — the per-turn `create_turn_chat_model*` entry points.
@@ -40,6 +41,7 @@
 pub(crate) mod access_gates;
 mod chat_model;
 mod cloud_slug;
+mod cloud_spec;
 mod credentials;
 mod discovery;
 mod local_runtime;
@@ -54,8 +56,8 @@ mod turn_model;
 pub(crate) use access_gates::current_host_requires_session;
 pub(crate) use chat_model::resolves_to_managed_backend;
 pub use chat_model::{
-    create_chat_model, create_chat_model_from_string, create_chat_model_from_string_with_model_id,
-    create_chat_model_with_model_id, probe_inference_readiness,
+    create_chat_model_from_string, create_chat_model_from_string_with_model_id,
+    create_chat_model_in, create_chat_model_with_model_id_in, probe_inference_readiness,
 };
 pub(crate) use credentials::openai_bearer_is_oauth;
 pub use credentials::{auth_key_for_slug, lookup_key_for_slug, redact_endpoint};
@@ -87,16 +89,18 @@ use local_runtime::{
     try_create_local_runtime_chat_model, try_create_local_runtime_chat_model_from_string,
     OptionalChatModelResult,
 };
-pub(crate) use managed_backend::make_openhuman_backend_model_for_thread;
-use managed_backend::{resolve_managed_backend, resolve_managed_backend_with_model_override};
+pub(crate) use managed_backend::{
+    make_openhuman_backend_model_for_options, make_openhuman_backend_model_for_thread,
+};
+use managed_backend::{managed_chat_model, resolve_managed_model};
 use primary_cloud::{legacy_inference_slug, resolve_primary_cloud_provider_string};
-use routing::split_model_and_temperature;
 use subprocess_providers::{
     prepare_claude_agent_sdk_chat_model, try_create_claude_agent_sdk_chat_model,
     try_create_claude_agent_sdk_chat_model_from_string, try_create_claude_code_chat_model,
     try_create_claude_code_chat_model_from_string,
 };
 use tiers::{is_abstract_tier_model, managed_default_model};
+use tinyinference_providers::route::split_model_and_temperature;
 
 /// Test-only seam: inject a mock [`ChatModel`] so e2e tests can drive the
 /// autonomous run paths (for example `spawn_workflow_run_background`)
@@ -120,9 +124,8 @@ mod factory_tests;
 use crate::config::schema::cloud_providers::AuthStyle;
 use crate::config::Config;
 use crate::inference::provider::openai_codex::resolve_openai_codex_routing;
-use crate::inference::provider::openhuman_backend_model::OpenHumanBackendModel;
-use crate::inference::provider::ProviderRuntimeOptions;
 use crate::security::credentials::AuthService;
+use crate::security::egress::EgressLedger;
 use std::sync::Arc;
 use tinyagents_harness::providers::claude_agent_sdk::ClaudeAgentSdkProvider;
 use tinyinference_llm::model::{ChatModel, ModelRequest, ModelResponse, ModelStream};

@@ -1,21 +1,25 @@
 use super::*;
 
 fn visible_names(agent_id: &str) -> std::collections::HashSet<String> {
-    let definition = crate::agent::harness::AgentDefinitionRegistry::builtins_only()
-        .get(agent_id)
-        .cloned()
-        .unwrap_or_else(|| panic!("built-in agent definition not found: {agent_id}"));
+    let definition =
+        crate::agent_registry::host_definition::AgentDefinitionRegistry::builtins_only()
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("built-in agent definition not found: {agent_id}"));
     visible_names_for(&definition)
 }
 
 fn visible_names_for(
-    definition: &crate::agent::harness::definition::AgentDefinition,
+    definition: &crate::agent_registry::host_definition::AgentDefinition,
 ) -> std::collections::HashSet<String> {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = test_config(&tmp);
-    let agent =
-        crate::agent::OpenHumanSessionHost::from_config_with_definition(&config, definition)
-            .unwrap_or_else(|e| panic!("{} session build: {e}", definition.id));
+    let agent = crate::agent::OpenHumanSessionHost::from_config_with_definition(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        &config,
+        definition,
+    )
+    .unwrap_or_else(|e| panic!("{} session build: {e}", definition.id));
     agent
         .visible_tool_specs_arc()
         .iter()
@@ -28,9 +32,12 @@ fn resetting_wildcard_visibility_keeps_collapsed_exposure() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = test_config(&tmp);
     let definition = super::wildcard_probe_def();
-    let mut agent =
-        crate::agent::OpenHumanSessionHost::from_config_with_definition(&config, &definition)
-            .expect("build wildcard agent");
+    let mut agent = crate::agent::OpenHumanSessionHost::from_config_with_definition(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        &config,
+        &definition,
+    )
+    .expect("build wildcard agent");
 
     agent.set_visible_tool_names(std::collections::HashSet::new());
 
@@ -44,9 +51,12 @@ fn hiding_and_reseeding_wildcard_visibility_keeps_collapsed_exposure() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = test_config(&tmp);
     let definition = super::wildcard_probe_def();
-    let mut agent =
-        crate::agent::OpenHumanSessionHost::from_config_with_definition(&config, &definition)
-            .expect("build wildcard agent");
+    let mut agent = crate::agent::OpenHumanSessionHost::from_config_with_definition(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        &config,
+        &definition,
+    )
+    .expect("build wildcard agent");
 
     agent.set_visible_tool_names(std::collections::HashSet::new());
     agent.hide_tools(&["todo"]);
@@ -136,11 +146,11 @@ fn wildcard_belt_defers_but_keeps_reachable() {
     let agent = build_with(direct_and_deferred(), std::collections::HashSet::new());
 
     assert_eq!(
-        agent.deferred_tool_names_for_test(),
-        &std::collections::HashSet::from(["rare".to_string()])
+        agent.deferred_tool_names,
+        std::collections::HashSet::from(["rare".to_string()])
     );
-    assert!(agent.visible_tool_names_for_test().contains("plain"));
-    assert!(!agent.visible_tool_names_for_test().contains("rare"));
+    assert!(agent.visible_tool_names.contains("plain"));
+    assert!(!agent.visible_tool_names.contains("rare"));
     assert!(
         !agent
             .visible_tool_specs_arc()
@@ -149,7 +159,7 @@ fn wildcard_belt_defers_but_keeps_reachable() {
         "a deferred tool must not be in the prompt's spec list"
     );
     assert!(
-        agent.tool_policy_session_for_test().is_allowed("rare"),
+        agent.tool_policy_session.is_allowed("rare"),
         "a deferred tool must be callable once found"
     );
 }
@@ -160,24 +170,21 @@ fn wildcard_belt_defers_but_keeps_reachable() {
 /// it, and the belt's own `Direct` entries stay exactly as written.
 #[test]
 fn named_belt_opts_into_discovery_by_naming_tool_search() {
-    let visible: std::collections::HashSet<String> = [
-        "plain",
-        crate::tools::implementations::meta::TOOL_SEARCH_NAME,
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
+    let visible: std::collections::HashSet<String> = ["plain", tinytools::TOOL_SEARCH_NAME]
+        .into_iter()
+        .map(String::from)
+        .collect();
     let agent = build_with(direct_and_deferred(), visible);
 
     assert_eq!(
-        agent.visible_tool_names_for_test(),
-        &std::collections::HashSet::from(["plain".to_string()])
+        agent.visible_tool_names,
+        std::collections::HashSet::from(["plain".to_string()])
     );
     assert_eq!(
-        agent.deferred_tool_names_for_test(),
-        &std::collections::HashSet::from(["rare".to_string()])
+        agent.deferred_tool_names,
+        std::collections::HashSet::from(["rare".to_string()])
     );
-    assert!(agent.tool_policy_session_for_test().is_allowed("rare"));
+    assert!(agent.tool_policy_session.is_allowed("rare"));
 }
 
 /// A named belt that does not opt in reaches nothing beyond what it wrote
@@ -187,8 +194,8 @@ fn named_belt_without_tool_search_reaches_no_deferred_tool() {
     let visible: std::collections::HashSet<String> = std::iter::once("plain".to_string()).collect();
     let agent = build_with(direct_and_deferred(), visible);
 
-    assert!(agent.deferred_tool_names_for_test().is_empty());
-    assert!(!agent.tool_policy_session_for_test().is_allowed("rare"));
+    assert!(agent.deferred_tool_names.is_empty());
+    assert!(!agent.tool_policy_session.is_allowed("rare"));
 }
 
 /// A hand-written `[tools] named` belt is left exactly as written: exposure is
@@ -220,16 +227,20 @@ fn named_belt_keeps_its_listed_members() {
 fn orchestrator_reaches_the_replaced_specialists_tools_through_discovery() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = test_config(&tmp);
-    let definition = crate::agent::harness::AgentDefinitionRegistry::builtins_only()
-        .get("orchestrator")
-        .cloned()
-        .expect("orchestrator built-in definition");
-    let agent =
-        crate::agent::OpenHumanSessionHost::from_config_with_definition(&config, &definition)
-            .expect("orchestrator session build");
-    let deferred = agent.deferred_tool_names_for_test();
-    let visible = agent.visible_tool_names_for_test();
-    let policy = agent.tool_policy_session_for_test();
+    let definition =
+        crate::agent_registry::host_definition::AgentDefinitionRegistry::builtins_only()
+            .get("orchestrator")
+            .cloned()
+            .expect("orchestrator built-in definition");
+    let agent = crate::agent::OpenHumanSessionHost::from_config_with_definition(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        &config,
+        &definition,
+    )
+    .expect("orchestrator session build");
+    let deferred = agent.deferred_tool_names;
+    let visible = agent.visible_tool_names;
+    let policy = agent.tool_policy_session;
     // Unconditionally registered members only: language commands run through shell and need
     // host Node runtime and the wallet family needs the `web3`
     // feature, so a test profile without them cannot see them either way.

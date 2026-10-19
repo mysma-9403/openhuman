@@ -51,6 +51,10 @@ pub enum HarnessError {
     )]
     AlreadyRunning,
 
+    /// Removing an agent failed to confirm cleanup of its captured MCP owner.
+    #[error("MCP cleanup remains pending: {0}")]
+    McpCleanup(#[source] tinybus::module::ModuleCallError),
+
     /// A builder input could not be honoured.
     #[error("{0}")]
     Invalid(String),
@@ -90,12 +94,14 @@ impl From<crate::AgentError> for HarnessError {
         use crate::AgentError as A;
         match err {
             A::Call(e) => Self::Call(e),
+            A::McpCleanup(e) => Self::McpCleanup(e),
             A::Workspace { what, source } => Self::Workspace { what, source },
             A::DuplicateId(_)
             | A::InvalidId { .. }
             | A::WidensRuntime(_)
             | A::ReservedId(_)
             | A::AgentLimit { .. }
+            | A::CleanupPending
             | A::UnknownId(_)
             | A::UnknownTemplate(_)
             | A::UnknownDefinition(_) => Self::Invalid(err_text(&err)),

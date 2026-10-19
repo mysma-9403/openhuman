@@ -27,7 +27,7 @@ instead of registering them as disabled.
 - `AskClarificationTool` returns the question text as its own tool output; it
   does not pause anything by itself. The pause happens because callers list
   `ask_user_clarification` in the harness seam's `early_exit_tools`
-  (`tinyagents::run_turn_via_tinyagents_shared`), and a successful call there
+  (`tinyagents::TurnSpec::run`), and a successful call there
   steers the loop to `Pause` instead of feeding the result back to the model.
   Any caller that exposes this tool without that listing gets a tool that
   answers its own question, since the model reads a normal success and keeps
@@ -44,9 +44,9 @@ instead of registering them as disabled.
   free-form preference into either the `general` or `situational` lane.
   `RunWorkflowTool` and `AwaitWorkflowTool` spawn a `crate::skills::runtime`
   workflow run and wait on its outcome.
-- `TodoTool` is the model-facing side of the session's todo list; storage and
-  status transitions belong to `crate::agent::todos`, which wraps the
-  TinyAgents todo store.
+- `TodoTool` is the model-facing side of the session's todo list; TinyAgents
+  owns its schema and store operations, while the host adapter selects the
+  thread key and publishes the product event.
 
 ## Where next
 
@@ -55,10 +55,10 @@ instead of registering them as disabled.
 - `crate::agent::orchestration` for the sub-agent spawn tools, which sit next
   to these conceptually but live separately because they carry more
   lifecycle state.
-- `crate::agent::todos` for the store `TodoTool` reads and writes.
+- `tinyagents_graph::todos` for the todo store and tool behavior.
 
 ## Further reading
 
 - [Parent module README](../README.md)
-- [Agent harness architecture](../../../../../gitbooks/developing/architecture/agent-harness.md)
-- [Native tools](../../../../../gitbooks/features/native-tools/README.md)
+- [Agent harness architecture](../../../../../docs/gitbooks/en/developing/architecture/agent-harness.md)
+- [Native tools](../../../../../docs/gitbooks/en/features/native-tools/README.md)

@@ -1,8 +1,8 @@
 //! History, context, and system prompt management.
 
 use super::super::types::OpenHumanSessionHost;
-use crate::agent::prompts::{tool_call_format_from_dialect, PromptContext, PromptTool};
-use crate::tools::agent_policy::render_tool_policy_boundary;
+use crate::agent::prompts::{PromptContext, PromptTool};
+use tinytools::render_tool_policy_boundary;
 
 use anyhow::Result;
 
@@ -46,7 +46,7 @@ impl OpenHumanSessionHost {
             tracing::debug!(
                 "[agents_md] disabled by config; skipping AGENTS.md injection for main agent"
             );
-            crate::agent::prompts::AgentsMdContent::default()
+            tinyagents_harness::context::AgentsMdContent::default()
         };
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
@@ -56,24 +56,17 @@ impl OpenHumanSessionHost {
             workflows: &self.workflows,
             dispatcher_instructions: &instructions,
             visible_tool_names: &prompt_visible_tool_names,
-            tool_call_format: tool_call_format_from_dialect(
-                self.tool_dispatcher.tool_call_format(),
-            ),
+            tool_call_format: self.tool_dispatcher.tool_call_format(),
             connected_integrations: &self.connected_integrations,
-            connected_identities_md: crate::agent::prompts::render_connected_identities(),
+            connected_identities_md: crate::integrations::render_connected_identities(
+                &self.dispatch_ctx(),
+            ),
             user_identity: crate::security::credentials::identity::peek_credential_user_identity(),
             personality_roster: vec![], // TODO: build_personality_roster(&workspace_dir)
             agents_md_global: agents_md.global,
             agents_md_local: agents_md.local,
         };
-        // Route through the global context manager so every
-        // prompt-building call-site — main agent, sub-agent runner,
-        // channel runtimes — shares one builder configuration.
-        let prompt = self
-            .context
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .build_system_prompt(&ctx)?;
+        let prompt = self.prompt_builder.build(&ctx)?;
         // Appended, not prepended (#5704). Every line of this block is
         // session-scoped — agent id, channel, entry point, risk level, the
         // allowed-tool list — so putting it first moves the prompt's first

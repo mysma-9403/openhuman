@@ -7,8 +7,7 @@ use tinyinference_llm::message::Message;
 
 const NUDGE: &str =
     "The last call failed validation. Correct its schema or arguments once before trying again.";
-const FAILED_TOOL_RESULT_WITH_NUDGE: &str =
-    "{\"status_code\": 422}\n\n[harness note]\nThe last call failed validation. Correct its schema or arguments once before trying again.";
+const FAILED_TOOL_RESULT_WITH_NUDGE: &str = "{\"status_code\": 422}\n\n[harness note]\nThe last call failed validation. Correct its schema or arguments once before trying again.";
 
 /// A native-tool-calling model that replays scripted responses and records the
 /// messages of every request it receives.
@@ -55,7 +54,11 @@ impl ChatModel<()> for RecordingProvider {
                 guard.remove(0)
             }
         };
-        Ok(crate::agent::tinyagents::model::native_model_response_for_request(&response, &request))
+        Ok(
+            crate::inference::provider::model::native_model_response_for_request(
+                &response, &request,
+            ),
+        )
     }
 }
 
@@ -225,17 +228,55 @@ fn committed_rows_mentioning_nudge(history: &[TranscriptEntry]) -> Vec<String> {
         .collect()
 }
 
-/// Every persisted file under the workspace, as text.
+/// Every persisted file under the workspace, as (lossy) text. A session
+/// store database is also read row by row, because TinyAgents keeps transcript
+/// entries zstd-compressed and a byte search of the file would
+/// never see them.
 fn persisted_text(root: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
     walkdir::WalkDir::new(root)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .filter_map(|entry| {
-            let text = std::fs::read_to_string(entry.path()).ok()?;
+            let bytes = std::fs::read(entry.path()).ok()?;
+            let mut text = String::from_utf8_lossy(&bytes).into_owned();
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("db") {
+                text.push_str(&database_rows_text(entry.path()));
+            }
             Some((entry.into_path(), text))
         })
         .collect()
+}
+
+/// The document bodies of the storage database at `path`, decompressed.
+fn database_rows_text(path: &std::path::Path) -> String {
+    use crate::storage::rusqlite::{types::Value, Connection, OpenFlags};
+    let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return String::new();
+    };
+    let Ok(mut statement) = conn.prepare("SELECT body FROM docs") else {
+        return String::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| row.get::<_, Value>(0)) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for value in rows.filter_map(Result::ok) {
+        match value {
+            Value::Text(text) => out.push_str(&text),
+            Value::Blob(bytes) => {
+                // One envelope byte (`1` = zstd), then the zstd frame.
+                let decoded = match bytes.split_first() {
+                    Some((1, frame)) => zstd::decode_all(frame).unwrap_or_else(|_| bytes.clone()),
+                    _ => bytes.clone(),
+                };
+                out.push_str(&String::from_utf8_lossy(&decoded));
+            }
+            _ => {}
+        }
+        out.push('\n');
+    }
+    out
 }
 
 #[tokio::test]

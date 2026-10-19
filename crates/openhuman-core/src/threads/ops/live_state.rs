@@ -8,7 +8,6 @@
 
 use super::support::{envelope, workspace_dir};
 use crate::agent::goals::goal_to_value;
-use crate::agent::todos::ops::{self as todos_ops, TodoScope};
 use crate::core::Outcome;
 use crate::threads::ApiEnvelope;
 
@@ -31,7 +30,7 @@ pub struct ThreadGoalGetResponse {
 /// thread has never written one.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ThreadTodosGetResponse {
-    pub todos: Vec<crate::agent::todos::ops::TodoItem>,
+    pub todos: Vec<tinyagents_graph::todos::TodoItem>,
 }
 
 /// `threads.goal_get` — read a thread's current goal without waiting for the
@@ -62,10 +61,8 @@ pub async fn todos_get(
     if thread_id.is_empty() {
         return Err("thread_id is required".to_string());
     }
-    let scope = TodoScope::Session {
-        id: thread_id.to_string(),
-    };
-    let todos = match todos_ops::list(&dir, &scope).await {
+    let store = crate::storage::sessions::stores_or_ephemeral(&dir).kv;
+    let todos = match tinyagents_graph::todos::store::list(&store, thread_id).await {
         Ok(snapshot) => snapshot.items,
         Err(e) => {
             log::debug!("[threads] todos_get thread_id={thread_id} list failed: {e}");

@@ -76,6 +76,7 @@ pub struct CoreContext {
     /// phase 2 of the pluggable-core work (`core::runtime`) introduced for exactly this
     /// migration — lets that loader prefer it without any handler changing.
     embedder_config: Option<crate::config::Config>,
+    latest_embedder_config: Option<Arc<std::sync::Mutex<crate::config::Config>>>,
     /// Per-tool-group disclosure for this context (see
     /// [`ToolGroups`](crate::tools::toolpacks::ToolGroups)).
     ///
@@ -85,6 +86,11 @@ pub struct CoreContext {
     /// the model. Defaults to every group withheld, which is what the
     /// compiled-in pack table meant before the type existed.
     tool_groups: crate::tools::toolpacks::ToolGroups,
+    /// Which tiny dependencies the config switched off (`[components]`). Only
+    /// narrows: `domains` and `tool_groups` are already clamped by it, and this
+    /// is kept so dispatch can answer `COMPONENT_DISABLED:<name>` for a method
+    /// that a disabled component removed.
+    components: crate::core::runtime::ComponentSet,
     /// Whether skill discovery under this context scans the operator's
     /// user-scope roots (`~/.openhuman/skills`, `~/.agents/skills`).
     ///
@@ -93,18 +99,17 @@ pub struct CoreContext {
     /// [`CoreContext::derive_with`] can turn it off so an embedded agent sees
     /// only the skills its host installed for it, never the operator's.
     user_skill_roots: bool,
-    /// The backend transport this context's handlers reach the hosted
-    /// TinyHumans backend through, when the host supplied one via
-    /// [`CoreBuilder::backend_transport`](crate::core::runtime::CoreBuilder::backend_transport).
-    /// `None` means "fall back to the process-global transport" — see
-    /// [`crate::backend::transport::resolve_backend_transport`] for the order.
-    /// Inherited unchanged by every context derived through
-    /// [`CoreContext::derive_with`].
-    backend_transport: Option<Arc<dyn crate::backend::transport::BackendTransport>>,
+    /// Hook registrations bound to this context (see [`crate::core::slots`]).
+    /// Empty unless the host supplied some through
+    /// [`CoreBuilder::extensions`](crate::core::runtime::CoreBuilder::extensions);
+    /// inherited by every context derived through [`CoreContext::derive_with`].
+    extensions: crate::core::slots::Extensions,
     /// Explicit authority on this derived turn context.
-    turn_origin: Option<crate::agent::turn_origin::AgentTurnOrigin>,
+    turn_origin: Option<crate::security::turn_origin::AgentTurnOrigin>,
+    /// Durable relay conversation carried by the immutable turn context.
+    channel_thread: Option<String>,
     /// The agent whose stores a host-installed session store
-    /// ([`crate::agent::session_store`]) hands out to work under this
+    /// ([`crate::storage::sessions`]) hands out to work under this
     /// context. `None` for booted contexts, which use the shared default.
     session_agent: Option<String>,
     /// The tenant (SaaS profile) this context serves. `None` for booted
@@ -112,6 +117,11 @@ pub struct CoreContext {
     profile: Option<String>,
     /// What the agent this context was derived for owns.
     agent: agent_parts::AgentParts,
+    /// A context that exists only to carry a turn origin where no core was
+    /// booted ([`CoreContext::bare`]). Every reader other than the turn-origin
+    /// ones treats it as if nothing were scoped: [`CoreContext::current`] and
+    /// [`CoreContext::scoped`] skip it.
+    bare: bool,
 }
 
 /// The workspace a context is bound to.
@@ -137,7 +147,7 @@ impl CoreContext {
         token: &TokenSource,
         domains: crate::core::runtime::DomainSet,
     ) -> anyhow::Result<(Arc<CoreContext>, bool, Option<crate::config::Config>)> {
-        Self::init_with_config(host_kind, token, domains, Default::default(), None, None).await
+        Self::init_with_config(host_kind, token, domains, Default::default(), None).await
     }
 
     /// [`init`](Self::init) with an optional caller-supplied configuration.
@@ -154,18 +164,13 @@ impl CoreContext {
     pub async fn init_with_config(
         host_kind: HostKind,
         token: &TokenSource,
-        domains: crate::core::runtime::DomainSet,
-        tool_groups: crate::tools::toolpacks::ToolGroups,
+        mut domains: crate::core::runtime::DomainSet,
+        mut tool_groups: crate::tools::toolpacks::ToolGroups,
         preloaded_config: Option<crate::config::Config>,
-        backend_transport: Option<Arc<dyn crate::backend::transport::BackendTransport>>,
     ) -> anyhow::Result<(Arc<CoreContext>, bool, Option<crate::config::Config>)> {
         log::debug!(
             "[core-context] init: host_kind={host_kind:?} domains={domains:?} \
-             tool_groups={tool_groups:?} backend_transport={}",
-            backend_transport
-                .as_ref()
-                .map(|t| t.name())
-                .unwrap_or("<process-global>")
+             tool_groups={tool_groups:?}"
         );
         crate::core::runtime::mode::admit_core(host_kind, DEFAULT_CONTEXT.get().is_some())
             .map_err(|e| anyhow::anyhow!("[core-context] {e}"))?;
@@ -228,6 +233,11 @@ impl CoreContext {
         // Kept for the context: `preloaded_config` is consumed below, and the
         // whole point is that handlers can reach it after boot.
         let embedder_config = preloaded_config.clone();
+        let latest_embedder_config = embedder_config.clone().map(|config| {
+            let snapshot = Arc::new(std::sync::Mutex::new(config));
+            crate::config::Config::bind_context_snapshot(&snapshot);
+            snapshot
+        });
         let loaded = match preloaded_config {
             // A supplied config is authoritative: no disk read, no env overlay,
             // and no `Err` arm to reach, because there was nothing to fail.
@@ -237,6 +247,14 @@ impl CoreContext {
             }
             None => crate::config::Config::load_or_init().await,
         };
+        // `[components]` can only narrow what the host chose.
+        let components = match &loaded {
+            Ok(cfg) => crate::core::runtime::ComponentSet::from_config(&cfg.components),
+            Err(_) => crate::core::runtime::ComponentSet::all(),
+        };
+        domains = components.narrow_domains(domains);
+        tool_groups = components.narrow_tool_groups(tool_groups);
+        log::debug!("[core-context] init: components={components:?} effective domains={domains:?}");
         let config = match loaded {
             Ok(cfg) => {
                 init_stores(&cfg, domains).await;
@@ -266,13 +284,17 @@ impl CoreContext {
             }))),
             domains,
             tool_groups,
+            components,
             embedder_config,
+            latest_embedder_config,
             user_skill_roots: true,
-            backend_transport,
+            extensions: Default::default(),
             turn_origin: None,
+            channel_thread: None,
             session_agent: None,
             profile: None,
             agent: Default::default(),
+            bare: false,
         });
         let _ = DEFAULT_CONTEXT.set(ctx.clone());
 
@@ -282,7 +304,13 @@ impl CoreContext {
         //    background jobs start later, from CoreRuntime::start_services(), after a transport binds
         //    succeeds.
         let runtime_config = config.clone();
-        super::bootstrap::bootstrap_core_runtime(host_kind, config, domains).await;
+        super::bootstrap::bootstrap_core_runtime(
+            host_kind,
+            config,
+            domains,
+            &super::DispatchCtx::new(ctx.clone()),
+        )
+        .await;
 
         Ok((ctx, has_operator_token, runtime_config))
     }
@@ -295,6 +323,11 @@ impl CoreContext {
     /// Which domain families are live for this context (#4796). The controller
     /// registry consults this (via [`CoreContext::current`]) to filter its
     /// schema/dispatch/tool surface. `full()` for desktop/CLI.
+    /// The `[components]` switches this context booted with.
+    pub fn components(&self) -> crate::core::runtime::ComponentSet {
+        self.components
+    }
+
     /// Per-group tool disclosure for this context.
     pub fn tool_groups(&self) -> crate::tools::toolpacks::ToolGroups {
         self.tool_groups.clone()
@@ -317,21 +350,33 @@ impl CoreContext {
         Self::current().is_none_or(|ctx| ctx.user_skill_roots())
     }
 
-    /// A child context sharing this one's host identity, with its own config,
-    /// domain set, tool groups and skill-root policy.
+    /// Derive a child with its own config and narrowed tool/runtime surfaces.
+    /// The child shares host identity but does not boot stores or alter the
+    /// process default; scoped readers observe its config and policy.
+    pub fn derive_with(&self, overlay: ContextOverlay) -> Arc<CoreContext> {
+        let parent_config = self.latest_embedder_config();
+        self.derive_with_parent_config_inner(parent_config.as_ref(), overlay)
+    }
+
+    /// Derive a child using the exact parent configuration it was built from.
     ///
-    /// **No boot runs.** No stores are initialised, no registry, gate or live
-    /// policy is (re)installed, and the process default context is untouched.
-    /// The child is only useful inside [`CoreContext::scope`] (or
-    /// `CoreRuntime::invoke_in` / `run_in`), where every reader that goes
-    /// through [`CoreContext::current`] — the config loader, the DomainSet
-    /// dispatch gate, the tool-group filter, skill discovery — sees the
-    /// overlay instead of the parent.
-    ///
-    /// The workspace binding is anchored to `overlay.config.workspace_dir`, so
-    /// an agent with its own workspace subdirectory resolves its own memory
-    /// binding lazily, exactly as an embedder-supplied config does at boot.
-    pub fn derive_with(&self, mut overlay: ContextOverlay) -> Arc<CoreContext> {
+    /// This is used by embedders that load their config after core boot: the
+    /// context may intentionally have no published embedder snapshot, while
+    /// the child still needs the correct baseline for conflict-refresh
+    /// overrides.
+    pub fn derive_with_parent_config(
+        &self,
+        parent_config: &crate::config::Config,
+        overlay: ContextOverlay,
+    ) -> Arc<CoreContext> {
+        self.derive_with_parent_config_inner(Some(parent_config), overlay)
+    }
+
+    fn derive_with_parent_config_inner(
+        &self,
+        parent_config: Option<&crate::config::Config>,
+        mut overlay: ContextOverlay,
+    ) -> Arc<CoreContext> {
         // Clamped to what this context can already dispatch. A derived
         // overlay may only narrow: callers outside this crate (embed's
         // `Runtime::agent`, for one) already refuse a spec that names a
@@ -379,18 +424,28 @@ impl CoreContext {
             }
         };
         let agent = self.agent.derive(&mut overlay);
+        config_access::record_context_config_overlay(self.profile(), parent_config, &mut overlay);
+        overlay.config.runtime_state.context_snapshot = None;
+        let latest_embedder_config = Some(Arc::new(std::sync::Mutex::new(overlay.config.clone())));
+        if let Some(snapshot) = &latest_embedder_config {
+            crate::config::Config::bind_context_snapshot(snapshot);
+        }
         Arc::new(CoreContext {
             host_kind: self.host_kind,
             workspace_binding: RwLock::new(shared_binding),
             domains,
             tool_groups: overlay.tool_groups,
+            components: self.components,
             embedder_config: Some(overlay.config),
+            latest_embedder_config,
             user_skill_roots: overlay.user_skill_roots,
-            backend_transport: self.backend_transport.clone(),
+            extensions: self.extensions.clone(),
             turn_origin: self.turn_origin.clone(),
+            channel_thread: self.channel_thread.clone(),
             session_agent: overlay.session_agent.or_else(|| self.session_agent.clone()),
             profile: overlay.profile.or_else(|| self.profile.clone()),
             agent,
+            bare: self.bare,
         })
     }
 
@@ -400,11 +455,25 @@ impl CoreContext {
         self.session_agent.as_deref()
     }
 
-    /// The backend transport bound to this context, if the host supplied one.
-    pub fn backend_transport(
-        &self,
-    ) -> Option<Arc<dyn crate::backend::transport::BackendTransport>> {
-        self.backend_transport.clone()
+    /// The hook registrations bound to this context. Shared (not copied) by
+    /// derived contexts.
+    pub fn extensions(&self) -> &crate::core::slots::Extensions {
+        &self.extensions
+    }
+
+    /// The hook registrations of the context this call runs under, for
+    /// [`HookSlot`](crate::core::slots::HookSlot) lookups.
+    ///
+    /// Outside SaaS that is the ambient context (the process default when the
+    /// task has no scope). In SaaS only the task's own scope counts: a task that
+    /// lost its scope must not read the operator's registrations.
+    pub fn current_extensions() -> Option<crate::core::slots::Extensions> {
+        let ctx = if crate::core::runtime::is_saas() {
+            Self::scoped()
+        } else {
+            Self::current()
+        };
+        ctx.map(|ctx| ctx.extensions.clone())
     }
 
     /// The resolved per-user workspace directory this context is bound to.
@@ -435,22 +504,6 @@ impl CoreContext {
     /// `None` means "discover it the usual way" — see the field docs.
     pub fn embedder_config(&self) -> Option<&crate::config::Config> {
         self.embedder_config.as_ref()
-    }
-
-    /// The embedder-supplied config for the current dispatch, if there is one.
-    ///
-    /// The read path for `config::ops::load_config_with_timeout`.
-    pub fn current_embedder_config() -> Option<crate::config::Config> {
-        Self::current().and_then(|ctx| ctx.embedder_config.clone())
-    }
-
-    /// Read the embedder-supplied config for the current dispatch without
-    /// cloning it. Prefer this over [`Self::current_embedder_config`] when only
-    /// a field or a predicate is needed: a `Config` clone is a large copy.
-    pub fn with_current_embedder_config<R>(
-        f: impl FnOnce(&crate::config::Config) -> R,
-    ) -> Option<R> {
-        Self::current().and_then(|ctx| ctx.embedder_config.as_ref().map(f))
     }
 
     /// Rebind the process default context to the current active user's
@@ -500,13 +553,33 @@ impl CoreContext {
 
     /// Run `fut` with `ctx` as the ambient [`CoreContext::current`]: dispatch wraps
     /// each handler in this, and multi-tenant hosts pass the tenant's context.
+    ///
+    /// A turn's origin survives a change of context: `ctx` without an origin of
+    /// its own, scoped inside a turn that has one (an embedded agent's derived
+    /// context replacing the caller's, say), keeps that turn's origin. Dropping
+    /// it would turn a labelled turn into an unlabelled one the approval gate
+    /// refuses.
     pub async fn scope<F: Future>(ctx: Arc<CoreContext>, fut: F) -> F::Output {
-        CURRENT_CONTEXT.scope(ctx, fut).await
+        CURRENT_CONTEXT
+            .scope(Self::keeping_turn_origin(ctx), fut)
+            .await
     }
 
     /// [`scope`](Self::scope) for a synchronous closure.
     pub fn sync_scope<R>(ctx: Arc<CoreContext>, f: impl FnOnce() -> R) -> R {
-        CURRENT_CONTEXT.sync_scope(ctx, f)
+        CURRENT_CONTEXT.sync_scope(Self::keeping_turn_origin(ctx), f)
+    }
+
+    /// `ctx`, carrying the origin of the turn it is being scoped inside when it
+    /// has none of its own.
+    fn keeping_turn_origin(ctx: Arc<CoreContext>) -> Arc<CoreContext> {
+        if ctx.turn_origin.is_some() {
+            return ctx;
+        }
+        match Self::scoped_for_turn().and_then(|outer| outer.turn_origin.clone()) {
+            Some(origin) => ctx.derive_channel_turn(None, Some(origin)),
+            None => ctx,
+        }
     }
 
     /// Capture the current context now and carry it across a subsequently
@@ -516,68 +589,9 @@ impl CoreContext {
     ///
     /// In SaaS only the caller's own task scope is carried (never the
     /// operator's default context), together with its memory identity — the
-    /// same rule as [`spawn_scoped`](crate::core::runtime::spawn_scoped).
+    /// same rule as [`DispatchCtx::spawn`](crate::core::runtime::DispatchCtx::spawn).
     pub fn propagate<F: Future>(fut: F) -> impl Future<Output = F::Output> {
         super::spawn::carry(fut)
-    }
-
-    /// Test-only constructor: build a context with an explicit
-    /// [`DomainSet`](crate::core::runtime::DomainSet) and optional workspace, so
-    /// cross-module tests (e.g. `core::all`'s registry filter) can exercise the
-    /// ambient DomainSet gate without going through the full [`CoreContext::init`]
-    /// boot sequence.
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        domains: crate::core::runtime::DomainSet,
-        workspace_dir: Option<std::path::PathBuf>,
-    ) -> Arc<CoreContext> {
-        Arc::new(CoreContext {
-            host_kind: HostKind::Cli,
-            workspace_binding: RwLock::new(Arc::new(RwLock::new(WorkspaceBinding {
-                workspace_dir,
-            }))),
-            domains,
-            tool_groups: Default::default(),
-            embedder_config: None,
-            user_skill_roots: true,
-            backend_transport: None,
-            turn_origin: None,
-            session_agent: None,
-            profile: None,
-            agent: Default::default(),
-        })
-    }
-
-    /// Test-only constructor that carries an embedder-supplied config, so a
-    /// cross-module test can exercise the `load_config_with_timeout()` read
-    /// path (which prefers [`CoreContext::current_embedder_config`]) without a
-    /// full boot or a racy on-disk `config.toml`.
-    ///
-    /// Distinct from [`CoreContext::for_test`] — which always sets
-    /// `embedder_config: None` — so the ~30 existing `for_test` call sites are
-    /// unaffected. The workspace binding is anchored to the config's
-    /// `workspace_dir`, matching how [`CoreContext::init`] wires an
-    /// embedder-supplied config.
-    #[cfg(test)]
-    pub(crate) fn for_test_with_config(
-        domains: crate::core::runtime::DomainSet,
-        config: crate::config::Config,
-    ) -> Arc<CoreContext> {
-        Arc::new(CoreContext {
-            host_kind: HostKind::Cli,
-            workspace_binding: RwLock::new(Arc::new(RwLock::new(WorkspaceBinding {
-                workspace_dir: Some(config.workspace_dir.clone()),
-            }))),
-            domains,
-            tool_groups: Default::default(),
-            embedder_config: Some(config),
-            user_skill_roots: true,
-            backend_transport: None,
-            turn_origin: None,
-            session_agent: None,
-            profile: None,
-            agent: Default::default(),
-        })
     }
 }
 
@@ -709,6 +723,13 @@ mod agent_parts;
 #[path = "context_overlay.rs"]
 mod overlay;
 pub use overlay::ContextOverlay;
+
+#[path = "context_config.rs"]
+mod config_access;
+
+#[cfg(test)]
+#[path = "context_test_support.rs"]
+mod test_support;
 
 #[cfg(test)]
 #[path = "context_tests.rs"]

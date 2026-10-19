@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{
-    chat_completion, chat_requests, runtime_without_master_key, tool_names, PointedTransport,
+    chat_completion, chat_requests, runtime_without_master_key, tool_names, PointedInference,
 };
 use openhuman_embed::seams::ToolHookDecision;
 use openhuman_embed::{
@@ -104,7 +104,7 @@ fn operator_named_cron_and_time_tools_run_on_a_direct_provider_within_the_iterat
 
 async fn scenario() {
     let (managed, chat) = (MockServer::start().await, MockServer::start().await);
-    let fire_at = chrono::Utc::now() + chrono::Duration::seconds(30);
+    let fire_at = chrono::Utc::now() + chrono::Duration::seconds(6);
     Mock::given(method("POST"))
         .and(path_regex(r"/v1/chat/completions$"))
         .and(header("authorization", "Bearer operator-chat-key"))
@@ -118,7 +118,7 @@ async fn scenario() {
         .respond_with(ResponseTemplate::new(500))
         .mount(&managed)
         .await;
-    PointedTransport::install(&managed.uri());
+    PointedInference::install(&managed.uri());
     openhuman_core::storage::install(Arc::new(openhuman_core::storage::MemoryStorage::new()));
 
     let root = tempfile::tempdir().unwrap();
@@ -141,7 +141,7 @@ async fn scenario() {
                 .map(String::from)
                 .to_vec(),
         ))
-        .can_use_tool(|_| Box::pin(async { ToolHookDecision::Proceed }))
+        .can_use_tool(|_| Box::pin(async { ToolHookDecision::default() }))
         .channel_permissions([("web_channel", PermissionLevel::Execute)])
         .cron_delivery(recorder.clone())
         .build()
@@ -161,8 +161,8 @@ async fn scenario() {
 
     // An agent job made through the tool binds to this thread and fires.
     handle.chat("t1", "schedule it").await.unwrap();
-    let later = chrono::Utc::now() + chrono::Duration::hours(1);
-    assert_eq!(runtime.sweep_cron_at(later).await.ran, 1);
+    common::wait_until(fire_at).await;
+    assert_eq!(runtime.sweep_cron_at(chrono::Utc::now()).await.ran, 1);
     tokio::time::timeout(Duration::from_secs(30), async {
         while recorder.0.lock().unwrap().is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -193,7 +193,7 @@ async fn scenario() {
             .any(|r| String::from_utf8_lossy(&r.body).contains("only agent cron jobs are allowed")),
         "the refusal reaches the model"
     );
-    assert_eq!(runtime.sweep_cron_at(later).await.ran, 0);
+    assert_eq!(runtime.sweep_cron_at(chrono::Utc::now()).await.ran, 0);
 
     // A model that never stops calling tools is cut off at the operator's cap:
     // the harness stops at CAP model calls and the turn's recovery adds a few

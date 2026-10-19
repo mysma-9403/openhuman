@@ -7,7 +7,8 @@
 //! real external effect (the "propose, never persist" invariant lives in the
 //! archetype body instead).
 
-use crate::agent::prompts::{render_tools, render_workspace, PromptContext};
+use crate::agent::prompts::PromptContext;
+use crate::prompts::{render_tools, render_workspace};
 use anyhow::Result;
 
 const ARCHETYPE: &str = tinyflows_copilot::prompts::WORKFLOW_BUILDER;

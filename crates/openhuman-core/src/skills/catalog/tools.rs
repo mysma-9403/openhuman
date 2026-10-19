@@ -11,11 +11,14 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::skills::ops_install::{ScanAcknowledgement, ScanBlockedOutcome, SkillInstallOutcome};
-use crate::tools::status::{NOT_FOUND_MARKER, UNSUPPORTED_MARKER};
+use tinytools::status::{NOT_FOUND_MARKER, UNSUPPORTED_MARKER};
 use tinytools::{PermissionLevel, Tool, ToolResult};
 
 use super::ops;
-use super::types::{CatalogPage, CatalogQuery, RegistryErrorKind, MAX_PAGE_SIZE};
+use {
+    super::types::CatalogPage, super::types::CatalogQuery, super::types::MAX_PAGE_SIZE,
+    tinyskills::RegistryErrorKind,
+};
 
 /// Matches returned per browse/search call when the caller does not say:
 /// enough candidates to compare and pick from in one read. A broad query over

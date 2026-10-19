@@ -9,7 +9,7 @@ use chrono::Utc;
 use openhuman_core::config::Config;
 use openhuman_core::desktop::notifications::store as notifications;
 use openhuman_core::desktop::notifications::types::{IntegrationNotification, NotificationStatus};
-use openhuman_core::integrations::composio::providers::NormalizedTask;
+use openhuman_core::integrations::composio::contract::NormalizedTask;
 use openhuman_core::integrations::task_sources::store as task_sources;
 use openhuman_core::integrations::task_sources::types::{FilterSpec, ProviderSlug, SourceTarget};
 use openhuman_core::security::devices::store as devices;
@@ -91,12 +91,12 @@ fn a_configured_backend_holds_devices_notifications_and_task_sources(case: Case)
         assert!(!workspace.path().join(db).exists(), "{db} was not written");
     }
 
-    // Without a backend the classic databases are back in use.
+    // Without a backend the workspace's own default database is used.
     assert!(openhuman_core::storage::clear());
     assert!(devices::list_devices(&config).unwrap().is_empty());
     assert_eq!(notifications::unread_count(&config).unwrap(), 0);
     assert!(task_sources::list_sources(&config).unwrap().is_empty());
-    assert!(workspace.path().join("devices/devices.db").exists());
+    assert!(workspace.path().join("storage/storage.db").exists());
 }
 
 driver_cases!(sync a_configured_backend_holds_devices_notifications_and_task_sources);

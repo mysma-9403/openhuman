@@ -6,21 +6,46 @@
 
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
-#[cfg(test)]
-use tinyagents_tasks::CompletionStore;
 
 use super::background_completions::state;
-#[cfg(test)]
-use super::background_completions::{new_router, Entry};
 
 use super::background_completions::{record_awaiting_input, record_completion, record_failure};
+
+#[cfg(test)]
+#[path = "completion_target_tests.rs"]
+pub(crate) mod tests;
+
+/// Completion-router key prefix for one task's awaiting-input notices.
+pub(super) fn awaiting_input_record_prefix(task_id: &str) -> String {
+    let encoded_task_id: String = task_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!(
+        "{}{}:",
+        super::completion_notice::AWAITING_INPUT_RECORD_PREFIX,
+        encoded_task_id
+    )
+}
+
+/// A pause is an independently delivered record, so each pause of a resumed
+/// task needs its own key while leaving the terminal task id free.
+pub(super) fn awaiting_input_record_id(task_id: &str) -> String {
+    format!(
+        "{}{}",
+        awaiting_input_record_prefix(task_id),
+        uuid::Uuid::new_v4().simple()
+    )
+}
 
 /// Where one detached child's completion lands: its workspace (which router),
 /// the parent session (the idle gate) and the parent chat thread (the router's
 /// parent key). Built once at spawn so every terminal path records the same way.
 #[derive(Clone, Debug)]
 pub(crate) struct CompletionTarget {
+    /// The dispatch context the child's completions are recorded under.
+    ctx: crate::core::runtime::DispatchCtx,
     workspace_dir: PathBuf,
     parent_session: String,
     parent_thread_id: Option<String>,
@@ -28,11 +53,13 @@ pub(crate) struct CompletionTarget {
 
 impl CompletionTarget {
     pub(crate) fn new(
+        ctx: crate::core::runtime::DispatchCtx,
         workspace_dir: PathBuf,
         parent_session: String,
         parent_thread_id: Option<String>,
     ) -> Self {
         Self {
+            ctx,
             workspace_dir,
             parent_session,
             parent_thread_id,
@@ -42,6 +69,7 @@ impl CompletionTarget {
     /// Queue a finished result. See [`record_completion`].
     pub(crate) async fn completed(&self, task_id: &str, agent_id: &str, summary: String) {
         record_completion(
+            &self.ctx,
             &self.workspace_dir,
             &self.parent_session,
             task_id,
@@ -55,6 +83,7 @@ impl CompletionTarget {
     /// Queue a failure. See [`record_failure`].
     pub(crate) async fn failed(&self, task_id: &str, agent_id: &str, error: &str) {
         record_failure(
+            &self.ctx,
             &self.workspace_dir,
             &self.parent_session,
             task_id,
@@ -74,6 +103,7 @@ impl CompletionTarget {
         checkpointed: bool,
     ) {
         record_awaiting_input(
+            &self.ctx,
             &self.workspace_dir,
             &self.parent_session,
             task_id,
@@ -86,84 +116,50 @@ impl CompletionTarget {
     }
 }
 
-/// A temporary workspace that forgets its router when dropped, so the
-/// process-wide registry does not accumulate entries for deleted directories.
-#[cfg(test)]
-pub(crate) struct TestWorkspace(tempfile::TempDir);
-
-#[cfg(test)]
-impl TestWorkspace {
-    pub(crate) fn new() -> Self {
-        Self(tempfile::tempdir().expect("tempdir"))
-    }
-
-    pub(crate) fn path(&self) -> &std::path::Path {
-        self.0.path()
-    }
-}
-
-#[cfg(test)]
-impl Drop for TestWorkspace {
-    fn drop(&mut self) {
-        forget_workspace_for_test(self.0.path());
-    }
-}
-
-/// Register `store` as `workspace_dir`'s completion store, so a test can inject
-/// one that fails.
-#[cfg(test)]
-pub(crate) fn install_store_for_test(workspace_dir: &Path, store: Arc<dyn CompletionStore>) {
-    let entry = Arc::new(Entry {
-        router: Arc::new(new_router(store.clone())),
-        store,
-    });
-    state().routers.insert(workspace_dir.to_path_buf(), entry);
-}
-
-/// Forget everything this process knows about `workspace_dir`, as a restart
-/// would: the router (and its open log handle) and every thread/session mapping
-/// that points at it. The on-disk log is untouched.
-#[cfg(test)]
-pub(crate) fn forget_workspace_for_test(workspace_dir: &Path) {
-    let mut st = state();
-    st.routers.remove(workspace_dir);
-    let gone: Vec<String> = st
-        .thread_workspaces
-        .iter()
-        .filter(|(_, ws)| ws.as_path() == workspace_dir)
-        .map(|(thread, _)| thread.clone())
-        .collect();
-    for thread in gone {
-        st.thread_workspaces.remove(&thread);
-        st.stopped_threads.remove(&thread);
-        st.deleted_threads.remove(&thread);
-    }
-    st.recovered_workspaces.remove(workspace_dir);
-    st.session_threads.clear();
-    st.session_order.clear();
-}
-
 /// Claim `workspace_dir`'s boot recovery for this process. `true` exactly once
 /// per workspace, so the host can scan every workspace it opens (the bootstrap
 /// one, then any other a spawn later opens) without rescanning.
-pub(crate) fn claim_recovery(workspace_dir: &Path) -> bool {
+pub(crate) fn claim_recovery_ctx(
+    ctx: &crate::core::runtime::DispatchCtx,
+    workspace_dir: &Path,
+) -> bool {
     state()
         .recovered_workspaces
-        .insert(workspace_dir.to_path_buf())
+        .insert(super::background_completions::router_scope_for(
+            ctx,
+            workspace_dir,
+        ))
+}
+
+#[cfg(test)]
+pub(crate) fn claim_recovery(workspace_dir: &Path) -> bool {
+    claim_recovery_ctx(&crate::core::runtime::DispatchCtx::ambient(), workspace_dir)
 }
 
 /// Let `workspace_dir` be recovered again (a profile re-leased after release),
-/// and drop its cached router when nothing is using it so the next scan replays
-/// the log another holder may have appended to. A router still in use stays,
-/// so a log never has two writers.
-pub(crate) fn forget_recovery(workspace_dir: &Path) {
-    let mut st = state();
-    st.recovered_workspaces.remove(workspace_dir);
-    let idle = st
-        .routers
-        .get(workspace_dir)
-        .is_some_and(|e| Arc::strong_count(e) == 1 && Arc::strong_count(&e.router) == 1);
-    if idle {
-        st.routers.remove(workspace_dir);
+/// and reopen its durable store in the cached router before the next scan. The
+/// owner migrates records under the router's lease lock, so an active holder
+/// can continue through the same router without losing records or leases.
+pub(crate) fn forget_recovery_ctx(ctx: &crate::core::runtime::DispatchCtx, workspace_dir: &Path) {
+    let scope = super::background_completions::router_scope_for(ctx, workspace_dir);
+    state().recovered_workspaces.remove(&scope);
+    let Ok(Some(router)) = super::background_completions::router_pool().get(&scope) else {
+        return;
+    };
+    let Ok(store) = super::background_completions::open_driver_store(ctx, workspace_dir) else {
+        return;
+    };
+    let previous = router.store();
+    match router.replace_store_if_current(&previous, store) {
+        Ok(tinyagents_tasks::CompletionStoreReplaceOutcome::Replaced(store))
+        | Ok(tinyagents_tasks::CompletionStoreReplaceOutcome::Current(store)) => {
+            state().stores.insert(scope, store);
+        }
+        Err(error) => {
+            log::error!(
+                "[background_completions] could not reopen durable completion store workspace_dir={} error={error:#}",
+                workspace_dir.display()
+            );
+        }
     }
 }

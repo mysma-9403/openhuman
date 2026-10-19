@@ -3,6 +3,7 @@ use super::*;
 use std::time::Duration;
 
 use crate::storage::MemoryStorage;
+use tinystoragedrivers::Precondition;
 
 const TTL: Duration = Duration::from_millis(1_000);
 
@@ -106,8 +107,10 @@ async fn bad_keys_and_corrupt_records_are_storage_errors() {
         .documents()
         .put(
             LEASE_COLLECTION,
-            "k",
-            serde_json::json!({ "owner": 7 }),
+            tinystoragedrivers::Key::of([LEASE_OWNER, "k"])
+                .unwrap()
+                .as_str(),
+            serde_json::json!({ "holder": 7 }),
             Precondition::None,
         )
         .await
@@ -213,4 +216,19 @@ async fn sub_millisecond_ttl_does_not_expire_at_acquisition() {
     let grant = a.acquire("k", 5).await.unwrap();
     assert!(grant.expires_at_ms > 5);
     assert!(matches!(b.acquire("k", 5).await, Err(LeaseError::Held(_))));
+}
+
+#[tokio::test]
+async fn concurrent_renewals_of_one_grant_have_one_winner() {
+    let storage = MemoryStorage::new();
+    let a = std::sync::Arc::new(node(&storage, "a"));
+    let grant = a.acquire("k", 0).await.unwrap();
+    let go = || {
+        let (a, grant) = (std::sync::Arc::clone(&a), grant.clone());
+        tokio::spawn(async move { a.renew(&grant, 100).await.is_ok() })
+    };
+    let (x, y) = tokio::join!(go(), go());
+    assert!(x.unwrap() ^ y.unwrap(), "exactly one renewal may succeed");
+    // The heartbeat's next renewal, from the grant the winner returned, holds.
+    assert!(a.holder("k").await.unwrap().unwrap().is_live(150));
 }

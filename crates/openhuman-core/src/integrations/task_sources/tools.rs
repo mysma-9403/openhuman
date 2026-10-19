@@ -181,9 +181,23 @@ impl Tool for TaskSourceFetchTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_with_context(args, tinytools::ToolCallOptions::default(), None)
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        _options: tinytools::ToolCallOptions,
+        context: Option<&dyn tinytools::ToolRunContext>,
+    ) -> anyhow::Result<ToolResult> {
         log::debug!("[tool][task_sources] fetch invoked");
         let id = read_required_str(&args, "id")?;
-        emit!(ops::fetch(&self.config, &id).await, "task_source_fetch")
+        let ctx = crate::agent::tinyagents::host::run_context::dispatch_ctx_for_tool(context);
+        emit!(
+            ops::fetch(&ctx, &self.config, &id).await,
+            "task_source_fetch"
+        )
     }
 }
 
@@ -499,6 +513,23 @@ impl Tool for TaskSourceRemoveTool {
         let id = read_required_str(&args, "id")?;
         emit!(ops::remove(&self.config, &id).await, "task_source_remove")
     }
+}
+
+/// Build this domain's tools in their persisted catalogue order.
+pub(crate) fn registered_tools(
+    config: std::sync::Arc<crate::config::Config>,
+) -> Vec<Box<dyn tinytools::Tool>> {
+    vec![
+        Box::new(TaskSourceListTool::new(config.clone())),
+        Box::new(TaskSourceGetTool::new(config.clone())),
+        Box::new(TaskSourceFetchTool::new(config.clone())),
+        Box::new(TaskSourceListTasksTool::new(config.clone())),
+        Box::new(TaskSourcePreviewFilterTool::new(config.clone())),
+        Box::new(TaskSourceStatusTool::new(config.clone())),
+        Box::new(TaskSourceAddTool::new(config.clone())),
+        Box::new(TaskSourceUpdateTool::new(config.clone())),
+        Box::new(TaskSourceRemoveTool::new(config.clone())),
+    ]
 }
 
 #[cfg(test)]

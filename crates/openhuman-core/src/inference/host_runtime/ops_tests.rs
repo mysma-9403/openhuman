@@ -263,8 +263,8 @@ fn grant_turn_cwd_is_the_only_mutation() {
 /// silently drop a real user message (#5312).
 #[tokio::test]
 async fn effective_origin_defaults_to_direct_chat_outside_any_scope() {
-    use crate::agent::turn_origin::AgentTurnOrigin;
-    let origin = effective_agent_chat_origin();
+    use crate::security::turn_origin::AgentTurnOrigin;
+    let origin = effective_agent_chat_origin(&crate::core::runtime::DispatchCtx::ambient());
     assert!(
         matches!(origin, AgentTurnOrigin::DirectChat),
         "unscoped agent_chat must be labelled DirectChat, got {origin:?}"
@@ -280,7 +280,7 @@ async fn effective_origin_defaults_to_direct_chat_outside_any_scope() {
 /// see, not the blanket `Cli` allowance this RPC would otherwise impose.
 #[tokio::test]
 async fn effective_origin_keeps_an_embedder_scoped_label() {
-    use crate::agent::turn_origin::{with_origin, AgentTurnOrigin, TrustedAutomationSource};
+    use crate::security::turn_origin::{with_origin, AgentTurnOrigin, TrustedAutomationSource};
     let observed = with_origin(
         AgentTurnOrigin::TrustedAutomation {
             job_id: "run-7".to_string(),
@@ -288,7 +288,7 @@ async fn effective_origin_keeps_an_embedder_scoped_label() {
                 require_approval: false,
             },
         },
-        async { effective_agent_chat_origin() },
+        async { effective_agent_chat_origin(&crate::core::runtime::DispatchCtx::ambient()) },
     )
     .await;
     assert!(matches!(
@@ -322,6 +322,7 @@ async fn agent_chat_for_rejects_an_unknown_agent_id() {
         None,
         None,
         None,
+        crate::inference::host_runtime::ops::AgentChatEnv::default(),
     )
     .await
     .expect_err("an unknown agent id must be refused");

@@ -72,7 +72,7 @@ None of its own. State (`status`, `socket_id`, `error`, attached `WebhookRouter`
 ## Dependencies
 
 - `crate::platform::socket::models`: `ConnectionStatus`, `SocketState` DTOs.
-- `crate::platform::socket::url::websocket_url`, `crate::backend::require_base_url` (asks the installed transport, which resolves `effective_backend_api_url`), `crate::security::credentials::session_support::get_session_token`: URL derivation and session-token lookup.
+- `crate::platform::socket::url::websocket_url`, `config.resolved_endpoints.require_control_plane` (the host-resolved control-plane URL), `crate::security::credentials::session_support::get_session_token`: URL derivation and session-token lookup.
 - `crate::core::all`: `ControllerFuture`, `RegisteredController` for the controller registry.
 - `crate::core::{ControllerSchema, FieldSchema, TypeSchema}`: RPC schema types.
 - `crate::core::bus::BUS.publish` / `crate::core::events::DomainEvent`: for routing inbound events.
@@ -107,5 +107,5 @@ None of its own. State (`status`, `socket_id`, `error`, attached `WebhookRouter`
 ## Further reading
 
 - [Parent module (`platform`)](../README.md)
-- [Architecture overview](../../../../../gitbooks/developing/architecture.md)
-- [Platform and availability](../../../../../gitbooks/features/platform.md)
+- [Architecture overview](../../../../../docs/gitbooks/en/developing/architecture.md)
+- [Platform and availability](../../../../../docs/gitbooks/en/features/platform.md)

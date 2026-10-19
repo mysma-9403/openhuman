@@ -8,6 +8,38 @@ use std::path::PathBuf;
 
 use crate::config::schema::*;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ConfigDocumentSnapshot {
+    pub version: Option<tinystoragedrivers::Version>,
+    pub anchor: Option<super::super::load::source::ConfigSourceAnchor>,
+}
+
+/// Opaque runtime bookkeeping that accompanies a [`Config`] snapshot.
+///
+/// Public only to preserve `Config { ..Default::default() }` construction in
+/// downstream crates; its fields remain private to this crate.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ConfigRuntimeState {
+    pub(crate) document_snapshot: std::sync::Mutex<ConfigDocumentSnapshot>,
+    pub(crate) context_snapshot: Option<std::sync::Weak<std::sync::Mutex<Config>>>,
+    pub(crate) context_overlay: std::sync::Mutex<
+        Option<std::sync::Arc<super::super::load::context_overlay::ConfigContextOverlay>>,
+    >,
+}
+
+impl Clone for ConfigRuntimeState {
+    fn clone(&self) -> Self {
+        Self {
+            document_snapshot: std::sync::Mutex::new(
+                self.document_snapshot.lock().unwrap().clone(),
+            ),
+            context_snapshot: self.context_snapshot.clone(),
+            context_overlay: std::sync::Mutex::new(self.context_overlay.lock().unwrap().clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ModelRegistryEntry {
     pub id: String,
@@ -54,6 +86,11 @@ pub struct CustomEmbeddingsConfig {
 /// `Clone` is implemented by hand in `config_clone.rs` so it is emitted once.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
+    /// Non-serialized persistence and context bookkeeping.
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[doc(hidden)]
+    pub runtime_state: ConfigRuntimeState,
     /// Immutable operator provider binding, absent from the user wire format.
     #[serde(skip)]
     #[schemars(skip)]
@@ -211,7 +248,7 @@ pub struct Config {
     /// Background-AI scheduler gate — throttles embeddings and other
     /// LLM-bound background work based on power
     /// state, CPU pressure, and deployment mode. See
-    /// [`crate::cron::scheduler_gate`].
+    /// [`crate::platform::llm_gate`].
     #[serde(default)]
     pub scheduler_gate: SchedulerGateConfig,
 
@@ -234,7 +271,7 @@ pub struct Config {
     /// Global context management configuration — budget thresholds,
     /// summarization trigger, microcompact/autocompact toggles, and the
     /// session-memory extraction cadence. Consumed by
-    /// [`crate::agent::context::ContextManager`].
+    /// the agent context middleware configuration.
     #[serde(default)]
     pub context: ContextConfig,
 
@@ -328,7 +365,7 @@ pub struct Config {
     /// User-facing agent registry — shipped default agents plus user-authored
     /// custom agents and persisted enable/disable/tool-policy overrides.
     #[serde(default)]
-    pub agent_registry: crate::agent::registry::types::AgentRegistryConfig,
+    pub agent_registry: crate::agent_registry::types::AgentRegistryConfig,
 
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
@@ -383,6 +420,14 @@ pub struct Config {
     #[schemars(skip)]
     pub ephemeral_route: Option<crate::config::schema::ephemeral_route::EphemeralRoute>,
 
+    /// Runtime only — service endpoints and identity a host's config enricher
+    /// resolved ([`crate::config::register_enricher`]). Empty until one runs;
+    /// never serialized. See
+    /// [`resolved_endpoints`](crate::config::schema::resolved_endpoints).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub resolved_endpoints: crate::config::schema::resolved_endpoints::ResolvedEndpoints,
+
     /// Provider string for direct conversational chat (simple back-and-forth).
     #[serde(default)]
     pub chat_provider: Option<String>,
@@ -421,12 +466,21 @@ pub struct Config {
     #[serde(default)]
     pub tokenjuice: TokenjuiceConfig,
 
+    /// TinyMemes remix tuning (`[memes]`); the switch is `[components] memes`.
+    #[serde(default)]
+    pub memes: MemesConfig,
+
+    /// Per-dependency switches (`[components]`). Narrow-only; applied at the
+    /// next core start.
+    #[serde(default)]
+    pub components: ComponentsConfig,
+
     /// Hosting provider credentials and switch (`hosting` feature).
     #[serde(default)]
     pub hosting: HostingConfig,
 
     /// Storage backend for state on the `tinystoragedrivers` ports
-    /// (`[storage]`). Empty keeps the classic on-disk layout.
+    /// (`[storage]`). Empty uses the default, `sqlite:<workspace>/storage`.
     #[serde(default)]
     pub storage: StorageConfig,
 

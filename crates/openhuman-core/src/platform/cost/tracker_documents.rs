@@ -1,43 +1,48 @@
 //! The cost ledger on the `tinystoragedrivers` document port.
 //!
-//! Used instead of `state/costs.jsonl` when the host configured a storage
-//! backend ([`crate::storage`]); `CostStorage` in `tracker.rs` picks it per
-//! call, so records live under the acting agent's storage scope (`local` on a
-//! single-user host). Without a backend the JSONL file at today's path is
-//! used unchanged.
+//! The only ledger: `CostStorage` in `tracker.rs` opens it per call, so
+//! records live under the acting agent's storage scope (`local` on a
+//! single-user host) in the installed backend, or the workspace default when
+//! none is installed ([`crate::storage::local`]). A legacy `state/costs.jsonl`
+//! is imported once.
 //!
 //! # Layout
 //!
 //! | Collection | Document id | Holds |
 //! | --- | --- | --- |
-//! | `cost_records` | record id | one [`CostRecord`], plus `ts_ms` (epoch ms) for ordering |
+//! | `cost.records` | `Key::of([record id])` | one [`CostRecord`], its usage timestamp carried once as `ts_ms` (epoch ms, [`super::storage_schema`]) |
 //!
 //! The JSONL ledger is append-only, so a record is written once
 //! (`Precondition::Absent`) and never edited. Readers get the records oldest
 //! first, the order the file kept them in.
 
 use anyhow::{Context, Result};
-use serde_json::Value;
-use tinystoragedrivers::{CollectionSpec, IndexSpec, Precondition, Query, Sort};
+use tinystoragedrivers::{CollectionSpec, Precondition, Query, Sort};
 
+use super::storage_schema::{from_body, spec, to_body, RECORDS};
 use super::types::CostRecord;
 use crate::storage::documents::Repo;
+use crate::storage::schema_support::key_of;
 use crate::storage::DocumentStoreExt;
 
-const RECORDS: &str = "cost_records";
 const DOMAIN: &str = "cost::tracker";
 
 fn collections() -> Vec<CollectionSpec> {
-    vec![CollectionSpec::new(RECORDS).index(IndexSpec::new("by_time", ["ts_ms"]))]
+    vec![spec()]
 }
 
-/// The document store for this call, when the host configured one.
-pub(super) fn current() -> Result<Option<CostDocs>> {
+/// The document store for this call: the installed backend, else the
+/// workspace default, in the acting scope.
+pub(super) fn current(workspace_dir: &std::path::Path) -> Result<CostDocs> {
     #[cfg(test)]
     if let Some(docs) = TEST_OVERRIDE.with(|slot| slot.borrow().clone()) {
-        return Ok(Some(docs));
+        return Ok(docs);
     }
-    Ok(Repo::current(DOMAIN, collections)?.map(CostDocs))
+    Ok(CostDocs(Repo::current_for(
+        workspace_dir,
+        DOMAIN,
+        collections,
+    )?))
 }
 
 /// Runs `f` with `docs` standing in for the installed backend, on this thread
@@ -67,9 +72,8 @@ impl CostDocs {
 
     /// Appends one record.
     pub(super) fn add(&self, record: &CostRecord) -> Result<()> {
-        let mut doc = serde_json::to_value(record).context("serialize cost record")?;
-        doc["ts_ms"] = Value::from(record.usage.timestamp.timestamp_millis());
-        let id = record.id.clone();
+        let doc = to_body(record).context("serialize cost record")?;
+        let id = key_of(&record.id)?;
         log::trace!("[cost::tracker] document add id={id}");
         self.0.run(|docs| async move {
             docs.put(RECORDS, &id, doc, Precondition::Absent)
@@ -133,9 +137,8 @@ impl CostDocs {
 
     /// Writes `record` unless its id is already stored; `false` when it was.
     fn add_if_absent(&self, record: &CostRecord) -> Result<bool> {
-        let mut doc = serde_json::to_value(record).context("serialize cost record")?;
-        doc["ts_ms"] = Value::from(record.usage.timestamp.timestamp_millis());
-        let id = record.id.clone();
+        let doc = to_body(record).context("serialize cost record")?;
+        let id = key_of(&record.id)?;
         self.0.run(|docs| async move {
             match docs.put(RECORDS, &id, doc, Precondition::Absent).await {
                 Ok(_) => Ok(true),
@@ -157,7 +160,7 @@ impl CostDocs {
         })?;
         Ok(stored
             .into_iter()
-            .filter_map(|item| match serde_json::from_value(item.doc) {
+            .filter_map(|item| match from_body(item.doc) {
                 Ok(record) => Some(record),
                 Err(error) => {
                     log::warn!(

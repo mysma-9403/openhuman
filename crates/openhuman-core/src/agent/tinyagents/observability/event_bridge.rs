@@ -2,19 +2,20 @@
 //! `tinyagents` harness event stream onto openhuman's [`AgentProgress`] +
 //! cost tracker (issue #4249). See the parent module doc for the overview.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::Sender;
 
 use tinyinference_llm::usage::Usage;
 
-use crate::agent::progress::AgentProgress;
 use crate::inference::provider::BilledUsage;
+use crate::progress::AgentProgress;
 use tinytools::humanize_tool_name;
 
-use super::cap_pauser::{
-    IterationCursor, ProviderUsageCarry, SubagentScope, ToolFailureMap, ToolNameMap,
+use super::bridge_types::{ProviderUsageCarry, SubagentScope, ToolFailureMap, ToolNameMap};
+use tinyagents_harness::events::{
+    AgentEvent, CallDedupe, EventRecord, IterationCursor, OrderedSender,
 };
 
 #[derive(Default)]
@@ -23,7 +24,7 @@ pub(super) struct BridgeState {
     pub(super) output_tokens: u64,
     pub(super) cached_input_tokens: u64,
     /// Every call's cost: reported charge, catalog estimate, or unknown.
-    pub(super) cost: crate::agent::cost::CostTally,
+    pub(super) cost: tinyagents_harness::cost::CostTally,
     /// Local response-cache hits observed on this turn (issue #4249, 03.2). A hit
     /// means the harness served a model call from its [`ResponseCache`] without
     /// invoking the provider. Additive counters — a follow-up (coordinated with
@@ -49,7 +50,6 @@ pub(super) struct ResolvedCallFigures {
 /// An [`EventListener`] that mirrors harness events onto openhuman's progress
 /// sink and cost tracker.
 pub(crate) struct OpenhumanEventBridge {
-    pub(super) on_progress: Option<Sender<AgentProgress>>,
     pub(super) model: String,
     /// Telemetry provider id (`"managed"`, `"openai"`, …) — from
     /// [`Provider::telemetry_provider_id`](crate::inference::provider::Provider::telemetry_provider_id).
@@ -57,8 +57,17 @@ pub(crate) struct OpenhumanEventBridge {
     /// model as `{provider_id}.{model}`.
     pub(super) provider_id: String,
     pub(super) max_iterations: u32,
+    /// Supplemental host repairs are durable trace generations but are not
+    /// extra agent-loop iterations or live wallet events. They share this
+    /// run-local ordered event sink, so `ModelStarted` brackets the following
+    /// `UsageRecorded` and terminal model event synchronously.
+    pub(super) supplemental_call_active: AtomicBool,
     /// `None` for a parent turn; `Some` to emit child-scoped `Subagent*` events.
     pub(super) scope: Option<SubagentScope>,
+    /// The agent definition the run acts as (its memory identity's agent),
+    /// attributed on usage records of a top-level turn. Set once by the turn
+    /// that owns the run ([`Self::set_definition`]).
+    pub(super) definition: std::sync::OnceLock<String>,
     /// Shared with the model adapter so thinking deltas line up with the
     /// model call (iteration) they belong to.
     pub(super) cursor: IterationCursor,
@@ -82,7 +91,7 @@ pub(crate) struct OpenhumanEventBridge {
     /// delivered to this bridge. Keyed on the run-scoped model-call identity (the
     /// iteration cursor, bumped once per `ModelStarted`) so a given call's usage
     /// is recorded exactly once. See [`OpenhumanEventBridge::record_usage`].
-    pub(super) recorded_iterations: Mutex<std::collections::HashSet<u32>>,
+    pub(super) recorded_iterations: CallDedupe,
     /// Per-iteration figures resolved by `record_usage` (see
     /// [`ResolvedCallFigures`]); taken by the `ModelCompleted` arm.
     pub(super) resolved_calls: Mutex<std::collections::HashMap<u32, ResolvedCallFigures>>,
@@ -113,15 +122,37 @@ pub(crate) struct OpenhumanEventBridge {
     /// `try_send` can never jump ahead of an earlier spilled event and scramble
     /// start/completed ordering (which would leave a tool row stuck `running`
     /// when a `ToolCallCompleted` overtakes its `ToolCallStarted`) (#4466).
-    pub(super) overflow: Arc<Mutex<OverflowState>>,
+    pub(super) sender: OrderedSender<AgentProgress>,
+    /// The context the run acts under; usage records take their tenant from it.
+    pub(super) dispatch: crate::core::runtime::DispatchCtx,
 }
 
-/// Backpressure overflow state guarded by a single mutex so the "are we
-/// draining?" decision and the queue mutation stay atomic together.
-#[derive(Default)]
-pub(super) struct OverflowState {
-    queue: std::collections::VecDeque<AgentProgress>,
-    draining: bool,
+impl OpenhumanEventBridge {
+    /// Supplemental host calls belong in the durable trace, but are not
+    /// agent-loop iterations or live wallet updates.
+    pub(super) fn project_supplemental(&self, record: &EventRecord) -> bool {
+        match &record.event {
+            AgentEvent::ModelStarted { call_id, .. }
+                if call_id.as_str().contains("-host-supplemental-") =>
+            {
+                self.supplemental_call_active.store(true, Ordering::SeqCst);
+                true
+            }
+            AgentEvent::UsageRecorded { .. }
+                if self.supplemental_call_active.load(Ordering::SeqCst) =>
+            {
+                true
+            }
+            AgentEvent::ModelCompleted { call_id, .. }
+            | AgentEvent::ModelFailed { call_id, .. }
+                if call_id.as_str().contains("-host-supplemental-") =>
+            {
+                self.supplemental_call_active.store(false, Ordering::SeqCst);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 impl OpenhumanEventBridge {
@@ -142,6 +173,7 @@ impl OpenhumanEventBridge {
             Arc::default(),
             Arc::default(),
             Vec::new(),
+            crate::core::runtime::DispatchCtx::unbound(),
         )
     }
 
@@ -163,25 +195,36 @@ impl OpenhumanEventBridge {
         failure_map: ToolFailureMap,
         usage_carry: ProviderUsageCarry,
         tool_sets: Vec<Arc<Vec<Box<dyn tinytools::Tool>>>>,
+        dispatch: crate::core::runtime::DispatchCtx,
     ) -> Arc<Self> {
         Arc::new(Self {
-            on_progress,
+            sender: OrderedSender::new(on_progress),
             model: model.into(),
             provider_id: provider_id.into(),
             max_iterations: max_iterations as u32,
+            supplemental_call_active: AtomicBool::new(false),
             scope,
+            definition: std::sync::OnceLock::new(),
             cursor,
             tool_names,
             failure_map,
             usage_carry,
-            recorded_iterations: Mutex::new(std::collections::HashSet::new()),
+            recorded_iterations: CallDedupe::default(),
             resolved_calls: Mutex::new(std::collections::HashMap::new()),
             tool_started_at: Mutex::new(std::collections::HashMap::new()),
             unknown_calls: Mutex::new(std::collections::HashMap::new()),
             tool_sets,
             state: Mutex::new(BridgeState::default()),
-            overflow: Arc::default(),
+            dispatch,
         })
+    }
+
+    /// Names the agent definition this run acts as, for usage attribution. The
+    /// first call wins.
+    pub(crate) fn set_definition(&self, definition: Option<&str>) {
+        if let Some(definition) = definition.filter(|definition| !definition.is_empty()) {
+            let _ = self.definition.set(definition.to_owned());
+        }
     }
 
     /// Resolve `tool_name` against the turn's registered tool sets and
@@ -234,7 +277,7 @@ impl OpenhumanEventBridge {
     /// Cumulative `(input_tokens, output_tokens, cached_input_tokens, cost)`
     /// observed so far — the full accounting the turn persists (transcript cost /
     /// session meters). `cost` says whether every call was priced.
-    pub(crate) fn totals_with_cost(&self) -> (u64, u64, u64, crate::agent::cost::CostTally) {
+    pub(crate) fn totals_with_cost(&self) -> (u64, u64, u64, tinyagents_harness::cost::CostTally) {
         let s = self.state.lock().unwrap();
         (
             s.input_tokens,
@@ -254,72 +297,19 @@ impl OpenhumanEventBridge {
 
     /// Forward a progress event without ever silently dropping it under
     /// backpressure (#4466). The crate `EventListener::on_event` callback is
-    /// **synchronous**, so we cannot `.await` a bounded `send()` inline the way
-    /// the legacy streaming path did. Fast path: `try_send`, which succeeds (and
-    /// stays fully synchronous + ordered) whenever the downstream channel has
-    /// room — the common case. Only when the channel is momentarily **full** do
-    /// we fall back to an awaited `send()` on a spawned task so the delta is
-    /// delivered under backpressure instead of being dropped (the old bug). A
-    /// `Closed` channel means the receiver is gone (turn tore down), where
-    /// dropping is correct.
+    /// **synchronous**, so the harness `OrderedSender` tries `try_send` first and,
+    /// when the channel is full, spills to a bounded FIFO drain task so later
+    /// items never overtake earlier ones. A closed channel means the receiver is
+    /// gone (turn tore down), where dropping is correct. If the bounded overflow
+    /// queue itself is full the delta is dropped and logged below.
     pub(super) fn send(&self, progress: AgentProgress) {
-        use tokio::sync::mpsc::error::TrySendError;
-        let Some(tx) = &self.on_progress else {
-            return;
-        };
-        // Hold the overflow lock across the ordering decision so "are we
-        // draining?" and the queue mutation are atomic (try_send is
-        // non-blocking, so holding a std mutex across it is fine).
-        let mut ov = self.overflow.lock().unwrap_or_else(|p| p.into_inner());
-        if ov.draining {
-            // Already spilling: queue in order; the single forwarder delivers it.
-            ov.queue.push_back(progress);
-            return;
-        }
-        match tx.try_send(progress) {
-            Ok(()) => {}
-            Err(TrySendError::Closed(_)) => {}
-            Err(TrySendError::Full(progress)) => {
-                // Backpressure, not capacity loss. Enter ordered-drain mode:
-                // queue this event and spawn ONE forwarder that awaits `send()`
-                // per event in FIFO order. `draining` stays set (so every later
-                // event also queues here) until the buffer fully drains — that is
-                // what stops a later `try_send` from overtaking a spilled earlier
-                // event and scrambling start/completed ordering.
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    ov.queue.push_back(progress);
-                    ov.draining = true;
-                    let overflow = Arc::clone(&self.overflow);
-                    let tx = tx.clone();
-                    drop(ov);
-                    handle.spawn(async move {
-                        loop {
-                            let next = {
-                                let mut ov = overflow.lock().unwrap_or_else(|p| p.into_inner());
-                                match ov.queue.pop_front() {
-                                    Some(item) => item,
-                                    None => {
-                                        ov.draining = false;
-                                        break;
-                                    }
-                                }
-                            };
-                            if tx.send(next).await.is_err() {
-                                // Receiver gone: stop draining, discard the rest.
-                                let mut ov = overflow.lock().unwrap_or_else(|p| p.into_inner());
-                                ov.queue.clear();
-                                ov.draining = false;
-                                break;
-                            }
-                        }
-                    });
-                } else {
-                    tracing::debug!(
-                        model = %self.model,
-                        "[tinyagents] progress channel full and no runtime to defer send; dropping one delta"
-                    );
-                }
-            }
+        use tinyagents_harness::events::SendFailure;
+        match self.sender.send(progress) {
+            Ok(()) | Err(SendFailure::Closed(_)) => {}
+            Err(SendFailure::Backpressure(_)) => tracing::debug!(
+                model = %self.model,
+                "[tinyagents] progress channel full and could not defer send; dropping one delta"
+            ),
         }
     }
 
@@ -342,20 +332,14 @@ impl OpenhumanEventBridge {
         // bridge instance is per-run (parent or child scope), so the set is
         // naturally (run, turn)-scoped. First writer for an iteration records;
         // any later `UsageRecorded` for the same iteration is a duplicate.
-        {
-            let mut seen = self
-                .recorded_iterations
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if !seen.insert(iteration) {
-                tracing::debug!(
-                    iteration,
-                    model = %self.model,
-                    child = self.scope.is_some(),
-                    "[budget] duplicate UsageRecorded for model call — skipping double record"
-                );
-                return;
-            }
+        if !self.recorded_iterations.first_claim(iteration) {
+            tracing::debug!(
+                iteration,
+                model = %self.model,
+                child = self.scope.is_some(),
+                "[budget] duplicate UsageRecorded for model call — skipping double record"
+            );
+            return;
         }
         // Drain the provider-usage side-channel the model adapter fed for this
         // model call (FIFO, one push per provider response). The crate `Usage`
@@ -379,10 +363,10 @@ impl OpenhumanEventBridge {
             .map(|u| u.charged_amount_usd)
             .filter(|c| c.is_finite() && *c >= 0.0);
         let cost = match provider_cost {
-            Some(charged) => crate::agent::cost::CallCost::Charged(charged),
+            Some(charged) => tinyagents_harness::cost::CallCost::Charged(charged),
             None => match Self::estimate_call_cost(&self.model, usage) {
-                Some(estimate) => crate::agent::cost::CallCost::Estimated(estimate),
-                None => crate::agent::cost::CallCost::Unknown,
+                Some(estimate) => tinyagents_harness::cost::CallCost::Estimated(estimate),
+                None => tinyagents_harness::cost::CallCost::Unknown,
             },
         };
         let call_cost = cost.usd();
@@ -394,7 +378,7 @@ impl OpenhumanEventBridge {
             .map(|u| u.context_window())
             .filter(|w| *w > 0)
             .unwrap_or_else(|| {
-                crate::platform::cost::catalog::lookup(&self.model)
+                tinyagents_registry::pricing::lookup(&self.model)
                     .map(|p| u64::from(p.context_window))
                     .unwrap_or(0)
             });
@@ -452,9 +436,11 @@ impl OpenhumanEventBridge {
             .with_cache_creation_tokens(cache_creation_tokens)
             .with_reasoning_tokens(reasoning_tokens);
         let usage_info = match cost {
-            crate::agent::cost::CallCost::Charged(usd) => usage_info.with_charged_usd(usd),
-            crate::agent::cost::CallCost::Estimated(usd) => usage_info.with_estimated_usd(usd),
-            crate::agent::cost::CallCost::Unknown => usage_info,
+            tinyagents_harness::cost::CallCost::Charged(usd) => usage_info.with_charged_usd(usd),
+            tinyagents_harness::cost::CallCost::Estimated(usd) => {
+                usage_info.with_estimated_usd(usd)
+            }
+            tinyagents_harness::cost::CallCost::Unknown => usage_info,
         };
         if reasoning_tokens > 0 || cache_creation_tokens > 0 {
             log::debug!(
@@ -471,7 +457,12 @@ impl OpenhumanEventBridge {
         crate::platform::cost::record_provider_usage_scoped(
             &self.model,
             &usage_info,
-            crate::platform::cost::UsageScope::ambient(Some(&self.provider_id), subagent),
+            crate::platform::cost::UsageScope::in_ctx(
+                &self.dispatch,
+                Some(&self.provider_id),
+                subagent,
+            )
+            .with_definition(self.definition.get().map(String::as_str)),
         );
 
         // The cost footer is a top-level surface; for a child run the global
@@ -497,7 +488,7 @@ impl OpenhumanEventBridge {
     /// Estimate one call's USD cost. Uses the tier-aware
     /// [`agent::cost`](crate::agent::cost) table (managed handles
     /// like `hint:chat`/`hint:burst` + the vendor catalog + heuristics) — the
-    /// previous `cost::catalog::estimate_cost_usd` only knew concrete vendor
+    /// previous `tinyagents_registry::pricing::estimate_cost_usd` only knew concrete vendor
     /// ids, so every managed-tier call priced as $0 in traces and the footer.
     /// `None` for a model the catalog does not price.
     pub(super) fn estimate_call_cost(model: &str, usage: &Usage) -> Option<f64> {

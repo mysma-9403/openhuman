@@ -2,11 +2,11 @@ pub mod browser;
 #[cfg(feature = "documents")]
 pub mod document;
 mod filesystem;
-pub mod meta;
 pub mod network;
 #[cfg(feature = "documents")]
 pub mod presentation;
 pub mod system;
+pub mod threads;
 
 pub use browser::*;
 #[cfg(feature = "documents")]

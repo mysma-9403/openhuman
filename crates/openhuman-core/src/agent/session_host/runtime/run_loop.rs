@@ -3,13 +3,13 @@
 //! events, and error sanitisation.
 
 use super::super::types::OpenHumanSessionHost;
-use crate::agent::error::AgentError;
 use crate::core::bus::BUS;
 use crate::core::events::DomainEvent;
 use crate::security::prompt_injection::{
     enforce_prompt_input, PromptEnforcementAction, PromptEnforcementContext,
 };
 use anyhow::Result;
+use tinyagents_harness::agent_error::AgentError;
 
 impl OpenHumanSessionHost {
     // ─────────────────────────────────────────────────────────────────
@@ -29,9 +29,25 @@ impl OpenHumanSessionHost {
     pub async fn run_single_with_origin(
         &mut self,
         message: &str,
-        origin: Option<crate::agent::turn_origin::AgentTurnOrigin>,
+        origin: Option<crate::security::turn_origin::AgentTurnOrigin>,
     ) -> Result<String> {
-        let origin = origin.or_else(crate::core::runtime::CoreContext::current_turn_origin);
+        self.run_single_with_approval(message, origin, Default::default())
+            .await
+    }
+
+    /// [`Self::run_single_with_origin`] for a turn that also owns an approval
+    /// context (chat surface, copilot flag, flow run). The context is handed to
+    /// this turn alone.
+    pub async fn run_single_with_approval(
+        &mut self,
+        message: &str,
+        origin: Option<crate::security::turn_origin::AgentTurnOrigin>,
+        approval: crate::security::approval::ApprovalTurnContext,
+    ) -> Result<String> {
+        let origin = origin.or_else(|| {
+            crate::core::runtime::DispatchCtx::from_weak(self.host_env.core.as_ref())
+                .turn_origin_or_scoped()
+        });
         let guard = enforce_prompt_input(
             message,
             PromptEnforcementContext {
@@ -74,25 +90,27 @@ impl OpenHumanSessionHost {
             return Err(anyhow::anyhow!(user_message));
         }
 
-        let history_snapshot = self.history();
         // Busy state for background-result delivery is marked here, in the
         // turn's own (profile) scope; the bus subscriber runs off-task.
         // A guard, so a turn dropped mid-flight does not leave it busy.
-        let busy =
-            crate::agent::orchestration::busy_guard::TurnBusy::start(self.event_session_id());
+        let busy = crate::agent::orchestration::busy_guard::TurnBusy::start(
+            &self.dispatch_ctx(),
+            self.event_session_id(),
+        );
         BUS.publish(DomainEvent::AgentTurnStarted {
             session_id: self.event_session_id().to_string(),
             channel: self.event_channel().to_string(),
         });
 
-        match self.turn_with_origin(message, origin.as_ref()).await {
+        match self
+            .turn_with_approval(message, origin.as_ref(), approval)
+            .await
+        {
             Ok(response) => {
-                let history = self.history();
-                let new_entries = Self::new_entries_for_turn(&history_snapshot, &history);
                 BUS.publish(DomainEvent::AgentTurnCompleted {
                     session_id: self.event_session_id().to_string(),
                     text_chars: response.chars().count(),
-                    iterations: Self::count_iterations(new_entries),
+                    iterations: self.last_turn_iterations() as usize,
                 });
                 drop(busy);
                 Ok(response)
@@ -107,7 +125,7 @@ impl OpenHumanSessionHost {
                 // (TAURI-RUST-4JX, "The model returned an empty response.
                 // Please try again."). Skip the Sentry funnel for both
                 // and emit a structured `log::info!` instead. The
-                // suppressed set is owned by `AgentError::skips_sentry()`
+                // suppressed set is owned by `AgentError::is_expected_outcome()`
                 // so the policy stays in one place.
                 //
                 // Other agent errors go through `report_error_or_expected`
@@ -120,7 +138,7 @@ impl OpenHumanSessionHost {
                 // downstream `recoverable=false` semantics are preserved.
                 let skips_sentry = err
                     .downcast_ref::<AgentError>()
-                    .is_some_and(AgentError::skips_sentry);
+                    .is_some_and(AgentError::is_expected_outcome);
                 if skips_sentry {
                     log::info!(
                         target: "agent",

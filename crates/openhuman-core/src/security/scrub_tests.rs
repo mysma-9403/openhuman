@@ -1,4 +1,5 @@
 use super::*;
+use tinyredact::has_likely_secret;
 
 #[test]
 fn redacts_an_api_key_in_text() {

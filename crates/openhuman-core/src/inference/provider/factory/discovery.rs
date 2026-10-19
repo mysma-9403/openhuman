@@ -4,15 +4,14 @@
 //! endpoint the turn actually talks to.
 
 use super::*;
-use tinyinference_llm::model::discover::{pinned_openrouter_providers, DiscoveryRequest};
+use tinyinference_llm::model::discover::DiscoveryRequest;
 
 /// The discovery request for `provider` (a role's resolved provider string)
 /// serving `model`, or `None` when the route has no listing to ask:
 ///
-/// - `openhuman` / an `OpenhumanJwt` entry: the managed backend's catalog
-///   listing (`/openai/v1/models?catalog=openrouter`), keyed by the managed
-///   inference base so overflow corrections from the managed chat model land
-///   on the same entry.
+/// - `openhuman` / an `OpenhumanJwt` entry: the registered managed catalog's
+///   limits request, keyed by the managed inference base so overflow
+///   corrections from the managed chat model land on the same entry.
 /// - `<slug>:<model>`: the cloud entry's OpenAI-compatible `{endpoint}/models`
 ///   with its stored key (Bearer, or `x-api-key` for Anthropic).
 /// - Local runtimes, subprocess providers, ChatGPT-OAuth (Codex) routing and
@@ -66,73 +65,35 @@ pub(crate) fn model_limits_request(
         log::debug!("[model_limits] codex oauth routing has no window listing slug={slug}");
         return None;
     }
-    let endpoint = resolution.codex.endpoint.clone();
-    let mut request = DiscoveryRequest::new(&endpoint, &resolution.effective_model);
-    let key = resolution.key.trim();
-    if !key.is_empty() {
-        request = match resolution.entry.auth_style {
-            AuthStyle::Anthropic => request
-                .with_header("x-api-key", key)
-                .with_header("anthropic-version", "2023-06-01"),
-            AuthStyle::Bearer => request.with_header("Authorization", format!("Bearer {key}")),
-            AuthStyle::None | AuthStyle::OpenhumanJwt => request,
-        };
-    }
-    if let Some(options) = super::cloud_slug::openrouter_default_provider_options(&endpoint) {
-        request = request.with_pinned_providers(pinned_openrouter_providers(&options));
-    }
-    Some(request)
+    let auth_style = super::cloud_spec::registry_auth_style(resolution.entry.auth_style)?;
+    let (extra_headers, temperature_unsupported) = (Vec::new(), Vec::new());
+    super::cloud_spec::cloud_discovery_request(&super::cloud_spec::CloudBuild {
+        spec: super::cloud_spec::cloud_provider_spec(resolution.entry, &resolution.effective_model),
+        auth_style,
+        key: resolution.key.as_str(),
+        temperature_override: None,
+        temperature_unsupported_models: &temperature_unsupported,
+        native_tool_calling: true,
+        extra_headers: &extra_headers,
+        extra_query_params: &[],
+        user_agent: None,
+        codex: Some(&resolution.codex),
+        http: None,
+    })
 }
 
-/// The managed backend's catalogue listing, authenticated with the backend
-/// credential when the URL is safe to carry it.
+/// The managed backend's catalogue listing request, from the registered
+/// catalog's limits function (`inference::registry`). With none registered the
+/// managed route has no listing to ask.
 fn managed_limits_request(model: &str, config: &Config) -> Option<DiscoveryRequest> {
-    use crate::inference::provider::openhuman_backend_model::{
-        is_managed_endpoint_for_api_key, is_safe_endpoint_for_managed_bearer,
-    };
-    use crate::security::credentials::session_support::{
-        resolve_backend_credential, BackendCredential,
-    };
-
-    let model = model.trim();
-    if model.is_empty() {
+    let Some(limits) =
+        crate::inference::registry::catalog(PROVIDER_OPENHUMAN).and_then(|entry| entry.limits)
+    else {
+        log::debug!("[model_limits] no managed catalog registered");
         return None;
-    }
-    let inference_base = crate::backend::inference_base_url(&config.api_url).ok()?;
-    let endpoint = format!("{}/openai/v1", inference_base.trim_end_matches('/'));
-    let api_base = crate::backend::base_url(&config.api_url).ok()?;
-    let listing_url = crate::inference::provider::append_query_param(
-        &crate::util::url::join_url(&api_base, "/openai/v1/models"),
-        "catalog",
-        "openrouter",
-    );
-    let mut request = DiscoveryRequest::new(endpoint, model)
-        .with_listing_url(listing_url.clone())
-        .with_single_model_probe(false);
-    match resolve_backend_credential(config) {
-        Ok(BackendCredential::ApiKey(key)) if is_managed_endpoint_for_api_key(&listing_url) => {
-            request = request.with_header("Authorization", format!("Bearer {key}"));
-        }
-        Ok(BackendCredential::Session(token))
-            if is_safe_endpoint_for_managed_bearer(&listing_url) =>
-        {
-            request = request.with_header("Authorization", format!("Bearer {token}"));
-        }
-        Ok(_) => {
-            log::warn!(
-                "[model_limits] refusing to send the backend credential to an unsafe listing url"
-            );
-        }
-        Err(_) => {
-            log::debug!("[model_limits] no backend credential; managed listing probed anonymously");
-        }
-    }
-    for (name, value) in crate::backend::attribution_headers().iter() {
-        if let Ok(value) = value.to_str() {
-            request = request.with_header(name.as_str(), value);
-        }
-    }
-    Some(request)
+    };
+    log::debug!("[model_limits] managed limits served by a registered catalog");
+    limits(model, config)
 }
 
 #[cfg(test)]

@@ -19,12 +19,66 @@
 use std::fmt::Write as _;
 
 use super::turn_checkpoint::CheckpointToolResult;
+use tinyagents_harness::turn_stop::TurnStop;
 
 /// Longest error line shown for one tool, in characters.
 const ERROR_LINE_CHARS: usize = 120;
 
 /// Most result lines listed; the rest are counted.
 const MAX_LISTED: usize = 8;
+
+/// Maps an unclassified breaker stop to the product's stable stop category.
+fn stop_fallback_class(note: &str) -> &'static str {
+    StopReasonKind::from_stop_note(note).key()
+}
+
+/// A breaker stop with the product-specific fallback category.
+pub(crate) fn breaker_stop(note: &str) -> TurnStop {
+    TurnStop::breaker(note, stop_fallback_class)
+}
+
+/// Classifies the terminal reason for a completed turn.
+pub(crate) fn classify_stop(
+    breaker_halt: Option<&str>,
+    wind_down: bool,
+    hit_cap: bool,
+) -> Option<TurnStop> {
+    TurnStop::classify(breaker_halt, wind_down, hit_cap, stop_fallback_class)
+}
+
+/// Classifies a completed turn with the failure classifier's typed cause when
+/// the harness carried one through the run. The human-readable stop note stays
+/// available for display, but never recovers the class or operation.
+pub(crate) fn classify_stop_with_cause(
+    breaker_halt: Option<&str>,
+    failure_cause: Option<tinyagents_harness::no_progress::ClassifiedStopCause>,
+    wind_down: bool,
+    hit_cap: bool,
+) -> Option<TurnStop> {
+    TurnStop::classify_with_cause(
+        breaker_halt,
+        failure_cause,
+        wind_down,
+        hit_cap,
+        stop_fallback_class,
+    )
+}
+
+/// Projects an incomplete result reason through the product's stop categories.
+pub(crate) fn stop_from_incomplete(reason: &str) -> TurnStop {
+    TurnStop::from_incomplete_reason(reason, stop_fallback_class)
+}
+
+/// Projects an incomplete result with its typed breaker cause, when available.
+pub(crate) fn stop_from_incomplete_with_cause(
+    reason: &str,
+    failure_cause: Option<tinyagents_harness::no_progress::ClassifiedStopCause>,
+) -> TurnStop {
+    if let Some(cause) = failure_cause {
+        return TurnStop::from_classified_cause(cause);
+    }
+    stop_from_incomplete(reason)
+}
 
 /// Why the breaker stopped the turn, in terms a user can act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,43 +150,13 @@ impl StopReasonKind {
 
     /// English copy completing "I stopped this turn early because …".
     pub(crate) fn copy(self) -> &'static str {
-        match self {
-            Self::Transient => "a service I needed kept timing out or was temporarily unavailable",
-            Self::UncertainSideEffect => {
-                "an action timed out and I could not confirm whether it went through, so I did \
-                 not repeat it"
-            }
-            Self::Authentication => "a service rejected my credentials",
-            Self::Permission => "I don't have permission for a step this needs",
-            Self::Policy => "a step this needs is blocked by your security settings",
-            Self::MissingProgram => {
-                "a program or feature this needs is not available on this device"
-            }
-            Self::NotFound => "something this needs could not be found",
-            Self::InvalidCalls => "a tool kept rejecting my requests as invalid",
-            Self::Unavailable => "a tool this needs is not available right now",
-            Self::SiteRefused => "a website kept refusing my requests",
-            Self::RepeatedFailure => "the same step kept failing",
-            Self::VariedFailures => "several different tool calls in a row failed",
-            Self::RepeatingStep => "I kept repeating the same step without getting anything new",
-            Self::OutOfCredits => {
-                "the account is out of inference credits; add credits, then ask me to try again"
-            }
-            Self::ProviderConfig => {
-                "the configured model or provider rejected the request; check the model and API \
-                 key in Connections"
-            }
-            Self::MissingConnection => {
-                "a service this needs isn't connected; connect it in Connections, then ask me to \
-                 try again"
-            }
-            Self::Generic => "my tool calls were not getting anywhere",
-        }
+        crate::inference::failure_copy::stop_summary_copy(self.key())
     }
 
     /// Read the kind from a breaker stop note. The notes come from a fixed
     /// set of host and harness templates (`ClassifiedFailureTracker`,
-    /// `NoProgressTracker`, `inference::failure_copy::halt`), so this matches
+    /// `NoProgressTracker`, `RepeatProgressMiddleware`,
+    /// `inference::failure_copy::halt`), so this matches
     /// their fixed wording, never the tool output they quote.
     pub(crate) fn from_stop_note(note: &str) -> Self {
         let note = note.trim();
@@ -177,7 +201,12 @@ impl StopReasonKind {
             "uncertain_side_effect" => Self::UncertainSideEffect,
             "authentication" => Self::Authentication,
             "permission" => Self::Permission,
-            "policy" => Self::Policy,
+            // `policy` is the user's denial; `blocked_by_policy` is the
+            // security policy refusing the call (read-only mode, a forbidden
+            // path). Both are the user's security settings, and the refusal
+            // used to fall through to `Generic` ("my tool calls were not
+            // getting anywhere").
+            "policy" | "blocked_by_policy" => Self::Policy,
             "unsupported" | "missing_app" => Self::MissingProgram,
             "not_found" | "missing_window" => Self::NotFound,
             "validation" | "invalid_arguments" => Self::InvalidCalls,
@@ -206,7 +235,7 @@ pub(crate) fn short_error_line(content: &str) -> String {
         None => first.to_owned(),
     };
     let line = crate::security::scrub::sanitize_text(&line).value;
-    let line = crate::security::pii::redact_identifiers(&line);
+    let line = tinymemory_api::safety::redact_identifiers(&line);
     let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.chars().count() <= ERROR_LINE_CHARS {
         return line;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::runtime::DispatchCtx;
 
 #[test]
 fn status_schema_shape() {
@@ -23,7 +24,12 @@ fn schemas_and_controllers_line_up() {
 
 #[tokio::test]
 async fn handler_returns_a_subsystems_array_containing_the_memory_slot() {
-    let value = handle_status(Map::new()).await.expect("handler succeeds");
+    // The handler loads the process-default config, which reads the workspace
+    // environment other tests point at temp dirs under this lock.
+    let _env = crate::config::TEST_ENV_LOCK.lock().await;
+    let value = handle_status(DispatchCtx::process_default(), Map::new())
+        .await
+        .expect("handler succeeds");
     let rows = value["subsystems"].as_array().expect("array");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["slot"], "memory");

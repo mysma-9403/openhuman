@@ -18,24 +18,15 @@
 //!   from the catalog.
 //! - [`TodoTool`] — the session's todo list (whole-list write, thread-scoped).
 //!
-//! `crate::tools` re-exports everything here (`pub use
-//! crate::agent::tools::*;` in `tools/mod.rs`); `tools::ops` registers the
-//! tools into the catalog.
-mod delegate;
-mod plan_exit;
+//! `agent::registration` assembles the dialogue tools; `tools::ops` composes
+//! domain registrations and applies the runtime capability filters.
+pub(crate) mod plan_exit;
 // Pure `skill_runtime` client (spawn + await a workflow run) — compiled out
 // with the `skills` gate so the tool list OMITS these rather than degrading
 // them to a disabled-error.
-#[cfg(feature = "skills")]
-mod run_workflow;
 mod todo;
 
-pub use delegate::DelegateTool;
-pub(crate) use delegate::DelegateToolDispatch;
-pub use plan_exit::{PlanExitTool, PLAN_EXIT_MARKER};
-#[cfg(feature = "skills")]
-pub use run_workflow::{
-    AwaitWorkflowTool, RunWorkflowTool, AWAIT_WORKFLOW_TOOL_NAME, RUN_WORKFLOW_TOOL_NAME,
-};
+pub use plan_exit::PlanExitTool;
+pub const PLAN_EXIT_MARKER: &str = tinyagents_harness::tool::plan_exit::PLAN_EXIT_MARKER;
 pub use todo::TodoTool;
 pub(crate) use todo::TodoToolDispatch;

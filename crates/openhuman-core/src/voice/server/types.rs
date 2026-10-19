@@ -1,7 +1,7 @@
 //! Wire and config types for the voice server: run state, status snapshot,
 //! and the tunables that shape a recording → transcription pass.
 
-use crate::voice::hotkey::ActivationMode;
+use tinyvoice_bus::hotkey::ActivationMode;
 
 /// Running state of the voice server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -15,6 +15,18 @@ pub enum ServerState {
     Recording,
     /// Transcribing recorded audio.
     Transcribing,
+}
+
+impl From<crate::modules::voice::SessionPhase> for ServerState {
+    fn from(phase: crate::modules::voice::SessionPhase) -> Self {
+        use crate::modules::voice::SessionPhase;
+        match phase {
+            SessionPhase::Stopped => Self::Stopped,
+            SessionPhase::Idle => Self::Idle,
+            SessionPhase::Recording => Self::Recording,
+            SessionPhase::Transcribing => Self::Transcribing,
+        }
+    }
 }
 
 /// Status snapshot of the voice server.

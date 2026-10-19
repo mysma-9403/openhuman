@@ -1,5 +1,14 @@
 use super::*;
-use tinyagents_harness::events::EventSink;
+use tinyagents_harness::events::{AgentEvent, EventListener, EventRecord, EventSink};
+
+#[derive(Default)]
+struct EventRecorder(std::sync::Mutex<Vec<AgentEvent>>);
+
+impl EventListener for EventRecorder {
+    fn on_event(&self, record: &EventRecord) {
+        self.0.lock().unwrap().push(record.event.clone());
+    }
+}
 
 /// A tool whose `display_label`/`display_detail` depend on the call
 /// arguments — the shape a dynamic Composio/MCP/integration tool takes (e.g.
@@ -98,6 +107,65 @@ async fn bridge_forwards_tool_and_cost_progress() {
 }
 
 #[tokio::test]
+async fn host_supplemental_generation_is_journaled_without_loop_progress_or_billing() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let bridge = OpenhumanEventBridge::new(Some(tx), "mock-model", 10);
+    let sink = EventSink::new();
+    sink.subscribe(bridge.clone());
+    let supplemental: tinyagents_harness::ids::CallId = "run-1-host-supplemental-1".into();
+    sink.emit(AgentEvent::ModelStarted {
+        call_id: supplemental.clone(),
+        model: "mock-model".into(),
+    });
+    let mut cached_usage = Usage::new(50, 12);
+    cached_usage.charged_amount = Some(tinyinference_llm::usage::ChargedAmount::usd_micros(8_000));
+    sink.emit(AgentEvent::ModelResponseCached {
+        call_id: supplemental.clone(),
+    });
+    sink.emit(AgentEvent::UsageRecorded {
+        usage: cached_usage,
+    });
+    sink.emit(AgentEvent::ModelCompleted {
+        call_id: supplemental,
+        started_at_ms: Some(1),
+        usage: Some(Usage {
+            charged_amount: Some(tinyinference_llm::usage::ChargedAmount::usd_micros(8_000)),
+            ..Usage::new(50, 12)
+        }),
+        input: Some(serde_json::json!(["private prompt"])),
+        output: Some(serde_json::json!("private response")),
+    });
+
+    let regular: tinyagents_harness::ids::CallId = "run-1-model-1".into();
+    sink.emit(AgentEvent::ModelStarted {
+        call_id: regular,
+        model: "mock-model".into(),
+    });
+    sink.emit(AgentEvent::UsageRecorded {
+        usage: Usage::new(7, 3),
+    });
+
+    assert_eq!(bridge.totals(), (7, 3, 0.0));
+    let progress: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert_eq!(
+        progress
+            .iter()
+            .filter(|event| matches!(event, AgentProgress::IterationStarted { .. }))
+            .count(),
+        1,
+        "only the real harness call advances UI iteration state"
+    );
+    assert_eq!(
+        progress
+            .iter()
+            .filter(|event| matches!(event, AgentProgress::TurnCostUpdated { .. }))
+            .count(),
+        1,
+        "supplemental usage is folded by the host terminal sidecar, not emitted as duplicate live billing"
+    );
+}
+
+#[tokio::test]
 async fn model_completed_projects_generation_with_content_and_provider() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let bridge = OpenhumanEventBridge::with_scope(
@@ -111,6 +179,7 @@ async fn model_completed_projects_generation_with_content_and_provider() {
         Arc::default(),
         Arc::default(),
         Vec::new(),
+        crate::core::runtime::DispatchCtx::ambient(),
     );
     let sink = EventSink::new();
     sink.subscribe(bridge.clone());
@@ -179,13 +248,13 @@ async fn subagent_model_completed_carries_task_attribution() {
             agent_id: "researcher".to_string(),
             task_id: "ctx-1".to_string(),
             extended_policy: true,
-            journal_run_id: None,
         }),
         Arc::default(),
         Arc::default(),
         Arc::default(),
         Arc::default(),
         Vec::new(),
+        crate::core::runtime::DispatchCtx::ambient(),
     );
     let sink = EventSink::new();
     sink.subscribe(bridge.clone());
@@ -347,7 +416,7 @@ async fn unknown_tool_call_projects_exactly_one_failed_timeline_row() {
     let failure = failure.expect("the failed row carries a classified failure");
     assert_eq!(
         failure.class,
-        crate::tools::status::ToolFailureClass::NotFound,
+        tinytools::status::ToolFailureClass::NotFound,
         "an unavailable tool must be classified NotFound, not Unknown"
     );
     assert!(!failure.recoverable);
@@ -391,13 +460,13 @@ async fn unknown_tool_call_in_a_child_run_projects_one_subagent_row() {
             agent_id: "researcher".to_string(),
             task_id: "task-1".to_string(),
             extended_policy: false,
-            journal_run_id: None,
         }),
         Arc::default(),
         Arc::default(),
         Arc::default(),
         Arc::default(),
         Vec::new(),
+        crate::core::runtime::DispatchCtx::ambient(),
     );
     let sink = EventSink::new();
     sink.subscribe(bridge.clone());
@@ -417,10 +486,7 @@ async fn unknown_tool_call_in_a_child_run_projects_one_subagent_row() {
         }
     }
     assert_eq!((started, completed), (1, 1));
-    assert_eq!(
-        class,
-        Some(crate::tools::status::ToolFailureClass::NotFound)
-    );
+    assert_eq!(class, Some(tinytools::status::ToolFailureClass::NotFound));
 }
 
 /// W2-budget-dedupe: two `UsageRecorded` events for the *same* model call
@@ -509,6 +575,7 @@ async fn tool_call_events_use_the_tool_s_own_display_label_and_detail() {
         Arc::default(),
         Arc::default(),
         fake_tool_sets(),
+        crate::core::runtime::DispatchCtx::ambient(),
     );
     let sink = EventSink::new();
     sink.subscribe(bridge.clone());
@@ -570,5 +637,42 @@ async fn tool_call_events_use_the_tool_s_own_display_label_and_detail() {
         completed_detail,
         Some("steven@example.com".to_string()),
         "the completed detail is recomputed from the real call arguments"
+    );
+}
+
+/// A running tool's progress report reaches the web channel as
+/// `ToolCallProgress` for the same call; an update with no message does not.
+#[tokio::test]
+async fn bridge_forwards_tool_progress_with_a_message() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let bridge = OpenhumanEventBridge::new(Some(tx), "mock-model", 10);
+    let sink = EventSink::new();
+    sink.subscribe(bridge.clone());
+
+    sink.emit(AgentEvent::ToolProgressDetail {
+        call_id: "c1".into(),
+        message: "running 4m 12s · 38.2 KB output".to_string(),
+        fraction: None,
+        partial: None,
+    });
+    sink.emit(AgentEvent::ToolProgressDetail {
+        call_id: "c1".into(),
+        message: String::new(),
+        fraction: Some(0.5),
+        partial: None,
+    });
+
+    let mut progress = Vec::new();
+    while let Ok(p) = rx.try_recv() {
+        if let AgentProgress::ToolCallProgress { call_id, message } = p {
+            progress.push((call_id, message));
+        }
+    }
+    assert_eq!(
+        progress,
+        vec![(
+            "c1".to_string(),
+            "running 4m 12s · 38.2 KB output".to_string()
+        )]
     );
 }

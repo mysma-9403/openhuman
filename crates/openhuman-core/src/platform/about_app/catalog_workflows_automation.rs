@@ -96,7 +96,7 @@ Capability {
         name: "Browser Automation",
         domain: "workflows",
         category: CapabilityCategory::Workflows,
-        description: "Inspect pages and run bounded browser tasks in Chrome through TinyComputer, with a rescue model for failed steps. A finished task's plan and the page elements it found are kept per site in the core's workspace, so the next task there starts sooner.",
+        description: "Inspect pages and run bounded browser tasks in Chrome through TinyComputer, with a rescue model for failed steps. A finished task's plan and the page elements it found are kept per site in the core's workspace, so the next task there starts sooner. Switched off by [components] computer = false, which unregisters the browser tools and answers the browser RPCs with COMPONENT_DISABLED:computer.",
         how_to: "Connections > Computer > Browser, then ask the assistant to use the browser; What tasks learn turns learning off or forgets learned sites",
         status: CapabilityStatus::Beta,
         privacy: Some(CapabilityPrivacy {
@@ -145,7 +145,7 @@ Capability {
         category: CapabilityCategory::Workflows,
         description:
             "Composio real-time trigger webhooks (Gmail new-message, Slack new-message, …) \
-             currently arrive over wss://api.tinyhumans.ai/socket.io and require backend mode. \
+             currently arrive over the managed backend socket and require backend mode. \
              Direct-mode users get synchronous tool execution but not async trigger push in \
              this release.",
         how_to: "Switch to Backend mode to receive triggers, or wait for the direct trigger sink follow-up",
@@ -187,7 +187,7 @@ Capability {
         name: "Wallet Execution Tools",
         domain: "wallet",
         category: CapabilityCategory::Workflows,
-        description: "Read addresses and balances, prepare/confirm/execute native + token transfers (ERC20/SPL/TRC20/BEP20), and inspect transactions (status, receipt, lookup) across the connected wallet (EVM, BTC, Solana, Tron). Quote-first; signing stays local.",
+        description: "Read addresses and balances, prepare/confirm/execute native + token transfers (ERC20/SPL/TRC20/BEP20), and inspect transactions (status, receipt, lookup) across the connected wallet (EVM, BTC, Solana, Tron). Quote-first; signing stays local. Switched off by [components] wallet = false, which answers COMPONENT_DISABLED:wallet and leaves keychain material, spending limits and RPC endpoints untouched.",
         how_to: "Use wallet.* RPC methods (balances, prepare_transfer, execute_prepared, tx_status, tx_receipt, lookup_tx) via the agent or core_rpc_relay, or via Settings > Crypto > Wallet Balances.",
         status: CapabilityStatus::Beta,
         privacy: LOCAL_CREDENTIALS,

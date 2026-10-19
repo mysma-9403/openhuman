@@ -18,21 +18,31 @@ the rest of the core (sub-agents, web-channel sessions, turn snapshots).
 
 ### Three kinds of per-thread data
 
-A thread has three separate records on disk, all under the workspace:
+A thread has three separate records, resolved through the configured storage
+backend:
 
 ```text
-<workspace>/memory/conversations/
-  threads.jsonl                      thread metadata, append-only upsert/delete log
-  threads/<hex(thread_id)>.jsonl     the thread's message log (what the UI lists)
-  turn_states/<hex(thread)>/<hex(request)>.json
-                                     snapshot of one turn's progress
-<workspace>/session_raw/*.jsonl      model-facing transcript (agent session host)
+conversation store                  thread metadata and messages
+turn-state store                    snapshot of one turn's progress
+session store (storage::sessions)   model-facing transcript (agent session host)
 ```
+
+Legacy `<workspace>/memory/conversations/` files are read once into the
+configured backend; they remain as an import source and are not the live store.
 
 The message log is the user-facing history: one row per user message and
 agent reply, which `threads.messages_list` returns. The transcript is what
-the model sees, written by the agent session host, and is the source for
-`threads.transcript_get` and `threads.token_usage`. The turn-state snapshots
+the model sees, written by the agent session host through the session store
+port, and is the source for `threads.transcript_get` and `threads.token_usage`.
+Every transcript read here goes through that port under the key the session
+host wrote with. The web-chat checkout records that key with the thread the
+first time a session is bound to it (`threads::store::bind_transcript_key`,
+first writer wins, the `threads_transcript_keys` collection in the thread's
+scope), and `ops::support::transcript_store(ctx, thread_id)` reads it back, so
+a later `[agent] chat_agent_id` change cannot strand the thread's earlier
+turns. A thread with no record resolves the key as the session host would
+today, from the request's own context (`<profile>~<agent>` for a SaaS profile,
+else the context's agent, else the chat agent id), never from ambient state. The turn-state snapshots
 record what a turn was doing (phase, tool timeline, streamed text) so a client
 that reloads mid-turn, or after a restart, can rebuild the process view.
 
@@ -124,7 +134,7 @@ its tools act in another. `web_chat::run_task` reads the binding through
 
 `web_chat::progress_bridge` drives a `tinyagents_session::turn_state::TurnStateMirror`
 for each web turn. `turn_state::mirror::ObserveProgress` (`mirror/observe.rs`)
-is the host projection: it turns each `agent::progress::AgentProgress` event
+is the host projection: it turns each `progress::AgentProgress` event
 into a `TurnState` mutation. Streaming deltas only update memory; the mirror
 flushes at iteration and tool boundaries. A finished turn is kept as
 `Completed` so the UI can replay it. A turn whose bridge exits without
@@ -142,20 +152,11 @@ inbound and processed channel turns into the store, using
 and `security/credentials/ops/user_scope.rs` (when the user dir activates).
 See [store/README.md](store/README.md).
 
-### Welcome migration
-
-`welcome_migration::migrate_welcome_agent_artifacts` is a one-shot cleanup for
-the removed welcome-agent onboarding: it strips the obsolete `"onboarding"`
-label from threads and renames `welcome*` session transcripts to
-`orchestrator*`. It is idempotent, guarded by
-`state/migrations/welcome_to_orchestrator_v1.done`, and called from
-`platform/startup/ops.rs`.
-
 ## Layout
 
 | Path | What it does |
 | --- | --- |
-| [`mod.rs`](./mod.rs) | Module declarations, re-exports of the RPC models, error type, controller aggregators and the welcome migration. |
+| [`mod.rs`](./mod.rs) | Module declarations, re-exports of the RPC models, error type and controller aggregators. |
 | [`rpc_models.rs`](./rpc_models.rs) | Serde request and response types for the namespace (`ConversationThreadSummary`, `ConversationMessageRecord`, the `*Request` types). |
 | [`error.rs`](./error.rs) | `ThreadsError` (`NotFound`, `Message`) and its structured RPC error with kind `ThreadNotFound`, so the frontend can drop a stale thread. |
 | [`ops.rs`](./ops.rs) | Re-exports the operations from [`ops/`](./ops/). |
@@ -164,16 +165,15 @@ label from threads and renames `welcome*` session transcripts to
 | [`ops/title_generation.rs`](./ops/title_generation.rs) | Model-generated titles and the replaceable-title rule. |
 | [`ops/working_dir.rs`](./ops/working_dir.rs) | Validating and binding a thread's working folder. |
 | [`ops/search.rs`](./ops/search.rs) | `threads.search`: cross-thread search with snippets for the global `Cmd`/`Ctrl+K` search. |
-| [`ops/transcript.rs`](./ops/transcript.rs) | `threads.transcript_get`: paginated display items from `tinyagents_session::transcript::view`. |
-| [`ops/usage.rs`](./ops/usage.rs) | `threads.token_usage`: token and cost totals from `transcript::spend::thread_spend`, re-priced, with per-sub-agent rows and the last turn's tokens for the context gauge. |
+| [`ops/transcript.rs`](./ops/transcript.rs) | `threads.transcript_get`: paginated display items from `tinyagents_session::transcript::view::get_page_in` over the request's transcript store. |
+| [`ops/usage.rs`](./ops/usage.rs) | `threads.token_usage`: token and cost totals from `transcript::spend::thread_spend_in` over the request's transcript store, re-priced, with per-sub-agent rows and the last turn's tokens for the context gauge. |
 | [`ops/live_state.rs`](./ops/live_state.rs) | `threads.goal_get` and `threads.todos_get`: one-shot reads of the thread's agent goal and todo list for hydration on load. |
 | [`ops/turn_state_ops.rs`](./ops/turn_state_ops.rs) | `threads.turn_state_*` over the snapshot store. |
 | [`ops/purge.rs`](./ops/purge.rs) | Workspace-wide purge. |
-| [`ops/support.rs`](./ops/support.rs) | Envelopes, workspace resolution, `run_to_completion`, type conversions, fallback titles. |
+| [`ops/support.rs`](./ops/support.rs) | Envelopes, workspace and transcript-store resolution (`transcript_store`), `run_to_completion`, type conversions, fallback titles. |
 | [`schemas/`](./schemas/) | `schema_defs.rs` (controller schemas), `handlers.rs` (param parsing, thin handlers), `registry.rs` (the controller list). |
 | [`store/`](./store/) | Re-export of `tinyagents_session::threads`, the `blocking` wrappers and the channel bus subscriber. See [store/README.md](store/README.md). |
 | [`turn_state/`](./turn_state/) | `mirror/observe.rs` (progress projection) and `rpc_types.rs` (turn-state RPC payloads). |
-| [`welcome_migration.rs`](./welcome_migration.rs) | The one-shot welcome-agent migration. |
 
 ## Key types and entry points
 
@@ -239,6 +239,6 @@ Run them with `cargo test -p openhuman threads::` or
 
 ## Further reading
 
-- [Chat](../../../../gitbooks/features/chat.md)
-- [Agent harness architecture](../../../../gitbooks/developing/architecture/agent-harness.md)
-- [Frontend architecture](../../../../gitbooks/developing/architecture/frontend.md)
+- [Chat](../../../../docs/gitbooks/en/features/chat.md)
+- [Agent harness architecture](../../../../docs/gitbooks/en/developing/architecture/agent-harness.md)
+- [Frontend architecture](../../../../docs/gitbooks/en/developing/architecture/frontend.md)

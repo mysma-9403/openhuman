@@ -23,14 +23,16 @@ use std::sync::Arc;
 
 use serde_json::json;
 use tempfile::TempDir;
-use tinyflows::caps::{CodeLanguage, CodeRunner, HttpClient, ToolInvoker};
+#[cfg(target_os = "linux")]
+use tinyflows::caps::{CodeLanguage, CodeRunner};
+use tinyflows::caps::{HttpClient, ToolInvoker};
 use tinyflows::model::{Edge, Node, NodeKind, WorkflowGraph};
 
 use crate::config::Config;
 use crate::security::SecurityPolicy;
 
 use super::build_capabilities;
-use super::caps::{OpenHumanCode, OpenHumanHttp, OpenHumanTools};
+use super::caps::{OpenHumanHttp, OpenHumanTools};
 
 fn test_config(tmp: &TempDir) -> Arc<Config> {
     let config = Config {
@@ -75,6 +77,7 @@ fn http_adapter(allowed_domains: Vec<String>) -> OpenHumanHttp {
         &config.action_dir,
     ));
     OpenHumanHttp {
+        ctx: crate::core::runtime::DispatchCtx::ambient(),
         security,
         http_config: crate::config::HttpRequestConfig {
             allowed_domains,
@@ -83,6 +86,7 @@ fn http_adapter(allowed_domains: Vec<String>) -> OpenHumanHttp {
         http_creds: Arc::new(
             crate::security::credentials::HttpCredentialsStore::from_config(&config),
         ),
+        approval: Default::default(),
     }
 }
 
@@ -100,7 +104,12 @@ fn tools_adapter(config: Arc<Config>) -> OpenHumanTools {
         &config.workspace_dir,
         &config.action_dir,
     ));
-    OpenHumanTools { config, security }
+    OpenHumanTools {
+        ctx: crate::core::runtime::DispatchCtx::ambient(),
+        config,
+        security,
+        approval: Default::default(),
+    }
 }
 
 /// Minimal seeded [`ToolContract`](super::caps::ToolContract) for the tests
@@ -133,9 +142,9 @@ use super::caps::{
 // ── B38 (Gap 2): a custom agent_ref must route to the harness (real tools),
 // not the persona-only completion fallback ─────────────────────────────────
 
-fn custom_registry_entry(enabled: bool) -> crate::agent::registry::AgentRegistryEntry {
-    use crate::agent::registry::types::{AgentRegistrySource, AgentSubagentPolicy};
-    crate::agent::registry::AgentRegistryEntry {
+fn custom_registry_entry(enabled: bool) -> crate::agent_registry::AgentRegistryEntry {
+    use crate::agent_registry::types::{AgentRegistrySource, AgentSubagentPolicy};
+    crate::agent_registry::AgentRegistryEntry {
         id: "finance_analyst".to_string(),
         name: "Finance Analyst".to_string(),
         description: "Reviews spend and drafts finance summaries.".to_string(),

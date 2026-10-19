@@ -34,8 +34,8 @@ pub(crate) enum SkillsDest {
 /// Description of an agent to instantiate on a [`Runtime`](crate::Runtime).
 pub struct AgentSpec {
     id: String,
-    post_turn_hooks: Vec<std::sync::Arc<dyn crate::seams::PostTurnHook>>,
-    tool_hooks: Vec<std::sync::Arc<dyn crate::seams::ToolHook>>,
+    post_turn_hooks: Vec<std::sync::Arc<dyn crate::seams::LearningSink>>,
+    tool_hooks: Vec<std::sync::Arc<dyn crate::seams::ToolHook<crate::seams::OpenHumanRunContext>>>,
     session_store: Option<std::sync::Arc<dyn crate::SessionStoreProvider>>,
     approval_handler: Option<std::sync::Arc<dyn crate::ApprovalHandler>>,
     definition: AgentDefinitionSpec,
@@ -58,7 +58,10 @@ pub struct AgentSpec {
     composio: Option<ComposioHostCredential>,
     config_fn: Option<ConfigEdit>,
     host_tools: Option<openhuman_core::agent::HostTools>,
-    hooks: openhuman_core::agent::hooks::HookScope,
+    hooks: tinyagents_hooks::scope::HookScope<
+        openhuman_core::agent::tinyagents::host::OpenHumanRunContext,
+        tinyagents_harness::cost::TurnCost,
+    >,
     memory: Option<MemoryBinding>,
     subagents: Vec<(String, AgentDefinitionSpec)>,
 }
@@ -147,13 +150,16 @@ impl AgentSpec {
     }
 
     /// Register a post-turn hook local to this agent, in addition to runtime hooks.
-    pub fn post_turn_hook(mut self, hook: std::sync::Arc<dyn crate::seams::PostTurnHook>) -> Self {
+    pub fn post_turn_hook(mut self, hook: std::sync::Arc<dyn crate::seams::LearningSink>) -> Self {
         self.post_turn_hooks.push(hook);
         self
     }
 
     /// Register a tool hook local to this agent, in addition to runtime hooks.
-    pub fn tool_hook(mut self, hook: std::sync::Arc<dyn crate::seams::ToolHook>) -> Self {
+    pub fn tool_hook(
+        mut self,
+        hook: std::sync::Arc<dyn crate::seams::ToolHook<crate::seams::OpenHumanRunContext>>,
+    ) -> Self {
         self.tool_hooks.push(hook);
         self
     }
@@ -476,8 +482,9 @@ impl AgentSpec {
 /// The spec's fields, destructured for [`super::build::instantiate`].
 pub(crate) struct AgentSpecParts {
     pub(crate) id: String,
-    pub(crate) post_turn_hooks: Vec<std::sync::Arc<dyn crate::seams::PostTurnHook>>,
-    pub(crate) tool_hooks: Vec<std::sync::Arc<dyn crate::seams::ToolHook>>,
+    pub(crate) post_turn_hooks: Vec<std::sync::Arc<dyn crate::seams::LearningSink>>,
+    pub(crate) tool_hooks:
+        Vec<std::sync::Arc<dyn crate::seams::ToolHook<crate::seams::OpenHumanRunContext>>>,
     pub(crate) session_store: Option<std::sync::Arc<dyn crate::SessionStoreProvider>>,
     pub(crate) approval_handler: Option<std::sync::Arc<dyn crate::ApprovalHandler>>,
     pub(crate) definition: AgentDefinitionSpec,
@@ -500,7 +507,10 @@ pub(crate) struct AgentSpecParts {
     pub(crate) composio: Option<ComposioHostCredential>,
     pub(crate) config_fn: Option<ConfigEdit>,
     pub(crate) host_tools: Option<openhuman_core::agent::HostTools>,
-    pub(crate) hooks: openhuman_core::agent::hooks::HookScope,
+    pub(crate) hooks: tinyagents_hooks::scope::HookScope<
+        openhuman_core::agent::tinyagents::host::OpenHumanRunContext,
+        tinyagents_harness::cost::TurnCost,
+    >,
     pub(crate) memory: Option<MemoryBinding>,
     pub(crate) subagents: Vec<(String, AgentDefinitionSpec)>,
 }

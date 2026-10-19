@@ -33,9 +33,10 @@ Every caller starts with a role (`chat`, `reasoning`, `agentic`, `coding`, `visi
      |                        egress descriptor
      v
   constructor by prefix:
-     +-- managed_backend.rs       "openhuman" / "cloud" -> OpenHumanBackendModel
+     +-- managed_backend.rs       "openhuman" / "cloud" -> tier pinning, gate, egress, then the registered chat model
      +-- local_runtime.rs         ollama / lmstudio / mlx / local-openai
-     +-- cloud_slug.rs            "<slug>:<model>" BYOK, OpenAI or Anthropic wire
+     +-- cloud_slug.rs            "<slug>:<model>" BYOK: host gates, headers, TLS client
+     +-- cloud_spec.rs            CloudProviderCreds -> ProviderSpec -> tinyinference ProviderRegistry
      +-- subprocess_providers.rs  claude_agent_sdk:, claude-code:
      v
   (Arc<dyn ChatModel<()>>, resolved model id)
@@ -57,7 +58,7 @@ The provider-string grammar is documented at the top of `provider/factory.rs`:
 ```
 
 The optional `@<temp>` suffix pins a temperature for that workload. It is stripped
-(`routing::split_model_and_temperature`) before the model id goes upstream. Unknown slugs and
+(`tinyinference_providers::route::split_model_and_temperature`) before the model id goes upstream. Unknown slugs and
 missing credentials produce actionable errors instead of a silent fallback.
 
 Background roles (`vision`, `embeddings`, `memory`, `agentic`, `burst`) fall back to the primary
@@ -79,12 +80,12 @@ through the same gates and constructors.
 
 ### The managed backend model
 
-[`provider/openhuman_backend_model.rs`](./provider/openhuman_backend_model.rs) is a host `ChatModel` for the OpenHuman backend. It cannot be
+The managed backend model (`crates/openhuman-tinyhumans/src/inference/managed_model.rs`, registered with `inference::registry` under `PROVIDER_OPENHUMAN`) is a host `ChatModel` for the OpenHuman backend. It cannot be
 a plain `tinyinference` OpenAI preset for three reasons: the session bearer is resolved fresh per
 call, the request carries a top-level `thread_id` so the backend can group logs and align cache
 keys, and the response carries an `openhuman.{billing,usage}` envelope with the charged USD that
 the generic parser drops. The model re-projects that envelope
-(`openhuman_backend_model_usage.rs`) so usage meters see real costs. When the bearer's `exp` has
+(`managed_usage.rs` in `openhuman-tinyhumans`) so usage meters see real costs. When the bearer's `exp` has
 already passed, or the backend rejects it, it publishes `DomainEvent::SessionExpired`.
 
 [`provider/openai_codex.rs`](./provider/openai_codex.rs) is related but is not a model. When ChatGPT/Codex OAuth tokens exist
@@ -156,9 +157,8 @@ A failed provider call passes through several layers, each with one job:
   HTTP / transport error
      |
      v
-  provider/ops/http_error/dispatch.rs   api_error(): run every classifier
-     |  quota_and_credits, local_provider, policy_rejection,
-     |  context_window, auth_failure
+  provider/ops/http_error.rs   api_error(): tinyinference_llm::failure::http
+     |  classifies; HostErrorReporter applies backend guards, demotion, Sentry
      |
      +--> auth_failure.rs: 401 from managed backend -> SessionExpired event
      |                     401/403 on a BYO key -> auth_error_registry::record
@@ -180,7 +180,7 @@ when they stop a turn for repeated tool failures.
 
 ### The OpenAI-compatible endpoint
 
-`http/server.rs` serves `/v1/chat/completions` (with SSE streaming) and `/v1/models`.
+The handlers for `/v1/chat/completions` (with SSE streaming) and `/v1/models` live in `tinyinference_llm::providers::openai::server_http`; `http/backend.rs` is the host `ChatBackend` that resolves models against `Config`.
 `openhuman-rpc` mounts it with `.nest("/v1", openhuman_core::inference::http::router())`, so it sits
 behind the same bearer middleware as `/rpc`. The bearer may be either the per-launch core token or
 a stable user-managed key stored under the `EXTERNAL_OPENAI_COMPAT_PROVIDER` auth profile, which
@@ -194,22 +194,22 @@ picks the provider the same way a provider string does.
 | [`mod.rs`](./mod.rs) | Module declarations and re-exports. Also `local_runtime_config` (projects `config.local_ai` into TinyInference's input), `local_vision_mode`, `disabled_local_ai_status`, the `LocalModelConfig` impl for `Config`, and `INFERENCE_COMPILED_IN`. |
 | `ops.rs` | `inference_*` business operations returning `Outcome<T>`: status, prompt, summarize, vision, sentiment, provider tests, model listing, settings updates, OpenAI OAuth wrappers, diagnostics. Demotes expected user-config failures to `warn!`. |
 | [`schemas.rs`](./schemas.rs), `schemas/` | The `inference.*` controller registry. `catalog.rs` has the schemas; `prompt_handlers.rs`, `settings_handlers.rs`, `oauth_handlers.rs` and `claude_code_handlers.rs` hold the thin handlers. |
-| `context_window.rs` | Per-turn context-window resolution (override, provider, local profile, static guess). |
+| `context_window.rs` | Per-turn context-window inputs (override, discovery request, static and local windows); the precedence and remembered windows are `tinyinference_llm::model::context_window::ContextWindowResolver`. |
 | `model_context.rs` | Static context-window table, the remembered window lookup, and vision capability checks. |
-| `auth_error_registry.rs` | Process-lived registry of rejected BYO provider keys, with a once-per-episode latch. |
+| `auth_error_registry.rs` | Process singleton and user-facing copy over `tinyinference_providers::auth_registry::ProviderAuthErrorRegistry` (the once-per-episode latch). |
 | `failure_copy/` | `table.rs` maps a failure class to the wire `error_type`, source, retry verdict and user copy. `halt.rs` has loop-guard halt summaries. |
 | `provider/` | Model construction and provider policy. See [`provider/README.md`](provider/README.md). |
-| `provider/factory.rs`, [`provider/factory/`](./provider/factory/) | Provider-string grammar and model construction: `routing`, `tiers`, `primary_cloud`, `access_gates`, `credentials`, `managed_backend`, `local_runtime`, `cloud_slug`, `subprocess_providers`, `discovery`, `chat_model`, `turn_model`. |
-| `provider/openhuman_backend_model*.rs` | Managed backend `ChatModel`, its call path and its usage/billing projection. |
+| `provider/factory.rs`, [`provider/factory/`](./provider/factory/) | Provider-string grammar and model construction: `routing`, `tiers`, `primary_cloud`, `access_gates`, `credentials`, `managed_backend`, `local_runtime`, `cloud_slug`, `cloud_spec`, `subprocess_providers`, `discovery`, `chat_model`, `turn_model`. |
+| `provider/openhuman_backend_model.rs` | Provider-neutral managed pieces kept in the core (`PROVIDER_LABEL`, `without_reasoning`). The managed `ChatModel`, catalog and embeddings live in `openhuman-tinyhumans` and register through `registry.rs`. |
 | `provider/openai_codex.rs` | Codex routing metadata for the `openai` slug when Codex OAuth is connected. |
 | [`provider/error_code.rs`](./provider/error_code.rs), [`provider/error_classify.rs`](./provider/error_classify.rs) | Managed `errorCode` extraction and Sentry ownership; OpenHuman policy over TinyInference's classifier. |
 | `provider/fallback_diagnostics.rs` | Explains background-role fallback when it hits a provider with no credentials. |
-| [`provider/ops/`](./provider/ops/) | `http_error/` (classification and `api_error`), `models/` (model catalog listing, local-runtime and OpenRouter entries), `provider_factory.rs` (`ProviderRuntimeOptions`, `list_providers`). |
+| [`provider/ops/`](./provider/ops/) | `http_error.rs` (host reporter over `tinyinference_llm::failure::http`, `api_error`), `models/` (model catalog listing, local-runtime and OpenRouter entries), `provider_factory.rs` (`ProviderRuntimeOptions`, `list_providers`). |
 | [`provider/types.rs`](./provider/types.rs) | Host DTOs kept at product and RPC boundaries: `ChatResponse`, `ProviderDelta`, `BilledUsage`, `AGENT_TURN_MAX_OUTPUT_TOKENS`. |
 | `host_runtime/` | Product policy, RPC and speech bindings over `tinyinference_local`. See [`host_runtime/README.md`](host_runtime/README.md). |
 | `embedding_host/` | Embedding provider selection (managed, Voyage, OpenAI, Cohere, Ollama, custom, noop) and the `embeddings.*` RPC. See [`embedding_host/README.md`](embedding_host/README.md). |
 | `tokenjuice/` | Host adapter for the TinyJuice tool-output compression module, the `juice_retrieve` recovery tool, and the `tokenjuice.*` RPC. See [`tokenjuice/README.md`](tokenjuice/README.md). |
-| `http/` | OpenAI-compatible `/v1` endpoint. `server.rs` (router and handlers) is behind the `http-server` feature; `types.rs` and `EXTERNAL_OPENAI_COMPAT_PROVIDER` stay ungated because `core::auth` reads them. |
+| `http/` | OpenAI-compatible `/v1` endpoint. `backend.rs` (host `ChatBackend` and `router()`) is behind the `http-server` feature; `EXTERNAL_OPENAI_COMPAT_PROVIDER` stays ungated because `core::auth` reads it. |
 
 ## Key types and entry points
 
@@ -224,7 +224,7 @@ picks the provider the same way a provider string does.
 - `probe_inference_readiness` (`provider/factory/chat_model.rs`) checks that a role can actually
   run: it builds the model and, for the managed backend, makes one cheap completion.
 - `BYOK_INCOMPLETE_SENTINEL` (`provider/factory.rs`) marks a BYOK route with missing pieces.
-- `OpenHumanBackendModel` (`provider/openhuman_backend_model.rs`) is the managed backend model.
+- `OpenHumanBackendModel` (`openhuman-tinyhumans`, `src/inference/managed_model.rs`) is the managed backend model, registered through `registry.rs`.
 - `host_runtime::global` ([`host_runtime/core.rs`](./host_runtime/core.rs)) returns the `LocalAiService` singleton.
 - `agent_chat_for` and `agent_chat_reply_for` (`host_runtime/ops/agent_chat.rs`) run an agent turn
   natively. `INFERENCE_AGENT_CHAT` (`schemas.rs`) is the wire method name hosts reference.
@@ -270,7 +270,7 @@ Outside JSON-RPC, `http::router()` serves `/v1/chat/completions` and `/v1/models
 ## Events and persistence
 
 This domain publishes but does not subscribe; there is no `bus.rs`. `SessionExpired` comes from
-[`provider/ops/http_error/auth_failure.rs`](./provider/ops/http_error/auth_failure.rs) and `provider/openhuman_backend_model.rs`.
+[`provider/ops/http_error/auth_failure.rs`](./provider/ops/http_error/auth_failure.rs) and `provider/openhuman_backend_model.rs` (the managed model itself is in `openhuman-tinyhumans`).
 `ProviderApiKeyRejected` comes from `auth_failure.rs`, gated by `auth_error_registry`.
 
 There is no `store.rs`. Routing, provider and local settings persist through `config` (`config/ops/
@@ -325,6 +325,6 @@ shared config take `inference_test_guard()` / `inference_test_guard_async()` fro
 ## Further reading
 
 - [Parent module README](../../README.md)
-- [Automatic model routing](../../../../gitbooks/features/model-routing/README.md)
-- [Local models and bring your own key](../../../../gitbooks/features/model-routing/local-and-byok-models.md)
-- [Pluggable engines](../../../../gitbooks/developing/engines.md)
+- [Automatic model routing](../../../../docs/gitbooks/en/features/model-routing/README.md)
+- [Local models and bring your own key](../../../../docs/gitbooks/en/features/model-routing/local-and-byok-models.md)
+- [Pluggable engines](../../../../docs/gitbooks/en/developing/engines.md)

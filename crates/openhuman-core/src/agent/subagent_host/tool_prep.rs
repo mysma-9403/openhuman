@@ -5,8 +5,11 @@
 //! actually see?).
 
 use super::types::SubagentRunError;
-use crate::agent::harness::definition::{PromptSource, ToolScope};
 use crate::agent::prompts::PromptContext;
+use crate::agent_registry::host_definition::AgentDefinition;
+use tinyagents_definition::{PromptSource, ToolScope};
+use tinyagents_orchestration::subagent::{restrict_tools_with_scope, SubagentRole};
+use tinyagents_runtime::ToolSnapshot;
 use tinytools::Tool;
 
 // ── Prompt dialect selection ────────────────────────────────────────────
@@ -18,31 +21,10 @@ use tinytools::Tool;
 /// dialect selection here prevents OpenHuman prompt text from drifting from
 /// the parser that consumes the response.
 pub(crate) fn subagent_prompt_protocol(
-    parent_format: crate::agent::prompts::ToolCallFormat,
+    parent_format: tinytools_agent::dialect::ToolCallFormat,
     tools: &[tinytools::ToolSpec],
-) -> (crate::agent::prompts::ToolCallFormat, String) {
-    use crate::agent::prompts::ToolCallFormat;
-    use tinytools_agent::dialect::{
-        CodeDialect, CodeStyle, NativeDialect, PFormatDialect, ToolDialect,
-    };
-    let instructions = match parent_format {
-        ToolCallFormat::PFormat => {
-            let registry = tinytools_agent::build_registry(
-                tools
-                    .iter()
-                    .map(|tool| (tool.name.as_str(), &tool.parameters)),
-            );
-            PFormatDialect::new(registry).prompt_instructions(tools)
-        }
-        // The native request carries its own structured catalogue; retain
-        // only the dialect guidance in the text prompt.
-        ToolCallFormat::Native => NativeDialect.prompt_instructions(&[]),
-        ToolCallFormat::Json => {
-            crate::agent::prompts::render_helpers::harness_json_tool_prompt(tools)
-        }
-        ToolCallFormat::Python => CodeDialect::instructions(CodeStyle::Python),
-        ToolCallFormat::TypeScript => CodeDialect::instructions(CodeStyle::TypeScript),
-    };
+) -> (tinytools_agent::dialect::ToolCallFormat, String) {
+    let instructions = tinytools_agent::dialect::render_protocol_instructions(parent_format, tools);
     (parent_format, instructions)
 }
 
@@ -75,7 +57,9 @@ pub(super) fn is_subagent_spawn_tool(name: &str) -> bool {
     // which let wildcard-scoped children inherit the orchestrator's spawn
     // surface. Resolve the override names via the registry so the strip
     // stays in lockstep with `collect_orchestrator_tools`'s naming.
-    if let Some(registry) = crate::agent::harness::definition::AgentDefinitionRegistry::current() {
+    if let Some(registry) =
+        crate::agent_registry::host_definition::AgentDefinitionRegistry::current()
+    {
         return registry
             .list()
             .iter()
@@ -88,10 +72,8 @@ pub(super) fn is_subagent_spawn_tool(name: &str) -> bool {
 /// invoke. Index-based filtering avoids cloning `Box<dyn Tool>` (which
 /// isn't Clone) and lets us reuse the parent's existing instances.
 ///
-/// Filters are applied in this order (shorter-circuit first):
-/// 1. `disallowed` — explicit deny list.
-/// 2. `skill_filter` — restrict to tools named `{skill}__*`.
-/// 3. `scope` — `Wildcard` (everything remaining) or `Named` allowlist.
+/// OpenHuman applies its explicit deny globs and the CCR recovery exception;
+/// TinyAgents applies the portable role, skill, scope, and delegation rules.
 ///
 pub(super) fn filter_tool_indices(
     parent_tools: &[Box<dyn Tool>],
@@ -99,36 +81,61 @@ pub(super) fn filter_tool_indices(
     disallowed: &[String],
     skill_filter: Option<&str>,
 ) -> Vec<usize> {
-    let skill_prefix = skill_filter.map(|s| format!("{s}__"));
+    let mut first_specs = std::collections::HashMap::new();
+    let mut specs = Vec::new();
+    let mut disallowed_recovery = std::collections::HashSet::new();
+    let mut delegation_tools = vec!["spawn_worker_thread".to_string()];
+    for tool in parent_tools {
+        let name = tool.name();
+        if is_subagent_spawn_tool(name) || name == "spawn_worker_thread" {
+            delegation_tools.push(name.to_string());
+        }
+        if crate::tools::rules::glob_list_matches(disallowed, name) {
+            if crate::inference::tokenjuice::is_recovery_tool(name) {
+                disallowed_recovery.insert(name.to_string());
+            }
+            continue;
+        }
+        if first_specs.insert(name.to_string(), ()).is_none() {
+            specs.push(tool.spec());
+        }
+    }
+    let snapshot = match ToolSnapshot::new(specs) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return Vec::new(),
+    };
+    let restricted = restrict_tools_with_scope(
+        &snapshot,
+        SubagentRole::Leaf,
+        None,
+        &delegation_tools,
+        Some(scope),
+        skill_filter,
+    );
+    let mut retained: std::collections::HashSet<String> = restricted
+        .specs()
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect();
+
+    // CCR recovery remains a host exception: it bypasses scope and skill
+    // filters, while the deny glob, leaf role, and explicit empty scope win.
+    if !matches!(scope, ToolScope::Named(allowed) if allowed.is_empty()) {
+        for tool in parent_tools {
+            let name = tool.name();
+            if crate::inference::tokenjuice::is_recovery_tool(name)
+                && !disallowed_recovery.contains(name)
+                && !delegation_tools.iter().any(|tool| tool == name)
+            {
+                retained.insert(name.to_string());
+            }
+        }
+    }
 
     parent_tools
         .iter()
         .enumerate()
-        .filter(|(_, tool)| {
-            let name = tool.name();
-            if crate::tools::rules::glob_list_matches(disallowed, name) {
-                return false;
-            }
-            // The CCR recovery tool is advertised to any agent that has a tool
-            // surface — compaction applies to its tool output, so the retrieve
-            // footer must be actionable regardless of scope/skill filters (an
-            // explicit `disallow` above still wins). A deliberately tool-less
-            // agent (`Named([])`, e.g. the payload summarizer) runs no tools,
-            // produces no compacted output, and so stays tool-less.
-            if crate::inference::tokenjuice::is_recovery_tool(name) {
-                return !matches!(scope, ToolScope::Named(allowed) if allowed.is_empty());
-            }
-            if let Some(prefix) = skill_prefix.as_deref() {
-                if !name.starts_with(prefix) {
-                    return false;
-                }
-            }
-            match scope {
-                ToolScope::Wildcard => true,
-                ToolScope::Named(allowed) => allowed.iter().any(|n| n == name),
-            }
-        })
-        .map(|(i, _)| i)
+        .filter_map(|(index, tool)| retained.contains(tool.name()).then_some(index))
         .collect()
 }
 
@@ -143,7 +150,42 @@ pub(super) fn retain_parent_visible_tool_indices(
     if parent_visible.is_empty() {
         return;
     }
-    indices.retain(|&index| parent_visible.contains(parent_tools[index].name()));
+    let mut seen = std::collections::HashSet::new();
+    let specs = parent_tools
+        .iter()
+        .filter(|tool| seen.insert(tool.name().to_string()))
+        .map(|tool| tool.spec())
+        .collect();
+    let Ok(snapshot) = ToolSnapshot::new(specs) else {
+        indices.clear();
+        return;
+    };
+    let mut seen_ceiling = std::collections::HashSet::new();
+    let ceiling_specs = parent_tools
+        .iter()
+        .filter(|tool| {
+            parent_visible.contains(tool.name()) && seen_ceiling.insert(tool.name().to_string())
+        })
+        .map(|tool| tool.spec())
+        .collect();
+    let Ok(ceiling) = ToolSnapshot::new(ceiling_specs) else {
+        indices.clear();
+        return;
+    };
+    let narrowed = restrict_tools_with_scope(
+        &snapshot,
+        SubagentRole::Leaf,
+        Some(&ceiling),
+        &[],
+        None,
+        None,
+    );
+    let names: std::collections::HashSet<_> = narrowed
+        .specs()
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect();
+    indices.retain(|&index| names.contains(parent_tools[index].name()));
 }
 
 #[cfg(test)]
@@ -208,16 +250,25 @@ pub(super) fn prompt_tools_for<'a>(
 }
 
 pub(super) fn load_prompt_source(
-    source: &PromptSource,
+    definition: &AgentDefinition,
     ctx: &PromptContext<'_>,
 ) -> Result<String, SubagentRunError> {
     let workspace_dir = ctx.workspace_dir;
-    match source {
+    match &definition.system_prompt {
         PromptSource::Inline(body) | PromptSource::Verbatim(body) => Ok(body.clone()),
-        PromptSource::Dynamic(build) => build(ctx).map_err(|e| SubagentRunError::PromptLoad {
-            path: format!("<dynamic:{}>", ctx.agent_id),
-            source: std::io::Error::other(e.to_string()),
-        }),
+        PromptSource::Dynamic(()) => {
+            let dynamic_path = || format!("<dynamic:{}>", ctx.agent_id);
+            let build = definition.extensions.prompt_builder.ok_or_else(|| {
+                SubagentRunError::PromptLoad {
+                    path: dynamic_path(),
+                    source: std::io::Error::other("dynamic prompt has no registered builder"),
+                }
+            })?;
+            build(ctx).map_err(|e| SubagentRunError::PromptLoad {
+                path: dynamic_path(),
+                source: std::io::Error::other(e.to_string()),
+            })
+        }
         PromptSource::File { path } => {
             // Try the workspace's `agent/prompts/` first (so users can
             // override built-in prompts), then fall back to the crate's

@@ -11,7 +11,7 @@ fn durable_upload_parts_survive_message_row_replay_without_inline_payloads() {
         ("video.mp4", "video/mp4"),
         ("archive.zip", "application/zip"),
     ] {
-        let attachment = crate::agent::attachments::Attachment {
+        let attachment = crate::attachments::Attachment {
             path: format!("uploads/thread/id/{name}"),
             name: name.into(),
             mime: mime.into(),
@@ -286,6 +286,14 @@ fn plain_assistant_prose_is_not_misread_as_a_tool_round() {
     };
     assert!(am.tool_calls.is_empty());
     assert_eq!(a.text(), "just a normal reply");
+}
+
+#[test]
+fn user_image_marker_text_preserves_whitespace_when_no_image_is_lifted() {
+    for text in ["  [IMAGE:]  ", "  dangling [IMAGE:data:x  "] {
+        let user = chat_message_to_message(&TranscriptMessage::user(text));
+        assert_eq!(user, Message::user(text));
+    }
 }
 
 #[test]

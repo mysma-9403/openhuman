@@ -214,6 +214,8 @@ mod tenant_tests;
 mod triage_tests;
 #[path = "gate_ttl_and_triage_tests.rs"]
 mod ttl_and_triage_tests;
+#[path = "gate_turn_context_tests.rs"]
+mod turn_context_tests;
 
 /// The boot line is where an operator learns whether the installed gate can
 /// park anything, so it must track `[autonomy] enabled` rather than assert a
@@ -226,7 +228,8 @@ fn arming_note_tracks_the_autonomy_master_switch() {
     // Scoped to the four command tools, and explicit that other
     // external-effect tools still park — `ScheduleTool` returns `true` for
     // every mutating action regardless of the policy.
-    assert!(disabled.contains("command tools do not park"), "{disabled}");
+    assert!(disabled.contains("allowed without parking"), "{disabled}");
+    assert!(!disabled.contains("no external effect"), "{disabled}");
     assert!(disabled.contains("still park"), "{disabled}");
     assert!(disabled.contains("[autonomy] enabled = true"), "{disabled}");
     assert!(!disabled.contains("nothing parks"), "{disabled}");

@@ -22,7 +22,7 @@
 
 use tinymemory_api::ObservedActor;
 
-use crate::agent::turn_origin::AgentTurnOrigin;
+use crate::security::turn_origin::AgentTurnOrigin;
 
 /// Channels whose senders are phone numbers (or, for iMessage, email
 /// addresses).

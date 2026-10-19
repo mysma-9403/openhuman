@@ -2,28 +2,84 @@
 
 use super::*;
 
+/// Apply OpenHuman's packed/deferred filters around shared synthesized-name
+/// reconciliation. TinyAgents restores permanent names after these filters.
+fn reconcile_surface_names(
+    visible: &mut std::collections::HashSet<String>,
+    deferred: &mut std::collections::HashSet<String>,
+    permanent: &mut std::collections::HashSet<String>,
+    previous_synthesized: &std::collections::HashSet<String>,
+    synthesized: &std::collections::HashSet<String>,
+    auto_include_new: bool,
+    discovery_deferred: Option<std::collections::HashSet<String>>,
+    strip_packed: impl FnOnce(&mut std::collections::HashSet<String>),
+) {
+    let mut managed = tinyagents_runtime::ManagedToolNames {
+        visible: std::mem::take(visible),
+        deferred: std::mem::take(deferred),
+        permanent: std::mem::take(permanent),
+    };
+    managed.refresh_synthesized(previous_synthesized, synthesized, auto_include_new);
+    // The host's wildcard belt re-admits every live synthesized name at each
+    // refresh. TinyAgents only adds names new since the prior snapshot, so
+    // preserve the narrower host policy before applying its packed/deferred
+    // projection. Explicit belts leave this disabled.
+    if auto_include_new {
+        managed.visible.extend(synthesized.iter().cloned());
+    }
+    // New wildcard-synthesized names must participate in packed-tool
+    // filtering so a withheld name can add its `use_skill` route. Restore
+    // permanent names afterward, preserving their precedence over both
+    // packed and deferred visibility filters.
+    strip_packed(&mut managed.visible);
+    if let Some(names) = &discovery_deferred {
+        managed.visible.retain(|name| !names.contains(name));
+        managed.deferred = names.clone();
+    }
+    managed.make_permanent(std::iter::empty::<String>());
+    if let Some(names) = &discovery_deferred {
+        managed.defer_visible(names);
+    }
+    *visible = managed.visible;
+    *deferred = managed.deferred;
+    *permanent = managed.permanent;
+}
+
 impl OpenHumanTurnPrelude {
     /// Rebuild every delegation-dependent tool view from the current cached
     /// integration set, replacing rather than appending. A revoked delegate is
     /// removed from the executable source, schema, and policy together before
     /// this request is prepared.
     pub(super) fn refresh_delegation_tool_surface(&self) -> anyhow::Result<()> {
-        use crate::agent::harness::definition::AgentDefinitionRegistry;
-        use crate::tools::agent_policy::ToolPolicyEngine;
+        use crate::agent_registry::host_definition::AgentDefinitionRegistry;
         use crate::tools::orchestrator_tools::collect_orchestrator_tools;
+        use tinytools::ToolPolicyEngine;
 
         let Some(registry) = AgentDefinitionRegistry::current() else {
             return Ok(());
         };
-        let Some(definition) = self.session_definition(&registry) else {
-            return Ok(());
-        };
+        let definition = self.session_definition(&registry);
         let has_recorded_tool_snapshot = self
             .mutable
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .recorded_tool_snapshot_adopted;
-        if definition.subagents.is_empty() && !has_recorded_tool_snapshot {
+        #[cfg(feature = "mcp")]
+        let has_configured_mcp_tools = !self
+            .mutable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mcp_tools
+            .configured
+            .is_empty();
+        #[cfg(not(feature = "mcp"))]
+        let has_configured_mcp_tools = false;
+        if definition
+            .as_ref()
+            .is_none_or(|definition| definition.subagents.is_empty())
+            && !has_recorded_tool_snapshot
+            && !has_configured_mcp_tools
+        {
             return Ok(());
         }
         let (integrations, integrations_are_authoritative, recorded_tool_snapshot_adopted) = {
@@ -39,25 +95,35 @@ impl OpenHumanTurnPrelude {
         };
         #[cfg(feature = "mcp")]
         let mcp_tools = self.collect_mcp_search_tools();
+        #[cfg(feature = "mcp")]
+        let configured_mcp_tools = self.collect_configured_mcp_tools();
         let mut surface = self
             .tool_surface
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut collected = collect_orchestrator_tools(&definition, &registry, &integrations);
+        let mut collected = definition
+            .as_ref()
+            .map(|definition| collect_orchestrator_tools(definition, &registry, &integrations))
+            .unwrap_or_default();
         #[cfg(feature = "mcp")]
         collected.extend(mcp_tools);
-        let rebuilt = self.rebuilt_recorded_tools(
-            &definition,
-            &surface.tools,
-            &collected,
-            &integrations,
-            integrations_are_authoritative,
-        );
+        #[cfg(feature = "mcp")]
+        collected.extend(configured_mcp_tools);
+        let rebuilt = definition.as_ref().map_or_else(Vec::new, |definition| {
+            self.rebuilt_recorded_tools(
+                definition,
+                &surface.tools,
+                &collected,
+                &integrations,
+                integrations_are_authoritative,
+            )
+        });
         collected.extend(rebuilt);
-        super::super::managed_tools::reject_synthesized_collisions(
+        tinyagents_runtime::reject_synthesized_collisions(
             &surface.permanent_tool_names,
             &collected,
-        )?;
+        )
+        .map_err(anyhow::Error::msg)?;
         let synthesized =
             super::super::builder::drop_synthesized_name_collisions(&surface.tools, collected);
         let synthesized_names = synthesized
@@ -69,12 +135,6 @@ impl OpenHumanTurnPrelude {
             synthesized_names.clone(),
         );
         let auto_include_new_synthesized_tools = surface.auto_include_new_synthesized_tools;
-        reconcile_synthesized_visibility(
-            &mut surface.visible_tool_names,
-            &previous_synthesized,
-            &synthesized_names,
-            auto_include_new_synthesized_tools,
-        );
         if recorded_tool_snapshot_adopted {
             surface.visible_tool_names.extend(
                 self.mutable
@@ -85,9 +145,38 @@ impl OpenHumanTurnPrelude {
                     .map(|spec| spec.name.clone()),
             );
         }
-        // Preserve permanently attached tools when re-deriving the surface.
-        permanent::refresh_visibility(&mut surface, &synthesized);
-
+        let discovery_deferred = if surface.discovery_enabled {
+            let deferred = tinytools::deferred_set(
+                surface.tools.as_slice(),
+                &synthesized,
+                &surface.requested_deferred_tools,
+            );
+            Some(deferred)
+        } else {
+            None
+        };
+        // Apply host-specific packed/deferred policy before the shared name
+        // reconciliation. TinyAgents restores permanent visibility after
+        // those filters and protects permanent names from deferred discovery.
+        let agent_definition_name = surface.agent_definition_name.clone();
+        let OpenHumanTurnToolSurface {
+            visible_tool_names,
+            deferred_tool_names,
+            permanent_tool_names,
+            ..
+        } = &mut *surface;
+        reconcile_surface_names(
+            visible_tool_names,
+            deferred_tool_names,
+            permanent_tool_names,
+            &previous_synthesized,
+            &synthesized_names,
+            auto_include_new_synthesized_tools,
+            discovery_deferred,
+            |visible| {
+                crate::tools::toolpacks::strip_packed_from_visible(visible, &agent_definition_name)
+            },
+        );
         let mut specs = surface
             .durable_tool_specs
             .iter()
@@ -119,6 +208,28 @@ impl OpenHumanTurnPrelude {
                 .iter()
                 .map(|spec| (spec.name.as_str(), spec))
                 .collect::<std::collections::HashMap<_, _>>();
+            for spec in &mut specs {
+                if let Some(frozen) = recorded.get(spec.name.as_str()) {
+                    *spec = Arc::new((*frozen).clone());
+                }
+            }
+        }
+        #[cfg(feature = "mcp")]
+        {
+            let recorded = self
+                .mutable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .mcp_tools
+                .recorded_specs
+                .clone();
+            let recorded = recorded
+                .iter()
+                .map(|spec| (spec.name.as_str(), spec))
+                .collect::<std::collections::HashMap<_, _>>();
+            // A resumed thread keeps the exact MCP declaration it was shown,
+            // while the current module presentation still supplies its live
+            // executor. This mirrors the REPL snapshot restoration above.
             for spec in &mut specs {
                 if let Some(frozen) = recorded.get(spec.name.as_str()) {
                     *spec = Arc::new((*frozen).clone());
@@ -174,3 +285,7 @@ impl OpenHumanTurnPrelude {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_session_tool_surface_tests.rs"]
+mod tests;

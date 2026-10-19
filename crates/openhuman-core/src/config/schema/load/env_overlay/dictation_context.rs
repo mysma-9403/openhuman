@@ -132,7 +132,8 @@ impl Config {
                 self.context.summarizer_model = Some(model.to_string());
             }
         }
-        let context_default = crate::agent::context::DEFAULT_TOOL_RESULT_BUDGET_BYTES;
+        let context_default =
+            tinyagents_harness::config::TurnConfig::default().tool_result_budget_bytes;
         let context_env_set = env.contains("OPENHUMAN_CONTEXT_TOOL_RESULT_BUDGET_BYTES");
         if !context_env_set
             && self.context.tool_result_budget_bytes == context_default

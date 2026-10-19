@@ -23,9 +23,4 @@
 //! which manages backend org/team membership.
 
 pub mod runtime;
-mod schemas;
 pub use runtime::start_member_run;
-pub use schemas::{
-    all_controller_schemas as all_agent_team_controller_schemas,
-    all_registered_controllers as all_agent_team_registered_controllers,
-};

@@ -5,11 +5,11 @@
 //! deduplicates by task id, holds tombstones (collected inline, stopped,
 //! cancelled parent), counts delivery attempts, hands back the records that
 //! gave up, and persists every transition to a per-workspace
-//! `JsonlCompletionStore`, so a completion that was never delivered is
+//! `DriverCompletionStore` (documents in the storage backend), so a completion that was never delivered is
 //! delivered after a restart. This module is the thin host seam over it:
 //!
-//! * one router per workspace, opened lazily next to the task ledger
-//!   (`<workspace>/.openhuman/background_completions.jsonl`);
+//! * one router per workspace, opened lazily beside the task ledger
+//!   (the `orchestration_completions` collection of the storage backend);
 //! * the router's parent key is the **chat thread id** — delivery is
 //!   thread-addressed, and a thread-scoped cancel (Stop, delete, purge) is then
 //!   the router's own `cancel_parent` / `resume_parent`;
@@ -21,27 +21,46 @@
 //! stays in [`super::background_delivery`]. The wording is
 //! [`super::completion_notice`].
 
+use crate::core::runtime::DispatchCtx;
 use std::collections::{HashMap, HashSet, VecDeque};
-// Keys of `HostState`'s thread and session maps: per profile (see `profile_key`).
-use crate::core::runtime::tenant::profile_key as key;
+mod store_adapter;
+mod thread_index;
+pub(crate) use store_adapter::router_for_workspace_ctx;
+pub(super) use store_adapter::{
+    degrade_to_memory, entry_for_ctx, open_driver_store, router_pool, router_scope_for,
+};
+#[cfg(test)]
+pub(super) use store_adapter::{
+    entry_for, router_for_workspace, router_scope, test_store_overrides,
+};
+use thread_index::{key, note_thread_workspace};
+pub(crate) use thread_index::{
+    note_session_thread, router_for_thread, thread_for_session, workspace_for_thread,
+};
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use tinyagents_orchestration::subagent::{
+    record_detached_completion, DetachedCompletionTarget, DetachedSubagentStatus,
+};
 use tinyagents_tasks::{
     CompletionRecord, CompletionResult, CompletionRouter, CompletionState, CompletionStatus,
-    CompletionStore, InMemoryCompletionStore, JsonlCompletionStore, NotifyMode, RecordOutcome,
-    TombstoneOutcome, DEFAULT_MAX_ATTEMPTS,
+    CompletionStore, NotifyMode, TombstoneOutcome,
 };
 
 use super::completion_notice::BackgroundCompletionFormatter;
 pub(crate) use super::completion_notice::{BackgroundAgentOutcome, AWAITING_INPUT_LABEL};
-pub(crate) use super::completion_target::CompletionTarget;
-pub(crate) use super::completion_target::{claim_recovery, forget_recovery};
 #[cfg(test)]
-pub(crate) use super::completion_target::{
+pub(crate) use super::completion_target::claim_recovery;
+#[cfg(test)]
+pub(crate) use super::completion_target::tests::{
     forget_workspace_for_test, install_store_for_test, TestWorkspace,
 };
+pub(crate) use super::completion_target::CompletionTarget;
+use super::completion_target::{awaiting_input_record_id, awaiting_input_record_prefix};
+pub(crate) use super::completion_target::{claim_recovery_ctx, forget_recovery_ctx};
 
 /// How long a settled record (delivered / gave up / tombstoned) is kept before
 /// compaction drops it. Dropping a settled record also drops its dedupe and its
@@ -54,8 +73,27 @@ const RELEASE_DRAIN: Duration = Duration::from_secs(3);
 /// Retries for a failed store write before a completion is reported lost.
 const RECORD_RETRIES: u32 = 3;
 
+/// Reserved prefix for independently deliverable pause notices. The encoded
+/// task id keeps these records out of the terminal task's dedupe slot; the UUID
+/// distinguishes repeated pauses of the same resumable task.
 /// Bound on the session -> thread cache; the oldest mapping is evicted first.
 const SESSION_THREADS_CAP: usize = 4096;
+
+/// Router authority is scoped to the acting profile and workspace. Threads
+/// share a router within that scope, while identical workspace paths in two
+/// SaaS profiles remain isolated.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(super) struct RouterScope {
+    profile_key: String,
+    workspace_dir: PathBuf,
+}
+
+impl RouterScope {
+    #[cfg(test)]
+    pub(super) fn workspace_dir(&self) -> &Path {
+        &self.workspace_dir
+    }
+}
 
 /// A workspace's router plus the store it sits on (kept so boot recovery and
 /// purge can enumerate parents, which the router itself does not expose).
@@ -66,8 +104,9 @@ pub(super) struct Entry {
 
 #[derive(Default)]
 pub(super) struct HostState {
-    /// One router per workspace.
-    pub(super) routers: HashMap<PathBuf, Arc<Entry>>,
+    /// Store sidecars let recovery enumerate per-scope stores without creating
+    /// another router cache beside TinyAgents' `CompletionRouterPool`.
+    pub(super) stores: HashMap<RouterScope, Arc<dyn CompletionStore>>,
     /// Which workspace holds a thread's completions. Thread-scoped operations
     /// (Stop, delete) carry no workspace, only a thread id.
     pub(super) thread_workspaces: HashMap<String, PathBuf>,
@@ -85,7 +124,7 @@ pub(super) struct HostState {
     /// after the delete sweep (the cooperative-abort race), is rejected for good.
     pub(super) deleted_threads: HashSet<String>,
     /// Workspaces whose log boot recovery has already scanned this process.
-    pub(super) recovered_workspaces: HashSet<PathBuf>,
+    pub(super) recovered_workspaces: HashSet<RouterScope>,
 }
 
 pub(super) fn state() -> std::sync::MutexGuard<'static, HostState> {
@@ -96,155 +135,10 @@ pub(super) fn state() -> std::sync::MutexGuard<'static, HostState> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Where a workspace's completion log lives, beside the detached-task ledger.
-fn completion_store_path(workspace_dir: &Path) -> PathBuf {
-    workspace_dir
-        .join(".openhuman")
-        .join("background_completions.jsonl")
-}
-
-fn entry_for(workspace_dir: &Path) -> Arc<Entry> {
-    if let Some(entry) = state().routers.get(workspace_dir) {
-        return entry.clone();
-    }
-    // Opening replays the whole log, so it happens outside the state lock; this
-    // dedicated lock keeps two callers from opening two writers on one log.
-    static OPEN_LOCK: Mutex<()> = Mutex::new(());
-    let _open = OPEN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(entry) = state().routers.get(workspace_dir) {
-        return entry.clone();
-    }
-    let path = completion_store_path(workspace_dir);
-    let store: Arc<dyn CompletionStore> = match JsonlCompletionStore::open(&path) {
-        Ok(store) => Arc::new(store),
-        Err(error) => {
-            // A workspace that cannot be written degrades to an in-memory
-            // queue rather than taking background delivery down.
-            log::error!(
-                "[background_completions] could not open {}; using an in-memory queue \
-                 (completions will not survive a restart): {error}",
-                path.display()
-            );
-            Arc::new(InMemoryCompletionStore::new())
-        }
-    };
-    let entry = Arc::new(Entry {
-        router: Arc::new(new_router(store.clone())),
-        store,
-    });
-    state()
-        .routers
-        .insert(workspace_dir.to_path_buf(), entry.clone());
-    log::debug!(
-        "[background_completions] opened router workspace_dir={}",
-        workspace_dir.display()
-    );
-    entry
-}
-
-/// Replace a workspace's failing durable store with an in-memory one that starts
-/// from the same records, so delivery keeps working in this process. The log on
-/// disk is left as it is and replays on the next boot.
-///
-/// Serialized per process: when two records hit the failure together, the second
-/// finds the first's fallback already installed and uses it, rather than
-/// installing a second one the delivery loop would never see. `failed` is the
-/// router the caller just saw fail.
-fn degrade_to_memory(workspace_dir: &Path, failed: &Arc<CompletionRouter>) -> Arc<Entry> {
-    static DEGRADE_LOCK: Mutex<()> = Mutex::new(());
-    let _serial = DEGRADE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let old = entry_for(workspace_dir);
-    if !Arc::ptr_eq(&old.router, failed) {
-        return old;
-    }
-    let store = Arc::new(InMemoryCompletionStore::new());
-    for record in old.store.list(None) {
-        if let Err(error) = store.put(&record) {
-            log::warn!("[background_completions] could not carry a record over: {error}");
-        }
-    }
-    let store: Arc<dyn CompletionStore> = store;
-    let entry = Arc::new(Entry {
-        router: Arc::new(new_router(store.clone())),
-        store,
-    });
-    state()
-        .routers
-        .insert(workspace_dir.to_path_buf(), entry.clone());
-    log::error!(
-        "[background_completions] degraded to an in-memory queue workspace_dir={}",
-        workspace_dir.display()
-    );
-    entry
-}
-
-pub(super) fn new_router(store: Arc<dyn CompletionStore>) -> CompletionRouter {
-    CompletionRouter::new(store)
-        .with_formatter(Arc::new(BackgroundCompletionFormatter))
-        .with_max_attempts(DEFAULT_MAX_ATTEMPTS)
-}
-
-/// The router for `workspace_dir`, opening it on first use.
-pub(crate) fn router_for_workspace(workspace_dir: &Path) -> Arc<CompletionRouter> {
-    entry_for(workspace_dir).router.clone()
-}
-
-/// Remember which workspace holds `thread_id`'s completions.
-fn note_thread_workspace(thread_id: &str, workspace_dir: &Path) {
-    state()
-        .thread_workspaces
-        .insert(key(thread_id), workspace_dir.to_path_buf());
-}
-
-/// The router that holds `thread_id`'s completions, if any child of that thread
-/// was spawned or recorded in this process.
-pub(crate) fn router_for_thread(thread_id: &str) -> Option<Arc<CompletionRouter>> {
-    let workspace = state().thread_workspaces.get(&key(thread_id)).cloned()?;
-    Some(router_for_workspace(&workspace))
-}
-
-/// The workspace holding `thread_id`'s completions, if known to this process.
-pub(crate) fn workspace_for_thread(thread_id: &str) -> Option<PathBuf> {
-    state().thread_workspaces.get(&key(thread_id)).cloned()
-}
-
-/// Remember that `session_id` is a turn on `thread_id`.
-pub(crate) fn note_session_thread(session_id: &str, thread_id: &str) {
-    let session_key = key(session_id);
-    let mut st = state();
-    if st
-        .session_threads
-        .insert(session_key.clone(), thread_id.to_string())
-        .is_none()
-    {
-        st.session_order.push_back(session_key);
-        while st.session_order.len() > SESSION_THREADS_CAP {
-            if let Some(oldest) = st.session_order.pop_front() {
-                st.session_threads.remove(&oldest);
-            }
-        }
-    }
-}
-
-/// The chat thread a session id belongs to: the cached mapping, else the
-/// `thread_id` a web-channel session id carries in its JSON body.
-pub(crate) fn thread_for_session(session_id: &str) -> Option<String> {
-    if let Some(thread) = state().session_threads.get(&key(session_id)) {
-        return Some(thread.clone());
-    }
-    if !session_id.starts_with('{') {
-        return None;
-    }
-    serde_json::from_str::<serde_json::Value>(session_id)
-        .ok()?
-        .get("thread_id")?
-        .as_str()
-        .map(str::to_owned)
-}
-
 /// Record a finished background sub-agent for idle delivery, keyed by its
 /// parent chat thread. Idempotent on `task_id`.
 pub(crate) async fn record_completion(
+    ctx: &DispatchCtx,
     workspace_dir: &Path,
     parent_session: &str,
     task_id: impl Into<String>,
@@ -253,6 +147,7 @@ pub(crate) async fn record_completion(
     parent_thread_id: Option<String>,
 ) {
     record_outcome(
+        ctx,
         workspace_dir,
         parent_session,
         task_id,
@@ -273,6 +168,7 @@ pub(crate) async fn record_completion(
 /// The router drops the record when its task was tombstoned (collected inline,
 /// stopped) or its thread was cancelled (deleted, stopped).
 pub(crate) async fn record_outcome(
+    ctx: &DispatchCtx,
     workspace_dir: &Path,
     parent_session: &str,
     task_id: impl Into<String>,
@@ -299,7 +195,7 @@ pub(crate) async fn record_outcome(
     {
         // The in-memory gates back up the router's durable cancelled-parent
         // marker, so a failed `cancel_parent` write cannot let a late result in.
-        let thread_key = key(&thread_id);
+        let thread_key = key(ctx, &thread_id);
         let st = state();
         if st.deleted_threads.contains(&thread_key) || st.stopped_threads.contains(&thread_key) {
             log::debug!(
@@ -309,67 +205,90 @@ pub(crate) async fn record_outcome(
             return;
         }
     }
-    if is_marked_deleted(&entry_for(workspace_dir), &thread_id) {
+    if is_marked_deleted(&entry_for_ctx(ctx, workspace_dir), &thread_id) {
         log::debug!(
             "[background_completions] dropping completion task_id={task_id} for deleted \
              thread_id={thread_id}"
         );
         return;
     }
-    note_thread_workspace(&thread_id, workspace_dir);
-    note_session_thread(parent_session, &thread_id);
-    super::completion_owners::note(&[&task_id, parent_session]); // owner, for off-task delivery
+    note_thread_workspace(ctx, &thread_id, workspace_dir);
+    note_session_thread(ctx, parent_session, &thread_id);
+    super::completion_owners::note(ctx, &[&task_id, parent_session]); // owner, for off-task delivery
 
-    let record = CompletionRecord::new(
-        task_id.clone(),
-        thread_id.clone(),
-        agent_id,
-        outcome.status(),
-        CompletionResult::text(summary),
-    )
-    .with_notify_mode(NotifyMode::Followup);
-    let record = if outcome == BackgroundAgentOutcome::AwaitingInput {
-        record.with_label(AWAITING_INPUT_LABEL)
-    } else {
-        record
+    let router = router_for_workspace_ctx(ctx, workspace_dir);
+    let summary = summary.into();
+    let target = DetachedCompletionTarget::new(router.clone(), thread_id.clone(), agent_id)
+        .with_notify_mode(NotifyMode::Followup);
+    let status = match outcome {
+        BackgroundAgentOutcome::Completed => DetachedSubagentStatus::Completed {
+            output: summary,
+            iterations: 0,
+        },
+        BackgroundAgentOutcome::Failed => DetachedSubagentStatus::Failed { error: summary },
+        BackgroundAgentOutcome::AwaitingInput => {
+            // TinyAgents deliberately excludes pauses from terminal dedupe; the
+            // host gives each paused checkpoint its own record identity above.
+            let record = CompletionRecord::new(
+                task_id.clone(),
+                thread_id.clone(),
+                target.agent_id.clone(),
+                outcome.status(),
+                CompletionResult::text(summary),
+            )
+            .with_notify_mode(NotifyMode::Followup)
+            .with_label(AWAITING_INPUT_LABEL);
+            record_completion_record(ctx, workspace_dir, &router, record, &task_id, &thread_id)
+                .await;
+            return;
+        }
     };
-    let router = router_for_workspace(workspace_dir);
-    let mut outcome_of_record = router
-        .record_with_retries(record.clone(), RECORD_RETRIES)
-        .await;
-    if let Err(error) = &outcome_of_record {
+    if record_detached_completion(&target, &task_id, &status).await {
+        log::debug!(
+            "[background_completions] recorded task_id={task_id} thread_id={thread_id} outcome={outcome:?}"
+        );
+    } else {
         // The log keeps refusing writes (disk full, permissions). Keep this
         // process delivering from memory rather than losing the result; what is
         // already on disk replays on the next boot.
         log::error!(
             "[background_completions] store write failed after retries; continuing in memory \
-             task_id={task_id} thread_id={thread_id} error={error}"
+             task_id={task_id} thread_id={thread_id}"
         );
-        outcome_of_record = degrade_to_memory(workspace_dir, &router)
+        let fallback = degrade_to_memory(ctx, workspace_dir, &router);
+        let fallback_target = DetachedCompletionTarget::new(
+            fallback.router.clone(),
+            thread_id.clone(),
+            target.agent_id.clone(),
+        )
+        .with_notify_mode(NotifyMode::Followup);
+        if !record_detached_completion(&fallback_target, &task_id, &status).await {
+            log::error!(
+                "[background_completions] completion LOST — in-memory fallback failed task_id={task_id} thread_id={thread_id}"
+            );
+        }
+    }
+}
+
+async fn record_completion_record(
+    ctx: &DispatchCtx,
+    workspace_dir: &Path,
+    router: &Arc<CompletionRouter>,
+    record: CompletionRecord,
+    task_id: &str,
+    thread_id: &str,
+) {
+    if let Err(error) = router
+        .record_with_retries(record.clone(), RECORD_RETRIES)
+        .await
+    {
+        log::error!(
+            "[background_completions] store write failed after retries; continuing in memory task_id={task_id} thread_id={thread_id} error={error}"
+        );
+        let _ = degrade_to_memory(ctx, workspace_dir, router)
             .router
             .record(record)
             .await;
-    }
-    match outcome_of_record {
-        Ok(RecordOutcome::Recorded { .. }) => log::debug!(
-            "[background_completions] recorded task_id={task_id} thread_id={thread_id} \
-             outcome={outcome:?}"
-        ),
-        Ok(RecordOutcome::Duplicate) => {
-            log::debug!("[background_completions] duplicate ignored task_id={task_id}")
-        }
-        Ok(RecordOutcome::Suppressed) => log::debug!(
-            "[background_completions] dropping completion task_id={task_id} for \
-             stopped/cancelled/collected thread_id={thread_id}"
-        ),
-        Ok(RecordOutcome::IdCollision) => log::warn!(
-            "[background_completions] task id already recorded for another thread \
-             task_id={task_id} thread_id={thread_id}"
-        ),
-        Err(error) => log::error!(
-            "[background_completions] completion LOST — store write failed \
-             task_id={task_id} thread_id={thread_id} error={error}"
-        ),
     }
 }
 
@@ -378,6 +297,7 @@ pub(crate) async fn record_outcome(
 /// relay, so the user learns the delegated task errored instead of the turn
 /// silently finalizing on "Accepted".
 pub(crate) async fn record_failure(
+    ctx: &DispatchCtx,
     workspace_dir: &Path,
     parent_session: &str,
     task_id: impl Into<String>,
@@ -388,6 +308,7 @@ pub(crate) async fn record_failure(
     let summary =
         format!("[SUBAGENT_FAILED] the async sub-agent errored before producing a result: {error}");
     record_outcome(
+        ctx,
         workspace_dir,
         parent_session,
         task_id,
@@ -402,8 +323,10 @@ pub(crate) async fn record_failure(
 /// Queue an **awaiting-user** async sub-agent for chat delivery (#4896). A
 /// detached child that pauses to ask a question will not continue on its own, so
 /// the framed `[SUBAGENT_NEEDS_INPUT]` notice is delivered back into chat for the
-/// parent agent to relay to (or answer for) the user.
+/// parent agent to relay to (or answer for) the user. Each pause has a separate
+/// router key: the same task may pause repeatedly before its final completion.
 pub(crate) async fn record_awaiting_input(
+    ctx: &DispatchCtx,
     workspace_dir: &Path,
     parent_session: &str,
     task_id: impl Into<String>,
@@ -414,6 +337,10 @@ pub(crate) async fn record_awaiting_input(
 ) {
     let task_id = task_id.into();
     let agent_id = agent_id.into();
+    // A pause is deliverable to the parent, but it is not the task's final
+    // completion. Use an independent key for every pause so resumed work can
+    // pause again and still eventually record under the original task id.
+    let pause_record_id = awaiting_input_record_id(&task_id);
     let summary = crate::agent::orchestration::tools::awaiting_user::awaiting_user_envelope(
         &task_id,
         &agent_id,
@@ -422,9 +349,10 @@ pub(crate) async fn record_awaiting_input(
         checkpointed,
     );
     record_outcome(
+        ctx,
         workspace_dir,
         parent_session,
-        task_id,
+        pause_record_id,
         agent_id,
         summary,
         parent_thread_id,
@@ -445,15 +373,24 @@ pub(crate) async fn release_all() -> usize {
     let deadline = tokio::time::Instant::now() + RELEASE_DRAIN;
     let mut released = 0;
     loop {
-        let retained = {
-            let mut st = state();
-            let before = st.routers.len();
-            st.routers
-                .retain(|_, e| Arc::strong_count(e) > 1 || Arc::strong_count(&e.router) > 1);
-            released += before - st.routers.len();
-            st.routers.len()
-        };
+        let scopes: Vec<_> = state().stores.keys().cloned().collect();
+        let retained = scopes
+            .iter()
+            .filter(|scope| {
+                router_pool()
+                    .get(scope)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|router| Arc::strong_count(&router) > 2)
+            })
+            .count();
         if retained == 0 {
+            let mut st = state();
+            released += st.stores.len();
+            st.stores.clear();
+            if let Err(error) = router_pool().clear() {
+                log::warn!("[background_completions] could not clear router pool: {error}");
+            }
             break;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -461,7 +398,12 @@ pub(crate) async fn release_all() -> usize {
                 "[background_completions] {retained} router(s) still in use at shutdown; \
                  dropping them anyway"
             );
-            released += retained;
+            let mut st = state();
+            released += st.stores.len();
+            st.stores.clear();
+            if let Err(error) = router_pool().clear() {
+                log::warn!("[background_completions] could not clear router pool: {error}");
+            }
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -487,18 +429,59 @@ pub(crate) async fn release_all() -> usize {
 
 /// Undelivered completions for `thread_id`, oldest first (read-only; includes
 /// records an in-flight delivery currently holds).
+#[cfg(test)]
 pub(crate) fn pending_for(workspace_dir: &Path, thread_id: &str) -> Vec<CompletionRecord> {
     router_for_workspace(workspace_dir).pending_for(thread_id)
+}
+
+pub(crate) fn pending_for_ctx(
+    ctx: &DispatchCtx,
+    workspace_dir: &Path,
+    thread_id: &str,
+) -> Vec<CompletionRecord> {
+    router_for_workspace_ctx(ctx, workspace_dir).pending_for(thread_id)
 }
 
 /// Mark `task_id` as collected inline by the parent (via `wait_subagent`) so its
 /// background completion is not independently delivered as a second, duplicate
 /// answer. The router withdraws an already-recorded completion and drops one
 /// that arrives later. Returns whether a pending completion was withdrawn.
+#[cfg(test)]
 pub(crate) fn mark_collected(workspace_dir: &Path, task_id: &str) -> bool {
-    let outcome = router_for_workspace(workspace_dir).tombstone(task_id);
-    log::debug!("[background_completions] mark_collected task_id={task_id} outcome={outcome:?}");
-    matches!(outcome, Ok(TombstoneOutcome::Suppressed))
+    let entry = entry_for(workspace_dir);
+    mark_collected_in_entry(entry, task_id)
+}
+
+pub(crate) fn mark_collected_ctx(ctx: &DispatchCtx, workspace_dir: &Path, task_id: &str) -> bool {
+    mark_collected_in_entry(entry_for_ctx(ctx, workspace_dir), task_id)
+}
+
+fn mark_collected_in_entry(entry: Arc<Entry>, task_id: &str) -> bool {
+    let router = &entry.router;
+    let completion = router.tombstone(task_id);
+    // A parent that collected the final result inline has no use for any
+    // queued pause notices from that same task. Sweep them too, including
+    // pauses persisted before a restart.
+    let pause_prefix = awaiting_input_record_prefix(task_id);
+    let pauses: Vec<String> = entry
+        .store
+        .list(None)
+        .into_iter()
+        .filter(|record| record.task_id.starts_with(&pause_prefix))
+        .map(|record| record.task_id)
+        .collect();
+    let pauses_collected = pauses.into_iter().fold(false, |collected, pause_id| {
+        let suppressed = matches!(
+            router.tombstone(&pause_id),
+            Ok(TombstoneOutcome::Suppressed)
+        );
+        collected | suppressed
+    });
+    log::debug!(
+        "[background_completions] mark_collected task_id={task_id} completion={completion:?} \
+         pauses_collected={pauses_collected}"
+    );
+    matches!(completion, Ok(TombstoneOutcome::Suppressed)) || pauses_collected
 }
 
 /// Drop every queued completion for `thread_id` and everything that finishes
@@ -509,15 +492,19 @@ pub(crate) fn mark_collected(workspace_dir: &Path, task_id: &str) -> bool {
 /// delivered into a thread that no longer exists. Takes the caller's workspace so
 /// the marker is written even when no child of the thread was seen by this
 /// process. Returns the number of queued completions removed.
-pub(crate) fn discard_for_thread(workspace_dir: &Path, thread_id: &str) -> usize {
+pub(crate) fn discard_for_thread(
+    ctx: &DispatchCtx,
+    workspace_dir: &Path,
+    thread_id: &str,
+) -> usize {
     let seen = {
-        let thread_key = key(thread_id);
+        let thread_key = key(ctx, thread_id);
         let mut st = state();
         st.deleted_threads.insert(thread_key.clone());
         st.stopped_threads.remove(&thread_key);
         st.thread_workspaces.contains_key(&thread_key)
     };
-    let entry = entry_for(workspace_dir);
+    let entry = entry_for_ctx(ctx, workspace_dir);
     // Nothing in this process or on disk refers to the thread (an ordinary chat
     // thread that never spawned background work): the in-memory gate is enough
     // and no log line is written for it.
@@ -581,9 +568,9 @@ fn cancel_deleted_parent(entry: &Entry, thread_id: &str) -> usize {
 /// gate lifts at [`resume_stopped_thread`] (the next accepted user turn), while
 /// the stopped generation's task ids stay tombstoned
 /// ([`finish_stop_for_thread`]). Returns the number of queued completions removed.
-pub(crate) fn discard_pending_for_thread(thread_id: &str) -> usize {
-    state().stopped_threads.insert(key(thread_id));
-    let Some(router) = router_for_thread(thread_id) else {
+pub(crate) fn discard_pending_for_thread(ctx: &DispatchCtx, thread_id: &str) -> usize {
+    state().stopped_threads.insert(key(ctx, thread_id));
+    let Some(router) = router_for_thread(ctx, thread_id) else {
         return 0;
     };
     let removed = router.cancel_parent(thread_id).unwrap_or_else(|error| {
@@ -601,8 +588,8 @@ pub(crate) fn discard_pending_for_thread(thread_id: &str) -> usize {
 /// Complete a Stop after its registered children were aborted: tombstone their
 /// task ids so a straggler from the stopped generation cannot record once a
 /// later user turn reopens the thread.
-pub(crate) fn finish_stop_for_thread(thread_id: &str, task_ids: &[String]) {
-    let Some(router) = router_for_thread(thread_id) else {
+pub(crate) fn finish_stop_for_thread(ctx: &DispatchCtx, thread_id: &str, task_ids: &[String]) {
+    let Some(router) = router_for_thread(ctx, thread_id) else {
         return;
     };
     for task_id in task_ids {
@@ -619,12 +606,12 @@ pub(crate) fn finish_stop_for_thread(thread_id: &str, task_ids: &[String]) {
 /// Stop is pressed. New task ids remain distinct from the stopped generation.
 /// Only a thread this process stopped or cancelled pays for the durable resume
 /// marker, so an ordinary chat message writes nothing.
-pub(crate) fn resume_stopped_thread(thread_id: &str) {
-    let was_stopped = state().stopped_threads.remove(&key(thread_id));
+pub(crate) fn resume_stopped_thread(ctx: &DispatchCtx, thread_id: &str) {
+    let was_stopped = state().stopped_threads.remove(&key(ctx, thread_id));
     if !was_stopped {
         return;
     }
-    if let Some(router) = router_for_thread(thread_id) {
+    if let Some(router) = router_for_thread(ctx, thread_id) {
         router.resume_parent(thread_id);
         log::debug!("[background_completions] resumed thread_id={thread_id}");
     }
@@ -642,12 +629,13 @@ pub(crate) fn resume_stopped_thread(thread_id: &str) {
 /// restart): a live spawn proves the user re-engaged the thread. Returns whether
 /// the child must be aborted.
 pub(crate) fn mark_stopped_task_if_thread_stopped(
+    ctx: &DispatchCtx,
     workspace_dir: &Path,
     thread_id: &str,
     task_id: &str,
 ) -> bool {
-    let entry = entry_for(workspace_dir);
-    let thread_key = key(thread_id);
+    let entry = entry_for_ctx(ctx, workspace_dir);
+    let thread_key = key(ctx, thread_id);
     let (first_sight, mut stopped) = {
         let mut st = state();
         let first_sight = st
@@ -680,8 +668,8 @@ pub(crate) fn mark_stopped_task_if_thread_stopped(
 /// purge of that workspace; each thread with undelivered results is cancelled
 /// durably (and remembered as deleted), so stragglers are still dropped. Other
 /// workspaces are untouched. Returns the number of completions removed.
-pub(crate) fn clear_all(workspace_dir: &Path) -> usize {
-    let entry = entry_for(workspace_dir);
+pub(crate) fn clear_all(ctx: &DispatchCtx, workspace_dir: &Path) -> usize {
+    let entry = entry_for_ctx(ctx, workspace_dir);
     let parents: HashSet<String> = entry
         .store
         .list(None)
@@ -691,7 +679,7 @@ pub(crate) fn clear_all(workspace_dir: &Path) -> usize {
         .collect();
     let mut removed = 0;
     for parent in parents {
-        state().deleted_threads.insert(key(&parent));
+        state().deleted_threads.insert(key(ctx, &parent));
         removed += cancel_deleted_parent(&entry, &parent);
     }
     log::debug!("[background_completions] clear_all removed={removed}");
@@ -702,8 +690,8 @@ pub(crate) fn clear_all(workspace_dir: &Path) -> usize {
 /// return the threads that still hold undelivered completions (a previous
 /// process finished the work but never delivered it). Remembers each thread's
 /// workspace so the delivery loop can claim them.
-pub(crate) fn recover_pending_threads(workspace_dir: &Path) -> Vec<String> {
-    let entry = entry_for(workspace_dir);
+pub(crate) fn recover_pending_threads(ctx: &DispatchCtx, workspace_dir: &Path) -> Vec<String> {
+    let entry = entry_for_ctx(ctx, workspace_dir);
     if let Err(error) = entry.router.compact(SETTLED_RETENTION) {
         log::warn!("[background_completions] compact failed error={error}");
     }
@@ -726,7 +714,7 @@ pub(crate) fn recover_pending_threads(workspace_dir: &Path) -> Vec<String> {
         .collect();
     threads.sort();
     for thread in &threads {
-        note_thread_workspace(thread, workspace_dir);
+        note_thread_workspace(ctx, thread, workspace_dir);
     }
     log::info!(
         "[background_completions] boot recovery found {} thread(s) with undelivered completions \
@@ -740,3 +728,11 @@ pub(crate) fn recover_pending_threads(workspace_dir: &Path) -> Vec<String> {
 #[cfg(test)]
 #[path = "background_completions_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "background_completions_pause_tests.rs"]
+mod pause_tests;
+
+#[cfg(test)]
+#[path = "background_completions_release_tests.rs"]
+mod release_tests;

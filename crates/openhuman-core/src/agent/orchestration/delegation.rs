@@ -1,37 +1,33 @@
-//! Production wiring for the multi-stage sub-agent delegation graph (issue
-//! #4249, Phase 3).
+//! OpenHuman policy and worker adapters for the multi-stage delegation tool.
 //!
-//! [`tinyagents_graph::delegation::run_delegation`](tinyagents_graph::delegation::run_delegation)
-//! is the durable plan→execute⇄review→finalize state machine, but it takes an
-//! *injected* per-stage worker so its orchestration mechanics can be unit-tested
-//! with a mock. This module supplies the **production** worker: every stage runs
-//! through [`run_subagent`] (the same dispatch path `spawn_subagent` uses), and
-//! the run is made durable/resumable by checkpointing the typed
-//! [`DelegationState`] through the crate
-//! [`SqliteCheckpointer`](tinyagents_graph::SqliteCheckpointer) at a dedicated
-//! `graph_checkpoints.db` under the workspace.
+//! TinyAgents' `DelegationTool` owns the durable plan→execute⇄review→finalize
+//! mechanics. This module supplies the product-specific stage prompts, target
+//! definition, checkpoint configuration, approval interpretation, and result
+//! projection. Each host stage worker enters the shared subagent driver so its
+//! lifecycle is visible to the same Jobs and Message tools as other children.
 //!
-//! Layering: the delegation *graph* lives in the `tinyagents` adapter seam; this
-//! production glue lives in `agent_orchestration`, which already depends on both
-//! the seam and `subagent_host` (so the seam stays free of orchestration deps).
+//! The host retains its caller context, trust and progress policy; it does not
+//! implement the generic graph state machine or job lifecycle.
 
 use std::sync::Arc;
 
-use crate::agent::harness::definition::AgentDefinition;
-use crate::agent::progress::AgentProgress;
 use crate::agent::subagent_host::{
-    run_subagent_with_parent, SubagentRunOptions, SubagentRunStatus,
+    run_subagent_via_driver_tool, SubagentRunOptions, SubagentRunStatus,
 };
-use crate::agent::tinyagents::host::delegation::run_or_resume_with_tracing;
 use crate::agent::tinyagents::host::OpenHumanRunContext;
+use crate::agent_registry::host_definition::AgentDefinition;
 use crate::config::Config;
+use crate::progress::AgentProgress;
 use tinyagents_graph::checkpoint::Checkpointer;
 use tinyagents_graph::delegation::{
     DelegationConfig, DelegationStage, DelegationStageOutput, DelegationState,
 };
-use tinyagents_graph::SqliteCheckpointer;
 use tinyagents_harness::context::{RunConfig, RunContext};
-use tinytools::WorkspaceDescriptor;
+use tinyagents_harness::tool::ToolDispatch;
+use tinytools::{
+    PermissionLevel, ToolCallOptions, ToolCategory, ToolResult, ToolScope, ToolTimeout,
+    WorkspaceDescriptor,
+};
 
 const LOG_TARGET: &str = "agent_orchestration::delegation";
 
@@ -66,24 +62,13 @@ pub(crate) async fn run_subagent_delegation_with_parent_context(
     max_revisions: usize,
     parent_workspace_descriptor: Option<WorkspaceDescriptor>,
     live_parent: Arc<RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>>,
-) -> Result<DelegationState, String> {
+) -> Result<ToolResult, String> {
     let thread_id = format!("delegrun-{}", uuid::Uuid::new_v4());
     // The graph and every stage share this cancellation token. A stage gets an
     // owned host carrier before it enters `run_subagent`, rather than making a
     // fresh context after the graph has spawned work.
-    let graph_cancellation = live_parent.cancellation.clone();
-    // Durable graph checkpoints ride the crate's `SqliteCheckpointer` (issue
-    // #4249, 04.3) at a dedicated `graph_checkpoints.db` under the workspace —
-    // a separate SQLite file from OpenHuman's session-db pool, so the crate's
-    // owned connection never contends on the run-ledger locks. Nothing outside
-    // the retired `SqlRunLedgerCheckpointer` read the old `graph_checkpoints`
-    // run-ledger table, so no row migration is needed: pre-swap in-flight
-    // durable graphs simply expire (orphaned tasks are reconciled at boot per
-    // 07.2). Checkpoint metadata (thread/checkpoint/parent/run ids) stays
-    // inspectable through the crate `Checkpointer` API.
-    //
-    // With a storage backend configured (`crate::storage`) the checkpoints
-    // live there instead, in the acting agent's scope.
+    // Durable graph checkpoints live in the storage backend, in the acting
+    // agent's scope (`DriverCheckpointer`).
     let checkpointer = open_delegation_checkpointer(&config)?;
 
     tracing::info!(
@@ -104,127 +89,193 @@ pub(crate) async fn run_subagent_delegation_with_parent_context(
         );
     }
 
-    let run = async move {
-        // Re-entrant per-stage worker: clones its captures each call so the graph
-        // node handler stays `Fn` while each stage dispatches a fresh sub-agent.
-        let parent_workspace_descriptor = parent_workspace_descriptor.clone();
-        let stage_parent = live_parent.clone();
-        let run_stage = move |stage: DelegationStage, state: DelegationState| {
-            let definition = definition.clone();
-            let task = task_prompt.clone();
-            let workspace_descriptor = parent_workspace_descriptor.clone();
-            let stage_parent = stage_parent.clone();
-            async move {
-                let prompt = build_stage_prompt(stage, &task, &state);
-                let (stage_parent, stage_context) =
-                    stage_run_contexts(&stage_parent, workspace_descriptor.clone())
-                        .map_err(|error| format!("delegation stage context: {error}"))?;
-                match run_subagent_with_parent(
-                    &stage_parent,
-                    definition,
-                    prompt.clone(),
-                    delegation_subagent_options(workspace_descriptor, stage_context),
-                )
-                .await
-                {
-                    Ok(outcome) => {
-                        let should_emit_lifecycle_effects = outcome.should_emit_lifecycle_effects();
-                        match outcome.status {
-                            SubagentRunStatus::Completed => {}
-                            SubagentRunStatus::AwaitingUser {
-                                question,
-                                checkpoint,
-                                ..
-                            } => {
-                                // A durable delegation graph cannot safely advance
-                                // plan/review state while one of its stages is
-                                // paused. Surface the exact durable child handle so
-                                // the caller can continue that stage instead of
-                                // silently stranding the checkpoint behind a generic
-                                // graph error.
-                                if should_emit_lifecycle_effects {
-                                    let parent_session = stage_parent
-                                        .data
-                                        .parent
-                                        .as_ref()
-                                        .map(|parent| parent.session_id.clone())
-                                        .unwrap_or_else(|| "standalone".to_string());
-                                    crate::agent::orchestration::subagent_events::publish_subagent_awaiting_user(
+    let invocation_agent_id = definition.id.clone();
+    let invocation_task_prompt = task_prompt.clone();
+    let stage_parent = live_parent.clone();
+    let run_stage = move |_stage_args: serde_json::Value,
+                          stage: DelegationStage,
+                          state: DelegationState| {
+        let definition = definition.clone();
+        let task = task_prompt.clone();
+        let workspace_descriptor = parent_workspace_descriptor.clone();
+        let stage_parent = stage_parent.clone();
+        async move {
+            let prompt = build_stage_prompt(stage, &task, &state);
+            let (stage_parent, stage_context) =
+                stage_run_contexts(&stage_parent, workspace_descriptor.clone())
+                    .map_err(|error| format!("delegation stage context: {error}"))?;
+            match run_subagent_via_driver_tool(
+                &stage_parent,
+                definition,
+                prompt.clone(),
+                delegation_subagent_options(workspace_descriptor, stage_context),
+            )
+            .await
+            {
+                Ok((outcome, _public_job_id)) => {
+                    let should_emit_lifecycle_effects = outcome.should_emit_lifecycle_effects();
+                    match outcome.status {
+                        SubagentRunStatus::Completed => {}
+                        SubagentRunStatus::AwaitingUser {
+                            question,
+                            checkpoint,
+                            ..
+                        } => {
+                            // A durable delegation graph cannot safely advance
+                            // plan/review state while one of its stages is
+                            // paused. Surface the exact durable child handle so
+                            // the caller can continue that stage instead of
+                            // silently stranding the checkpoint behind a generic
+                            // graph error.
+                            if should_emit_lifecycle_effects {
+                                let parent_session = stage_parent
+                                    .data
+                                    .parent
+                                    .as_ref()
+                                    .map(|parent| parent.session_id.clone())
+                                    .unwrap_or_else(|| "standalone".to_string());
+                                crate::agent::orchestration::subagent_events::publish_subagent_awaiting_user(
                                         parent_session,
                                         outcome.task_id.clone(),
                                         outcome.agent_id.clone(),
                                         question.clone(),
                                     );
-                                    if let Some(progress) = stage_parent.data.progress.clone() {
-                                        let _ = progress
-                                            .send(AgentProgress::SubagentAwaitingUser {
-                                                agent_id: outcome.agent_id.clone(),
-                                                task_id: outcome.task_id.clone(),
-                                                question: question.clone(),
-                                                worker_thread_id: None,
-                                                checkpoint_path: checkpoint
-                                                    .as_ref()
-                                                    .map(|path| path.to_string_lossy().to_string()),
-                                            })
-                                            .await;
-                                    }
+                                if let Some(progress) = stage_parent.data.progress.clone() {
+                                    let _ = progress
+                                        .send(AgentProgress::SubagentAwaitingUser {
+                                            agent_id: outcome.agent_id.clone(),
+                                            task_id: outcome.task_id.clone(),
+                                            question: question.clone(),
+                                            worker_thread_id: None,
+                                            checkpoint_path: checkpoint
+                                                .as_ref()
+                                                .map(|path| path.to_string_lossy().to_string()),
+                                        })
+                                        .await;
                                 }
-                                return Err(format!(
-                                    "[SUBAGENT_AWAITING_USER]\nagent_id: {}\ntask_id: {}\nquestion: {}\ncheckpointed: {}\n[/SUBAGENT_AWAITING_USER]\n\
+                            }
+                            return Err(format!(
+                                "[SUBAGENT_AWAITING_USER]\nagent_id: {}\ntask_id: {}\nquestion: {}\ncheckpointed: {}\n[/SUBAGENT_AWAITING_USER]\n\
                                      delegation stage {stage:?} is awaiting user input; relay the answer with continue_subagent using this task_id.",
-                                    outcome.agent_id,
-                                    outcome.task_id,
-                                    serde_json::to_string(&question).unwrap_or_else(|_| {
-                                        "\"<unserializable question>\"".to_string()
-                                    }),
-                                    checkpoint.is_some(),
-                                ));
-                            }
-                            SubagentRunStatus::Incomplete { reason } => {
-                                return Err(format!(
-                                    "delegation stage {stage:?} stopped incomplete: {reason}"
-                                ));
-                            }
-                            SubagentRunStatus::Cancelled => {
-                                return Err(format!("delegation stage {stage:?} was cancelled"));
-                            }
+                                outcome.agent_id,
+                                outcome.task_id,
+                                serde_json::to_string(&question).unwrap_or_else(|_| {
+                                    "\"<unserializable question>\"".to_string()
+                                }),
+                                checkpoint.is_some(),
+                            ));
                         }
-                        let approved = matches!(stage, DelegationStage::Review)
-                            && review_approves(&outcome.output);
-                        Ok(DelegationStageOutput {
-                            text: outcome.output,
-                            approved,
-                            // Persist the exact prompt this stage sent so the
-                            // execute step's `StepRecord` carries its provenance
-                            // (read only for the execute stage; #3884).
-                            prompt: Some(prompt),
-                        })
+                        SubagentRunStatus::Incomplete { reason } => {
+                            return Err(format!(
+                                "delegation stage {stage:?} stopped incomplete: {reason}"
+                            ));
+                        }
+                        SubagentRunStatus::Cancelled => {
+                            return Err(format!("delegation stage {stage:?} was cancelled"));
+                        }
                     }
-                    Err(e) => Err(format!("delegation stage {stage:?} failed: {e}")),
+                    let approved = matches!(stage, DelegationStage::Review)
+                        && review_approves(&outcome.output);
+                    Ok(DelegationStageOutput {
+                        text: outcome.output,
+                        approved,
+                        // Persist the exact prompt this stage sent so the
+                        // execute step's `StepRecord` carries its provenance
+                        // (read only for the execute stage; #3884).
+                        prompt: Some(prompt),
+                    })
                 }
+                Err(e) => Err(format!("delegation stage {stage:?} failed: {e}")),
             }
-        };
-
-        let delegation_config = DelegationConfig {
-            max_revisions,
-            checkpointer: Some(checkpointer),
-            thread_id: Some(thread_id),
-            cancel: graph_cancellation,
-            // Automated (non-human-gated) delegation: the reviewer stage decides
-            // approve/revise on its own. The durable human-approval interrupt
-            // (see `tinyagents_graph::delegation::run_delegation_durable`) is opt-in and
-            // stays off here until a human-review delegation surface wires it.
-            ..DelegationConfig::default()
-        };
-        // Resume-aware entry (#3884): with today's fresh-per-run `thread_id` this
-        // is always a fresh run; reusing a stable `thread_id` resumes from the
-        // last checkpoint boundary instead of restarting.
-        run_or_resume_with_tracing(delegation_config, run_stage)
-            .await
-            .map(|outcome| outcome.state)
+        }
     };
+    let config_checkpointer = Arc::clone(&checkpointer);
+    let config_thread_id = thread_id.clone();
+    let config_factory =
+        move |_state: &(), parent: &RunContext<OpenHumanRunContext>, _args: &serde_json::Value| {
+            let mut delegation_config = DelegationConfig {
+                max_revisions,
+                checkpointer: Some(Arc::clone(&config_checkpointer)),
+                thread_id: Some(config_thread_id.clone()),
+                cancel: parent.cancellation.clone(),
+                // Automated delegation: preserve the host's existing worker-output
+                // review policy while the generic tool owns graph lifecycle mechanics.
+                ..DelegationConfig::default()
+            };
+            delegation_config.event_sink = Some(Arc::new(tinyagents_graph::GraphTracingSink::new(
+                "delegation:graph",
+            )));
+            delegation_config
+        };
+    let result_agent_id = invocation_agent_id.clone();
+    let tool = tinyagents_orchestration::subagent::DelegationTool::new(config_factory, run_stage)
+        .with_tool_name("delegate_graph")
+        .with_description("Durable plan, execute, review, and finalize delegation.")
+        .with_parameters(serde_json::json!({
+            "type": "object",
+            "required": ["task"],
+            "properties": {"task": {"type": "string"}}
+        }))
+        .with_resumable_execution()
+        .with_review_approval_policy(
+            tinyagents_orchestration::subagent::ReviewApprovalPolicy::WorkerOutput,
+        )
+        .with_metadata(
+            PermissionLevel::Execute,
+            ToolScope::All,
+            ToolCategory::System,
+            ToolTimeout::Unbounded,
+        )
+        .with_result_projection(move |result| match result {
+            Ok(outcome) if outcome.pending.is_some() => {
+                let pending = outcome.pending.expect("checked above");
+                ToolResult::json(serde_json::json!({
+                    "status": "pending",
+                    "state": outcome.state,
+                    "pending": {
+                        "interrupt_id": pending.interrupt_id,
+                        "node": pending.node,
+                        "payload": pending.payload,
+                        "thread_id": pending.thread_id,
+                    }
+                }))
+            }
+            Ok(outcome) if outcome.state.cancelled => {
+                ToolResult::error(format!("delegate_graph cancelled for '{result_agent_id}'."))
+            }
+            Ok(outcome) => {
+                let state = outcome.state;
+                let final_output = state
+                    .final_output
+                    .unwrap_or_else(|| "(delegation produced no final output)".to_string());
+                let note = if state.revisions > 0 {
+                    " (after revision)"
+                } else {
+                    ""
+                };
+                ToolResult::success(format!(
+                    "[Delegated to {result_agent_id}{note}, {} review pass(es)]\n{final_output}",
+                    state.reviews.len()
+                ))
+            }
+            Err(error) => ToolResult::error(format!(
+                "delegate_graph failed for '{result_agent_id}': {error}"
+            )),
+        });
 
-    run.await
+    tool.execute(
+        &(),
+        tinyagents_harness::CallId::new(format!("delegation-{thread_id}")),
+        serde_json::json!({
+            "agent_id": invocation_agent_id,
+            "task": invocation_task_prompt,
+            "max_revisions": max_revisions
+        }),
+        ToolCallOptions::default(),
+        &live_parent,
+    )
+    .await
+    .map_err(|error| format!("delegate_graph failed: {error}"))
 }
 
 /// Per-stage prompt builder: each stage sees the task plus the accumulated state
@@ -292,32 +343,24 @@ fn delegation_subagent_options(
         worktree_action_dir,
         workspace_descriptor,
         run_queue: None,
+        message_run_queue: None,
     }
 }
 
 /// Open the delegation graph's durable checkpointer: the acting agent's scope
-/// on the storage backend when one is installed, else `graph_checkpoints.db`
-/// under the workspace.
+/// on the storage backend ([`crate::storage::local::open`]).
 pub fn open_delegation_checkpointer(
     config: &Config,
 ) -> Result<Arc<dyn Checkpointer<DelegationState>>, String> {
-    match crate::storage::current_scoped()
-        .map_err(|e| format!("resolve the storage scope for graph checkpoints: {e}"))?
-    {
-        Some(scoped) => Ok(Arc::new(
-            tinyagents_graph::checkpoint::DriverCheckpointer::<DelegationState>::with_prefix(
-                Arc::clone(scoped.documents()),
-                "delegation_graph",
-            ),
-        )),
-        None => {
-            let checkpoint_db = config.workspace_dir.join("graph_checkpoints.db");
-            Ok(Arc::new(
-                SqliteCheckpointer::<DelegationState>::open(&checkpoint_db)
-                    .map_err(|e| format!("open durable graph checkpoint store: {e}"))?,
-            ))
-        }
-    }
+    let scoped = crate::storage::local::open("delegation", &config.workspace_dir)
+        .and_then(|opened| opened.scoped())
+        .map_err(|e| format!("open the storage for graph checkpoints: {e:#}"))?;
+    Ok(Arc::new(
+        tinyagents_graph::checkpoint::DriverCheckpointer::<DelegationState>::with_namespace(
+            Arc::clone(scoped.documents()),
+            "delegation",
+        ),
+    ))
 }
 
 #[cfg(test)]

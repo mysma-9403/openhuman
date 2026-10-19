@@ -25,6 +25,7 @@ impl Default for Config {
         });
 
         Self {
+            runtime_state: super::config::ConfigRuntimeState::default(),
             profile_providers: None,
             workspace_dir: openhuman_dir.join("workspace"),
             action_dir: crate::config::default_action_dir(),
@@ -39,6 +40,7 @@ impl Default for Config {
             api_key: None,
             inference_url: None,
             ephemeral_route: None,
+            resolved_endpoints: Default::default(),
             default_model: Some(DEFAULT_MODEL.to_string()),
             default_temperature: DEFAULT_TEMPERATURE,
             output_language: None,
@@ -87,7 +89,7 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             cost: CostConfig::default(),
             legacy_memory_sources: Vec::new(),
-            agent_registry: crate::agent::registry::types::AgentRegistryConfig::default(),
+            agent_registry: crate::agent_registry::types::AgentRegistryConfig::default(),
             agents: HashMap::new(),
             local_ai: LocalAiConfig::default(),
             claude_agent_sdk: ClaudeAgentSdkConfig::default(),
@@ -103,6 +105,8 @@ impl Default for Config {
             embeddings_provider: None,
             custom_embeddings: None,
             tokenjuice: TokenjuiceConfig::default(),
+            memes: MemesConfig::default(),
+            components: ComponentsConfig::default(),
             hosting: HostingConfig::default(),
             storage: StorageConfig::default(),
             voice_server: VoiceServerConfig::default(),

@@ -38,7 +38,7 @@ registered.
  JSON-RPC  openhuman.billing_get_balance
    |
    v
- schemas.rs handler         load config (config_rpc::load_config_with_timeout)
+ schemas.rs handler         load config (DispatchCtx::load_config)
    |                        read and validate params
    v
  ops.rs operation           validate inputs (trimmed, non-empty) first
@@ -145,11 +145,11 @@ contracts.
   has no typed method, a domain uses the SDK's raw request primitive
   (`billing`, and `oauth`'s `POST /auth/integrations/{id}/client-key`).
   `team`'s `POST /teams` and `DELETE /teams/{id}` are not in the SDK's route
-  registry at all, so they stay on the core's `BackendClient::authed_json`
+  registry at all, so they stay on this crate's `BackendClient::authed_json`
   until the SDK carries them.
 - These domains do not go through `BackendTransport::send_json`; they build a
-  typed `TinyHumansClient` directly. They still depend on a transport being
-  installed, for the gate and for its HTTP client.
+  typed `TinyHumansClient` directly. They still depend on this crate's shared transport, for the gate and for its
+  HTTP client.
 
 ## Gotchas
 
@@ -181,4 +181,4 @@ cargo test -p openhuman-tinyhumans hosted::
 - [`crates/openhuman-tinyhumans/src/hosted/referral/README.md`](referral/README.md): the referral module README.
 - [`crates/openhuman-tinyhumans/src/hosted/team/README.md`](team/README.md): the team module README.
 - [`crates/openhuman-tinyhumans/src/hosted/webhooks/README.md`](webhooks/README.md): the webhooks module README.
-- [`gitbooks/developing/tinyhumans-api-key.md`](../../../../gitbooks/developing/tinyhumans-api-key.md): running on a TinyHumans API key.
+- [`docs/gitbooks/en/developing/tinyhumans-api-key.md`](../../../../docs/gitbooks/en/developing/tinyhumans-api-key.md): running on a TinyHumans API key.

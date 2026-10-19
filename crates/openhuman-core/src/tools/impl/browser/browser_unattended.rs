@@ -7,8 +7,8 @@
 //! unattended_actions` names the gated kinds such a turn may take without
 //! asking; every other origin keeps the forced gate exactly as it was.
 
-use crate::agent::turn_origin::{AgentTurnOrigin, TrustedAutomationSource};
 use crate::config::BrowserConfig;
+use crate::security::turn_origin::{AgentTurnOrigin, TrustedAutomationSource};
 
 /// A turn the user authorized ahead of time and nobody is watching live.
 /// A workflow that asked for review (`require_approval`) is excluded.

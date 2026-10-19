@@ -1,7 +1,7 @@
 //! Context management configuration.
 //!
-//! Knobs for the global `crates/openhuman-core/src/agent/context/` module — budget
-//! thresholds, summarization trigger percentages and microcompact behavior. Wired into the root
+//! Knobs for the agent context middleware — byte budgets, summarization
+//! trigger settings and microcompact behavior. Wired into the root
 //! [`super::Config`] as the `context` section; env overrides live in
 //! [`super::load`].
 
@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ContextConfig {
-    /// Master switch. When `false`, [`crate::agent::context::ContextManager`]
-    /// skips every reduction stage and the summarizer is never invoked.
+    /// Master switch. When `false`, the session host disables context
+    /// compression middleware and the summarizer is never invoked.
     /// Useful for tests and diagnostics; not recommended for production.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -201,7 +201,7 @@ fn default_microcompact_keep_recent() -> usize {
 }
 
 fn default_tool_result_budget_bytes() -> usize {
-    crate::agent::context::DEFAULT_TOOL_RESULT_BUDGET_BYTES
+    tinyagents_harness::config::TurnConfig::default().tool_result_budget_bytes
 }
 
 fn default_summarizer_payload_threshold_tokens() -> usize {

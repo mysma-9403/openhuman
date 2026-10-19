@@ -9,7 +9,9 @@ use common::{
     chat_completion, eventually, offline_config, route, runtime, scripted_provider, stub_backend,
     tool_call_completion,
 };
-use openhuman_embed::seams::{PostTurnHook, ToolHook, ToolHookContext, TurnContext};
+use openhuman_embed::seams::{
+    LearningSink, OpenHumanRunContext, ToolHook, ToolHookContext, TurnSummary,
+};
 use openhuman_embed::{
     AgentDefinitionSpec, AgentSpec, HostTurnTools, Runtime, Tool, ToolScopeSpec, Workspace,
 };
@@ -44,11 +46,15 @@ impl Observer {
 }
 
 #[async_trait::async_trait]
-impl ToolHook for Observer {
+impl ToolHook<OpenHumanRunContext> for Observer {
     fn name(&self) -> &str {
         "same-policy-name"
     }
-    async fn before_tool(&self, ctx: &ToolHookContext) -> anyhow::Result<()> {
+    async fn before_tool(
+        &self,
+        _: &OpenHumanRunContext,
+        ctx: &ToolHookContext,
+    ) -> anyhow::Result<()> {
         self.record("before", ctx.arguments["owner"].as_str().unwrap());
         if self.first.swap(false, Ordering::SeqCst) {
             if let Some(barrier) = &self.overlap {
@@ -57,7 +63,11 @@ impl ToolHook for Observer {
         }
         Ok(())
     }
-    async fn after_tool(&self, ctx: &ToolHookContext) -> anyhow::Result<()> {
+    async fn after_tool(
+        &self,
+        _: &OpenHumanRunContext,
+        ctx: &ToolHookContext,
+    ) -> anyhow::Result<()> {
         assert_eq!(ctx.success, Some(true));
         self.record("after", ctx.arguments["owner"].as_str().unwrap());
         Ok(())
@@ -65,14 +75,10 @@ impl ToolHook for Observer {
 }
 
 #[async_trait::async_trait]
-impl PostTurnHook for Observer {
-    fn name(&self) -> &str {
-        "same-policy-name"
-    }
-    async fn on_turn_complete(&self, ctx: &TurnContext) -> anyhow::Result<()> {
-        assert!(ctx.session_id.is_some());
-        assert!(ctx.agent_id.is_some());
-        self.record("turn", ctx.user_message.lines().last().unwrap());
+impl LearningSink for Observer {
+    async fn on_turn_complete(&self, ctx: &TurnSummary) -> tinyagents_harness::error::Result<()> {
+        assert!(!ctx.agent_id.is_empty());
+        self.record("turn", ctx.input.lines().last().unwrap());
         Ok(())
     }
 }
@@ -89,8 +95,8 @@ impl Tool for Probe {
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{"owner":{"type":"string"}},"required":["owner"]})
     }
-    async fn execute(&self, _: Value) -> anyhow::Result<openhuman_core::tools::ToolResult> {
-        Ok(openhuman_core::tools::ToolResult::success("observed"))
+    async fn execute(&self, _: Value) -> anyhow::Result<tinytools::ToolResult> {
+        Ok(tinytools::ToolResult::success("observed"))
     }
 }
 
@@ -161,12 +167,18 @@ async fn scenario() {
     scheduled
         .scope(async {
             assert_eq!(
-                openhuman_core::agent::hooks::turn_tool_hooks().len(),
+                openhuman_core::agent::hooks::embedder_tool_hooks_in(
+                    &openhuman_core::core::runtime::DispatchCtx::ambient()
+                )
+                .len(),
                 2,
                 "scheduled turns lost the agent's tool hooks"
             );
             assert_eq!(
-                openhuman_core::agent::hooks::turn_post_turn_hooks().len(),
+                openhuman_core::agent::hooks::embedder_post_turn_hooks_in(
+                    &openhuman_core::core::runtime::DispatchCtx::ambient()
+                )
+                .len(),
                 2,
                 "scheduled turns lost the agent's post-turn hooks"
             );

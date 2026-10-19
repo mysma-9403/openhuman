@@ -12,14 +12,6 @@ fn metadata_methods_expose_execute_permission_and_schema() {
 }
 
 #[test]
-fn ownership_boundary_is_prepended_when_present() {
-    let prompt = with_ownership_boundary("implement tests", Some("files: src/foo.rs"));
-    assert!(prompt.starts_with("[Ownership Boundary]"));
-    assert!(prompt.contains("files: src/foo.rs"));
-    assert!(prompt.contains("[Task]\nimplement tests"));
-}
-
-#[test]
 fn schema_advertises_isolation_and_base_ref() {
     let tool = SpawnParallelAgentsTool;
     let schema = tool.parameters_schema();
@@ -61,9 +53,10 @@ fn result_omits_worktree_fields_when_absent() {
         agent_id: "a".into(),
         lineage: test_lineage("t1"),
         success: true,
-        status: crate::agent::orchestration::spawn_parallel_graph::ParallelAgentStatus::Completed,
+        status: crate::agent::orchestration::spawn_parallel::ParallelAgentStatus::Completed,
         output: Some("ok".into()),
         error: None,
+        failure_cause: None,
         awaiting_question: None,
         checkpoint_path: None,
         ownership: None,
@@ -88,9 +81,10 @@ fn result_serializes_worktree_fields_when_present() {
         agent_id: "coder".into(),
         lineage: test_lineage("t2"),
         success: true,
-        status: crate::agent::orchestration::spawn_parallel_graph::ParallelAgentStatus::Completed,
+        status: crate::agent::orchestration::spawn_parallel::ParallelAgentStatus::Completed,
         output: None,
         error: None,
+        failure_cause: None,
         awaiting_question: None,
         checkpoint_path: None,
         ownership: None,
@@ -164,14 +158,17 @@ async fn rejects_more_tasks_than_parent_parallel_limit() {
     let _ = AgentDefinitionRegistry::init_global_builtins();
     let tool = SpawnParallelAgentsTool::new();
     let parent = parent_context(2);
-    let result = with_parent_context(parent, async {
-        tool.execute(json!({
-            "tasks": [
-                { "agent_id": "researcher", "prompt": "one" },
-                { "agent_id": "planner", "prompt": "two" },
-                { "agent_id": "critic", "prompt": "three" }
-            ]
-        }))
+    let result = (async {
+        tool.execute_under_parent(
+            json!({
+                "tasks": [
+                    { "agent_id": "researcher", "prompt": "one" },
+                    { "agent_id": "planner", "prompt": "two" },
+                    { "agent_id": "critic", "prompt": "three" }
+                ]
+            }),
+            parent.clone(),
+        )
         .await
     })
     .await
@@ -190,13 +187,16 @@ async fn collects_immediate_task_validation_failures() {
     let tool = SpawnParallelAgentsTool::new();
     let parent = parent_context(4);
 
-    let result = with_parent_context(parent, async {
-        tool.execute(json!({
-            "tasks": [
-                { "agent_id": " ", "prompt": "missing agent", "ownership": "files: none" },
-                { "agent_id": "__missing_agent__", "prompt": "unknown agent" }
-            ]
-        }))
+    let result = (async {
+        tool.execute_under_parent(
+            json!({
+                "tasks": [
+                    { "agent_id": " ", "prompt": "missing agent", "ownership": "files: none" },
+                    { "agent_id": "__missing_agent__", "prompt": "unknown agent" }
+                ]
+            }),
+            parent.clone(),
+        )
         .await
     })
     .await
@@ -220,8 +220,8 @@ async fn collects_immediate_task_validation_failures() {
         .any(|error| error.contains("unknown agent_id")));
 }
 
-#[test]
-fn shared_workspace_rejects_write_capable_named_worker_without_worktree() {
+#[tokio::test]
+async fn shared_workspace_rejects_write_capable_named_worker_without_worktree() {
     let definition = definition_with_tool_scope(
         "researcher",
         ToolScope::Named(vec!["write_fixture".into()]),
@@ -247,7 +247,8 @@ fn shared_workspace_rejects_write_capable_named_worker_without_worktree() {
         }],
         &definitions,
         &parent,
-    );
+    )
+    .await;
 
     match preflight.into_iter().next().expect("one preflight result") {
         SpawnParallelTaskPreflight::Rejected(rejection) => {
@@ -261,8 +262,8 @@ fn shared_workspace_rejects_write_capable_named_worker_without_worktree() {
     }
 }
 
-#[test]
-fn shared_workspace_allows_readonly_or_explicitly_isolated_workers() {
+#[tokio::test]
+async fn shared_workspace_allows_readonly_or_explicitly_isolated_workers() {
     let readonly = definition_with_tool_scope(
         "researcher",
         ToolScope::Named(vec!["write_fixture".into()]),
@@ -303,7 +304,8 @@ fn shared_workspace_allows_readonly_or_explicitly_isolated_workers() {
         ],
         &definitions,
         &parent,
-    );
+    )
+    .await;
 
     assert!(preflight
         .into_iter()
@@ -354,8 +356,8 @@ fn spawn_parallel_agents_opts_out_of_the_global_tool_timeout() {
 
 /// An absolute or parent-escaping ownership path is rejected with the host's
 /// own sentence, not the crate's typed error.
-#[test]
-fn invalid_ownership_paths_are_rejected_with_the_host_message() {
+#[tokio::test]
+async fn invalid_ownership_paths_are_rejected_with_the_host_message() {
     for raw in ["files: /etc/passwd", "files: ../outside.rs"] {
         let definition = definition_with_tool_scope(
             "writer",
@@ -369,7 +371,8 @@ fn invalid_ownership_paths_are_rejected_with_the_host_message() {
             vec![dispatch_task("writer", Some(raw), None)],
             &definitions,
             &parent,
-        );
+        )
+        .await;
 
         match &preflight[0] {
             SpawnParallelTaskPreflight::Rejected(rejection) => {
@@ -395,8 +398,8 @@ fn invalid_ownership_paths_are_rejected_with_the_host_message() {
 /// worktree-isolated writer parallel, shared read-only agent parallel, shared
 /// writer with disjoint ownership serialized, shared writer claiming an
 /// already-claimed path rejected — is the contract.
-#[test]
-fn mixed_batch_dispatch_modes_and_claim_conflicts_are_stable() {
+#[tokio::test]
+async fn mixed_batch_dispatch_modes_and_claim_conflicts_are_stable() {
     let isolated_writer = definition_with_tool_scope(
         "isolated_writer",
         ToolScope::Named(vec!["write_fixture".into()]),
@@ -449,7 +452,8 @@ fn mixed_batch_dispatch_modes_and_claim_conflicts_are_stable() {
         ],
         &definitions,
         &parent,
-    );
+    )
+    .await;
 
     // The earlier policy rejection is surfaced in place, without advancing the
     // admission index the later dispatch decisions key off.
@@ -504,8 +508,8 @@ fn mixed_batch_dispatch_modes_and_claim_conflicts_are_stable() {
 
 /// A shared-workspace writer whose ownership paths are disjoint from every
 /// earlier claim is admitted, and serialized rather than run in parallel.
-#[test]
-fn disjoint_ownership_admits_both_writers_serially() {
+#[tokio::test]
+async fn disjoint_ownership_admits_both_writers_serially() {
     let first = definition_with_tool_scope(
         "first",
         ToolScope::Named(vec!["write_fixture".into()]),
@@ -526,7 +530,8 @@ fn disjoint_ownership_admits_both_writers_serially() {
         ],
         &definitions,
         &parent,
-    );
+    )
+    .await;
 
     let modes: Vec<Option<WorkerDispatchMode>> = preflight
         .iter()
@@ -547,8 +552,8 @@ fn disjoint_ownership_admits_both_writers_serially() {
 
 /// Directory-level ownership contains the files beneath it, so a worker
 /// claiming `src` collides with one claiming `src/a.rs`.
-#[test]
-fn directory_ownership_contains_files_beneath_it() {
+#[tokio::test]
+async fn directory_ownership_contains_files_beneath_it() {
     let owner = definition_with_tool_scope(
         "owner",
         ToolScope::Named(vec!["write_fixture".into()]),
@@ -569,7 +574,8 @@ fn directory_ownership_contains_files_beneath_it() {
         ],
         &definitions,
         &parent,
-    );
+    )
+    .await;
 
     // The directory-level owner keeps its claim and serializes against any
     // sibling write rather than fanning out.

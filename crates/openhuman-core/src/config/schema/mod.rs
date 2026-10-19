@@ -6,6 +6,8 @@ pub mod cloud_providers;
 pub use cloud_providers::{generate_provider_id, is_slug_reserved, AuthStyle, CloudProviderCreds};
 pub mod ephemeral_route;
 pub use ephemeral_route::{EphemeralRoute, EPHEMERAL_ROUTE_SLUG};
+pub mod resolved_endpoints;
+pub use resolved_endpoints::ResolvedEndpoints;
 mod agent;
 mod autonomy;
 mod capability_providers;
@@ -24,6 +26,8 @@ mod defaults;
 mod dictation;
 mod hooks;
 pub use hooks::HooksConfig;
+pub mod components;
+pub use components::ComponentsConfig;
 pub mod hosting;
 pub use hosting::HostingConfig;
 pub mod storage;
@@ -31,8 +35,9 @@ pub use storage::StorageConfig;
 pub mod profile_layout;
 pub use profile_layout::{users_dir, ProfileLayout};
 mod identity_cost;
-mod load;
+pub(crate) mod load;
 pub(crate) use load::config_from_toml_str;
+pub(crate) use load::source::storage_schema::storage_schema as config_storage_schema;
 pub use load::{
     action_dir_env_override, active_user_marker_path, active_workspace_dir,
     active_workspace_dir_cached, active_workspace_snapshot, clear_active_user, default_action_dir,
@@ -56,7 +61,8 @@ pub(crate) use load::CONFIG_OWNER_MISMATCH_MARKER;
 pub mod claude_agent_sdk;
 pub use claude_agent_sdk::ClaudeAgentSdkConfig;
 mod local_ai;
-mod memory;
+mod memes;
+pub(crate) mod memory;
 mod modules;
 mod observability;
 mod privacy;
@@ -92,12 +98,15 @@ pub use identity_cost::{
     BudgetAction, BudgetPeriod, BudgetPolicy, BudgetScope, CostConfig, ModelPricing,
 };
 pub use local_ai::{LocalAiConfig, LocalAiUsage};
+pub use memes::MemesConfig;
 pub use memory::{
     migrate_legacy_source, MemoryAgentConfig, MemoryConfig, MemoryConversationsConfig,
     MemoryEngineSettings, MemoryLayoutMode, MemoryRecallConfig, MemorySourceConfig,
     MemorySourceKind, MEMORY_CORTEXDB_KEY_NAME,
 };
-pub use modules::{ModuleOverride, ModulesConfig};
+pub use modules::{
+    module_source_env_for, ModuleOverride, ModuleSourceMode, ModulesConfig, MODULE_SOURCE_ENV,
+};
 pub use observability::{AgentTracingBackend, AgentTracingConfig, ObservabilityConfig};
 pub use privacy::{PrivacyConfig, PrivacyMode};
 pub use proxy::{
@@ -118,13 +127,13 @@ pub use tools::{
     ComposioHostCredential, CurlConfig, GitbooksConfig, HttpHeader, HttpRequestConfig,
     IntegrationToggle, IntegrationsConfig, LegacySearchInputs, McpAuthConfig, McpClientConfig,
     McpClientIdentityConfig, McpServerConfig, McpToolExposure, MultimodalConfig,
-    MultimodalFileConfig, SearchConfig, SearchEngineCredentials, SearchHostCredential,
-    SearchPresentation, SearchProviderSettings, SearchRoute, SearxngConfig, SecretsConfig,
-    SeltzConfig, UnknownKeyedSearchProvider, WebSearchConfig, COMPOSIO_MODE_BACKEND,
-    COMPOSIO_MODE_DIRECT, COMPOSIO_MODE_DISABLED, MANAGED_SEARCH_PROVIDERS, SEARCH_ENGINE_BRAVE,
-    SEARCH_ENGINE_DISABLED, SEARCH_ENGINE_EXA, SEARCH_ENGINE_MANAGED, SEARCH_ENGINE_PARALLEL,
-    SEARCH_ENGINE_QUERIT, SEARCH_ENGINE_TAVILY, SEARCH_PROVIDERS, SEARCH_ROLES, SEARCH_ROLE_ANSWER,
-    SEARCH_ROLE_CONTENTS, SEARCH_ROLE_SEARCH,
+    MultimodalFileConfig, PresentationMode, ProviderRoute, SearchConfig, SearchEngineCredentials,
+    SearchHostCredential, SearchProviderSettings, SearxngConfig, SecretsConfig, SeltzConfig,
+    UnknownKeyedSearchProvider, WebSearchConfig, COMPOSIO_MODE_BACKEND, COMPOSIO_MODE_DIRECT,
+    COMPOSIO_MODE_DISABLED, MANAGED_SEARCH_PROVIDERS, SEARCH_ENGINE_BRAVE, SEARCH_ENGINE_DISABLED,
+    SEARCH_ENGINE_EXA, SEARCH_ENGINE_MANAGED, SEARCH_ENGINE_PARALLEL, SEARCH_ENGINE_QUERIT,
+    SEARCH_ENGINE_TAVILY, SEARCH_PROVIDERS, SEARCH_ROLES, SEARCH_ROLE_ANSWER, SEARCH_ROLE_CONTENTS,
+    SEARCH_ROLE_SEARCH,
 };
 pub use update::{UpdateConfig, UpdateRestartStrategy};
 pub use web_chat_config::WebChatConfig;
@@ -138,4 +147,5 @@ pub use voice_providers::{
     VoiceProviderCreds, BUILTIN_VOICE_PROVIDERS,
 };
 mod types;
+pub(crate) use types::ConfigDocumentSnapshot;
 pub use types::*;

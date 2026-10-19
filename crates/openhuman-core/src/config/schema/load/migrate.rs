@@ -11,8 +11,11 @@ pub(crate) fn migrate_legacy_inference_url(config: &mut Config) {
     if !trimmed.ends_with("/chat/completions") {
         return;
     }
-    let is_openhuman_backend = trimmed.starts_with("https://api.tinyhumans.ai/")
-        || trimmed.starts_with("https://staging-api.tinyhumans.ai/");
+    // The managed backend's own chat-completions URL is derived, not moved: it
+    // is recognised by the managed hosts the installed host resolved.
+    let hosts = crate::config::enrichers::managed_hosts_for(config);
+    let is_openhuman_backend = trimmed.starts_with("https://")
+        && crate::config::schema::resolved_endpoints::host_matches_any(trimmed, &hosts);
     let moved = if is_openhuman_backend {
         None
     } else {
@@ -79,6 +82,18 @@ pub(crate) fn migrate_cloud_provider_slugs(config: &mut Config) {
         .iter()
         .map(|e| (e.slug.clone(), e.id.clone()))
         .collect();
+
+    let managed_hosts = crate::config::enrichers::managed_hosts_for(config);
+    let looks_like_openhuman_provider_endpoint = |url: &str| {
+        crate::config::schema::resolved_endpoints::host_matches_any(url, &managed_hosts)
+    };
+
+    let is_openhuman_provider_entry =
+        |entry: &super::super::cloud_providers::CloudProviderCreds| {
+            entry.slug == "openhuman"
+                || matches!(entry.auth_style, AuthStyle::OpenhumanJwt)
+                || looks_like_openhuman_provider_endpoint(&entry.endpoint)
+        };
 
     let legacy_custom_slug = config
         .inference_url
@@ -182,27 +197,6 @@ pub(crate) fn migrate_cloud_provider_slugs(config: &mut Config) {
     fn normalize_provider_endpoint(url: &str) -> String {
         url.trim().trim_end_matches('/').to_ascii_lowercase()
     }
-
-    fn looks_like_openhuman_provider_endpoint(url: &str) -> bool {
-        let lower = url.trim().to_ascii_lowercase();
-        let without_scheme = lower.split("://").nth(1).unwrap_or(&lower);
-        let authority = without_scheme.split('/').next().unwrap_or("");
-        let host = authority.split('@').next_back().unwrap_or(authority);
-        let host_no_port = host.split(':').next().unwrap_or(host);
-        matches!(
-            host_no_port,
-            "api.openhuman.ai" | "api.tinyhumans.ai" | "staging-api.tinyhumans.ai" | "openhuman"
-        ) || host_no_port.ends_with(".openhuman.ai")
-            || host_no_port.ends_with(".tinyhumans.ai")
-    }
-
-    fn is_openhuman_provider_entry(
-        entry: &super::super::cloud_providers::CloudProviderCreds,
-    ) -> bool {
-        entry.slug == "openhuman"
-            || matches!(entry.auth_style, AuthStyle::OpenhumanJwt)
-            || looks_like_openhuman_provider_endpoint(&entry.endpoint)
-    }
 }
 
 /// Convert the single-engine `[search]` format into providers, routes and
@@ -273,4 +267,123 @@ pub(crate) fn migrate_legacy_memory_backend(config: &mut Config, raw: &str) {
     tracing::warn!(
         "[config] legacy memory backend is unsupported; select an explicit v2 memory engine"
     );
+}
+
+/// One-shot migration of the legacy per-dependency switches into
+/// `[components]` (`hosting.enabled`, `search.enabled`, `mcp_client.enabled`,
+/// `memory.engine = "none"`, `OPENHUMAN_TINYMEMES`, `composio.mode =
+/// "disabled"`). `composio.enabled` was never read and is simply dropped with
+/// its field; `composio.mode` stays as the route selector.
+///
+/// A legacy switch is read from the raw TOML (so an unset key keeps its
+/// default) and only moves a component that `[components]` does not already
+/// name, which makes the migration idempotent: once saved, the explicit
+/// `components.*` key wins and the legacy key is never consulted again.
+pub(crate) fn migrate_components(config: &mut Config, raw: &str) {
+    #[cfg(feature = "tinymemes")]
+    let tinymemes = std::env::var(crate::tinymemes::FLAG_ENV).ok();
+    #[cfg(not(feature = "tinymemes"))]
+    let tinymemes: Option<String> = None;
+    migrate_components_with(config, raw, tinymemes.as_deref());
+}
+
+pub(crate) fn migrate_components_with(config: &mut Config, raw: &str, tinymemes: Option<&str>) {
+    let value = toml::from_str::<toml::Value>(raw).ok();
+    let explicit = |name: &str| {
+        value
+            .as_ref()
+            .and_then(|v| v.get("components"))
+            .and_then(|c| c.get(name))
+            .is_some()
+    };
+    let legacy_bool = |table: &str| {
+        value
+            .as_ref()
+            .and_then(|v| v.get(table))
+            .and_then(|t| t.get("enabled"))
+            .and_then(toml::Value::as_bool)
+    };
+    let mut moved: Vec<&str> = Vec::new();
+    let mut disable = |config: &mut Config, name: &'static str, legacy_on: Option<bool>| {
+        if legacy_on == Some(false) && !explicit(name) && config.components.get(name) == Some(true)
+        {
+            config.components.set(name, false);
+            moved.push(name);
+        }
+    };
+    disable(config, "hosting", legacy_bool("hosting"));
+    disable(config, "search", legacy_bool("search"));
+    disable(config, "mcp", legacy_bool("mcp_client"));
+    let composio_off = value
+        .as_ref()
+        .and_then(|v| v.get("composio"))
+        .and_then(|t| t.get("mode"))
+        .and_then(toml::Value::as_str)
+        .is_some_and(|m| m.trim().eq_ignore_ascii_case("disabled"));
+    disable(config, "connectors", composio_off.then_some(false));
+    let engine_none = value
+        .as_ref()
+        .and_then(|v| v.get("memory"))
+        .and_then(|m| m.get("engine"))
+        .and_then(toml::Value::as_str)
+        .is_some_and(|e| e.trim().eq_ignore_ascii_case("none"));
+    disable(config, "memory", engine_none.then_some(false));
+    #[cfg(feature = "tinymemes")]
+    let memes_on = tinymemes
+        .filter(|v| !v.trim().is_empty())
+        .map(crate::tinymemes::flag_enabled);
+    // Without the `tinymemes` gate there is no legacy flag to migrate.
+    #[cfg(not(feature = "tinymemes"))]
+    let memes_on = tinymemes.and(None::<bool>);
+    disable(config, "memes", memes_on);
+    // The old tool-output compaction master switch, `[tokenjuice]
+    // router_enabled = false`, becomes `[components] juice = false`. The
+    // switch stays as a sub-setting of the on state.
+    // Voice had three independent switches (`[dictation] enabled`,
+    // `[voice_server] auto_start`, `always_on_enabled`). Only a config that
+    // names all three and has every one off says "no voice at all"; any other
+    // mix keeps the component on, so the old keys keep working for a release.
+    let voice_flag = |table: &str, key: &str| {
+        value
+            .as_ref()
+            .and_then(|v| v.get(table))
+            .and_then(|t| t.get(key))
+            .and_then(toml::Value::as_bool)
+    };
+    let voice_flags = [
+        voice_flag("dictation", "enabled"),
+        voice_flag("voice_server", "auto_start"),
+        voice_flag("voice_server", "always_on_enabled"),
+    ];
+    if voice_flags.iter().all(|f| *f == Some(false)) {
+        disable(config, "voice", Some(false));
+    }
+    let router_enabled = value
+        .as_ref()
+        .and_then(|v| v.get("tokenjuice"))
+        .and_then(|t| t.get("router_enabled"))
+        .and_then(toml::Value::as_bool);
+    disable(config, "juice", router_enabled);
+    // `[sandbox] enabled = false` (and the same key under `[security.sandbox]`)
+    // already meant "no isolation backend"; it now also keeps the TinyBox
+    // module from loading. Unset (auto) and `true` keep the component on.
+    let sandbox_flag = |path: &[&str]| {
+        let mut node = value.as_ref()?;
+        for key in path {
+            node = node.get(key)?;
+        }
+        node.get("enabled").and_then(toml::Value::as_bool)
+    };
+    let sandbox_off = [
+        sandbox_flag(&["sandbox"]),
+        sandbox_flag(&["security", "sandbox"]),
+    ]
+    .contains(&Some(false));
+    disable(config, "sandbox", sandbox_off.then_some(false));
+    if !moved.is_empty() {
+        tracing::info!(
+            "[config][migrate] legacy switches moved to [components]: {}",
+            moved.join(",")
+        );
+    }
 }

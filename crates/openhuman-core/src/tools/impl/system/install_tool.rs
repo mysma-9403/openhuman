@@ -112,16 +112,35 @@ impl Tool for InstallToolTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_with_context(args, tinytools::ToolCallOptions::default(), None)
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        _options: tinytools::ToolCallOptions,
+        context: Option<&dyn tinytools::ToolRunContext>,
+    ) -> anyhow::Result<ToolResult> {
+        let approval = crate::agent::tinyagents::host::run_context::approval_for_tool(context);
+        self.run(args, &approval).await
+    }
+}
+
+impl InstallToolTool {
+    /// Runs the install for a turn whose approval context is `approval`.
+    pub(crate) async fn run(
+        &self,
+        args: serde_json::Value,
+        approval: &crate::security::approval::ApprovalTurnContext,
+    ) -> anyhow::Result<ToolResult> {
         // Gate 0: installs mutate the host (not the workspace), so they must
         // never run without an explicit human Approve. The ApprovalGate only
-        // parks for an interactive turn (`APPROVAL_CHAT_CONTEXT` present, set on
-        // the web-chat path); background / triage / cron turns bypass the gate
-        // entirely. Fail closed there — a doomed retry is short-circuited by the
-        // `[policy-denied]` marker.
-        if crate::security::approval::APPROVAL_CHAT_CONTEXT
-            .try_with(|_| ())
-            .is_err()
-        {
+        // parks for an interactive turn (a chat context on the turn's approval
+        // context, set on the web-chat path); background / triage / cron turns
+        // bypass the gate entirely. Fail closed there — a doomed retry is
+        // short-circuited by the `[policy-denied]` marker.
+        if !approval.is_interactive() {
             return Ok(ToolResult::error(
                 "[policy-denied] install_tool requires interactive approval and is not available \
                  in autonomous (background) turns.",
@@ -157,17 +176,18 @@ impl Tool for InstallToolTool {
             )));
         }
 
-        let manager =
-            match args.get("manager").and_then(|v| v.as_str()) {
+        let manager = match args.get("manager").and_then(|v| v.as_str()) {
+            Some(m) => m.to_string(),
+            None => match detect_system_manager() {
                 Some(m) => m.to_string(),
-                None => match detect_system_manager() {
-                    Some(m) => m.to_string(),
-                    None => return Ok(ToolResult::error(
+                None => {
+                    return Ok(ToolResult::error(
                         "No supported package manager detected on PATH. Pass 'manager' explicitly \
                          (e.g. brew, pipx, npm, cargo).",
-                    )),
-                },
-            };
+                    ));
+                }
+            },
+        };
 
         let Some((program, prefix)) = manager_argv(&manager) else {
             return Ok(ToolResult::error(format!(
@@ -198,7 +218,7 @@ impl Tool for InstallToolTool {
         cmd.args(&prefix).arg(package);
         cmd.current_dir(&self.security.workspace_dir);
 
-        let output = match crate::tools::timeout::output_or_kill(
+        let output = match tinytools_std::timeout::output_or_kill(
             &mut cmd,
             Duration::from_secs(INSTALL_TIMEOUT_SECS),
         )
@@ -208,12 +228,12 @@ impl Tool for InstallToolTool {
             Ok(Err(e)) => {
                 return Ok(ToolResult::error(format!(
                     "Failed to launch {program}: {e}"
-                )))
+                )));
             }
             Err(_) => {
                 return Ok(ToolResult::error(format!(
                     "Install timed out after {INSTALL_TIMEOUT_SECS}s and was killed"
-                )))
+                )));
             }
         };
 

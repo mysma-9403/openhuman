@@ -24,10 +24,11 @@ use tinyflows::error::{EngineError, Result};
 use super::{ToolBackend, ToolCallCtx};
 use crate::config::ops as config_rpc;
 use crate::config::Config;
-use crate::integrations::composio::module_client::{self as connectors, methods};
+use crate::integrations::composio::module_client::{self as connectors};
 use crate::integrations::composio::types::ComposioExecuteRequest;
 use crate::integrations::composio::ComposioExecuteResponse;
 use crate::security::GateDecision;
+use tinyconnectors_bus::names::methods;
 
 /// Dispatches a Composio action slug through the tier, curation, preflight and
 /// approval gates.
@@ -101,7 +102,7 @@ impl ToolBackend for ComposioToolBackend {
             })?;
         // Autonomy-tier gate (Phase 2, made effect-aware): the node's
         // [`CommandClass`] is derived from the action's curated
-        // [`ToolScope`](crate::integrations::composio::providers::ToolScope)
+        // [`ToolScope`](crate::integrations::composio::contract::ToolScope)
         // via [`classify_composio_action_for_tier`] — a curated Read action
         // (e.g. `TWITTER_RECENT_SEARCH`) is `CommandClass::Read`, which every
         // tier `Allow`s; a curated Write/Admin action, or anything not
@@ -128,7 +129,7 @@ impl ToolBackend for ComposioToolBackend {
         // doc for why this differs from the general agent tool-call path).
         // Runs before anything else — a rejected slug never reaches the
         // composio client at all.
-        if !super::super::is_curated_flow_tool(&live_config, slug).await {
+        if !super::super::is_curated_flow_tool(ctx.dispatch, &live_config, slug).await {
             tracing::warn!(
                 target: "flows",
                 %slug,
@@ -171,7 +172,15 @@ impl ToolBackend for ComposioToolBackend {
         let (outcome, audit_id) = if tier_decision == GateDecision::Allow {
             (crate::security::approval::GateOutcome::Allow, None)
         } else {
-            super::super::gate_call_for_tier(tier_decision, slug, &summary, redacted).await
+            super::super::gate_call_for_tier(
+                ctx.dispatch,
+                ctx.approval,
+                tier_decision,
+                slug,
+                &summary,
+                redacted,
+            )
+            .await
         };
         if let crate::security::approval::GateOutcome::Deny { reason } = outcome {
             tracing::warn!(

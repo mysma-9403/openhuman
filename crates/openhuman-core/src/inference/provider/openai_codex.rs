@@ -19,8 +19,8 @@ pub(crate) fn resolve_openai_codex_routing(
             Ok(credentials) => credentials,
             Err(err) if !bearer_key.trim().is_empty() => {
                 log::warn!(
-                "[providers][openai-codex] oauth metadata unavailable; continuing with standard bearer key: {err}"
-            );
+                    "[providers][openai-codex] oauth metadata unavailable; continuing with standard bearer key: {err}"
+                );
                 None
             }
             Err(err) => return Err(format!("[chat-factory] openai oauth lookup failed: {err}")),

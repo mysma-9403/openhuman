@@ -12,6 +12,7 @@ async fn create_chat_model_managed_emits_exactly_one_egress_realpath() {
     use crate::security::egress::{EgressDescriptor, EgressReason};
     use std::time::Duration;
 
+    let _guard = crate::inference::inference_test_guard_async().await;
     crate::core::bus::init().await.expect("bus init");
     let mut rx = crate::core::bus::BUS.get().unwrap().receiver();
 
@@ -21,7 +22,12 @@ async fn create_chat_model_managed_emits_exactly_one_egress_realpath() {
     let marker = "egress-managed-realpath-marker-v1";
     let mut config = Config::default();
     config.default_model = Some(marker.to_string());
-    let _ = create_chat_model_with_model_id("scratch", &config, 0.7);
+    let _ = create_chat_model_with_model_id_in(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        "scratch",
+        &config,
+        0.7,
+    );
 
     // Bound the drain with a unique sentinel published AFTER our construction.
     let sentinel = "egress-managed-sentinel-end";
@@ -72,7 +78,12 @@ async fn create_chat_model_local_runtime_does_not_emit_egress_realpath() {
     let local_marker = "egress-local-realpath-marker";
     let mut config = Config::default();
     config.chat_provider = Some(format!("ollama:{local_marker}"));
-    let _ = create_chat_model_with_model_id("chat", &config, 0.7);
+    let _ = create_chat_model_with_model_id_in(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        "chat",
+        &config,
+        0.7,
+    );
 
     // Sentinel bounds the drain; if the local marker ever appears as an external
     // transfer before it, the local-suppression contract is broken.

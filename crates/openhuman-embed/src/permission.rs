@@ -26,20 +26,32 @@ impl<F> PermissionHook<F> {
 }
 
 #[async_trait::async_trait]
-impl<F> ToolHook for PermissionHook<F>
+impl<F> ToolHook<crate::seams::OpenHumanRunContext> for PermissionHook<F>
 where
     F: for<'a> Fn(&'a ToolHookContext) -> PermissionFuture<'a> + Send + Sync,
 {
     fn name(&self) -> &str {
         &self.name
     }
-    async fn before_tool(&self, _: &ToolHookContext) -> anyhow::Result<()> {
+    async fn before_tool(
+        &self,
+        _: &crate::seams::OpenHumanRunContext,
+        _: &ToolHookContext,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn after_tool(&self, _: &ToolHookContext) -> anyhow::Result<()> {
+    async fn after_tool(
+        &self,
+        _: &crate::seams::OpenHumanRunContext,
+        _: &ToolHookContext,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn before_tool_decision(&self, context: &ToolHookContext) -> ToolHookDecision {
+    async fn before_tool_decision(
+        &self,
+        _: &crate::seams::OpenHumanRunContext,
+        context: &ToolHookContext,
+    ) -> ToolHookDecision {
         (self.callback)(context).await
     }
 }
