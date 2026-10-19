@@ -204,6 +204,20 @@ pub fn was_ingested(config: &Config, source_id: &str, external_id: &str) -> Resu
     docs.was_ingested(source_id, external_id)
 }
 
+/// The whole dedup ledger for one source as `external_id -> content_hash`.
+///
+/// Both per-task questions come out of this map — [`is_ingested`] is "an entry
+/// exists and its hash matches", [`was_ingested`] is "an entry exists" — and
+/// each of those costs its own document read, so asking per task spent 2N of
+/// them on a fetch of N tasks.
+pub fn ingested_hashes(
+    config: &Config,
+    source_id: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    let docs = super::store_documents::current(config)?;
+    docs.ingested_hashes(source_id)
+}
+
 /// Return ingested task ids for one source. Used by reconciliation to prune
 /// ledger rows that no longer match the upstream source/filter.
 pub fn list_ingested_refs(config: &Config, source_id: &str) -> Result<Vec<IngestedTaskRef>> {
