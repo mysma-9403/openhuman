@@ -107,8 +107,8 @@ async fn start_channels_inner(mut config: Config, session: CancellationToken) ->
     let security = crate::security::live_policy::install(
         Arc::new(
             SecurityPolicy::for_config(&config)
-                .with_privacy_mode(config.privacy.mode)
-                .with_account_dir(config.config_path.parent()),
+                // `for_config` already attaches the config's account root.
+                .with_privacy_mode(config.privacy.mode),
         ),
         config.workspace_dir.clone(),
         config.action_dir.clone(),
