@@ -210,10 +210,15 @@ pub fn was_ingested(config: &Config, source_id: &str, external_id: &str) -> Resu
 /// exists and its hash matches", [`was_ingested`] is "an entry exists" — and
 /// each of those costs its own document read, so asking per task spent 2N of
 /// them on a fetch of N tasks.
+///
+/// A present key with a `None` hash is "ingested, hash unknown": the migration
+/// from the legacy ledger only copies `content_hash` when the old row had one.
+/// That is exactly the case where the two point reads disagree, so it has to
+/// stay distinguishable from an absent key.
 pub fn ingested_hashes(
     config: &Config,
     source_id: &str,
-) -> Result<std::collections::HashMap<String, String>> {
+) -> Result<std::collections::HashMap<String, Option<String>>> {
     let docs = super::store_documents::current(config)?;
     docs.ingested_hashes(source_id)
 }
