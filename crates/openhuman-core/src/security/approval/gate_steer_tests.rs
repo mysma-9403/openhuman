@@ -92,10 +92,29 @@ async fn steer_publishes_domain_event_with_resolution() {
             ..
         } => {
             assert_eq!(decision, "steer");
-            assert_eq!(resolution.as_deref(), Some("steer: Nie płać kartą X, użyj karty firmowej Y"));
+            assert_eq!(resolution.as_deref(), Some("steered"));
         }
         other => panic!("expected ApprovalDecided event, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn steer_without_live_waiter_fails() {
+    let (gate, _dir) = test_gate();
+    let gate = Arc::new(gate);
+
+    let request_id = "req-unparked-row";
+    let pending = PendingApproval::new(
+        request_id,
+        "shell",
+        "rm -rf /",
+        serde_json::json!({}),
+        None,
+    );
+    store::insert_pending(&gate.config, &pending, &gate.session_id).unwrap();
+
+    let err = gate.steer(request_id, "do not run").unwrap_err();
+    assert!(err.to_string().contains("no live waiter"));
 }
 
 #[tokio::test]

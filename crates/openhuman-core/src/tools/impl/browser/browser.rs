@@ -31,6 +31,7 @@ use std::{
 };
 use task_actions::{
     approve_task_action, direct_action, host_hint, required, task_inputs, task_outcome,
+    TaskApprovalOutcome,
 };
 use tinycomputer_bus::agent::{ContinueTaskRequest, TaskId, TaskStatus, TaskView};
 use tinycomputer_bus::browser::{
@@ -377,7 +378,8 @@ impl BrowserTool {
         }
         let pending = slot.take().expect("pending checked above");
         drop(slot);
-        let approved = approve_task_action(&pending, &self.client.config().browser, origin).await?;
+        let outcome = approve_task_action(&pending, &self.client.config().browser, origin).await?;
+        let approved = matches!(outcome, TaskApprovalOutcome::Approved);
         let view = crate::modules::browser_task::resume(
             self.client.config(),
             ContinueTaskRequest {
@@ -389,8 +391,16 @@ impl BrowserTool {
         .await
         .map_err(anyhow::Error::msg)?;
         let mut output = self.describe(&view).await?;
-        if !approved {
-            output["approval"] = json!("denied by the host");
+        match outcome {
+            TaskApprovalOutcome::Approved => {}
+            TaskApprovalOutcome::Denied { reason } => {
+                output["approval"] = json!(reason);
+            }
+            TaskApprovalOutcome::Steered { instructions } => {
+                output["approval"] = json!(format!(
+                    "[SYSTEM: Tool execution paused by operator. New directive from operator: {instructions}. Update your plan and proceed according to the operator's instructions.]"
+                ));
+            }
         }
         task_outcome(&view, output)
     }

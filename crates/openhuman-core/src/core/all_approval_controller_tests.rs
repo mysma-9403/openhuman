@@ -13,6 +13,7 @@ fn raw_approval_security_registry_matches_its_independent_contract() {
                 "openhuman.approval_list_recent_decisions",
             ),
             ("approval.decide", "openhuman.approval_decide"),
+            ("approval.steer", "openhuman.approval_steer"),
             (
                 "approval.get_gate_state",
                 "openhuman.approval_get_gate_state",
@@ -56,6 +57,14 @@ fn raw_approval_security_registry_matches_its_independent_contract() {
             ],
             vec![("decided", Ref("PendingApproval"), true)],
         ),
+        (
+            vec![
+                ("request_id", String, true),
+                ("instructions", String, true),
+                ("agent_id", Option(Box::new(String)), false),
+            ],
+            vec![("steered", Ref("PendingApproval"), true)],
+        ),
         (vec![], vec![("state", Ref("ApprovalGateBootState"), true)]),
         (
             vec![
@@ -92,6 +101,7 @@ fn raw_approval_decoders_keep_permissive_and_strict_wire_behavior() {
         "approval.list_pending",
         "approval.list_recent_decisions",
         "approval.decide",
+        "approval.steer",
         "approval.get_gate_state",
         "approval.preauthorize_flow",
     ];
@@ -106,6 +116,7 @@ fn raw_approval_decoders_keep_permissive_and_strict_wire_behavior() {
         json!({"agent_id": "  raw agent  ", "unknown": {"nested": [1, null]}}),
         json!({"limit": 0, "unknown": true}),
         json!({"request_id": " raw id ", "decision": "deny", "extra": [false]}),
+        json!({"request_id": " raw id ", "instructions": " raw inst ", "extra": 42}),
         json!({"anything": {"ignored": true}}),
         json!({"flow_id": " raw flow ", "tool_names": [" ", "tool"], "extra": null}),
     ]) {
@@ -125,7 +136,13 @@ fn raw_approval_decoders_keep_permissive_and_strict_wire_behavior() {
             ("decision".into(), json!(1)),
         ]))
         .expect_err("bound schema decoder enforces string wire types");
-    entries[4]
+    entries[3]
+        .decode_params(Map::from_iter([
+            ("request_id".into(), json!("id")),
+            ("instructions".into(), json!(1)),
+        ]))
+        .expect_err("bound schema decoder enforces instructions string wire type");
+    entries[5]
         .decode_params(Map::from_iter([
             ("flow_id".into(), json!("flow")),
             ("tool_names".into(), json!([1])),

@@ -2883,6 +2883,7 @@ const messages: TranslationMap = {
   'settings.approvalHistory.decision.approveAlways': 'مسموح دائمًا',
   'settings.approvalHistory.decision.approveAlwaysFlow': 'مسموح دائمًا (التدفق)',
   'settings.approvalHistory.decision.deny': 'مرفوض',
+  'settings.approvalHistory.decision.steer': 'تم التوجيه',
   'settings.theme.variantLight': 'فاتح',
   'settings.theme.variantDark': 'داكن',
   'settings.theme.variantAuto': 'تلقائي',

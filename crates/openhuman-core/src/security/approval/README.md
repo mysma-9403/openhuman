@@ -25,7 +25,7 @@ Interactive approval workflow for supervised mode (issue #1339). `ApprovalGate` 
 | `crates/openhuman-core/src/security/approval/store.rs` | SQLite persistence (`pending_approvals` table). `insert_pending`, `decide`, `get_decision`, `record_execution`, `list_pending`, `list_recent_decisions`, `purge_session`, `expire_stale`, plus idempotent column migration for the v1 schema. |
 | `crates/openhuman-core/src/security/approval/types.rs` | Serde domain types: `PendingApproval`, `ApprovalAuditEntry`, `ApprovalDecision`, `GateOutcome`, `ExecutionOutcome`. |
 | `crates/openhuman-core/src/security/approval/redact.rs` | `redact_args` (PII/chat-content key scrubbing + home-path stripping) and `summarize_action` (safe-field summary). |
-| `crates/openhuman-core/src/security/approval/rpc.rs` | Domain RPC entry points returning `Outcome<T>`: `approval_get_gate_state`, `approval_list_pending`, `approval_list_recent_decisions`, `approval_decide`, `approval_preauthorize_flow`. |
+| `crates/openhuman-core/src/security/approval/rpc.rs` | Domain RPC entry points returning `Outcome<T>`: `approval_get_gate_state`, `approval_list_pending`, `approval_list_recent_decisions`, `approval_decide`, `approval_steer`, `approval_preauthorize_flow`. |
 | `crates/openhuman-core/src/security/approval/schemas.rs` | Controller schemas + `handle_*` fns wiring the RPC into the registry. |
 
 ## Public surface
@@ -34,7 +34,7 @@ Re-exported from [`mod.rs`](./mod.rs):
 
 - Gate: `ApprovalGate`, `ApprovalChatContext`, `FlowRunContext`, `ApprovalTurnContext` (the explicit per-turn chat / copilot / flow-run context every gate check takes), `parse_approval_reply`.
 - Redaction: `redact_args`, `summarize_action`.
-- Types: `PendingApproval`, `ApprovalAuditEntry`, `ApprovalDecision`, `ApprovalSourceContext`, `ExecutionOutcome`, `GateOutcome`.
+- Types: `PendingApproval`, `ApprovalAuditEntry`, `ApprovalDecision`, `GateResolution`, `ApprovalSourceContext`, `ExecutionOutcome`, `GateOutcome`.
 - Controller registry: `all_approval_controller_schemas`, `all_approval_registered_controllers`.
 
 `ApprovalGate::try_global()` returns `None` when no gate is installed; tools/harness branches treat `None` as "no gating".
@@ -49,6 +49,7 @@ Namespace `approval` (registered via `all_approval_registered_controllers`, cons
 | `approval.list_recent_decisions` | `limit?: u64` (1-500, default 50) | `decisions: ApprovalAuditEntry[]` |
 | `approval.get_gate_state` | none | `state: ApprovalGateBootState` (installed / disabled-by-env / override-ignored / host tag) |
 | `approval.decide` | `request_id: string`, `decision: string` (`approve_once` / `approve_always_for_tool` / `approve_always_for_flow` / `deny`) | `decided: PendingApproval` |
+| `approval.steer` | `request_id: string`, `instructions: string`, `agent_id?: string` | `decided: PendingApproval` (redirects a parked agent turn with operator directives, injecting a synthetic tool return into the harness turn loop) |
 | `approval.preauthorize_flow` | `flow_id: string`, `tool_names: string[]` | `result: FlowPreauthorizationResult` (idempotent flow-scoped trust grants; succeeds with `gate_installed=false` when the gate is off) |
 
 `list_pending` / `list_recent_decisions` return empty (not an error) when the gate is not installed; `decide` errors when the gate is absent or the `request_id` is unknown/already decided.

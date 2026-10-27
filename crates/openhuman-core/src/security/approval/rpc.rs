@@ -392,10 +392,13 @@ pub async fn approval_steer(
 ) -> anyhow::Result<Outcome<PendingApproval>> {
     tracing::debug!(
         request_id = request_id,
-        instructions = instructions,
+        instructions_len = instructions.len(),
         agent_id = agent_id.unwrap_or("<any>"),
         "[rpc:approval_steer] entry"
     );
+    if instructions.trim().is_empty() {
+        anyhow::bail!("steer instructions must not be empty");
+    }
     let gate = ApprovalGate::try_global().ok_or_else(|| {
         tracing::warn!(
             request_id = request_id,

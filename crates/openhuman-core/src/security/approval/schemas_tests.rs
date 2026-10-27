@@ -205,6 +205,14 @@ fn decide_parser_preserves_parse_order_raw_values_and_four_decisions() {
     assert_eq!(
         parse_decide(Map::from_iter([
             ("request_id".into(), json!("id")),
+            ("decision".into(), json!("steer")),
+        ]))
+        .unwrap_err(),
+        "invalid 'decision': steer requires an operator instruction via approval.steer"
+    );
+    assert_eq!(
+        parse_decide(Map::from_iter([
+            ("request_id".into(), json!("id")),
             ("decision".into(), json!("deny")),
             ("agent_id".into(), json!(false)),
         ]))
@@ -270,6 +278,13 @@ fn steer_parser_validates_inputs() {
 
     let err2 = parse_steer(Map::from_iter([("request_id".into(), json!("req-1"))])).unwrap_err();
     assert!(err2.contains("missing required param 'instructions'"));
+
+    let err3 = parse_steer(Map::from_iter([
+        ("request_id".into(), json!("req-1")),
+        ("instructions".into(), json!("   ")),
+    ]))
+    .unwrap_err();
+    assert!(err3.contains("must not be empty"));
 }
 
 #[test]

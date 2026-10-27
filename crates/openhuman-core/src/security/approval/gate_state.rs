@@ -176,13 +176,27 @@ impl ApprovalGate {
         request_id: &str,
         instructions: String,
     ) -> anyhow::Result<Option<PendingApproval>> {
+        let tx = match self.take_waiter(request_id) {
+            Some(tx) => tx,
+            None => {
+                anyhow::bail!("no live waiter for request {request_id} (expired or not parked)");
+            }
+        };
+        if tx
+            .send(super::types::GateResolution::Steer {
+                instructions: instructions.clone(),
+            })
+            .is_err()
+        {
+            anyhow::bail!("waiter closed before receiving steer directive for request {request_id}");
+        }
         let decided = self.decide_in_parked_scope(request_id, ApprovalDecision::Steer)?;
         if let Some(row) = &decided {
-            if let Some(tx) = self.take_waiter(request_id) {
-                let _ = tx.send(super::types::GateResolution::Steer {
-                    instructions: instructions.clone(),
-                });
-            }
+            tracing::info!(
+                request_id = %request_id,
+                instructions_len = instructions.len(),
+                "[approval::gate] steer directive sent to waiter"
+            );
             let route = self.take_request_route(request_id);
             BUS.publish(DomainEvent::ApprovalDecided {
                 request_id: row.request_id.clone(),
@@ -191,7 +205,7 @@ impl ApprovalGate {
                 thread_id: route.as_ref().and_then(|r| r.thread_id.clone()),
                 client_id: route.as_ref().and_then(|r| r.client_id.clone()),
                 tool_call_id: route.and_then(|r| r.tool_call_id),
-                resolution: Some(format!("steer: {instructions}")),
+                resolution: Some("steered".to_string()),
                 agent_id: row.agent_id.clone(),
             });
         }

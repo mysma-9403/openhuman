@@ -25,6 +25,7 @@ fn staged_bound_methods() -> Vec<&'static str> {
         "approval.list_pending",
         "approval.list_recent_decisions",
         "approval.decide",
+        "approval.steer",
         "approval.get_gate_state",
         "approval.preauthorize_flow",
     ]);

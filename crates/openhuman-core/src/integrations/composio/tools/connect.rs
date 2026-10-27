@@ -457,7 +457,7 @@ impl ComposioConnectTool {
                 }))?))
             }
             crate::security::approval::GateOutcome::Steer { instructions } => {
-                tracing::info!(toolkit = %toolkit, instructions = %instructions, "[composio] connect.execute: steered");
+                tracing::info!(toolkit = %toolkit, instructions_len = instructions.len(), "[composio] connect.execute: steered");
                 Ok(ToolResult::success(serde_json::to_string(&json!({
                     "toolkit": toolkit,
                     "connected": false,

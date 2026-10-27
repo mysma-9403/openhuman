@@ -379,6 +379,12 @@ fn parse_decide(
 ) -> Result<(String, ApprovalDecision, Option<String>), String> {
     let request_id = read_required_string(&params, "request_id")?;
     let decision_str = read_required_string(&params, "decision")?;
+    if decision_str.trim() == "steer" {
+        return Err(
+            "invalid 'decision': steer requires an operator instruction via approval.steer"
+                .to_string(),
+        );
+    }
     let decision = ApprovalDecision::from_str(decision_str.trim()).ok_or_else(|| {
         format!(
             "invalid 'decision': expected \
@@ -392,6 +398,9 @@ fn parse_decide(
 fn parse_steer(params: Map<String, Value>) -> Result<(String, String, Option<String>), String> {
     let request_id = read_required_string(&params, "request_id")?;
     let instructions = read_required_string(&params, "instructions")?;
+    if instructions.trim().is_empty() {
+        return Err("invalid 'instructions': must not be empty".to_string());
+    }
     let agent_id = read_optional_string(&params, "agent_id")?;
     Ok((request_id, instructions, agent_id))
 }

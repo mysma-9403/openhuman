@@ -157,7 +157,7 @@ impl ApprovalResolver<crate::agent::tinyagents::host::OpenHumanRunContext>
             GateOutcome::Steer { instructions } => {
                 tracing::info!(
                     tool = %call.name,
-                    instructions = %instructions,
+                    instructions_len = instructions.len(),
                     "[tinyagents::mw] approval gate steered tool call by operator"
                 );
                 let reason = format!(
