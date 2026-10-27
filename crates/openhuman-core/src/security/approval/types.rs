@@ -173,6 +173,8 @@ pub enum ApprovalDecision {
     ApproveAlwaysForFlow,
     /// Reject the call. The agent receives a structured error string.
     Deny,
+    /// Steer the agent with direct operator instructions instead of running the tool.
+    Steer,
 }
 
 impl ApprovalDecision {
@@ -182,6 +184,7 @@ impl ApprovalDecision {
             Self::ApproveAlwaysForTool => "approve_always_for_tool",
             Self::ApproveAlwaysForFlow => "approve_always_for_flow",
             Self::Deny => "deny",
+            Self::Steer => "steer",
         }
     }
 
@@ -192,6 +195,7 @@ impl ApprovalDecision {
             "approve_always_for_tool" => Some(Self::ApproveAlwaysForTool),
             "approve_always_for_flow" => Some(Self::ApproveAlwaysForFlow),
             "deny" => Some(Self::Deny),
+            "steer" => Some(Self::Steer),
             _ => None,
         }
     }
@@ -202,16 +206,41 @@ impl ApprovalDecision {
             Self::ApproveOnce | Self::ApproveAlwaysForTool | Self::ApproveAlwaysForFlow
         )
     }
+
+    pub fn is_steer(self) -> bool {
+        matches!(self, Self::Steer)
+    }
+}
+
+/// What resolves a parked approval waiter: either a static decision or a
+/// steering directive from the operator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GateResolution {
+    Decision(ApprovalDecision),
+    Steer { instructions: String },
 }
 
 /// Outcome of routing a tool call through `ApprovalGate::intercept`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateOutcome {
     /// Proceed with `tool.execute(args)`.
     Allow,
     /// Abort the call. The agent sees `reason` in place of a tool
     /// result.
     Deny { reason: String },
+    /// Operator redirected the agent's intent with new instructions.
+    Steer { instructions: String },
+}
+
+impl GateOutcome {
+    pub fn is_allow(&self) -> bool {
+        matches!(self, Self::Allow)
+    }
+
+    pub fn is_steer(&self) -> bool {
+        matches!(self, Self::Steer { .. })
+    }
 }
 
 /// Terminal status of a tool action that the gate previously allowed.

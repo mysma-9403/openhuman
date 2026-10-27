@@ -382,3 +382,71 @@ pub async fn approval_decide(
     );
     Ok(Outcome::new(row, logs))
 }
+
+/// Apply an operator steering directive to a pending row.
+pub async fn approval_steer(
+    _ctx: &DispatchCtx,
+    request_id: &str,
+    instructions: &str,
+    agent_id: Option<&str>,
+) -> anyhow::Result<Outcome<PendingApproval>> {
+    tracing::debug!(
+        request_id = request_id,
+        instructions = instructions,
+        agent_id = agent_id.unwrap_or("<any>"),
+        "[rpc:approval_steer] entry"
+    );
+    let gate = ApprovalGate::try_global().ok_or_else(|| {
+        tracing::warn!(
+            request_id = request_id,
+            "[rpc:approval_steer] gate not installed"
+        );
+        anyhow!("approval gate is not installed; supervised mode disabled")
+    })?;
+    let decided = match agent_id {
+        Some(agent) => gate.steer_for_agent(agent, request_id, instructions),
+        None => gate.steer(request_id, instructions),
+    };
+    let decided = match decided {
+        Ok(row) => row,
+        Err(err) => {
+            tracing::error!(
+                request_id = request_id,
+                error = %err,
+                "[rpc:approval_steer] gate steer failed"
+            );
+            return Err(err);
+        }
+    };
+    let row = match decided {
+        Some(row) => row,
+        None => {
+            return match gate.classify_decide_miss(request_id) {
+                DecideMiss::AlreadyResolved => {
+                    tracing::warn!(
+                        request_id = request_id,
+                        "[rpc:approval_steer] no pending approval found (already decided/expired — benign race)"
+                    );
+                    Err(anyhow!(
+                        "no pending approval found for request_id '{request_id}' (already decided or expired)"
+                    ))
+                }
+                DecideMiss::NeverRegistered => {
+                    tracing::warn!(
+                        request_id = request_id,
+                        "[rpc:approval_steer] no pending approval ever registered (genuine lost registration)"
+                    );
+                    Err(anyhow!(
+                        "no pending approval ever registered for request_id '{request_id}'"
+                    ))
+                }
+            };
+        }
+    };
+
+    let log = format!(
+        "[approval] steered request_id={} tool={} with instructions: {}",
+        row.request_id, row.tool_name, instructions
+    );
+    Ok(Outcome::single_log(row, log))
+}

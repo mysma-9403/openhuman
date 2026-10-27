@@ -41,5 +41,5 @@ pub use schemas::all_registered_controllers as all_approval_registered_controlle
 pub(crate) use schemas::approval_parameter_contracts;
 pub use types::{
     ApprovalAuditEntry, ApprovalDecision, ApprovalSourceContext, ExecutionOutcome, GateOutcome,
-    PendingApproval,
+    GateResolution, PendingApproval,
 };

@@ -512,7 +512,7 @@ impl ApprovalGate {
         // no waiter exists — would otherwise leave the parked call
         // to time out and return `Deny` incorrectly. (CodeRabbit
         // review on PR #2149.)
-        let (tx, rx) = oneshot::channel::<ApprovalDecision>();
+        let (tx, rx) = oneshot::channel::<super::types::GateResolution>();
         let scope = turn_ctx
             .host_overrides()
             .and_then(|overrides| overrides.approval_scope());

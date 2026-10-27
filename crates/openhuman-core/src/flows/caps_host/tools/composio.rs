@@ -47,6 +47,9 @@ impl FlowCallPolicy for FlowPolicy {
         match outcome {
             crate::security::approval::GateOutcome::Allow => Ok(audit_id),
             crate::security::approval::GateOutcome::Deny { reason } => Err(reason),
+            crate::security::approval::GateOutcome::Steer { instructions } => {
+                Err(format!("Steered by operator: {instructions}"))
+            }
         }
     }
     fn record(&self, audit_id: &str, result: &std::result::Result<Value, String>) {

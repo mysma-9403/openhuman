@@ -30,6 +30,17 @@ fn unanswered_approval_text(tool_name: &str) -> String {
 pub(super) fn decision_for_outcome(tool_name: &str, outcome: GateOutcome) -> GateDecision {
     match outcome {
         GateOutcome::Allow => GateDecision::Prompted { approved: true },
+        GateOutcome::Steer { instructions } => {
+            tracing::info!(
+                target: "tinyagents",
+                tool = %tool_name,
+                instructions = %instructions,
+                "[tinyagents::host::security] approval gate steered tool call by operator"
+            );
+            GateDecision::deny(format!(
+                "[SYSTEM: Tool execution paused by operator. New directive from operator: {instructions}. Do not re-execute the original tool call with the previous parameters. Update your plan and proceed according to the operator's instructions.]"
+            ))
+        }
         // An expired prompt is not a refusal: nobody answered, and the gate has
         // now denied the request. Saying so lets the agent (and, for a
         // sub-agent, its parent) tell the user the approval window expired and

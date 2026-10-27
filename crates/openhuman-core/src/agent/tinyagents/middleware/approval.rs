@@ -154,6 +154,17 @@ impl ApprovalResolver<crate::agent::tinyagents::host::OpenHumanRunContext>
             )
             .await;
         match outcome {
+            GateOutcome::Steer { instructions } => {
+                tracing::info!(
+                    tool = %call.name,
+                    instructions = %instructions,
+                    "[tinyagents::mw] approval gate steered tool call by operator"
+                );
+                let reason = format!(
+                    "[SYSTEM: Tool execution paused by operator. New directive from operator: {instructions}. Do not re-execute the original tool call with the previous parameters. Update your plan and proceed according to the operator's instructions.]"
+                );
+                ApprovalResolution::Deny { reason }
+            }
             GateOutcome::Deny { reason } => {
                 tracing::warn!(
                     tool = %call.name,

@@ -77,7 +77,7 @@ impl ApprovalGate {
             // handler, which is async and owns the config save+reload path. The
             // gate only resolves the parked future and emits the audit event.
             if let Some(tx) = self.take_waiter(request_id) {
-                let _ = tx.send(decision);
+                let _ = tx.send(super::types::GateResolution::Decision(decision));
             }
             // Routing (thread/client/tool_call_id) was recorded at park time —
             // see `intercept_audited_inner` — so a decision made after the
@@ -155,6 +155,84 @@ impl ApprovalGate {
         self.decide(request_id, decision)
     }
 
+    /// Apply an operator steering directive to a pending tool call.
+    pub fn steer(
+        &self,
+        request_id: &str,
+        instructions: impl Into<String>,
+    ) -> anyhow::Result<Option<PendingApproval>> {
+        let instructions = instructions.into();
+        let scope = self.request_scope(request_id);
+        match scope {
+            Some(scope) => scope
+                .with_open(|| self.steer_open(request_id, instructions.clone()))
+                .unwrap_or(Ok(None)),
+            None => self.steer_open(request_id, instructions),
+        }
+    }
+
+    fn steer_open(
+        &self,
+        request_id: &str,
+        instructions: String,
+    ) -> anyhow::Result<Option<PendingApproval>> {
+        let decided = self.decide_in_parked_scope(request_id, ApprovalDecision::Steer)?;
+        if let Some(row) = &decided {
+            if let Some(tx) = self.take_waiter(request_id) {
+                let _ = tx.send(super::types::GateResolution::Steer {
+                    instructions: instructions.clone(),
+                });
+            }
+            let route = self.take_request_route(request_id);
+            BUS.publish(DomainEvent::ApprovalDecided {
+                request_id: row.request_id.clone(),
+                tool_name: row.tool_name.clone(),
+                decision: ApprovalDecision::Steer.as_str().to_string(),
+                thread_id: route.as_ref().and_then(|r| r.thread_id.clone()),
+                client_id: route.as_ref().and_then(|r| r.client_id.clone()),
+                tool_call_id: route.and_then(|r| r.tool_call_id),
+                resolution: Some(format!("steer: {instructions}")),
+                agent_id: row.agent_id.clone(),
+            });
+        }
+        Ok(decided)
+    }
+
+    /// [`Self::steer`] on behalf of `agent`: refuses with
+    /// [`ApprovalError::WrongAgent`] when the request was parked by any other
+    /// agent (or by the process itself).
+    pub fn steer_for_agent(
+        &self,
+        agent: &str,
+        request_id: &str,
+        instructions: impl Into<String>,
+    ) -> anyhow::Result<Option<PendingApproval>> {
+        let owner = match self
+            .request_routes
+            .lock()
+            .get(request_id)
+            .map(|route| route.agent_id.clone())
+        {
+            Some(owner) => Some(owner),
+            None => store::pending_agent(&self.config, request_id)?,
+        };
+        if let Some(owner) = owner {
+            if owner.as_deref() != Some(agent) {
+                tracing::warn!(
+                    request_id = %request_id,
+                    agent_id = %agent,
+                    owner = owner.as_deref().unwrap_or("<process>"),
+                    "[approval::gate] steer refused: request belongs to another agent"
+                );
+                return Err(ApprovalError::WrongAgent {
+                    request_id: request_id.to_string(),
+                }
+                .into());
+            }
+        }
+        self.steer(request_id, instructions)
+    }
+
     /// Deny every undecided request `agent` parked, resolving its waiters.
     /// Returns how many rows were denied.
     pub fn deny_all_for_agent(
@@ -176,7 +254,7 @@ impl ApprovalGate {
             };
             denied += 1;
             if let Some(tx) = self.take_waiter(&decided.request_id) {
-                let _ = tx.send(ApprovalDecision::Deny);
+                let _ = tx.send(super::types::GateResolution::Decision(ApprovalDecision::Deny));
             }
             let route = self.take_request_route(&decided.request_id);
             if let Some(thread_key) = route.as_ref().and_then(|r| r.thread_key.as_deref()) {
@@ -340,7 +418,7 @@ impl ApprovalGate {
             .and_then(|route| route.approval_scope.clone())
     }
 
-    fn take_waiter(&self, request_id: &str) -> Option<oneshot::Sender<ApprovalDecision>> {
+    fn take_waiter(&self, request_id: &str) -> Option<oneshot::Sender<super::types::GateResolution>> {
         let mut waiters = self.waiters.lock();
         waiters.remove(request_id)
     }

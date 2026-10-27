@@ -47,7 +47,8 @@ use tinytools::status::POLICY_DENIED_MARKER;
 
 use super::store;
 use super::types::{
-    ApprovalDecision, ApprovalSourceContext, ExecutionOutcome, GateOutcome, PendingApproval,
+    ApprovalDecision, ApprovalSourceContext, ExecutionOutcome, GateOutcome, GateResolution,
+    PendingApproval,
 };
 
 /// Disambiguates why [`ApprovalGate::decide`] returned `Ok(None)`. See
@@ -323,7 +324,7 @@ pub struct ApprovalGate {
     config: Config,
     session_id: String,
     ttl: Duration,
-    waiters: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
+    waiters: Mutex<HashMap<String, oneshot::Sender<GateResolution>>>,
     /// [`thread_route_key`] → request_id for the approval currently parked on
     /// that chat thread, so the web channel can route a yes/no reply to
     /// `approval_decide`.

@@ -17,34 +17,48 @@ impl ApprovalGate {
         request_id: &str,
         tool_name: &str,
         wait: Duration,
-        rx: oneshot::Receiver<ApprovalDecision>,
+        rx: oneshot::Receiver<super::types::GateResolution>,
         park_bound_active: bool,
         park_bound_elapsed: &mut bool,
         effective_ttl: Duration,
     ) -> (GateOutcome, Option<String>) {
         match tokio::time::timeout(wait, rx).await {
-            Ok(Ok(decision)) => {
-                tracing::info!(
-                    request_id = %request_id,
-                    tool = tool_name,
-                    decision = decision.as_str(),
-                    "[approval::gate] decision received"
-                );
-                if decision.is_approve() {
-                    (GateOutcome::Allow, Some(request_id.to_string()))
-                } else {
+            Ok(Ok(resolution)) => match resolution {
+                super::types::GateResolution::Decision(decision) => {
+                    tracing::info!(
+                        request_id = %request_id,
+                        tool = tool_name,
+                        decision = decision.as_str(),
+                        "[approval::gate] decision received"
+                    );
+                    if decision.is_approve() {
+                        (GateOutcome::Allow, Some(request_id.to_string()))
+                    } else {
+                        (
+                            GateOutcome::Deny {
+                                reason: format!(
+                                    "{POLICY_DENIED_MARKER} User denied '{tool_name}' execution. Do \
+                                     not re-request the same call this turn; take a different approach \
+                                     or stop."
+                                ),
+                            },
+                            None,
+                        )
+                    }
+                }
+                super::types::GateResolution::Steer { instructions } => {
+                    tracing::info!(
+                        request_id = %request_id,
+                        tool = tool_name,
+                        instructions = %instructions,
+                        "[approval::gate] steer directive received from operator"
+                    );
                     (
-                        GateOutcome::Deny {
-                            reason: format!(
-                                "{POLICY_DENIED_MARKER} User denied '{tool_name}' execution. Do \
-                                 not re-request the same call this turn; take a different approach \
-                                 or stop."
-                            ),
-                        },
-                        None,
+                        GateOutcome::Steer { instructions },
+                        Some(request_id.to_string()),
                     )
                 }
-            }
+            },
             Ok(Err(_canceled)) => {
                 // Sender dropped — treat as denial so the agent does
                 // not silently no-op.

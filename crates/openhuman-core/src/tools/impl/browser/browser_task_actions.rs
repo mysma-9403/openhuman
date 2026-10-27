@@ -118,6 +118,10 @@ pub(super) async fn approve_task_action(
                 tracing::debug!(%reason, "[browser] task action denied by host");
                 false
             }
+            GateOutcome::Steer { instructions } => {
+                tracing::debug!(%instructions, "[browser] task action steered by host");
+                false
+            }
         },
     )
 }

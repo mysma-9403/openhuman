@@ -255,6 +255,15 @@ impl EventHandler<DomainEvent> for ProactiveMessageSubscriber {
                             );
                             return;
                         }
+                        crate::security::approval::GateOutcome::Steer { instructions } => {
+                            tracing::warn!(
+                                source = %source,
+                                channel = %key,
+                                instructions = %instructions,
+                                "[proactive] approval gate steered external delivery"
+                            );
+                            return;
+                        }
                     }
                 }
 

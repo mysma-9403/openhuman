@@ -95,6 +95,7 @@ async fn approve_browser_action(
     match gate.intercept_forced("browser", &summary, args).await {
         GateOutcome::Allow => {}
         GateOutcome::Deny { reason } => anyhow::bail!("{reason}"),
+        GateOutcome::Steer { instructions } => anyhow::bail!("Steered by operator: {instructions}"),
     }
     let after = client
         .read_page(

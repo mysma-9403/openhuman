@@ -20,6 +20,7 @@ pub fn all_controller_schemas() -> Vec<ControllerSchema> {
         schemas("list_pending"),
         schemas("list_recent_decisions"),
         schemas("decide"),
+        schemas("steer"),
         schemas("get_gate_state"),
         schemas("preauthorize_flow"),
     ]
@@ -40,6 +41,10 @@ pub fn all_registered_controllers() -> Vec<RegisteredController> {
             handler: handle_decide,
         },
         RegisteredController {
+            schema: schemas("steer"),
+            handler: handle_steer,
+        },
+        RegisteredController {
             schema: schemas("get_gate_state"),
             handler: handle_get_gate_state,
         },
@@ -55,6 +60,7 @@ pub(crate) fn all_approval_controller_entries() -> Vec<ControllerEntry> {
         ControllerEntry::bound(list_pending_controller()),
         ControllerEntry::bound(list_recent_decisions_controller()),
         ControllerEntry::bound(decide_controller()),
+        ControllerEntry::bound(steer_controller()),
         ControllerEntry::bound(get_gate_state_controller()),
         ControllerEntry::bound(preauthorize_flow_controller()),
     ]
@@ -143,6 +149,37 @@ pub fn schemas(function: &str) -> ControllerSchema {
                 name: "decided",
                 ty: TypeSchema::Ref("PendingApproval"),
                 comment: "The pending row after the decision was applied.",
+                required: true,
+            }],
+        },
+        "steer" => ControllerSchema {
+            namespace: "approval",
+            function: "steer",
+            description: "Provide dynamic steering instructions to a pending tool call instead of running it.",
+            inputs: vec![
+                FieldSchema {
+                    name: "request_id",
+                    ty: TypeSchema::String,
+                    comment: "Identifier of the pending approval to steer.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "instructions",
+                    ty: TypeSchema::String,
+                    comment: "Steering instructions or directives for the agent to follow.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "agent_id",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::String)),
+                    comment: "Steer as this embedded agent; refused when the request belongs to another agent.",
+                    required: false,
+                },
+            ],
+            outputs: vec![FieldSchema {
+                name: "steered",
+                ty: TypeSchema::Ref("PendingApproval"),
+                comment: "The pending row after steering was applied.",
                 required: true,
             }],
         },
@@ -276,6 +313,31 @@ fn run_decide(
     })
 }
 
+fn handle_steer(ctx: DispatchCtx, params: Map<String, Value>) -> ControllerFuture {
+    steer_controller().invoke(ctx, params)
+}
+
+fn steer_controller() -> BoundRegisteredController {
+    BoundRegisteredController::typed(schemas("steer"), parse_steer, run_steer)
+}
+
+fn run_steer(
+    ctx: DispatchCtx,
+    (request_id, instructions, agent_id): (String, String, Option<String>),
+) -> ControllerFuture {
+    Box::pin(async move {
+        let outcome = approval_rpc::approval_steer(
+            &ctx,
+            request_id.trim(),
+            instructions.trim(),
+            agent_id.as_deref(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        to_json(outcome)
+    })
+}
+
 fn handle_preauthorize_flow(_ctx: DispatchCtx, params: Map<String, Value>) -> ControllerFuture {
     preauthorize_flow_controller().invoke(_ctx, params)
 }
@@ -325,6 +387,13 @@ fn parse_decide(
     })?;
     let agent_id = read_optional_string(&params, "agent_id")?;
     Ok((request_id, decision, agent_id))
+}
+
+fn parse_steer(params: Map<String, Value>) -> Result<(String, String, Option<String>), String> {
+    let request_id = read_required_string(&params, "request_id")?;
+    let instructions = read_required_string(&params, "instructions")?;
+    let agent_id = read_optional_string(&params, "agent_id")?;
+    Ok((request_id, instructions, agent_id))
 }
 
 fn parse_preauthorize_flow(params: Map<String, Value>) -> Result<(String, Vec<String>), String> {
