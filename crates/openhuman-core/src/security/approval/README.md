@@ -49,7 +49,7 @@ Namespace `approval` (registered via `all_approval_registered_controllers`, cons
 | `approval.list_recent_decisions` | `limit?: u64` (1-500, default 50) | `decisions: ApprovalAuditEntry[]` |
 | `approval.get_gate_state` | none | `state: ApprovalGateBootState` (installed / disabled-by-env / override-ignored / host tag) |
 | `approval.decide` | `request_id: string`, `decision: string` (`approve_once` / `approve_always_for_tool` / `approve_always_for_flow` / `deny`) | `decided: PendingApproval` |
-| `approval.steer` | `request_id: string`, `instructions: string`, `agent_id?: string` | `decided: PendingApproval` (redirects a parked agent turn with operator directives, injecting a synthetic tool return into the harness turn loop) |
+| `approval.steer` | `request_id: string`, `instructions: string`, `agent_id?: string` | `steered: PendingApproval` (redirects a parked agent turn with operator directives, injecting a synthetic tool return into the harness turn loop) |
 | `approval.preauthorize_flow` | `flow_id: string`, `tool_names: string[]` | `result: FlowPreauthorizationResult` (idempotent flow-scoped trust grants; succeeds with `gate_installed=false` when the gate is off) |
 
 `list_pending` / `list_recent_decisions` return empty (not an error) when the gate is not installed; `decide` errors when the gate is absent or the `request_id` is unknown/already decided.

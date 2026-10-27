@@ -259,7 +259,7 @@ impl EventHandler<DomainEvent> for ProactiveMessageSubscriber {
                             tracing::warn!(
                                 source = %source,
                                 channel = %key,
-                                instructions = %instructions,
+                                instructions_len = instructions.len(),
                                 "[proactive] approval gate steered external delivery"
                             );
                             return;

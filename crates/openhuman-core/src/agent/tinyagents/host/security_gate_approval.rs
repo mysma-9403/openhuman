@@ -34,7 +34,7 @@ pub(super) fn decision_for_outcome(tool_name: &str, outcome: GateOutcome) -> Gat
             tracing::info!(
                 target: "tinyagents",
                 tool = %tool_name,
-                instructions = %instructions,
+                instructions_len = instructions.len(),
                 "[tinyagents::host::security] approval gate steered tool call by operator"
             );
             GateDecision::deny(format!(

@@ -6,6 +6,7 @@ import {
   fetchPendingApprovals,
   fetchRecentApprovalDecisions,
   preauthorizeFlow,
+  steerApproval,
   unwrapRows,
 } from './approvalApi';
 
@@ -119,6 +120,21 @@ describe('decideApproval', () => {
     expect(mockCallCoreRpc).toHaveBeenCalledWith({
       method: 'openhuman.approval_decide',
       params: { request_id: 'req-1', decision: 'approve_always_for_flow' },
+    });
+  });
+});
+
+describe('steerApproval', () => {
+  beforeEach(() => mockCallCoreRpc.mockReset());
+
+  it('calls openhuman.approval_steer with request id and instructions', async () => {
+    mockCallCoreRpc.mockResolvedValueOnce({});
+
+    await steerApproval('req-1', 'use different branch', 'agent-a');
+
+    expect(mockCallCoreRpc).toHaveBeenCalledWith({
+      method: 'openhuman.approval_steer',
+      params: { request_id: 'req-1', instructions: 'use different branch', agent_id: 'agent-a' },
     });
   });
 });

@@ -163,12 +163,12 @@ pub async fn apply_decision(
                             action = %action_str,
                             target_agent = %target,
                             external_id = %envelope.external_id,
-                            instructions = %instructions,
+                            instructions_len = instructions.len(),
                             "[triage::escalation] approval gate steered dispatch"
                         );
                         events::publish_failed(
                             envelope,
-                            &format!("approval steered for `{target}`: {instructions}"),
+                            &format!("approval steered for `{target}`"),
                         );
                         return Ok(());
                     }

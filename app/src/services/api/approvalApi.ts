@@ -27,6 +27,9 @@ export type ApprovalDecision =
   | 'deny'
   | 'steer';
 
+/** Decisions accepted by `openhuman.approval_decide`. `steer` uses `approval_steer`. */
+export type ApprovalDecisionInput = Exclude<ApprovalDecision, 'steer'>;
+
 /**
  * Origin hint attached to a pending approval that was raised from inside a
  * `tinyflows` run rather than an interactive chat turn. Lets the flow-run
@@ -117,7 +120,7 @@ export const fetchPendingApprovals = async (): Promise<PendingApproval[]> => {
  */
 export const decideApproval = async (
   requestId: string,
-  decision: ApprovalDecision
+  decision: ApprovalDecisionInput
 ): Promise<void> => {
   await callCoreRpc({
     method: 'openhuman.approval_decide',

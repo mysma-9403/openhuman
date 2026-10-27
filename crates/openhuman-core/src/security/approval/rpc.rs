@@ -448,8 +448,8 @@ pub async fn approval_steer(
     };
 
     let log = format!(
-        "[approval] steered request_id={} tool={} with instructions: {}",
-        row.request_id, row.tool_name, instructions
+        "[approval] steered request_id={} tool={}",
+        row.request_id, row.tool_name
     );
     Ok(Outcome::single_log(row, log))
 }

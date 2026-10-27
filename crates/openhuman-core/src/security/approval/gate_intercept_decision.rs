@@ -50,7 +50,7 @@ impl ApprovalGate {
                     tracing::info!(
                         request_id = %request_id,
                         tool = tool_name,
-                        instructions = %instructions,
+                        instructions_len = instructions.len(),
                         "[approval::gate] steer directive received from operator"
                     );
                     (
