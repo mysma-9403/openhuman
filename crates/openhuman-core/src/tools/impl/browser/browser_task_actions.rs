@@ -98,7 +98,7 @@ impl TaskApprovalOutcome {
 pub(super) async fn approve_task_action(
     pending: &Pending,
     browser: &crate::config::BrowserConfig,
-    origin: Option<&crate::security::turn_origin::AgentTurnOrigin>,
+    origin: Option<&crate::core::runtime::turn_origin::AgentTurnOrigin>,
 ) -> anyhow::Result<TaskApprovalOutcome> {
     let clean = |raw: &str| {
         let cleaned = raw.chars().filter(|c| !c.is_control()).collect::<String>();

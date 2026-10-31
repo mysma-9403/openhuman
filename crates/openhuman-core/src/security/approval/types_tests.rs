@@ -7,7 +7,6 @@ fn approval_decision_round_trips() {
         ApprovalDecision::ApproveAlwaysForTool,
         ApprovalDecision::ApproveAlwaysForFlow,
         ApprovalDecision::Deny,
-        ApprovalDecision::Steer,
     ] {
         assert_eq!(ApprovalDecision::from_str(d.as_str()), Some(d));
     }
@@ -24,28 +23,6 @@ fn is_approve_true_for_approval_variants_only() {
     assert!(ApprovalDecision::ApproveAlwaysForTool.is_approve());
     assert!(ApprovalDecision::ApproveAlwaysForFlow.is_approve());
     assert!(!ApprovalDecision::Deny.is_approve());
-    assert!(!ApprovalDecision::Steer.is_approve());
-    assert!(ApprovalDecision::Steer.is_steer());
-}
-
-#[test]
-fn gate_resolution_and_outcome_helpers() {
-    let res = GateResolution::Steer {
-        instructions: "use alternate tool".to_string(),
-    };
-    let json = serde_json::to_value(&res).unwrap();
-    assert_eq!(json["type"], "steer");
-    assert_eq!(json["instructions"], "use alternate tool");
-
-    let outcome_steer = GateOutcome::Steer {
-        instructions: "directive".to_string(),
-    };
-    assert!(outcome_steer.is_steer());
-    assert!(!outcome_steer.is_allow());
-
-    let outcome_allow = GateOutcome::Allow;
-    assert!(outcome_allow.is_allow());
-    assert!(!outcome_allow.is_steer());
 }
 
 #[test]
@@ -187,6 +164,8 @@ fn pending_approval_debug_and_serialize_do_not_carry_session_id() {
         expires_at: None,
         decided_at: Utc::now(),
         decision: ApprovalDecision::ApproveOnce,
+        decided_by: None,
+        judge: None,
     };
     let audit_dbg = format!("{audit:?}");
     assert!(

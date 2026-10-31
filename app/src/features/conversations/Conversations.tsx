@@ -83,6 +83,7 @@ import {
   type ProcessingTranscriptItem,
   setToolTimelineForThread,
   type ToolTimelineEntry,
+  workflowProposalKey,
 } from '../../store/chatRuntimeSlice';
 import { useAppDispatch, useAppSelector } from '../../store/hooks';
 import { pendingFollowupAdded } from '../../store/queueSlice';
@@ -2050,11 +2051,12 @@ const Conversations = ({
           path from proposal to saved automation via "Save & enable"
           (`flows_create`), or the user can Dismiss it outright. */}
       {selectedThreadId && pendingWorkflowProposal && (
-        // Keyed by name so a second proposal in the same thread (before the
-        // first is resolved) remounts the card and resets its local
-        // saving/error state, matching the PlanReviewCard pattern above.
+        // Keyed by the proposal's identity (source message + name) so a
+        // second proposal in the same thread (before the first is resolved)
+        // remounts the card and resets its local saving/error state, matching
+        // the PlanReviewCard pattern above.
         <WorkflowProposalCard
-          key={pendingWorkflowProposal.name}
+          key={workflowProposalKey(pendingWorkflowProposal)}
           threadId={selectedThreadId}
           proposal={pendingWorkflowProposal}
         />

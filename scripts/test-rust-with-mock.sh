@@ -305,6 +305,7 @@ run_json_rpc_e2e() {
   # provider route persisted by one scenario cannot affect another one.
   local target listing test_names test_name matched_count=0
   local -a targets=(json_rpc_threads_e2e json_rpc_wallet_e2e json_rpc_flows_e2e
+    json_rpc_flows_builder_chat_e2e
     json_rpc_mcp_e2e json_rpc_inference_e2e json_rpc_auth_security_e2e
     json_rpc_config_e2e json_rpc_agent_team_e2e json_rpc_web_chat_e2e
     json_rpc_misc_e2e)

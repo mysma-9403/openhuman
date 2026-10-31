@@ -6,11 +6,12 @@ use serde_json::json;
 
 #[test]
 fn legacy_handlers_keep_their_identity_and_order() {
-    let expected: [(&str, ControllerHandler); 6] = [
+    let expected: [(&str, ControllerHandler); 7] = [
         ("list_pending", handle_list_pending),
         ("list_recent_decisions", handle_list_recent_decisions),
+        ("list_tool_trust", handle_list_tool_trust),
+        ("revoke_tool_trust", handle_revoke_tool_trust),
         ("decide", handle_decide),
-        ("steer", handle_steer),
         ("get_gate_state", handle_get_gate_state),
         ("preauthorize_flow", handle_preauthorize_flow),
     ];
@@ -48,6 +49,18 @@ pub(super) fn parameter_contracts() -> Vec<ControllerParamContract> {
             ],
         },
         ControllerParamContract {
+            method: "approval.list_tool_trust",
+            required: &[],
+            optional: &[],
+            examples: vec![json!({})],
+        },
+        ControllerParamContract {
+            method: "approval.revoke_tool_trust",
+            required: &["request_id"],
+            optional: &[],
+            examples: vec![json!({"request_id": "grant-1"})],
+        },
+        ControllerParamContract {
             method: "approval.decide",
             required: &["request_id", "decision"],
             optional: &["agent_id"],
@@ -61,8 +74,8 @@ pub(super) fn parameter_contracts() -> Vec<ControllerParamContract> {
             required: &["request_id", "instructions"],
             optional: &["agent_id"],
             examples: vec![
-                json!({"request_id": "request-1", "instructions": "use different branch"}),
-                json!({"request_id": " request-2 ", "instructions": " stop ", "agent_id": null}),
+                json!({"request_id": "request-1", "instructions": "push to a branch instead"}),
+                json!({"request_id": " request-2 ", "instructions": " use the other card ", "agent_id": null}),
             ],
         },
         ControllerParamContract {
@@ -81,6 +94,23 @@ pub(super) fn parameter_contracts() -> Vec<ControllerParamContract> {
             ],
         },
     ]
+}
+
+#[test]
+fn revoke_tool_trust_parser_requires_a_string_id() {
+    assert_eq!(
+        parse_revoke_tool_trust(Map::from_iter([("request_id".into(), json!(" grant-1 "))]))
+            .unwrap(),
+        " grant-1 "
+    );
+    assert_eq!(
+        parse_revoke_tool_trust(Map::new()).unwrap_err(),
+        "missing required param 'request_id'"
+    );
+    assert_eq!(
+        parse_revoke_tool_trust(Map::from_iter([("request_id".into(), json!(false))])).unwrap_err(),
+        "invalid 'request_id': expected string, got bool"
+    );
 }
 
 #[test]
@@ -205,14 +235,6 @@ fn decide_parser_preserves_parse_order_raw_values_and_four_decisions() {
     assert_eq!(
         parse_decide(Map::from_iter([
             ("request_id".into(), json!("id")),
-            ("decision".into(), json!("steer")),
-        ]))
-        .unwrap_err(),
-        "invalid 'decision': steer requires an operator instruction via approval.steer"
-    );
-    assert_eq!(
-        parse_decide(Map::from_iter([
-            ("request_id".into(), json!("id")),
             ("decision".into(), json!("deny")),
             ("agent_id".into(), json!(false)),
         ]))
@@ -259,32 +281,6 @@ fn decide_parser_preserves_parse_order_raw_values_and_four_decisions() {
             "decision type validation precedes the invalid agent_id"
         );
     }
-}
-
-#[test]
-fn steer_parser_validates_inputs() {
-    let params = Map::from_iter([
-        ("request_id".into(), json!("req-1")),
-        ("instructions".into(), json!("do something else")),
-        ("agent_id".into(), json!("agent-x")),
-    ]);
-    let (req, inst, agent) = parse_steer(params).unwrap();
-    assert_eq!(req, "req-1");
-    assert_eq!(inst, "do something else");
-    assert_eq!(agent.as_deref(), Some("agent-x"));
-
-    let err = parse_steer(Map::new()).unwrap_err();
-    assert!(err.contains("missing required param 'request_id'"));
-
-    let err2 = parse_steer(Map::from_iter([("request_id".into(), json!("req-1"))])).unwrap_err();
-    assert!(err2.contains("missing required param 'instructions'"));
-
-    let err3 = parse_steer(Map::from_iter([
-        ("request_id".into(), json!("req-1")),
-        ("instructions".into(), json!("   ")),
-    ]))
-    .unwrap_err();
-    assert!(err3.contains("must not be empty"));
 }
 
 #[test]

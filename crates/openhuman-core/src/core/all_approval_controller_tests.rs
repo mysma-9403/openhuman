@@ -12,6 +12,14 @@ fn raw_approval_security_registry_matches_its_independent_contract() {
                 "approval.list_recent_decisions",
                 "openhuman.approval_list_recent_decisions",
             ),
+            (
+                "approval.list_tool_trust",
+                "openhuman.approval_list_tool_trust",
+            ),
+            (
+                "approval.revoke_tool_trust",
+                "openhuman.approval_revoke_tool_trust",
+            ),
             ("approval.decide", "openhuman.approval_decide"),
             ("approval.steer", "openhuman.approval_steer"),
             (
@@ -35,7 +43,7 @@ fn raw_approval_security_registry_matches_its_independent_contract() {
         .iter()
         .filter(|row| row.controller.schema.namespace == "approval")
         .collect();
-    use TypeSchema::{Array, Option, Ref, String, U64};
+    use TypeSchema::{Array, Bool, Option, Ref, String, U64};
     let fields = [
         (
             vec![("agent_id", Option(Box::new(String)), false)],
@@ -48,6 +56,14 @@ fn raw_approval_security_registry_matches_its_independent_contract() {
                 Array(Box::new(Ref("ApprovalAuditEntry"))),
                 true,
             )],
+        ),
+        (
+            vec![],
+            vec![("grants", Array(Box::new(Ref("ToolTrustEntry"))), true)],
+        ),
+        (
+            vec![("request_id", String, true)],
+            vec![("revoked", Bool, true)],
         ),
         (
             vec![
@@ -100,6 +116,8 @@ fn raw_approval_decoders_keep_permissive_and_strict_wire_behavior() {
     let methods = [
         "approval.list_pending",
         "approval.list_recent_decisions",
+        "approval.list_tool_trust",
+        "approval.revoke_tool_trust",
         "approval.decide",
         "approval.steer",
         "approval.get_gate_state",
@@ -115,6 +133,8 @@ fn raw_approval_decoders_keep_permissive_and_strict_wire_behavior() {
     for (entry, extra) in entries.iter().zip([
         json!({"agent_id": "  raw agent  ", "unknown": {"nested": [1, null]}}),
         json!({"limit": 0, "unknown": true}),
+        json!({}),
+        json!({"request_id": " grant-id "}),
         json!({"request_id": " raw id ", "decision": "deny", "extra": [false]}),
         json!({"request_id": " raw id ", "instructions": " raw inst ", "extra": 42}),
         json!({"anything": {"ignored": true}}),
@@ -130,7 +150,10 @@ fn raw_approval_decoders_keep_permissive_and_strict_wire_behavior() {
     entries[1]
         .decode_params(Map::from_iter([("limit".into(), json!(-1))]))
         .expect_err("bound schema decoder rejects negative limit");
-    entries[2]
+    entries[3]
+        .decode_params(Map::new())
+        .expect_err("bound schema decoder requires grant ID");
+    entries[4]
         .decode_params(Map::from_iter([
             ("request_id".into(), json!("id")),
             ("decision".into(), json!(1)),

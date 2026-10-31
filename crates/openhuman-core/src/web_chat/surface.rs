@@ -39,6 +39,7 @@ pub(crate) struct Surface {
     ctx: DispatchCtx,
     scope_key: String,
     ids: TurnIds,
+    sequenced: bool,
 }
 
 impl Surface {
@@ -74,7 +75,17 @@ impl Surface {
             ctx: ctx.clone(),
             scope_key,
             ids,
+            sequenced: true,
         }
+    }
+
+    /// Publish this surface's projections without the module's `seq`. A late
+    /// event projected after the turn's own projection closed gets a fresh
+    /// module handle whose sequence restarts, and clients drop an event whose
+    /// `seq` is not above the last one they saw for the request.
+    pub(crate) fn unsequenced(mut self) -> Self {
+        self.sequenced = false;
+        self
     }
 
     /// A host-authored terminal event does not need a module handle when the
@@ -100,6 +111,7 @@ impl Surface {
             ctx: ctx.clone(),
             scope_key,
             ids,
+            sequenced: true,
         }
     }
 
@@ -234,7 +246,10 @@ impl Surface {
             }
         };
         let terminal = projected.events.iter().any(is_terminal);
-        for event in projected.events {
+        for mut event in projected.events {
+            if !self.sequenced {
+                event.context_mut().seq = None;
+            }
             self.publish(event, interim_round, true);
         }
         if terminal {

@@ -12,9 +12,11 @@ pub mod daemon;
 pub mod enrichers;
 pub mod migrations;
 pub mod ops;
+pub(crate) mod proxy_tool;
 pub mod schema;
 mod schemas;
 pub mod tools;
+pub(crate) mod user_scope;
 pub mod workspace;
 pub mod workspace_handle;
 
@@ -48,20 +50,20 @@ pub use schema::{
     BudgetPeriod, BudgetPolicy, BudgetScope, CapabilityProviderConfig,
     CapabilityProviderTrustState, ChannelVoiceConfig, ChannelVoiceOverride, ChannelsConfig,
     CompactionSettings, CompactionStrategy, ComposioConfig, ComposioDirectBaseUrls,
-    ComposioHostCredential, ComputerConfig, Config, ContextConfig, CostConfig, CronConfig,
-    CurlConfig, DashboardConfig, DecisionModel, DiagramViewerConfig, DiscordConfig,
+    ComposioHostCredential, ComputerConfig, Config, ContextConfig, ContextSettings, CostConfig,
+    CronConfig, CurlConfig, DashboardConfig, DecisionModel, DiagramViewerConfig, DiscordConfig,
     DockerRuntimeConfig, EmailConfig, EmbeddingRouteConfig, GitbooksConfig, HttpHeader,
     HttpRequestConfig, IMessageConfig, IntegrationToggle, IntegrationsConfig, LarkConfig,
-    LegacySearchInputs, LinqConfig, LocalAiConfig, LocalJailConfig, McpAuthConfig, McpClientConfig,
-    McpClientIdentityConfig, McpServerConfig, McpToolExposure, MemoryConfig, MemoryLayoutMode,
-    ModelRouteConfig, MultimodalConfig, MultimodalFileConfig, ObservabilityConfig,
-    OrchestratorModelConfig, PresentationMode, PrivacyConfig, PrivacyMode, ProviderRoute,
-    ProxyConfig, ProxyScope, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
+    LegacySearchInputs, LinqConfig, LocalAiConfig, LocalJailConfig, MatrixConfig, McpAuthConfig,
+    McpClientConfig, McpClientIdentityConfig, McpServerConfig, McpToolExposure, MemoryConfig,
+    MemoryLayoutMode, ModelRouteConfig, MultimodalConfig, MultimodalFileConfig,
+    ObservabilityConfig, OrchestratorModelConfig, PresentationMode, PrivacyConfig, PrivacyMode,
+    ProviderRoute, ProxyConfig, ProxyScope, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
     SandboxBackend, SandboxConfig, SchedulerConfig, SchedulerGateConfig, SchedulerGateMode,
     SearchConfig, SearchEngineCredentials, SearchHostCredential, SearchProviderSettings,
     SearxngConfig, SecretsConfig, SecurityConfig, ShellConfig, SlackConfig, StreamMode, SttEngine,
     TeamModelConfig, TelegramConfig, TokenjuiceConfig, UnknownKeyedSearchProvider, UpdateConfig,
-    UpdateRestartStrategy, VoiceServerConfig, WebSearchConfig, YuanbaoConfig,
+    UpdateRestartStrategy, VoiceServerConfig, WebSearchConfig, WebhookConfig, YuanbaoConfig,
     MANAGED_SEARCH_PROVIDERS, SEARCH_ENGINE_BRAVE, SEARCH_ENGINE_DISABLED, SEARCH_ENGINE_EXA,
     SEARCH_ENGINE_MANAGED, SEARCH_ENGINE_PARALLEL, SEARCH_ENGINE_QUERIT, SEARCH_ENGINE_TAVILY,
     SEARCH_PROVIDERS, SEARCH_ROLES, SEARCH_ROLE_ANSWER, SEARCH_ROLE_CONTENTS, SEARCH_ROLE_SEARCH,
@@ -69,6 +71,7 @@ pub use schema::{
 // Kept as a separate re-export (issue #4117) so the large alphabetized group
 // above stays byte-identical and rustfmt-stable.
 pub use schema::RequiredOutputContract;
+pub use schema::SummarizerSettings;
 pub use schema::{InboundDebounceConfig, InboundDebounceOverride};
 pub use schemas::{
     all_controller_schemas as all_config_controller_schemas,

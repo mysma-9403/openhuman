@@ -267,6 +267,7 @@ impl WebHost {
                 client_id: payload.client_id.clone(),
                 thread_id: thread_id.to_owned(),
                 request_id: id.to_owned(),
+                config: (*config).clone(),
             }),
         );
         let _beat = AbortOnDrop(spawn_heartbeat(&ctx, projection.clone()));

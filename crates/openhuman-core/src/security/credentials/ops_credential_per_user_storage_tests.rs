@@ -235,3 +235,44 @@ async fn another_user_signing_in_does_not_get_the_first_users_api_key() {
     assert_eq!(state.credential.as_deref(), Some("session"));
     assert_eq!(state.user_id.as_deref(), Some("user-77"));
 }
+
+// A carry that fails after the sign-out rebound storage to the signed-out
+// database cannot put the key back: its source is another database, no longer
+// installed. The error says so, and nothing is written through the old
+// user-scoped config into the signed-out store, where the record would sit
+// under this user's secret namespace and read back as nothing.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)] // Serializes the process-wide storage slot.
+async fn a_failed_carry_on_per_user_storage_says_the_key_must_be_entered_again() {
+    let _module = crate::integrations::composio::module_client::module_lock_guard().await;
+    let _env_guard = crate::config::TEST_ENV_LOCK.lock().await;
+    let _slot = crate::storage::test_support::lock_storage_slot();
+    let tmp = TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("HOME", tmp.path());
+    let _env = EnvVarGuard::unset_many(&["OPENHUMAN_STORAGE_URL", "OPENHUMAN_WORKSPACE"]);
+    let pre_login = crate::config::load_config_with_timeout().await.unwrap();
+    let _storage = DefaultStorageForTest::install(&pre_login).await;
+    let user_scoped = sign_in(&pre_login, "user-42").await;
+    set_api_key(&user_scoped, "sk-live").await;
+
+    let error = clear_credential_with(
+        &DispatchCtx::process_default(),
+        &user_scoped,
+        Some(session_support::CredentialKind::Session),
+        |_, _| Err(anyhow::anyhow!("injected carry failure")),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("injected carry failure"), "{error}");
+    assert!(error.contains("must be entered again"), "{error}");
+
+    let signed_out = crate::config::load_config_with_timeout().await.unwrap();
+    assert_eq!(signed_out.config_path, pre_login.config_path);
+    assert!(
+        crate::security::credentials::AuthService::from_config(&signed_out)
+            .get_profile(api_key::API_KEY_PROVIDER, None)
+            .unwrap()
+            .is_none(),
+        "no api-key record may be written into the signed-out store under the old user's namespace"
+    );
+}

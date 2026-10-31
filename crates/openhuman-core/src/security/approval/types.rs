@@ -1,21 +1,19 @@
-//! Types shared between the `ApprovalGate`, the SQLite store, and the
-//! RPC layer. Kept narrow so the gate, the store, and the RPC ops can
-//! evolve independently without circular imports through `mod.rs`.
+//! Approval values shared by the gate, TinySecurity adapter, and RPC layer.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// A tool call that has been intercepted and is awaiting a user
-/// decision. Persisted in `pending_approvals` and surfaced to the UI
+/// decision. Persisted by TinySecurity and surfaced to the UI
 /// via `approval_list_pending`.
 ///
 /// Note: this type intentionally does not expose a `session_id`. Session
 /// provenance is an internal correlation token owned by `ApprovalGate`
-/// and the persistence layer; surfacing it on the public type made it
+/// and the persistence callback; surfacing it on the public type made it
 /// too easy for callers to log or serialize a value that historically
 /// derived from credential material (the JSON-RPC bearer token). The
-/// underlying column is retained in SQLite for downgrade safety but no
-/// longer carries any credential-shaped value.
+/// legacy migration data may retain its historical column, but new records
+/// never carry a credential-shaped value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct PendingApproval {
@@ -130,6 +128,34 @@ pub struct ApprovalAuditEntry {
     pub expires_at: Option<DateTime<Utc>>,
     pub decided_at: DateTime<Utc>,
     pub decision: ApprovalDecision,
+    /// Who decided: `auto:jev`, `auto:host-policy`, or absent for a human.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
+    /// The judge's nonsensitive verdict when `decided_by` is `auto:jev`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge: Option<JudgeVerdict>,
+}
+
+/// A live durable whole-tool grant in one approval scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ToolTrustEntry {
+    /// Redacted display label returned by TinySecurity.
+    pub tool: String,
+    /// Opaque identity to pass back when revoking this grant.
+    pub request_id: String,
+    /// When the grant was recorded, in epoch milliseconds.
+    pub granted_at_ms: u64,
+}
+
+/// Nonsensitive judge evidence shown in approval history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JudgeVerdict {
+    pub outcome: String,
+    pub intent_millis: Option<u16>,
+    pub reversible_millis: Option<u16>,
+    pub exfiltrate_millis: Option<u16>,
+    pub cached: bool,
 }
 
 /// Result of `approval_preauthorize_flow`: which trust grants were newly
@@ -166,14 +192,25 @@ pub enum ApprovalDecision {
     /// workflow: subsequent runs of *that* flow (including scheduled/
     /// triggered ones) auto-allow *that* tool without prompting, but a new
     /// tool the flow starts calling still parks. Persisted via
-    /// `approval::store::insert_flow_trust`, not `autonomy.auto_approve`.
+    /// TinySecurity's durable flow trust, not `autonomy.auto_approve`.
     /// Only meaningful when `source_context` is `Some(Flow { .. })` — the
     /// `approval_decide` RPC handler logs and no-ops the persistence step
     /// otherwise (the decision itself still resolves the parked call).
     ApproveAlwaysForFlow,
     /// Reject the call. The agent receives a structured error string.
     Deny,
-    /// Steer the agent with direct operator instructions instead of running the tool.
+    /// Refuse *this* call but redirect the agent: the operator supplies a
+    /// directive the agent sees in place of the tool result.
+    ///
+    /// To the engine — and so to TinySecurity's durable lifecycle and audit
+    /// trail — a steer is a denial: nothing executes, so the module records
+    /// `Denied` and the host keeps the distinction in its own decision label.
+    /// The directive itself never leaves the host and is never logged.
+    ///
+    /// Deliberately fieldless. The directive travels beside the decision (see
+    /// [`Resolution`]) rather than inside it, so this enum stays `Copy` and
+    /// keeps serializing as a plain `"steer"` string in persisted rows and on
+    /// the wire.
     Steer,
 }
 
@@ -206,40 +243,48 @@ impl ApprovalDecision {
             Self::ApproveOnce | Self::ApproveAlwaysForTool | Self::ApproveAlwaysForFlow
         )
     }
-
-    pub fn is_steer(self) -> bool {
-        matches!(self, Self::Steer)
-    }
-}
-
-/// What resolves a parked approval waiter: either a static decision or a
-/// steering directive from the operator.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum GateResolution {
-    Decision(ApprovalDecision),
-    Steer { instructions: String },
 }
 
 /// Outcome of routing a tool call through `ApprovalGate::intercept`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum GateOutcome {
     /// Proceed with `tool.execute(args)`.
     Allow,
     /// Abort the call. The agent sees `reason` in place of a tool
     /// result.
     Deny { reason: String },
-    /// Operator redirected the agent's intent with new instructions.
+    /// Abort the call and hand the agent the operator's `instructions`
+    /// instead of a tool result. Like [`Self::Deny`] the tool never runs, so
+    /// the call reserves nothing.
     Steer { instructions: String },
 }
 
 impl GateOutcome {
-    pub fn is_allow(&self) -> bool {
-        matches!(self, Self::Allow)
-    }
-
     pub fn is_steer(&self) -> bool {
         matches!(self, Self::Steer { .. })
+    }
+}
+
+/// What a human's answer resolves a parked call with.
+///
+/// The decision is the part the engine, the persisted row and the product
+/// event all speak; `directive` is the host-only payload a
+/// [`ApprovalDecision::Steer`] carries. In-process only — this crosses the
+/// parked `oneshot`, never a transport — which is why widening it costs
+/// nothing on the wire.
+#[derive(Debug)]
+pub struct Resolution {
+    pub decision: ApprovalDecision,
+    pub directive: Option<String>,
+}
+
+impl Resolution {
+    /// A plain decision with no directive.
+    pub fn plain(decision: ApprovalDecision) -> Self {
+        Self {
+            decision,
+            directive: None,
+        }
     }
 }
 

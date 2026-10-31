@@ -11,7 +11,7 @@ use crate::core::Outcome;
 use super::gate::{try_boot_state, ApprovalGate, ApprovalGateBootState, DecideMiss};
 use super::types::{
     ApprovalAuditEntry, ApprovalDecision, ApprovalSourceContext, FlowPreauthorizationResult,
-    PendingApproval,
+    PendingApproval, ToolTrustEntry,
 };
 
 /// Upper bound on `tool_names` per pre-authorization call — far above any
@@ -108,6 +108,47 @@ pub async fn approval_list_recent_decisions(
     Ok(Outcome::single_log(rows, log))
 }
 
+/// List live durable whole-tool grants in the authenticated dispatch tenant.
+/// When the approval gate is disabled, there are no grants to display.
+pub async fn approval_list_tool_trust(
+    ctx: &DispatchCtx,
+) -> anyhow::Result<Outcome<Vec<ToolTrustEntry>>> {
+    ctx.tenant()
+        .map_err(|error| anyhow!("tool grant listing has no tenant: {error}"))?;
+    let Some(gate) = ApprovalGate::try_global() else {
+        return Ok(Outcome::new(Vec::new(), vec![]));
+    };
+    let grants = gate.list_tool_trust(ctx)?;
+    let count = grants.len();
+    Ok(Outcome::single_log(
+        grants,
+        format!("[approval] list_tool_trust returned {count} grant(s)"),
+    ))
+}
+
+/// Revoke a live whole-tool grant by its opaque ID in the dispatch tenant's
+/// standard approval scope. Unknown IDs are an idempotent false result.
+pub async fn approval_revoke_tool_trust(
+    ctx: &DispatchCtx,
+    request_id: &str,
+) -> anyhow::Result<Outcome<bool>> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Err(anyhow!("request_id must not be empty"));
+    }
+    ctx.tenant()
+        .map_err(|error| anyhow!("tool grant revocation has no tenant: {error}"))?;
+    let gate = ApprovalGate::try_global()
+        .ok_or_else(|| anyhow!("approval gate is not installed; supervised mode disabled"))?;
+    let revoked = gate.revoke_tool_trust_by_id(ctx, request_id)?;
+    let log = if revoked {
+        "[approval] whole-tool grant revoked"
+    } else {
+        "[approval] whole-tool grant was already absent"
+    };
+    Ok(Outcome::single_log(revoked, log.to_string()))
+}
+
 /// Batch-grant "approve always for this flow" trust at save+enable time
 /// (consolidated pre-authorization card). Loops the idempotent
 /// `INSERT OR IGNORE` per tool and writes one born-decided audit row per
@@ -164,17 +205,8 @@ pub async fn approval_preauthorize_flow(
             continue;
         }
         gate.insert_flow_trust(flow_id, &tool_name)?;
-        // Audit row is best-effort: the grant above is what changes behavior,
-        // and failing the whole batch over a bookkeeping row would leave the
-        // user with a half-approved card for no security benefit.
-        if let Err(err) = gate.record_flow_preauthorization(flow_id, &tool_name) {
-            tracing::warn!(
-                flow_id = flow_id,
-                tool = tool_name.as_str(),
-                error = %err,
-                "[rpc:approval_preauthorize_flow] failed to write audit row for grant"
-            );
-        }
+        // GrantFlowTool2 records the grant and its audit event atomically in
+        // TinySecurity; there is no host-side approval audit store.
         granted.push(tool_name);
     }
 
@@ -209,6 +241,50 @@ pub async fn approval_decide(
     decision: ApprovalDecision,
     agent_id: Option<&str>,
 ) -> anyhow::Result<Outcome<PendingApproval>> {
+    decide_with_directive(ctx, request_id, decision, None, agent_id).await
+}
+
+/// Refuse a pending call but redirect the agent with `instructions`.
+///
+/// The tool does not run, so this takes the same path as a denial: the engine
+/// records the refusal and nothing is reserved. `instructions` is host-only —
+/// it resolves the parked call and is never persisted, published on the bus or
+/// logged (only its length is).
+pub async fn approval_steer(
+    ctx: &DispatchCtx,
+    request_id: &str,
+    instructions: &str,
+    agent_id: Option<&str>,
+) -> anyhow::Result<Outcome<PendingApproval>> {
+    tracing::debug!(
+        request_id = request_id,
+        instructions_len = instructions.len(),
+        agent_id = agent_id.unwrap_or("<any>"),
+        "[rpc:approval_steer] entry"
+    );
+    if instructions.trim().is_empty() {
+        anyhow::bail!("steer instructions must not be empty");
+    }
+    decide_with_directive(
+        ctx,
+        request_id,
+        ApprovalDecision::Steer,
+        Some(instructions.to_string()),
+        agent_id,
+    )
+    .await
+}
+
+/// The one body every decision runs through, so the gate lookup, the
+/// already-decided disambiguation ([`DecideMiss`]) and the grant persistence
+/// are not duplicated per decision kind.
+async fn decide_with_directive(
+    ctx: &DispatchCtx,
+    request_id: &str,
+    decision: ApprovalDecision,
+    directive: Option<String>,
+    agent_id: Option<&str>,
+) -> anyhow::Result<Outcome<PendingApproval>> {
     tracing::debug!(
         request_id = request_id,
         decision = decision.as_str(),
@@ -223,8 +299,8 @@ pub async fn approval_decide(
         anyhow!("approval gate is not installed; supervised mode disabled")
     })?;
     let decided = match agent_id {
-        Some(agent) => gate.decide_for_agent(agent, request_id, decision),
-        None => gate.decide(request_id, decision),
+        Some(agent) => gate.decide_for_agent_with_directive(agent, request_id, decision, directive),
+        None => gate.decide_with_directive(request_id, decision, directive),
     };
     let decided = match decided {
         Ok(row) => row,
@@ -381,75 +457,4 @@ pub async fn approval_decide(
         "[rpc:approval_decide] exit"
     );
     Ok(Outcome::new(row, logs))
-}
-
-/// Apply an operator steering directive to a pending row.
-pub async fn approval_steer(
-    _ctx: &DispatchCtx,
-    request_id: &str,
-    instructions: &str,
-    agent_id: Option<&str>,
-) -> anyhow::Result<Outcome<PendingApproval>> {
-    tracing::debug!(
-        request_id = request_id,
-        instructions_len = instructions.len(),
-        agent_id = agent_id.unwrap_or("<any>"),
-        "[rpc:approval_steer] entry"
-    );
-    if instructions.trim().is_empty() {
-        anyhow::bail!("steer instructions must not be empty");
-    }
-    let gate = ApprovalGate::try_global().ok_or_else(|| {
-        tracing::warn!(
-            request_id = request_id,
-            "[rpc:approval_steer] gate not installed"
-        );
-        anyhow!("approval gate is not installed; supervised mode disabled")
-    })?;
-    let decided = match agent_id {
-        Some(agent) => gate.steer_for_agent(agent, request_id, instructions),
-        None => gate.steer(request_id, instructions),
-    };
-    let decided = match decided {
-        Ok(row) => row,
-        Err(err) => {
-            tracing::error!(
-                request_id = request_id,
-                error = %err,
-                "[rpc:approval_steer] gate steer failed"
-            );
-            return Err(err);
-        }
-    };
-    let row = match decided {
-        Some(row) => row,
-        None => {
-            return match gate.classify_decide_miss(request_id) {
-                DecideMiss::AlreadyResolved => {
-                    tracing::warn!(
-                        request_id = request_id,
-                        "[rpc:approval_steer] no pending approval found (already decided/expired — benign race)"
-                    );
-                    Err(anyhow!(
-                        "no pending approval found for request_id '{request_id}' (already decided or expired)"
-                    ))
-                }
-                DecideMiss::NeverRegistered => {
-                    tracing::warn!(
-                        request_id = request_id,
-                        "[rpc:approval_steer] no pending approval ever registered (genuine lost registration)"
-                    );
-                    Err(anyhow!(
-                        "no pending approval ever registered for request_id '{request_id}'"
-                    ))
-                }
-            };
-        }
-    };
-
-    let log = format!(
-        "[approval] steered request_id={} tool={}",
-        row.request_id, row.tool_name
-    );
-    Ok(Outcome::single_log(row, log))
 }

@@ -812,7 +812,49 @@ export interface WorkflowProposal {
    * enable" click would call `createFlow` again and duplicate the flow.
    */
   completedFlowId?: string;
+  /**
+   * The saved flow this proposal revises (`flow_id` on the proposal payload,
+   * set when the builder edited an existing flow). "Save & enable" writes onto
+   * this flow with `flows_update` instead of creating another one.
+   */
+  flowId?: string;
+  /**
+   * `flowId`'s `updated_at` when the builder produced this revision
+   * (`flow_version` on the payload). Sent as `flows_update`'s
+   * `expected_version`, so a save refuses to overwrite a newer edit.
+   */
+  flowVersion?: string;
+  /**
+   * Id of the flow once "Save & enable" persisted it, before the enable step
+   * finished (pre-authorization pending, denied, or failed). Mirrored into
+   * Redux and onto the source message's `saved_flow_id` so a remount or reload
+   * resumes the enable step instead of creating the flow again.
+   */
+  savedFlowId?: string;
 }
+
+/**
+ * A proposal's identity across Redux updates and card remounts: its source
+ * message when it has one, and its name. Also the card's React key, so a
+ * replacement remounts the card and a late save/enable result from the
+ * replaced proposal is ignored instead of landing on the new one.
+ */
+export function workflowProposalKey(
+  proposal: Pick<WorkflowProposal, 'name' | 'sourceMessageId'>
+): string {
+  return `${proposal.sourceMessageId ?? ''}|${proposal.name}`;
+}
+
+/** Payload of the save/completion updates, naming the proposal they belong to. */
+interface WorkflowProposalSaveUpdate {
+  threadId: string;
+  flowId: string;
+  name: string;
+  sourceMessageId?: string;
+}
+
+const isSameProposal = (proposal: WorkflowProposal, update: WorkflowProposalSaveUpdate) =>
+  workflowProposalKey(proposal) === workflowProposalKey(update);
 
 /**
  * Lifecycle status of a single agent-generated artifact, as projected
@@ -2587,15 +2629,26 @@ const chatRuntimeSlice = createSlice({
      * state survives a remount (thread switch, route change) while the
      * proposal is still sitting in `pendingWorkflowProposalsByThread` — see
      * `WorkflowProposal.completedFlowId`. No-op if the proposal was already
-     * cleared (e.g. a race with `clearWorkflowProposalForThread`).
+     * cleared (e.g. a race with `clearWorkflowProposalForThread`) or replaced
+     * by another proposal (see `isSameProposal`).
      */
-    markWorkflowProposalCompleted: (
-      state,
-      action: PayloadAction<{ threadId: string; flowId: string }>
-    ) => {
+    markWorkflowProposalCompleted: (state, action: PayloadAction<WorkflowProposalSaveUpdate>) => {
       const proposal = state.pendingWorkflowProposalsByThread[action.payload.threadId];
-      if (proposal) {
+      if (proposal && isSameProposal(proposal, action.payload)) {
         proposal.completedFlowId = action.payload.flowId;
+      }
+    },
+    /**
+     * Record that a pending proposal's flow is persisted but not yet enabled
+     * (see `WorkflowProposal.savedFlowId`). Applied only to the proposal that
+     * was saved (same name and source message): a newer proposal that replaced
+     * it while the save was in flight must not inherit its flow id. No-op if
+     * the proposal was cleared or replaced.
+     */
+    markWorkflowProposalSaved: (state, action: PayloadAction<WorkflowProposalSaveUpdate>) => {
+      const proposal = state.pendingWorkflowProposalsByThread[action.payload.threadId];
+      if (proposal && isSameProposal(proposal, action.payload)) {
+        proposal.savedFlowId = action.payload.flowId;
       }
     },
     /**
@@ -3309,6 +3362,7 @@ export const {
   setWorkflowProposalForThread,
   clearWorkflowProposalForThread,
   markWorkflowProposalCompleted,
+  markWorkflowProposalSaved,
   upsertArtifactInProgressForThread,
   upsertArtifactReadyForThread,
   upsertArtifactFailedForThread,

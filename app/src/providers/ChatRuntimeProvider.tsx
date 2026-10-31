@@ -1182,10 +1182,18 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
               tool: event.tool_name,
               name: subagentProposal.name,
             });
+            // The core persists this proposal as message
+            // `workflow-proposal:<task_id>` when the worker finishes
+            // (`spawn_subagent_surface.rs`). Pointing the card at it lets a
+            // save record `saved_flow_id` (and Save/Dismiss mark it consumed)
+            // durably, as for a rehydrated proposal.
+            const proposalTaskId = event.subagent?.task_id;
             dispatch(
               setWorkflowProposalForThread({
                 threadId: event.thread_id,
-                proposal: subagentProposal,
+                proposal: proposalTaskId
+                  ? { ...subagentProposal, sourceMessageId: `workflow-proposal:${proposalTaskId}` }
+                  : subagentProposal,
               })
             );
           }

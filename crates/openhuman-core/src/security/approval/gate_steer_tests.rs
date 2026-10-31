@@ -1,50 +1,154 @@
+//! Steering a parked call: the operator refuses *this* call and hands the
+//! agent a directive instead.
+//!
+//! The property these tests exist for is that a steer takes the **denial**
+//! path through the engine. Nothing runs, so nothing may be reserved — a
+//! reservation is irreversible (`ApprovalLifecycle2::Reserved`) and would
+//! consume an approval for a call that never executes.
+
 use super::*;
+use crate::security::approval::engine_stub::State;
 
-#[tokio::test]
-async fn steer_returns_steer_outcome_with_instructions() {
-    let (gate, _dir) = test_gate();
-    let gate = Arc::new(gate);
-
-    let g = gate.clone();
+/// Park one call and return its request id once the engine delivered the
+/// prompt and the waiter is registered.
+async fn park_one(
+    gate: &Arc<ApprovalGate>,
+    tool: &'static str,
+) -> (tokio::task::JoinHandle<GateOutcome>, String) {
+    let worker = gate.clone();
     let handle = tokio::spawn(async move {
         turn_origin::with_origin(
             web_origin(),
-            g.intercept(
+            worker.intercept(
                 &ApprovalTurnContext::chat(chat_ctx()),
-                "shell",
+                tool,
                 "git push --force origin main",
                 serde_json::json!({}),
             ),
         )
         .await
     });
-
     let mut tries = 0;
-    let pending = loop {
-        let list = gate.list_pending().unwrap();
-        if let Some(p) = list.into_iter().next() {
-            break p;
+    let request_id = loop {
+        if let Some(id) = parked_request_id(gate) {
+            break id;
         }
         tries += 1;
-        assert!(tries < 50, "pending row never appeared");
+        assert!(tries < 500, "the call never parked");
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
+    (handle, request_id)
+}
 
-    let directive = "Wypchnij to na osobny branch fix/login i otwórz PR";
-    let decided = gate.steer(&pending.request_id, directive).unwrap();
-    assert!(decided.is_some());
+#[tokio::test]
+async fn a_steer_hands_the_agent_the_directive_instead_of_running_the_tool() {
+    let (gate, _dir) = test_gate();
+    let gate = Arc::new(gate);
+    let (handle, request_id) = park_one(&gate, "shell").await;
 
-    let outcome = handle.await.unwrap();
-    match outcome {
-        GateOutcome::Steer { instructions } => {
-            assert_eq!(instructions, directive);
-        }
+    let directive = "push to a branch fix/login and open a PR instead";
+    assert!(gate
+        .decide_with_directive(
+            &request_id,
+            ApprovalDecision::Steer,
+            Some(directive.to_string()),
+        )
+        .unwrap()
+        .is_some());
+
+    match handle.await.unwrap() {
+        GateOutcome::Steer { instructions } => assert_eq!(instructions, directive),
         other => panic!("expected GateOutcome::Steer, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn steer_publishes_domain_event_with_resolution() {
+async fn a_steer_is_a_denial_to_the_engine_and_reserves_nothing() {
+    let (gate, _dir) = test_gate();
+    let gate = Arc::new(gate);
+    let stub = stub_of(&gate);
+    let (handle, request_id) = park_one(&gate, "shell").await;
+
+    gate.decide_with_directive(
+        &request_id,
+        ApprovalDecision::Steer,
+        Some("do it differently".to_string()),
+    )
+    .unwrap();
+    assert!(handle.await.unwrap().is_steer());
+
+    // The module recorded a refusal — not an approval, and above all not a
+    // reservation: the tool never ran.
+    assert_eq!(stub.state(&request_id), Some(State::Denied));
+}
+
+#[tokio::test]
+async fn a_steer_without_a_directive_denies_rather_than_steering_emptily() {
+    let (gate, _dir) = test_gate();
+    let gate = Arc::new(gate);
+    let (handle, request_id) = park_one(&gate, "shell").await;
+
+    // The RPC rejects an empty directive; this is the belt behind it.
+    gate.decide_with_directive(
+        &request_id,
+        ApprovalDecision::Steer,
+        Some("   ".to_string()),
+    )
+    .unwrap();
+
+    match handle.await.unwrap() {
+        GateOutcome::Deny { reason } => assert!(reason.contains("no instructions"), "{reason}"),
+        other => panic!("a directive-less steer must deny, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_forced_request_cannot_be_steered() {
+    let (gate, _dir) = test_gate();
+    let gate = Arc::new(gate);
+    let worker = gate.clone();
+    let handle = tokio::spawn(async move {
+        turn_origin::with_origin(
+            web_origin(),
+            worker.intercept_forced(
+                "browser",
+                "Click Submit on checkout",
+                serde_json::json!({"action": "click", "target": "Submit"}),
+            ),
+        )
+        .await
+    });
+    let mut tries = 0;
+    let request_id = loop {
+        if let Some(id) = parked_request_id(&gate) {
+            break id;
+        }
+        tries += 1;
+        assert!(tries < 500, "the forced call never parked");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    // A forced approval was escalated *because* it needs an explicit yes or
+    // no; redirecting it would weaken that posture.
+    let err = gate
+        .decide_with_directive(
+            &request_id,
+            ApprovalDecision::Steer,
+            Some("click the other button".to_string()),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("one-time approval or denial"),
+        "{err}"
+    );
+
+    // The call is still parked, so answer it properly and let the turn finish.
+    decide_parked(&gate, &request_id, ApprovalDecision::Deny);
+    assert!(matches!(handle.await.unwrap(), GateOutcome::Deny { .. }));
+}
+
+#[tokio::test]
+async fn a_steer_is_published_as_its_own_decision() {
     crate::core::bus::init().await.expect("bus init");
     let mut rx = crate::core::bus::BUS
         .get()
@@ -52,87 +156,30 @@ async fn steer_publishes_domain_event_with_resolution() {
         .receiver();
     let (gate, _dir) = test_gate();
     let gate = Arc::new(gate);
+    let (handle, request_id) = park_one(&gate, "browser_click").await;
 
-    let g = gate.clone();
-    let handle = tokio::spawn(async move {
-        turn_origin::with_origin(
-            web_origin(),
-            g.intercept(
-                &ApprovalTurnContext::chat(chat_ctx()),
-                "browser_click",
-                "click pay button",
-                serde_json::json!({}),
-            ),
-        )
-        .await
-    });
+    let directive = "use the company card, not card X";
+    gate.decide_with_directive(
+        &request_id,
+        ApprovalDecision::Steer,
+        Some(directive.to_string()),
+    )
+    .unwrap();
+    assert!(handle.await.unwrap().is_steer());
 
-    let mut tries = 0;
-    let pending = loop {
-        let list = gate.list_pending().unwrap();
-        if let Some(p) = list.into_iter().next() {
-            break p;
-        }
-        tries += 1;
-        assert!(tries < 50, "pending row never appeared");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
-
-    let directive = "Nie płać kartą X, użyj karty firmowej Y";
-    gate.steer(&pending.request_id, directive).unwrap();
-
-    let outcome = handle.await.unwrap();
-    assert!(outcome.is_steer());
-
-    let ev = find_approval_decided(&mut rx, &pending.request_id).await;
-    match ev {
+    match find_approval_decided(&mut rx, &request_id).await {
         crate::core::events::DomainEvent::ApprovalDecided {
             decision,
             resolution,
             ..
         } => {
             assert_eq!(decision, "steer");
-            assert_eq!(resolution.as_deref(), Some("steered"));
+            // `resolution` marks a request that ended *without* a person's
+            // decision (cancelled/expired). A steer is a decision.
+            assert_eq!(resolution, None);
+            // The directive is host-only and must never ride the bus.
+            assert!(!format!("{decision:?}").contains(directive));
         }
-        other => panic!("expected ApprovalDecided event, got {other:?}"),
+        other => panic!("expected ApprovalDecided, got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn steer_without_live_waiter_fails() {
-    let (gate, _dir) = test_gate();
-    let gate = Arc::new(gate);
-
-    let request_id = "req-unparked-row";
-    let pending = PendingApproval::new(
-        request_id,
-        "shell",
-        "rm -rf /",
-        serde_json::json!({}),
-        None,
-    );
-    store::insert_pending(&gate.config, &pending, &gate.session_id).unwrap();
-
-    let err = gate.steer(request_id, "do not run").unwrap_err();
-    assert!(err.to_string().contains("no live waiter"));
-}
-
-#[tokio::test]
-async fn steer_for_agent_enforces_agent_ownership() {
-    let (gate, _dir) = test_gate();
-    let gate = Arc::new(gate);
-
-    let request_id = "req-test-ownership";
-    let pending = PendingApproval::new(
-        request_id,
-        "shell",
-        "rm -rf /",
-        serde_json::json!({}),
-        None,
-    );
-    store::insert_pending(&gate.config, &pending, &gate.session_id).unwrap();
-
-    // Not registered to agent-b
-    let err = gate.steer_for_agent("agent-b", request_id, "cancel this").unwrap_err();
-    assert!(err.to_string().contains("belongs to another agent"));
 }

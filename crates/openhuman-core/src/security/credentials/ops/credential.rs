@@ -383,6 +383,24 @@ pub async fn clear_credential(
     config: &Config,
     kind: Option<CredentialKind>,
 ) -> Result<Outcome<Value>, String> {
+    clear_credential_with(ctx, config, kind, |to, key| {
+        api_key::store_api_key(to, key).map(|_| ())
+    })
+    .await
+}
+
+/// [`clear_credential`] with the carry of the API key into the signed-out
+/// workspace passed in, so a test can make it fail. Production passes
+/// [`api_key::store_api_key`].
+pub(crate) async fn clear_credential_with<F>(
+    ctx: &DispatchCtx,
+    config: &Config,
+    kind: Option<CredentialKind>,
+    carry: F,
+) -> Result<Outcome<Value>, String>
+where
+    F: FnOnce(&Config, &str) -> anyhow::Result<()>,
+{
     refuse_process_credential_in_saas("clear_credential")?;
     let _mutation = CREDENTIAL_MUTATION_LOCK.lock().await;
     let mut logs = Vec::new();
@@ -426,20 +444,41 @@ pub async fn clear_credential(
             cleared_source_api_key = api_key::clear_api_key(config).map_err(|e| e.to_string())?;
         }
 
-        let outcome = match clear_session_credential(ctx, config).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                restore_api_key(config, source_api_key.as_deref(), "teardown failed");
-                return Err(error);
+        // A failure from here on puts the key back where it was, but only
+        // while that store is still the installed one: profiles follow the
+        // installed backend, so after a rebind to another database a write
+        // through `config` would land in the signed-out store under this
+        // user's secret namespace, where nothing reads it.
+        // A teardown can fail before its rebind (the source is still
+        // installed) or after it (a later rebind step); the check covers both.
+        let source_url = crate::storage::installed_url();
+        let fail = |reason: &str, error: String| -> String {
+            let Some(key) = source_api_key.as_deref() else {
+                return error;
+            };
+            if crate::storage::installed_url() == source_url {
+                restore_api_key(config, Some(key), reason);
+                return error;
             }
+            tracing::error!(
+                domain = "credentials",
+                operation = "clear_credential",
+                reason,
+                "{LOG_PREFIX} api key lost: the sign-out failed after storage moved off its source"
+            );
+            format!("{error}; the API key could not be kept and must be entered again")
         };
-        removed_session = outcome.value;
+        let outcome = clear_session_credential(ctx, config)
+            .await
+            .map_err(|error| fail("teardown failed", error))?;
+        let (removed, signed_out_config) = outcome.value;
+        removed_session = removed;
         logs.extend(outcome.logs);
 
-        // The teardown rebinds every process global to the signed-out
+        // The teardown rebound every process global to the signed-out
         // workspace whether or not a session profile was found; follow it so
         // the api-key checks below agree with `auth.get_state`.
-        effective_config = reload_config_or(ctx, config).await?;
+        effective_config = signed_out_config;
         if let Some(key) = source_api_key.as_deref() {
             if matches!(
                 kind,
@@ -451,10 +490,8 @@ pub async fn clear_credential(
                 // is only removing the session — an unrelated, stale key at
                 // the pre-login workspace must never silently outrank the key
                 // that was the effective credential a moment ago (#6318).
-                if let Err(error) = api_key::store_api_key(&effective_config, key) {
-                    restore_api_key(config, Some(key), "carry failed");
-                    return Err(error.to_string());
-                }
+                carry(&effective_config, key)
+                    .map_err(|error| fail("carry failed", error.to_string()))?;
                 logs.push("api key carried forward to the signed-out workspace".to_string());
             }
         }
@@ -544,7 +581,7 @@ fn restore_api_key(config: &Config, key: Option<&str>, reason: &str) {
 async fn clear_session_credential(
     ctx: &DispatchCtx,
     config: &Config,
-) -> Result<Outcome<bool>, String> {
+) -> Result<Outcome<(bool, Config)>, String> {
     let mut logs = Vec::new();
     crate::platform::llm_gate::set_signed_out(true);
     #[cfg(feature = "web3")]
@@ -590,23 +627,22 @@ async fn clear_session_credential(
     // Every process-global store must follow the now-active pre-login
     // workspace, or a signed-out caller keeps reading the previous account's
     // context until the process restarts.
-    match ctx.load_config().await {
-        Ok(signed_out_config) => {
-            logs.extend(rebind_after_credential_change(
-                &signed_out_config,
-                "credential cleared",
-            )?);
-            logs.push(format!(
-                "process globals rebound to signed-out workspace {}",
-                signed_out_config.workspace_dir.display()
-            ));
-        }
-        Err(error) => return Err(format!("failed to resolve signed-out workspace: {error}")),
-    }
+    let signed_out_config = ctx
+        .load_config()
+        .await
+        .map_err(|error| format!("failed to resolve signed-out workspace: {error}"))?;
+    logs.extend(rebind_after_credential_change(
+        &signed_out_config,
+        "credential cleared",
+    )?);
+    logs.push(format!(
+        "process globals rebound to signed-out workspace {}",
+        signed_out_config.workspace_dir.display()
+    ));
 
     sentry_scope::clear();
     logs.push("session cleared".to_string());
-    Ok(Outcome::new(removed, logs))
+    Ok(Outcome::new((removed, signed_out_config), logs))
 }
 
 /// Historical entry point: install a session (or local) credential from a

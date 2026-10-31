@@ -78,7 +78,7 @@ pub(super) fn tap_progress(
         while let Some(event) = rx.recv().await {
             if runner_gone {
                 if let Some(late) = late.as_ref() {
-                    late.publish(&publish_ctx, event);
+                    late.publish(&publish_ctx, event).await;
                 }
                 continue;
             }
@@ -105,7 +105,7 @@ pub(super) fn tap_progress(
             }
             if runner_gone {
                 if let Some(late) = late.as_ref() {
-                    late.publish(&publish_ctx, event);
+                    late.publish(&publish_ctx, event).await;
                 }
             }
             if completed {
@@ -123,44 +123,48 @@ pub(super) struct LateSubagentSink {
     pub(super) client_id: String,
     pub(super) thread_id: String,
     pub(super) request_id: String,
+    pub(super) config: crate::config::Config,
 }
 
 impl LateSubagentSink {
-    fn publish(&self, ctx: &DispatchCtx, event: AgentProgress) {
-        // Only the event that settles a sub-agent card can matter after the
-        // turn: a child aborted by `subagent_cancel` (or one that failed late)
-        // still reports its failure. Everything else is turn-scoped output
-        // the finished turn no longer renders.
-        let AgentProgress::SubagentFailed {
-            agent_id,
-            task_id,
-            error,
-            ..
-        } = event
-        else {
-            return;
+    async fn publish(&self, ctx: &DispatchCtx, event: AgentProgress) {
+        // Only the events that settle a sub-agent card can matter after the
+        // turn: a detached child usually finishes after its parent replied,
+        // and one aborted by `subagent_cancel` still reports its failure.
+        // Everything else is turn-scoped output the finished turn no longer
+        // renders.
+        let kind = match &event {
+            AgentProgress::SubagentCompleted { task_id, .. } => ("completed", task_id),
+            AgentProgress::SubagentFailed { task_id, .. } => ("failed", task_id),
+            AgentProgress::SubagentAwaitingUser { task_id, .. } => ("awaiting_user", task_id),
+            _ => return,
         };
         log::debug!(
-            "[web-channel] late subagent_failed task_id={task_id} request_id={}",
+            "[web-channel] late subagent_{} task_id={} request_id={}",
+            kind.0,
+            kind.1,
             self.request_id
         );
-        let context = super::super::event_context(
-            self.client_id.clone(),
-            self.thread_id.clone(),
-            self.request_id.clone(),
-        );
-        super::super::event_bus_channel::publish_web_channel_event_in(
+        let Some(output) = super::super::progress_map::subagent_event(event, 0, None) else {
+            return;
+        };
+        // The turn's own projection is closed, so the event gets a projection
+        // turn of its own: the module still owns the wire form, including the
+        // child's output and spend a detached completion carries. Its restarted
+        // sequence would fall below the turn's, so it is published without one.
+        let surface = super::super::surface::Surface::new(
             ctx,
-            tinychannels_bus::web::WebChannelEvent::SubagentFailed {
-                context,
-                message: Some(error),
-                tool_name: Some(agent_id),
-                skill_id: Some(task_id),
-                success: Some(false),
-                subagent: None,
-                round: None,
+            super::super::surface::TurnIds {
+                client_id: self.client_id.clone(),
+                thread_id: self.thread_id.clone(),
+                request_id: self.request_id.clone(),
             },
-        );
+            self.config.clone(),
+        )
+        .await
+        .unsequenced();
+        surface.output(output).await;
+        surface.close().await;
     }
 }
 

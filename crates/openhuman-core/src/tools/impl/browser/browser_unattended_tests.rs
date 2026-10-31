@@ -143,7 +143,11 @@ async fn an_unlisted_or_untrusted_task_step_still_needs_the_gate() {
     for origin in [external_channel(), approval_workflow()] {
         let outcome =
             approve_task_action(&pending(), &listing(&["task_step"]), Some(&origin)).await;
-        assert_ne!(outcome.ok(), Some(TaskApprovalOutcome::Approved), "{origin:?}");
+        assert_ne!(
+            outcome.ok(),
+            Some(TaskApprovalOutcome::Approved),
+            "{origin:?}"
+        );
     }
 }
 

@@ -214,6 +214,10 @@ pub struct Config {
     #[serde(default)]
     pub autonomy: AutonomyConfig,
 
+    /// Durable security audit settings (`[audit]`).
+    #[serde(default)]
+    pub audit: AuditConfig,
+
     /// Operator tool rules (`[tool_rules]`): allow / deny / hide / approval
     /// patterns over tool names, families and tags, applied to every agent's
     /// catalogue, `tool_search` and calls. See `tinytools::ToolRules` and
@@ -290,7 +294,7 @@ pub struct Config {
     /// the agent context middleware configuration.
     #[serde(default)]
     #[schemars(with = "super::super::context::ContextConfigSchema")]
-    pub context: ContextConfig,
+    pub context: ContextSettings,
 
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
