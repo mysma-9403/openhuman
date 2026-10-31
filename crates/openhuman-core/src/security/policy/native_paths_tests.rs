@@ -1,3 +1,4 @@
+use super::types::{ACCOUNT_CONFIG_FILE, ACCOUNT_INTERNAL_FILES};
 use super::*;
 
 /// The reserved paths the host hands TinySecurity, as plain path buffers.
