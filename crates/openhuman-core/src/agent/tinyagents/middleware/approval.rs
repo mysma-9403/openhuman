@@ -134,6 +134,16 @@ impl ApprovalSecurityMiddleware {
         match outcome {
             GateOutcome::Deny { reason } => ApprovalResolution::Deny { reason },
             GateOutcome::Allow => ApprovalResolution::Allow { ticket: request_id },
+            GateOutcome::Steer { instructions } => {
+                tracing::info!(
+                    tool = %call.name,
+                    instructions_len = instructions.len(),
+                    "[tinyagents::mw] approval gate steered tool call by operator"
+                );
+                ApprovalResolution::Deny {
+                    reason: GateOutcome::steer_message(&instructions),
+                }
+            }
         }
     }
 
@@ -228,10 +238,9 @@ impl ApprovalResolver<crate::agent::tinyagents::host::OpenHumanRunContext>
                     instructions_len = instructions.len(),
                     "[tinyagents::mw] approval gate steered tool call by operator"
                 );
-                let reason = format!(
-                    "[SYSTEM: Tool execution paused by operator. New directive from operator: {instructions}. Do not re-execute the original tool call with the previous parameters. Update your plan and proceed according to the operator's instructions.]"
-                );
-                ApprovalResolution::Deny { reason }
+                ApprovalResolution::Deny {
+                    reason: GateOutcome::steer_message(&instructions),
+                }
             }
             GateOutcome::Deny { reason } => {
                 tracing::warn!(

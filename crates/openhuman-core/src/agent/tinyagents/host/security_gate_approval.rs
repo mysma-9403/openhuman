@@ -37,9 +37,7 @@ pub(super) fn decision_for_outcome(tool_name: &str, outcome: GateOutcome) -> Gat
                 instructions_len = instructions.len(),
                 "[tinyagents::host::security] approval gate steered tool call by operator"
             );
-            GateDecision::deny(format!(
-                "[SYSTEM: Tool execution paused by operator. New directive from operator: {instructions}. Do not re-execute the original tool call with the previous parameters. Update your plan and proceed according to the operator's instructions.]"
-            ))
+            GateDecision::deny(GateOutcome::steer_message(&instructions))
         }
         // An expired prompt is not a refusal: nobody answered, and the gate has
         // now denied the request. Saying so lets the agent (and, for a

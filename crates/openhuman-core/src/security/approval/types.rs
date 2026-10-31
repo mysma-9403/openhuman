@@ -263,6 +263,23 @@ impl GateOutcome {
     pub fn is_steer(&self) -> bool {
         matches!(self, Self::Steer { .. })
     }
+
+    /// How a steered tool call is reported to the model.
+    ///
+    /// The single home for this wording: a steer replaces the tool result, so
+    /// the model has to be told both that the call did not run and what to do
+    /// instead — otherwise it retries the same call and parks again.
+    ///
+    /// A browser *task* step that was steered mid-run words it differently
+    /// (`tools/impl/browser/browser.rs`): the task itself kept going, so
+    /// "do not re-execute the original call" would not apply there.
+    pub fn steer_message(instructions: &str) -> String {
+        format!(
+            "[SYSTEM: Tool execution paused by operator. New directive from operator: \
+             {instructions}. Do not re-execute the original tool call with the previous \
+             parameters. Update your plan and proceed according to the operator's instructions.]"
+        )
+    }
 }
 
 /// What a human's answer resolves a parked call with.
