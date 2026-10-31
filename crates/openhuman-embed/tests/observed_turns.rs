@@ -107,7 +107,12 @@ fn analyst(id: &str, provider: &MockServer, reads: Arc<AtomicUsize>) -> AgentSpe
                 .bare_prompt("You must call read_file on documents/sample.txt before analyzing the document. Answer with the analysis JSON.")
                 .tools(ToolScopeSpec::HostOnly),
         )
-        .tools(move |_| HostTurnTools::advertised(vec![Box::new(ReadFile(reads.clone()))]))
+        .tools(move |_| {
+            let reads = reads.clone();
+            Box::pin(async move {
+                HostTurnTools::advertised(vec![Box::new(ReadFile(reads))])
+            })
+        })
 }
 
 #[derive(Default)]
@@ -168,6 +173,7 @@ fn model_and_tool_observations_capture_payloads_only_with_consent() {
             assert!(terminal[0].1.is_some());
             assert!(events.iter().all(|event| match event {
                 TurnObservation::Model {run_id,..} => Some(run_id) == terminal[0].1.as_ref(),
+                TurnObservation::ModelDispatch {run_id,..} => Some(run_id) == terminal[0].1.as_ref(),
                 TurnObservation::Tool {run_id,..} => run_id == &terminal[0].1,
             }));
             assert_eq!(models[1].0.as_deref(),Some("actual-model"));

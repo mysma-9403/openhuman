@@ -58,6 +58,15 @@ test("private workflow pins checkout, image and signed Tinymold without artifact
   assert.match(privateJob, /allow-unsafe-pr-checkout: true/);
   assert.match(privateJob, /tinyhumansai\/tinymold@[a-f0-9]{40}/);
   assert.match(privateJob, /install: none/);
+  // The per-compile log is what ranks misses and uncacheable compiles.
+  assert.match(
+    privateJob,
+    /TINYMOLD_LOG=\$RUNNER_TEMP\/tinymold\.log.*GITHUB_ENV/s,
+  );
+  assert.ok(
+    privateJob.indexOf("TINYMOLD_LOG=$RUNNER_TEMP/tinymold.log") <
+      privateJob.indexOf("- name: Setup Tinymold"),
+  );
   assert.match(privateJob, /backend: remote/);
   assert.match(privateJob, /remote-signing-key:/);
   assert.match(privateJob, /remote-trusted-keys:/);
@@ -129,13 +138,22 @@ test("membership gate routes mixed identities, outsiders and bots away from EX63
       '#!/usr/bin/env bash\nurl="${!#}"\ncase "$url" in */members/alice|*/members/bob) echo 204;; *) echo 404;; esac\n',
       { mode: 0o755 },
     );
-    for (const [author, actor, association, token, expected] of [
+    for (const [author, actor, association, token, expected, event, draft] of [
       ["alice", "bob", "MEMBER", "fixture", true],
+      // Draft PRs stay off the EX63, even an org member's.
+      ["alice", "bob", "MEMBER", "fixture", false, undefined, "true"],
+      ["alice", "alice", "MEMBER", "", false, undefined, "true"],
+      ["alice", "bob", "MEMBER", "fixture", true, undefined, "false"],
       ["alice", "outsider", "MEMBER", "fixture", false],
       ["outsider", "alice", "NONE", "fixture", false],
       ["dependabot[bot]", "dependabot[bot]", "NONE", "fixture", false],
       ["alice", "alice", "MEMBER", "", true],
       ["alice", "bob", "MEMBER", "", false],
+      // A manual dispatch has no PR author: only the dispatcher is checked,
+      // and only when the membership token can check it.
+      ["", "alice", "", "fixture", true, "workflow_dispatch"],
+      ["", "outsider", "", "fixture", false, "workflow_dispatch"],
+      ["", "alice", "", "", false, "workflow_dispatch"],
     ]) {
       const output = join(dir, "output");
       writeFileSync(output, "");
@@ -150,6 +168,8 @@ test("membership gate routes mixed identities, outsiders and bots away from EX63
           ASSOCIATION: association,
           MEMBERSHIP_TOKEN: token,
           GITHUB_OUTPUT: output,
+          GITHUB_EVENT_NAME: event ?? "pull_request_target",
+          DRAFT: draft ?? "",
         },
       });
       assert.equal(result.status, 0, result.stderr);

@@ -264,7 +264,9 @@ pub fn normalize_session_backend(raw: &str) -> Result<String, String> {
     Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
-fn check_session_backend(config: &Config, profile: Option<&AuthProfile>) -> Result<(), String> {
+/// Purely verifies that a stored session belongs to the selected config's
+/// control-plane endpoint. It does not publish expiry events or mutate auth state.
+pub fn check_session_backend(config: &Config, profile: Option<&AuthProfile>) -> Result<(), String> {
     let Some(profile) = profile else {
         return Ok(());
     };
@@ -418,8 +420,8 @@ impl BackendCredential {
 pub const LOCAL_SESSION_BACKEND_UNAVAILABLE: &str =
     "BACKEND_UNAVAILABLE: hosted account data is unavailable for the offline local session";
 
-/// Error [`OpenHumanBackendModel::resolve_bearer`](crate::inference::provider::OpenHumanBackendModel)
-/// returns for the offline local session. The local credential authenticates
+/// Error returned by the TinyHumans managed-inference host resolver for the
+/// offline local session. The local credential authenticates
 /// no TinyHumans account, so managed inference has nothing to bill or route;
 /// sending the token anyway earned a backend `401` that read to the user as an
 /// expired session (#6932). Distinct from
@@ -559,6 +561,14 @@ pub fn load_app_session_profile(config: &Config) -> Result<Option<AuthProfile>, 
     auth_service
         .get_profile(APP_SESSION_PROVIDER, None)
         .map_err(|e| e.to_string())
+}
+
+/// Reads the selected app-session profile for doctor checks without opening
+/// the ordinary mutable auth-profile store.
+pub fn load_app_session_profile_read_only(
+    config: &Config,
+) -> Result<Option<AuthProfile>, super::profiles::ReadOnlyAuthProfileError> {
+    AuthService::get_profile_read_only(config, APP_SESSION_PROVIDER, None)
 }
 
 pub fn session_state_from_profile(profile: Option<&AuthProfile>) -> AuthStateResponse {

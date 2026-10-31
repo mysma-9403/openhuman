@@ -95,9 +95,9 @@ async fn a_wrapped_read_is_pointed_at_the_materialised_file() {
 /// from this tenant's store, so its key is never served or materialised.
 #[tokio::test]
 async fn artifacts_are_tenant_scoped() {
-    use tinystoragedrivers::{MemoryStorage, Scope, StorageBackend};
+    use crate::storage::{test_support::memory_backend, Scope};
     let tmp = tempfile::tempdir().unwrap();
-    let backend = MemoryStorage::new();
+    let backend = memory_backend();
     let scoped = |name: &str| {
         let scope = Scope::new(name).unwrap();
         Arc::clone(backend.for_scope(&scope).unwrap().blobs())

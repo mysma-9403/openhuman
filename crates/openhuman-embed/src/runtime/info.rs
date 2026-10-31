@@ -89,13 +89,13 @@ pub struct StorageInfo {
     pub configured: bool,
 }
 impl StorageInfo {
-    pub(super) fn describe(source: Option<&super::StorageSource>, config: &Config) -> Self {
+    pub(super) fn describe(
+        source: Option<&super::StorageSource>,
+        config: &Config,
+        retained_driver: Option<&str>,
+    ) -> Self {
         match source {
-            Some(super::StorageSource::Backend(backend)) => Self {
-                source: "backend".into(),
-                driver: Some(backend.driver().into()),
-                configured: true,
-            },
+            Some(super::StorageSource::Backend(_)) => Self::backend_driver(retained_driver),
             Some(super::StorageSource::Url(url)) => Self::url("explicit", url),
             None => match openhuman_core::storage::explicit_url(config) {
                 Some(url) => Self::url("configuration", &url),
@@ -107,7 +107,7 @@ impl StorageInfo {
             },
         }
     }
-    fn url(source: &str, url: &str) -> Self {
+    pub(super) fn url(source: &str, url: &str) -> Self {
         let driver = openhuman_core::storage::StorageUrl::parse(url)
             .ok()
             .map(|u| u.driver().to_string());
@@ -116,6 +116,27 @@ impl StorageInfo {
             driver,
             configured: true,
         }
+    }
+
+    pub(super) fn backend(installed_url: Option<&str>) -> Self {
+        match installed_url {
+            Some(url) => Self::url("backend", url),
+            None => Self::backend_driver(None),
+        }
+    }
+
+    fn backend_driver(driver: Option<&str>) -> Self {
+        Self {
+            source: "backend".into(),
+            driver: driver.map(str::to_owned),
+            configured: true,
+        }
+    }
+
+    pub(super) fn recover_sessions_on_open(&self) -> bool {
+        self.driver
+            .as_deref()
+            .is_some_and(|driver| !openhuman_core::storage::driver_is_shared(driver))
     }
 }
 
@@ -186,7 +207,11 @@ impl RuntimeBuilder {
             self.selection.as_ref(),
         );
         info.configuration_resolved = self.config_source == super::ConfigSource::Resolved;
-        info.storage = StorageInfo::describe(self.seams.storage.as_ref(), &config);
+        info.storage = StorageInfo::describe(
+            self.seams.storage.as_ref(),
+            &config,
+            self.seams.storage_driver.as_deref(),
+        );
         // `build` gives a stateless workspace with no storage source an
         // in-memory backend; report what it will install.
         if !info.storage.configured && matches!(self.workspace, crate::Workspace::Stateless) {
@@ -294,7 +319,7 @@ fn make_info(
             has_tool_rules: config.tool_rules.default != tinytools::DefaultEffect::Allow
                 || !config.tool_rules.rules.is_empty(),
         },
-        storage: StorageInfo::describe(None, config),
+        storage: StorageInfo::describe(None, config, None),
         modules: selection.map(|s| s.modules.clone()).unwrap_or_default(),
         weight: selection
             .map(|s| s.weight)

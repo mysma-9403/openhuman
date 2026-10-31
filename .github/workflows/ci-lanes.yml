@@ -27,7 +27,14 @@ on:
         required: true
       pr-number:
         type: number
-        required: true
+        required: false
+        default: 0
+      # A trusted branch ref to check out instead of the PR merge commit: the
+      # manual `workflow_dispatch` test path of ci-fast.yml. Empty for PRs.
+      ref:
+        type: string
+        required: false
+        default: ""
       base-ref:
         type: string
         required: true
@@ -56,7 +63,7 @@ jobs:
       - name: Checkout PR merge commit
         uses: tinyhumansai/.github/actions/checkout@35fa65b76c80d48779592b111837e55d9d0860d4
         with:
-          ref: refs/pull/${{ inputs.pr-number }}/merge
+          ref: ${{ inputs.ref != '' && inputs.ref || format('refs/pull/{0}/merge', inputs.pr-number) }}
           fetch-depth: 0
           submodules: recursive
           # Pin ancestry checks also inspect compile-only vendor repositories.
@@ -69,13 +76,24 @@ jobs:
       - name: Verify private runner contract
         run: bash scripts/ci/self-hosted/verify-runner.sh
 
+      - name: Set Tinymold diagnostic log path
+        # RUNNER_TEMP is available to steps, but not to the job-level env block.
+        run: echo "TINYMOLD_LOG=$RUNNER_TEMP/tinymold.log" >> "$GITHUB_ENV"
+
       - name: Setup Tinymold
         id: tinymold
-        uses: tinyhumansai/tinymold@b7c4c26f184acdbf7133487b158062fc610d2f28
+        uses: tinyhumansai/tinymold@c4a7ea77ce4a95bf0a65fb403de310bd624197d4
         with:
           install: none
           backend: remote
           store: /scratch/tinymold
+          # Instrumented test executables link the whole core (~0.5-1 GB each,
+          # ~90 GB per run). Stored, they share inodes with the target, so
+          # neither copy can be freed: that filled the 160 GB scratch disk
+          # (runs 39315551099, 39331958941, 39340683561). Scratch is 320 GB
+          # now, so they are stored and the core test harness is not
+          # recompiled on every run.
+          max-executable-size: 2G
           remote-url: ${{ env.TINYMOLD_REMOTE_URL }}
           remote-auth: ${{ env.TINYMOLD_REMOTE_AUTH }}
           remote-signing-key: ${{ env.TINYMOLD_REMOTE_SIGNING_KEY }}
@@ -133,10 +151,6 @@ jobs:
         if: ${{ !cancelled() && contains(fromJSON(steps.lanes.outputs.lanes || '[]'), 'tauri') }}
         run: node scripts/ci/self-hosted/lanes.mjs --wait tauri
 
-      - name: "Lane: storage drivers (sqlite + file)"
-        if: ${{ !cancelled() && contains(fromJSON(steps.lanes.outputs.lanes || '[]'), 'storage-drivers') }}
-        run: node scripts/ci/self-hosted/lanes.mjs --wait storage-drivers
-
       - name: "Lane: install.ps1 (Pester)"
         if: ${{ !cancelled() && contains(fromJSON(steps.lanes.outputs.lanes || '[]'), 'pester') }}
         run: node scripts/ci/self-hosted/lanes.mjs --wait pester
@@ -173,13 +187,16 @@ jobs:
         continue-on-error: true
         # A measured cache push took 8m36s; keep headroom and a finite bound.
         timeout-minutes: 15
-        uses: tinyhumansai/tinymold/save@b7c4c26f184acdbf7133487b158062fc610d2f28
+        uses: tinyhumansai/tinymold/save@c4a7ea77ce4a95bf0a65fb403de310bd624197d4
 
       - name: Record cache statistics and save time
         if: ${{ always() && steps.tinymold.outcome == 'success' }}
         run: |
           mkdir -p ci-out
           tinymold stats > ci-out/tinymold-stats.txt || true
+          # One line per compile (outcome, crate, time, why not stored), for
+          # ranking the misses after the run.
+          [ -f "${TINYMOLD_LOG:-}" ] && cp "${TINYMOLD_LOG}" ci-out/tinymold.log || true
           if [ -f ci-out/cache-save-start ]; then
             echo "$(( $(date +%s) - $(cat ci-out/cache-save-start) ))" > ci-out/cache-save-seconds.txt
           fi
@@ -390,10 +407,6 @@ jobs:
       - name: "Lane: Tauri clippy + coverage"
         if: ${{ !cancelled() && contains(fromJSON(steps.lanes.outputs.lanes || '[]'), 'tauri') }}
         run: node scripts/ci/self-hosted/lanes.mjs --wait tauri
-
-      - name: "Lane: storage drivers (sqlite + file)"
-        if: ${{ !cancelled() && contains(fromJSON(steps.lanes.outputs.lanes || '[]'), 'storage-drivers') }}
-        run: node scripts/ci/self-hosted/lanes.mjs --wait storage-drivers
 
       - name: "Lane: install.ps1 (Pester)"
         if: ${{ !cancelled() && contains(fromJSON(steps.lanes.outputs.lanes || '[]'), 'pester') }}

@@ -6,9 +6,12 @@ fn ctx(dir: &str) -> Arc<CoreContext> {
         host_kind: HostKind::Cli,
         workspace_binding: RwLock::new(Arc::new(RwLock::new(WorkspaceBinding {
             workspace_dir: Some(PathBuf::from(dir)),
+            config_path: None,
         }))),
         domains: crate::core::runtime::DomainSet::full(),
         tool_groups: Default::default(),
+        autonomy_tier_source: AutonomyTierSource::LiveConfig,
+        autonomy_tier_ceiling: None,
         components: Default::default(),
         embedder_config: None,
         latest_embedder_config: None,
@@ -18,6 +21,7 @@ fn ctx(dir: &str) -> Arc<CoreContext> {
         channel_thread: None,
         session_agent: None,
         profile: None,
+        profile_admission: Arc::new(()),
         agent: Default::default(),
         bare: false,
     })
@@ -209,6 +213,44 @@ fn derive_with_defaults_to_visible_user_skill_roots() {
     assert!(ctx("/tmp/ws").derive_with(overlay).user_skill_roots());
 }
 
+#[test]
+fn profile_admission_lineage_is_inherited_only_within_the_same_profile() {
+    let root = ctx("/tmp/profile-root");
+    let profile = root.derive_with(
+        ContextOverlay::new(
+            crate::config::Config::default(),
+            crate::core::runtime::DomainSet::full(),
+            Default::default(),
+        )
+        .profile("profile-a"),
+    );
+    let derived = profile.derive_with(ContextOverlay::new(
+        crate::config::Config::default(),
+        crate::core::runtime::DomainSet::full(),
+        Default::default(),
+    ));
+    let same_profile = profile.derive_with(
+        ContextOverlay::new(
+            crate::config::Config::default(),
+            crate::core::runtime::DomainSet::full(),
+            Default::default(),
+        )
+        .profile("profile-a"),
+    );
+    let switched = profile.derive_with(
+        ContextOverlay::new(
+            crate::config::Config::default(),
+            crate::core::runtime::DomainSet::full(),
+            Default::default(),
+        )
+        .profile("profile-b"),
+    );
+
+    assert!(profile.shares_profile_admission(&derived));
+    assert!(profile.shares_profile_admission(&same_profile));
+    assert!(!profile.shares_profile_admission(&switched));
+}
+
 #[tokio::test]
 async fn two_derived_contexts_serve_their_own_config_to_the_dispatch() {
     // The read path `load_config_with_timeout` uses. Two agents scoped one
@@ -367,9 +409,12 @@ fn degraded_context_rejects_workspace_bound_stores() {
         host_kind: HostKind::Cli,
         workspace_binding: RwLock::new(Arc::new(RwLock::new(WorkspaceBinding {
             workspace_dir: None,
+            config_path: None,
         }))),
         domains: crate::core::runtime::DomainSet::full(),
         tool_groups: Default::default(),
+        autonomy_tier_source: AutonomyTierSource::LiveConfig,
+        autonomy_tier_ceiling: None,
         components: Default::default(),
         embedder_config: None,
         latest_embedder_config: None,
@@ -379,6 +424,7 @@ fn degraded_context_rejects_workspace_bound_stores() {
         channel_thread: None,
         session_agent: None,
         profile: None,
+        profile_admission: Arc::new(()),
         agent: Default::default(),
         bare: false,
     };
@@ -399,3 +445,14 @@ fn degraded_context_rejects_workspace_bound_stores() {
 
 #[path = "context_turn_origin_tests.rs"]
 mod turn_origin_tests;
+#[test]
+fn inspection_context_uses_captured_autonomy_tier_without_a_ceiling() {
+    let context = CoreContext::for_inspection(crate::config::Config::default());
+
+    assert_eq!(
+        context.autonomy_tier_source(),
+        AutonomyTierSource::Captured,
+        "inspection runs against its explicitly supplied config snapshot"
+    );
+    assert_eq!(context.autonomy_tier_ceiling(), None);
+}

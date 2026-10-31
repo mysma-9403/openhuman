@@ -513,11 +513,11 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// [`MemoryError::InvalidRequest`](crate::memory::MemoryError::InvalidRequest)
+    /// [`tinymemory_api::Error::InvalidRequest`]
     /// when `root` is not a valid layout root, or is the store root itself.
-    pub fn memory(&self, root: &str) -> crate::memory::MemoryResult<crate::memory::Memory> {
+    pub fn memory(&self, root: &str) -> tinymemory_api::Result<crate::memory::Memory> {
         if let Some(error) = &self.config_unavailable {
-            return Err(crate::memory::MemoryError::InvalidRequest(format!(
+            return Err(tinymemory_api::Error::InvalidRequest(format!(
                 "the runtime's config failed to load ({error})"
             )));
         }
@@ -563,8 +563,8 @@ impl Runtime {
     /// runtime — both exposed via [`Runtime::core`] — must see this reflect
     /// that change immediately. A cached bool would otherwise report `false`
     /// right after a key was stored, or `true` right after it was cleared.
-    pub fn has_api_key(&self) -> bool {
-        openhuman_core::security::credentials::api_key::has_api_key(&self.base_config)
+    pub async fn has_api_key(&self) -> bool {
+        openhuman_core::credentials::api_key::has_api_key(&self.base_config).await
     }
 
     pub(crate) fn core_ref(&self) -> &Core {
@@ -668,7 +668,6 @@ impl std::fmt::Debug for Runtime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Resolved paths and a provider bearer are both in here.
         f.debug_struct("Runtime")
-            .field("has_api_key", &self.has_api_key())
             .field("domains", &self.domains)
             .finish_non_exhaustive()
     }

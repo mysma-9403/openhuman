@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::transport::BackendTransport;
+use openhuman_embed::__host::core::slots::Extensions;
 use openhuman_embed::seams::DomainGroup;
 use openhuman_embed::BuilderSummary;
 
@@ -16,7 +17,10 @@ fn connect_wires_transport_hosted_controllers_and_ranker() {
     let _registry = crate::registry_test_lock();
 
     let summary = connected(RuntimeBuilder::new());
-    assert_eq!(summary.controller_extensions, vec![DomainGroup::Hosted]);
+    assert_eq!(
+        summary.controller_extensions,
+        vec![DomainGroup::Inference, DomainGroup::Hosted]
+    );
     #[cfg(feature = "jev")]
     assert_eq!(
         summary.tool_ranker.as_deref(),
@@ -55,7 +59,7 @@ fn hosted_controllers_and_jev_can_be_turned_off() {
             .hosted_controllers(false)
             .jev_ranker(false),
     );
-    assert!(summary.controller_extensions.is_empty());
+    assert_eq!(summary.controller_extensions, vec![DomainGroup::Inference]);
     assert!(summary.tool_ranker.is_none());
 }
 
@@ -68,7 +72,7 @@ fn product_identity_is_set_on_connect() {
     let builder = RuntimeBuilder::new().product_identity(identity.clone());
     // Not applied until the builder connects.
     assert_ne!(crate::product_identity(), identity);
-    let wired = wiring(&builder.install).expect("wiring");
+    let wired = wiring(&builder.install, &Extensions::new()).expect("wiring");
     assert_eq!(crate::product_identity(), identity);
     assert_eq!(wired.transport.product_identity(), "opencompany");
 
@@ -78,6 +82,7 @@ fn product_identity_is_set_on_connect() {
             .hosted_controllers(false)
             .tool_ranker(false)
             .product_identity(crate::ProductIdentity::default()),
+        &Extensions::new(),
     )
     .expect("restore");
     assert_eq!(
@@ -146,7 +151,9 @@ fn knobs_and_seams_forward_unchanged() {
             .listen("127.0.0.1", 7791)
             .action_dir("/srv/work")
             .workspace_dir("/srv/state")
-            .session_store(Arc::new(openhuman_embed::InMemorySessionStores::new()))
+            .session_store(Arc::new(
+                tinyagents_session::port::InMemorySessionStores::new(),
+            ))
             .tool_ranker(Arc::new(Ranker)),
     );
     assert!(summary.fixed_token);

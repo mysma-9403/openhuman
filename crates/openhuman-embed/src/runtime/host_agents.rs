@@ -78,7 +78,7 @@ impl AgentInner {
             config.default_model = Some(model.to_string());
         }
         if let Some(route) = self.provider.route() {
-            if !crate::turn::is_safe_endpoint_for_bearer(&route.base_url) {
+            if !crate::security::is_safe_endpoint_for_bearer(&route.base_url) {
                 log::warn!(
                     "[embed][agent] id={} has an insecure route; not offered to core drivers",
                     self.id
@@ -89,8 +89,16 @@ impl AgentInner {
                 Some(route.base_url.clone()),
                 Some(route.api_key.clone()),
             )
-            .map(|scoped| scoped.with_headers(route.headers.clone()))
-            {
+            .map(|scoped| {
+                scoped
+                    .with_headers(route.headers.clone())
+                    .with_provider_options(route.provider_options.clone())
+                    .with_reasoning_effort(
+                        route
+                            .reasoning_effort
+                            .map(|effort| effort.as_str().to_string()),
+                    )
+            }) {
                 openhuman_core::config::schema::ephemeral_route::apply(&mut config, route);
             }
         }

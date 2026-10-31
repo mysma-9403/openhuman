@@ -27,13 +27,16 @@
 pub mod agents;
 pub mod blob_sweep;
 pub mod boot;
+mod claim_bound;
 pub mod config;
 pub mod documents;
 pub mod fence;
 pub mod fenced_backend;
+mod fenced_ports;
 mod host_importers;
 pub mod import;
 pub mod import_state;
+mod inspection;
 pub mod journal_maintenance;
 pub mod layout;
 pub mod lease;
@@ -43,16 +46,23 @@ pub mod local;
 pub mod rebind;
 pub mod schema;
 pub mod schema_support;
+pub(crate) use inspection::probe_directory_writable;
 pub mod scope;
+#[cfg(feature = "legacy-import")]
 pub mod scope_move;
 pub mod secrets;
 pub mod sessions;
 pub mod state_kv;
+#[cfg(test)]
+pub mod test_support;
 
-pub use scope::{scope_for_agent, scope_for_module, scope_for_profile, tenant_scope};
+pub use scope::{
+    scope_for_agent, scope_for_module, scope_for_profile, tenant_scope, ParsedScope, Principal,
+    Scope, Tenant,
+};
 
 use std::future::Future;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
+use std::sync::{mpsc, Arc, LazyLock, Mutex, OnceLock, RwLock};
 
 /// SQLite bindings re-exported by the storage driver crate, for the two
 /// consumers that open a SQLite file that is not a storage backend: the
@@ -65,11 +75,125 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 /// tinystoragedrivers owns the one copy; the re-export goes when the importers
 /// do (the one-time legacy import window closes). Re-checked for #7768: both
 /// consumers are still present, so it stays.
-pub use tinystoragedrivers::sqlite::rusqlite;
 pub use tinystoragedrivers::{
-    Blocking, CollectionSpec, DocumentStore, DocumentStoreExt, MemoryStorage, Precondition, Scope,
-    ScopedStorage, StorageBackend, StorageConfig as StorageUrl, StorageError,
+    CollectionSpec, Precondition, StorageBackend, StorageConfig as StorageUrl, StorageError,
 };
+pub use tinystoragedrivers_api::{DocumentStore, Storage};
+
+/// Read-only legacy importers use SQLite to consume historical files. The
+/// process storage API remains the `StorageBackend` facade above.
+#[cfg(feature = "legacy-import")]
+pub use tinystoragedrivers_connect::sqlite::rusqlite;
+
+/// Typed conveniences for document consumers, including a bounded cursor
+/// walk for callers that need every matching record.
+#[async_trait::async_trait]
+pub trait DocumentStoreExt: tinystoragedrivers_api::DocumentStoreExt {
+    /// Read every record matching `query`, following the driver's cursor until
+    /// the final page. Each request is bounded to 256 documents.
+    async fn query_all(
+        &self,
+        collection: &str,
+        query: &tinystoragedrivers_types::Query,
+    ) -> Result<Vec<tinystoragedrivers_types::Versioned<serde_json::Value>>, StorageError> {
+        let mut page_query = query.clone();
+        page_query.limit = Some(256);
+        page_query.cursor = None;
+        let mut records = Vec::new();
+        loop {
+            let page = self.query(collection, &page_query).await?;
+            records.extend(page.items);
+            let Some(cursor) = page.next else {
+                break;
+            };
+            page_query.cursor = Some(cursor);
+        }
+        Ok(records)
+    }
+}
+
+impl<T: tinystoragedrivers_api::DocumentStoreExt + ?Sized> DocumentStoreExt for T {}
+
+type StorageTask = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send>;
+
+/// Dedicated runtime for synchronous domain surfaces that bridge to the
+/// asynchronous storage ports. Keeping it on its own thread also permits a
+/// synchronous facade to be called while the caller is on a current-thread
+/// Tokio runtime.
+struct Blocking {
+    tasks: mpsc::Sender<StorageTask>,
+}
+
+thread_local! {
+    static ON_STORAGE_RUNTIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl Blocking {
+    fn new() -> anyhow::Result<Self> {
+        let (tasks, receiver) = mpsc::channel::<StorageTask>();
+        let (started, ready) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("openhuman-storage".to_owned())
+            .spawn(move || {
+                // The bridge thread can be idle in `receiver.recv()` between
+                // sync calls. A current-thread runtime would stop polling its
+                // background tasks during that interval, so use a small
+                // multithread runtime dedicated to storage work.
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .on_thread_start(|| {
+                        // Futures spawned from a bridge request may be
+                        // polled on runtime workers rather than the owner
+                        // thread, and must obey the same re-entrancy guard.
+                        ON_STORAGE_RUNTIME.with(|active| active.set(true));
+                    })
+                    .build();
+                match runtime {
+                    Ok(runtime) => {
+                        if started.send(Ok(())).is_err() {
+                            return;
+                        }
+                        while let Ok(task) = receiver.recv() {
+                            task(&runtime);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = started.send(Err(error.to_string()));
+                    }
+                }
+            })?;
+        ready
+            .recv()
+            .map_err(|error| anyhow::anyhow!("storage runtime failed to start: {error}"))?
+            .map_err(anyhow::Error::msg)?;
+        Ok(Self { tasks })
+    }
+
+    fn run<T, F>(&self, future: F) -> Result<T, StorageError>
+    where
+        F: Future<Output = Result<T, StorageError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        if ON_STORAGE_RUNTIME.with(std::cell::Cell::get) {
+            return Err(StorageError::backend(
+                "synchronous storage bridge cannot be re-entered from its own runtime",
+            ));
+        }
+        let (reply, result) = mpsc::sync_channel(1);
+        self.tasks
+            .send(Box::new(move |runtime| {
+                ON_STORAGE_RUNTIME.with(|active| active.set(true));
+                let outcome = runtime.block_on(future);
+                ON_STORAGE_RUNTIME.with(|active| active.set(false));
+                let _ = reply.send(outcome);
+            }))
+            .map_err(|error| StorageError::backend(format!("storage bridge stopped: {error}")))?;
+        result
+            .recv()
+            .map_err(|error| StorageError::backend(format!("storage bridge stopped: {error}")))?
+    }
+}
 
 use crate::config::schema::storage::redact_url;
 use crate::config::Config;
@@ -109,6 +233,51 @@ impl Slot {
 
 static BACKEND: LazyLock<Slot> = LazyLock::new(Slot::default);
 
+/// The libtest thread (named after its test) that installed the slot, under
+/// `cfg(test)`. Unit tests share one process and run in parallel; without this,
+/// a backend one test installs becomes every concurrent test's storage
+/// ([`local::backend_for`] prefers the slot), and their rows mix and vanish
+/// when the installer restores it (MAIN-57).
+#[cfg(test)]
+static SLOT_OWNER: Mutex<Option<String>> = Mutex::new(None);
+
+#[cfg(test)]
+fn set_slot_owner(owner: Option<String>) {
+    *SLOT_OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = owner;
+}
+
+/// Whether the installed slot belongs to the calling test. A slot a test
+/// installed is hidden from the other tests' threads; one installed off a test
+/// thread (a runtime worker, the storage bridge) stays visible to all, as in
+/// production.
+#[cfg(test)]
+fn slot_visible_here() -> bool {
+    let owner = SLOT_OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(owner) = owner.filter(|owner| is_test_thread(owner)) else {
+        return true;
+    };
+    match std::thread::current().name() {
+        Some(name) if is_test_thread(name) => name == owner,
+        _ => true,
+    }
+}
+
+/// libtest names each test's thread after its path (`module::tests::name`).
+///
+/// Assumes no other thread is named with `::`: runtime workers, the storage
+/// bridge and the module runtime are not. A test that spawns a helper thread
+/// with such a name makes it a "different test", so the helper stops seeing
+/// the slot its installer test set, and that installer test fails.
+#[cfg(test)]
+fn is_test_thread(name: &str) -> bool {
+    name.contains("::")
+}
+
 /// The URL the installed backend was opened from, when the host installed it
 /// by URL ([`install_for_url`]). [`rebind`] compares against it; a backend
 /// installed without one (a test's, an embedder's own) is never rebound.
@@ -123,6 +292,10 @@ fn set_installed_url(url: Option<String>) {
 /// The URL the installed backend was opened from, if the host installed it by
 /// URL.
 pub fn installed_url() -> Option<String> {
+    #[cfg(test)]
+    if !slot_visible_here() {
+        return None;
+    }
     INSTALLED_URL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -174,22 +347,61 @@ pub async fn open(url: &str) -> Result<Arc<dyn StorageBackend>, StorageError> {
     );
     // Every opened backend checks the process's lease fences on write; with
     // no fence registered (every single-user host) that is a pass-through.
-    let backend = tinystoragedrivers::open(&parsed).await?;
-    // Schema, scope move and migrations run on the raw backend, before any
-    // lease fence exists to refuse them.
-    let report = boot::prepare_and_migrate(&backend).await?;
-    if !report.failures.is_empty() {
-        tracing::warn!(
-            target: "openhuman::storage",
-            failures = report.failures.len(),
-            "[storage] opened with unfinished migrations; they retry at the next boot"
-        );
-    }
+    let backend =
+        connect_on_storage_runtime(move || async move { tinystoragedrivers::open(&parsed).await })
+            .await??;
+    boot::prepare_and_migrate(&backend).await?;
     Ok(fenced_backend::wrap(backend))
+}
+
+/// The process's storage runtime: two worker threads that live as long as the
+/// process. A driver connected here starts its connection-time background tasks
+/// (MongoDB's connection pool and monitors) here, off the host runtime, so
+/// callers parked on [`block_on`] cannot starve them. Cleanup tasks registered
+/// by later object drops can run on the internal [`block_on`] runtime instead.
+fn storage_runtime() -> Result<&'static tokio::runtime::Runtime, StorageError> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("openhuman-storage")
+                .enable_all()
+                .build()
+                .map_err(|error| format!("cannot build the storage runtime: {error}"))
+        })
+        .as_ref()
+        .map_err(|error| StorageError::backend(error.clone()))
+}
+
+/// Runs `connect` on the storage runtime and returns what it built.
+///
+/// # Errors
+///
+/// When the storage runtime cannot start or `connect` panics.
+pub(crate) async fn connect_on_storage_runtime<F, Fut, T>(connect: F) -> Result<T, StorageError>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let runtime = storage_runtime()?;
+    tracing::debug!(
+        target: "openhuman::storage",
+        "[storage] connecting on the storage runtime"
+    );
+    runtime
+        .spawn(async move { connect().await })
+        .await
+        .map_err(|error| {
+            StorageError::backend(format!("connecting on the storage runtime failed: {error}"))
+        })
 }
 
 /// Makes `backend` the process's storage backend; returns the previous one.
 pub fn install(backend: Arc<dyn StorageBackend>) -> Option<Arc<dyn StorageBackend>> {
+    #[cfg(test)]
+    set_slot_owner(std::thread::current().name().map(str::to_owned));
     set_installed_url(None);
     let previous = BACKEND.install(backend);
     // What was recorded described the previous backend.
@@ -212,6 +424,10 @@ pub fn install_for_url(
 
 /// The installed backend, when the host configured one.
 pub fn installed() -> Option<Arc<dyn StorageBackend>> {
+    #[cfg(test)]
+    if !slot_visible_here() {
+        return None;
+    }
     BACKEND.installed()
 }
 
@@ -219,7 +435,11 @@ pub fn installed() -> Option<Arc<dyn StorageBackend>> {
 pub fn clear() -> bool {
     set_installed_url(None);
     agents::reset_recorded();
-    BACKEND.clear()
+    let cleared = BACKEND.clear();
+    // Only after the backend is gone, so other tests never see it in between.
+    #[cfg(test)]
+    set_slot_owner(None);
+    cleared
 }
 
 /// The storage scope of the current call: the tenant's profile
@@ -268,10 +488,12 @@ pub fn scope_from(
 ///
 /// When the scope cannot be resolved ([`current_scope`]) or the backend
 /// refuses it.
-pub fn current_scoped() -> Result<Option<ScopedStorage>, StorageError> {
-    installed()
-        .map(|backend| backend.for_scope(&current_scope()?))
-        .transpose()
+pub fn current_scoped() -> Result<Option<Storage>, StorageError> {
+    let Some(backend) = installed() else {
+        return Ok(None);
+    };
+    let scope = current_scope()?;
+    backend.for_scope(&scope.to_storage_scope()).map(Some)
 }
 
 /// Runs `future` to completion from synchronous code, on one dedicated
@@ -279,7 +501,10 @@ pub fn current_scoped() -> Result<Option<ScopedStorage>, StorageError> {
 ///
 /// For domain stores whose API is synchronous (most of the core's), so they
 /// can call the async storage ports without `block_in_place` — which would
-/// panic on a current-thread runtime.
+/// panic on a current-thread runtime. The backend [`open`] returns runs on the
+/// storage runtime, so `future` depends only on that thread and the storage
+/// runtime, never on the caller's: however many callers are parked here, the
+/// host runtime cannot be left without the threads the backend needs.
 ///
 /// # Errors
 ///
@@ -294,7 +519,7 @@ where
         .get_or_init(|| Blocking::new().map_err(|error| error.to_string()))
         .as_ref()
         .map_err(|error| StorageError::backend(error.clone()))?;
-    bridge.run(future)?
+    bridge.run(future)
 }
 
 /// [`block_on`] for a future whose error is an `anyhow::Error` — the stores
@@ -322,12 +547,29 @@ pub fn driver_is_shared(driver: &str) -> bool {
     driver == "mongodb"
 }
 
-/// Whether a backend with this driver name makes a compare-and-swap
+/// Whether an opened backend makes a compare-and-swap
 /// (`Precondition::Version` / `Absent`) atomic across processes, which a
-/// [`lease::DocumentLeases`] needs to exclude other nodes. MongoDB and SQLite
-/// do (a database-side conditional write; SQLite's immediate transaction
-/// under the file lock); the memory driver lives in one process, and the
-/// file driver checks versions in-process only.
+/// [`lease::DocumentLeases`] needs to exclude other nodes. The driver says so
+/// itself with [`tinystoragedrivers::Capability::SharedAcrossProcesses`], and
+/// tinystoragedrivers' `conformance::run_shared` proves the claim per driver.
+pub fn backend_has_cross_process_cas(backend: &dyn StorageBackend) -> bool {
+    backend
+        .for_scope(&Scope::cluster())
+        .ok()
+        .is_some_and(|storage| {
+            storage
+                .documents()
+                .capabilities()
+                .contains(tinystoragedrivers::Capability::CrossProcessCas)
+        })
+}
+
+/// The same answer from a driver name alone, for the boot guard, which judges
+/// a configured URL before anything is opened (so it has no backend to ask).
+/// It must agree with [`backend_has_cross_process_cas`]: MongoDB and SQLite
+/// claim `SharedAcrossProcesses`; the memory driver lives in one process and
+/// the file driver checks versions in-process only. A test opens a real
+/// backend per driver and pins the two together.
 pub fn driver_has_cross_process_cas(driver: &str) -> bool {
     matches!(driver, "mongodb" | "sqlite")
 }
@@ -335,7 +577,10 @@ pub fn driver_has_cross_process_cas(driver: &str) -> bool {
 /// Whether the installed backend may be shared with other processes; `false`
 /// when none is installed. See [`driver_is_shared`].
 pub fn installed_is_shared() -> bool {
-    installed().is_some_and(|backend| driver_is_shared(backend.driver()))
+    installed_url()
+        .as_deref()
+        .and_then(|url| StorageUrl::parse(url).ok())
+        .is_some_and(|config| driver_is_shared(config.driver()))
 }
 
 /// A stable key for a legacy import source (a workspace directory), for the

@@ -5,8 +5,9 @@
 //! recovery and retry budgets belong to the channel module.
 
 use openhuman_embed::__host::channel_callback::ChannelCallbackCtx;
-use openhuman_embed::__host::security::credentials::session_support::{
-    get_session_token, is_local_session_token, BackendCredential,
+use openhuman_embed::__host::credentials::backend_credential::BackendCredential;
+use openhuman_embed::__host::credentials::session_state::{
+    get_session_token, is_local_session_token,
 };
 use serde_json::json;
 use tinychannels_bus::module_progressive::{
@@ -31,15 +32,15 @@ fn request_channel(request: &ProgressiveTransportRequest) -> &str {
         ProgressiveTransportRequest::Send { channel, .. }
         | ProgressiveTransportRequest::Edit { channel, .. }
         | ProgressiveTransportRequest::Delete { channel, .. }
-        | ProgressiveTransportRequest::Typing { channel } => channel,
+        | ProgressiveTransportRequest::Typing { channel, .. } => channel,
     }
 }
 
 /// The hosted session credential, never the offline local token.
-fn hosted_credential(
+async fn hosted_credential(
     config: &openhuman_embed::__host::config::Config,
 ) -> Option<BackendCredential> {
-    match get_session_token(config) {
+    match get_session_token(config).await {
         Ok(Some(token)) if !is_local_session_token(&token) => {
             Some(BackendCredential::Session(token))
         }
@@ -62,7 +63,7 @@ pub(super) async fn execute(
             return ProgressiveTransportResult::Failed;
         }
     }
-    let Some(credential) = hosted_credential(&ctx.config) else {
+    let Some(credential) = hosted_credential(&ctx.config).await else {
         log::debug!("[tinyhumans][channels] hosted channel credential unavailable");
         return ProgressiveTransportResult::Unavailable;
     };
@@ -110,12 +111,12 @@ async fn send(
             message_id,
         } => {
             client
-                .send_channel_delete(&channel, &message_id, credential.clone())
+                .send_channel_delete(&channel, &message_id, credential.clone(), None)
                 .await
         }
         ProgressiveTransportRequest::Typing { channel } => {
             client
-                .send_channel_typing(&channel, credential.clone())
+                .send_channel_typing(&channel, credential.clone(), json!({}))
                 .await
         }
     };

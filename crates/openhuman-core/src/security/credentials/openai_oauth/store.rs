@@ -197,17 +197,40 @@ fn auth_profiles_store(config: &Config) -> AuthProfilesStore {
 
 fn try_refresh_oauth_token(refresh: &str) -> Result<OAuthTokenSet, String> {
     let cfg = openai_codex_config("http://127.0.0.1:1455/auth/callback");
+    #[cfg(test)]
+    let cfg = if let Some(token_url) = local_refresh_url_override() {
+        let mut cfg = cfg;
+        cfg.token_url = token_url;
+        cfg
+    } else {
+        cfg
+    };
     let refresh = refresh.to_string();
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         // `block_in_place` lets the multi-thread runtime move other tasks off this
         // worker before we synchronously drive the refresh future, avoiding a
         // deadlock when this lookup is reached from inside an async caller.
-        return tokio::task::block_in_place(|| {
-            handle.block_on(refresh_access_token(&cfg, &refresh))
-        })
-        .map_err(|e| e.to_string());
+        let refreshed =
+            tokio::task::block_in_place(|| handle.block_on(refresh_access_token(&cfg, &refresh)))
+                .map_err(|e| e.to_string())?;
+        if refreshed.access_token.trim().is_empty() {
+            return Err("OAuth refresh response contained an empty access token".to_owned());
+        }
+        return Ok(refreshed);
     }
     Err("tokio runtime required to refresh openai oauth token".to_string())
+}
+
+/// Local-only endpoint override for OAuth refresh tests. Production builds do
+/// not read this variable, and tests cannot redirect refresh credentials away
+/// from loopback.
+#[cfg(test)]
+fn local_refresh_url_override() -> Option<String> {
+    let endpoint = std::env::var("OPENAI_CODEX_OAUTH_TOKEN_URL").ok()?;
+    let parsed = reqwest::Url::parse(&endpoint).ok()?;
+    let host = parsed.host_str()?;
+    (parsed.scheme() == "http" && matches!(host, "localhost" | "127.0.0.1" | "::1"))
+        .then(|| endpoint.clone())
 }
 
 /// Look up the OpenAI bearer token sourced from the OAuth (ChatGPT

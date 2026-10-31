@@ -78,7 +78,7 @@ pub use openhuman_core::profiles::cron::SweepReport as CronSweepReport;
 pub use openhuman_core::profiles::{OpenError, ProfileId, ProfileIdMode, ProfileSummary};
 pub use openhuman_core::storage::lease::LeaseRecord;
 pub use openhuman_core::threads::{ConversationMessageRecord, ConversationThreadSummary};
-pub use openhuman_core::web_chat::WebChannelEvent;
+pub use openhuman_core::web_chat::{ScopedWebEvent, WebChannelEvent};
 
 /// The kind of backend credential a profile holds (see
 /// [`ProfileRuntime::set_credential`]).
@@ -167,8 +167,9 @@ impl ProfileRuntimeBuilder {
     /// provisioned profile once a minute for due agent jobs
     /// ([`ProfileRuntime::sweep_cron`]) and hands each reply to
     /// [`CronDelivery::deliver`] with the profile, the thread the job was
-    /// created in and its [`JobOrigin`]. A run that answers `NO_REPLY`, or
-    /// fails, is never delivered. Without one nothing is swept.
+    /// created in and its [`JobOrigin`]. A failed run is never delivered, nor
+    /// is `NO_REPLY` from a job whose prompt allows it; any other job always
+    /// delivers a message. Without one nothing is swept.
     #[must_use]
     pub fn cron_delivery(mut self, delivery: Arc<dyn CronDelivery>) -> Self {
         self.cron_delivery = Some(delivery);

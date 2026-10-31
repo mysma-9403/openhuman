@@ -7,8 +7,8 @@
 //!
 //! * managed inference (`{api_url}` + the inference path) sends it as
 //!   `Authorization: Bearer <key>` — the OpenAI-compatible endpoint takes a
-//!   bearer, and `OpenHumanBackendModel::resolve_bearer` prefers this profile
-//!   over the app session;
+//!   bearer, and the managed-inference host resolver prefers this profile over
+//!   the app session;
 //! * SDK REST clients send it as `x-api-key` — `BackendClient` and
 //!   `IntegrationClient` pick the header from [`BackendCredential`];
 //! * bearer-only callers (cloud STT and embeddings, the connector proxy
@@ -79,8 +79,19 @@ pub fn get_api_key(config: &Config) -> Result<Option<String>> {
     )
 }
 
+/// Reads the selected profile's API key for doctor checks without using the
+/// ordinary mutable auth-profile store.
+pub fn get_api_key_read_only(
+    config: &Config,
+) -> Result<Option<String>, super::profiles::ReadOnlyAuthProfileError> {
+    let Some(profile) = AuthService::get_profile_read_only(config, API_KEY_PROVIDER, None)? else {
+        return Ok(None);
+    };
+    Ok(api_key_from_profile(profile))
+}
+
 /// [`get_api_key`] against an explicit credential state directory — for
-/// callers that hold `ProviderRuntimeOptions` rather than a `Config`.
+/// callers that resolve credentials for the configured runtime.
 ///
 /// Requires the [`API_KEY_KIND_META`] marker, not just a profile named
 /// [`API_KEY_PROVIDER`]. The generic `auth_store_provider_credentials`
@@ -93,19 +104,23 @@ pub fn get_api_key_in(state_dir: &Path, encrypt: bool) -> Result<Option<String>>
     let Some(profile) = service.get_profile(API_KEY_PROVIDER, None)? else {
         return Ok(None);
     };
+    Ok(api_key_from_profile(profile))
+}
+
+fn api_key_from_profile(profile: AuthProfile) -> Option<String> {
     if profile.metadata.get(API_KEY_KIND_META).map(String::as_str) != Some(API_KEY_KIND) {
         log::debug!(
             "[credentials][api-key] provider profile {:?} exists but lacks the {API_KEY_KIND_META}={API_KEY_KIND} \
              marker — treating as absent, not a TinyHumans api key",
             API_KEY_PROVIDER
         );
-        return Ok(None);
+        return None;
     }
     let credential = match profile.kind {
         super::profiles::AuthProfileKind::Token => profile.token,
         super::profiles::AuthProfileKind::OAuth => profile.token_set.map(|t| t.access_token),
     };
-    Ok(credential.filter(|t| !t.trim().is_empty()))
+    credential.filter(|t| !t.trim().is_empty())
 }
 
 /// Whether an API key is stored. Errors reading the store count as "no key"

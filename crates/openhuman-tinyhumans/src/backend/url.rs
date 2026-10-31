@@ -65,6 +65,41 @@ pub const DEFAULT_STAGING_API_BASE_URL: &str = "https://staging-api.tinyhumans.a
 /// across call-sites) means a backend path rename shows up as a single diff.
 pub const OPENHUMAN_INFERENCE_PATH: &str = "/openai/v1/chat/completions";
 
+/// Convert a control-plane HTTP(S) base to the Socket.IO WebSocket handshake URL.
+pub fn websocket_url(http_or_https_base: &str) -> String {
+    let Ok(mut url) = url::Url::parse(http_or_https_base) else {
+        return http_or_https_base.to_string();
+    };
+    let scheme = match url.scheme() {
+        "https" => "wss".to_owned(),
+        "http" => "ws".to_owned(),
+        other => other.to_owned(),
+    };
+    let _ = url.set_scheme(&scheme);
+    url.set_path(&format!("{}/socket.io/", url.path().trim_end_matches('/')));
+    url.set_query(Some("EIO=4&transport=websocket"));
+    url.to_string()
+}
+
+/// Socket.IO credentials are restricted to TLS endpoints and loopback HTTP.
+pub fn is_safe_socket_endpoint(endpoint: &str) -> bool {
+    let Ok(mut url) = url::Url::parse(endpoint) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    let scheme = match url.scheme() {
+        "wss" => "https",
+        "ws" => "http",
+        _ => return false,
+    };
+    if url.set_scheme(scheme).is_err() {
+        return false;
+    }
+    crate::client::endpoint::is_safe_endpoint_for_managed_bearer(url.as_str())
+}
+
 // ─── Known local-AI ports ────────────────────────────────────────────────────
 
 /// Well-known ports used by local model runners.
@@ -162,10 +197,10 @@ pub fn effective_backend_api_url(api_url: &Option<String>) -> String {
         // billing) would 400/404 against the inference host — TAURI-RUST-HW1
         // (4932 `GET /teams/me/usage` 400s from `openrouter.ai`). Cloud analogue
         // of the local-AI guard (OPENHUMAN-TAURI-51/-80/-7Z, Ollama).
-        let is_cloud_inference = openhuman_embed::__host::config::schema::cloud_providers::endpoint_host(u)
-            .is_some_and(|h| {
-                openhuman_embed::__host::config::schema::cloud_providers::host_is_builtin_cloud_provider(&h)
-            });
+        let presets = crate::hosted_config::provider_presets();
+        let is_cloud_inference = presets
+            .endpoint_host(u)
+            .is_some_and(|host| presets.host_is_builtin_cloud_provider(&host));
 
         tracing::debug!(
             api_url = %redact_url_for_log(u),

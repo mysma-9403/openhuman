@@ -10,7 +10,7 @@ The adapter seam between OpenHuman and the vendored [`tinyagents`](../../../../.
 - Route workloads to model tiers and record the resolved provider/model for audit ([`routes.rs`](./routes.rs), canonical TinyInference response metadata).
 - Let TinyAgents stop repetitive visible model streams in its agent loop; the OpenHuman session driver turns `GenerationStalled` into a bounded partial containing completed tool evidence.
 - Make turns durable and replayable: a JSONL event journal plus status store ([`journal.rs`](./journal.rs)), a startup sweep for orphaned runs ([`reaper.rs`](./reaper.rs)), and a read-only RPC surface over both (`replay/`).
-- Provide graph-layer helpers for multi-stage sub-agent orchestration (`orchestration.rs`, `delegation.rs`) (graph structure export lives in `tinyagents_orchestration::topology`).
+- Adapt TinyAgents' generic async sub-agent lifecycle to OpenHuman's actor context, execution policy, and product projections.
 - Pick which tools a turn even considers: `discovery/` holds the process-wide tool-search ranker slot (see [Tool search](#tool-search) below).
 - Host adapters (`host/`) for the crate's ten host-capability traits. Not yet wired into the live turn path; see [Host adapters](#host-adapters) below.
 
@@ -36,17 +36,15 @@ The adapter seam between OpenHuman and the vendored [`tinyagents`](../../../../.
 | [`middleware/research_budget.rs`](./middleware/research_budget.rs) | Withdraws the web tools from a top-level turn after eight successful search or fetch calls (forcing an answer only when no other tool remains), and notes once when consecutive web calls fail. |
 | `model.rs` | Helpers and wrappers over native crate `ChatModel` values: message/response translation, usage merging, stream-delta forwarding, `MaxTokensModel`, `ProfileOverrideModel`. |
 | [`tools.rs`](./tools.rs) | `CanonicalSharedToolAdapter`: resolves an OpenHuman shared tool registry and forwards the canonical `tinytools::Tool` contract; `EarlyExitHook` pauses successful `ask_user_clarification`-style calls. |
-| `routes.rs` | the workload router projected from the upstream `WORKLOAD_ROUTES` table, `RequiredCapabilitiesMiddleware`, `FallbackObserverMiddleware`, `UsageCarryMiddleware`, and the per-model fallback policy. |
 | [`observability.rs`](./observability.rs) + `observability/` | `event_bridge.rs`: `OpenhumanEventBridge`, translating crate `AgentEvent`s into `AgentProgress` and feeding per-call usage into `crate::platform::cost`. `event_projection.rs`: its `EventListener` impl. `bridge_types.rs`: `SubagentScope` and the shared bridge carries (the cap pauser itself is `tinyagents_harness::events::CapPauser`). |
-| [`host/steering.rs`](./host/steering.rs) | OpenHuman's steering allowlist and the shared `SteeringRegistry` for detached sub-agents. Task primitives are imported directly from `tinyagents_graph::orchestration`. |
-| [`host/delegation.rs`](./host/delegation.rs) | Explicit tracing-bound execution helpers over `tinyagents_graph::delegation`'s plan, execute, review, finalize graph. |
+| [`host/steering.rs`](./host/steering.rs) | OpenHuman's steering allowlist and the shared `SteeringRegistry` for detached sub-agents. Task primitives come from `tinyagents_orchestration`. |
 | [`payload_summarizer.rs`](./payload_summarizer.rs) | `PayloadSummarizer` trait, `SummarizeOutcome`/`UnavailableReason`, and the default `SubagentPayloadSummarizer` that compresses oversized tool results through the `summarizer` sub-agent instead of hard-truncating them. |
 | [`policy_denial.rs`](./policy_denial.rs) | `maybe_enrich_policy_block`: rewrites `[policy-blocked]` tool results into structured what/why/workaround messages that tell the model to relay the denial rather than fabricate output. Called from `ToolOutcomeCaptureMiddleware`. |
 | [`host/run_context.rs`](./host/run_context.rs) + typed tool dispatch | `OpenHumanRunContext` owns one root `CancellationToken`; child contexts share it and recursive tools receive it from their typed parent `RunContext`. |
 | [`steering_forwarder.rs`](./steering_forwarder.rs) | Host adapter over `tinyagents_harness::run_queue::SteeringForwarderGuard` (forwards `RunQueue` steer/collect messages into the harness `SteeringHandle`; abort-on-drop so drop-based cancellation always deregisters it, issue #4456): `QueuedMessage for QueuedTurn`, the `RunQueue*` domain-event sink and the steering-registry cleanup hook. |
 | `summarize.rs` | `ModelSummarizer` / `FaultTolerantCachingSummarizer` plus a context-window-aware `SummarizationPolicy` driving the crate's `ContextCompressionMiddleware`. |
 | [`embeddings.rs`](./embeddings.rs) | `ProviderEmbeddingModel`: cost-recording binding over the host-built `tinyinference_embeddings::EmbeddingModel`. |
-| [`todos.rs`](./todos.rs) | `todos_store` / `scratch_todos_store` (the crate `Store` behind per-thread agent todos, `tinyagents_graph::todos`). |
+| [`todos.rs`](./todos.rs) | `todos_store` / `scratch_todos_store` (the crate `Store` behind per-thread agent todos, `tinyagents_harness_tools::todos`). |
 | [`config.rs`](./config.rs) | Maps OpenHuman's `Config` (including model pins) onto `tinyagents_harness::config` structs. |
 | `*_tests.rs` | Sibling test suites for each file/part group above. |
 
@@ -72,7 +70,7 @@ Most of the module is `pub(crate)` or private. The `pub` items, per `mod.rs`:
 
 - `config::*`: the host half of the generic-harness config seam.
 - `payload_summarizer::*`: `pub` since issue #6014 so an embedder can pass its own `Arc<dyn PayloadSummarizer>` to `AgentBuilder::payload_summarizer` (the default dispatches a sub-agent, which some embedders cannot do).
-- `routes::ResolvedRouteMiddleware`: records canonical response metadata in the explicit run context; `TinyagentsTurnOutcome` carries it to the bus.
+- Native workload middleware: `turn_middleware.rs` installs the upstream `ResolvedRouteMiddleware` with OpenHuman's cost estimator, pricing lookup, and explicit route sink. `turn_plan.rs` and `turn_exec.rs` read fallback and capability policy directly from `WorkloadRouter`.
 - `host::*` (the `OpenHuman*` adapter structs) and `TurnModelSource`.
 
 Within the crate the entry point is `TurnSpec::run` (`pub(crate)`); `run_turn_via_tinyagents` is `#[cfg(test)]` only.
@@ -91,7 +89,7 @@ Responses project the crate's own `AgentObservation` and `HarnessRunStatus` serd
 
 ## Dependencies
 
-- The vendored crates under [`vendor/tinyagents/`](../../../../../vendor/tinyagents/): `tinyagents-harness`, `tinyagents-graph`, `tinyagents-registry`, plus `tinyinference` and `tinytools` from [`vendor/tinyagents/vendor/`](../../../../../vendor/tinyagents/vendor/), all declared as path dependencies in [`crates/openhuman-core/Cargo.toml`](../../../Cargo.toml). Per AGENTS.md, use this vendored copy; a second path to the same crates creates incompatible Rust types.
+- The vendored crates under [`vendor/tinyagents/`](../../../../../vendor/tinyagents/): `tinyagents-harness`, `tinyagents-orchestration`, `tinyagents-registry`, plus `tinyinference` and `tinytools` from [`vendor/tinyagents/vendor/`](../../../../../vendor/tinyagents/vendor/), all declared as path dependencies in [`crates/openhuman-core/Cargo.toml`](../../../Cargo.toml). Per AGENTS.md, use this vendored copy; a second path to the same crates creates incompatible Rust types.
 - `crate::agent::message_convert` for `TranscriptMessage` to/from crate `Message` conversion.
 - `crate::agent::harness::{run_queue, tool_result_artifacts}` and `crate::agent::{messages, progress, stop_hooks, cost, hooks, subagent_host}`: the OpenHuman-side turn plumbing this seam plugs into.
 - `crate::tools`: the canonical `tinytools::Tool` trait resolved by `CanonicalSharedToolAdapter`, and `tools::registry::denials` for recording policy blocks.
@@ -101,7 +99,7 @@ Responses project the crate's own `AgentObservation` and `HarnessRunStatus` serd
 ## Used by
 
 - [`agent/session_host/runtime_session/`](../session_host/runtime_session/): the chat-turn route into `TurnSpec::run`.
-- [`agent/harness/graph.rs`](../harness/graph.rs): the channel/CLI bus turn route.
+- [`channels/runtime/turn_driver.rs`](../../channels/runtime/turn_driver.rs): the channel/CLI bus turn route.
 - [`agent/subagent_host/`](../subagent_host/): the sub-agent spawn route. It and the session route both build their context-window summarizer through `TurnModelSource::build_summarizer`.
 - [`agent/session_host/builder/setters.rs`](../session_host/builder/setters.rs), `agent/subagent_host/ops/{provider,runner}.rs`, `channels/`: construct `TurnModelSource`.
 - [`agent/bus.rs`](../bus.rs): reads `TinyagentsTurnOutcome::resolved_route` after a turn.

@@ -36,6 +36,7 @@ fn bare() -> crate::agent::SessionHostBuilder {
         Arc::new(tinyagents_harness::testkit::ScriptedModel::new(Vec::new()));
     crate::agent::SessionHostBuilder::new()
         .chat_model(model)
+        .model_name("test/session-fixture".to_string())
         .tools(Vec::new())
         .tool_dispatcher(Box::new(tinytools_agent::dialect::XmlDialect))
 }
@@ -181,8 +182,8 @@ async fn the_session_is_stamped_with_the_definitions_own_id() {
     );
 }
 
-#[test]
-fn a_name_the_definition_contradicts_fails_the_build() {
+#[tokio::test]
+async fn a_name_the_definition_contradicts_fails_the_build() {
     // Silently preferring either one would leave a session that resolves to
     // nothing, and every turn refused for want of a definition.
     // `OpenHumanSessionHost` is not `Debug`, so the `Ok` arm cannot be

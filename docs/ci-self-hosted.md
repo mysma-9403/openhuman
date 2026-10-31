@@ -30,7 +30,6 @@ provisioning, deploys and the runner token.
 | `rust-cov`        | test modules from the registry, then `scripts/ci/rust-coverage.sh`                                                                                                                                                                                                        |
 | `rust-lint`       | clippy (product set; embed's clippy covers the core's contributor set), embed and tinyhumans lint, embed gates-off check                                                                                                                                                  |
 | `rust-gates-off`  | gates-off checks and gate-contract tests, kernel floor, dep-sim calibration                                                                                                                                                                                               |
-| `storage-drivers` | the `storage_*_e2e` targets and `cli_storage_url_e2e` once per driver (memory, sqlite, file), plus the lib tests of the stores on the storage ports, with `storage-sqlite,storage-file`; armed by the `storage` area. MongoDB runs nightly and on demand in its own workflow, `storage-mongodb.yml`, not on pull requests |
 | `tauri`           | Tauri clippy and coverage, plus a private uninstrumented application build                                                                                                                                                                                                |
 | `pester`          | `install.ps1` tests                                                                                                                                                                                                                                                       |
 
@@ -141,10 +140,36 @@ for any commit without posting it.
     All private instrumented checks use `LLVM_PROFILE_FILE_NAME=openhuman-%8m.profraw`:
     LLVM's locked merge pool bounds raw profiles to eight files per binary,
     including the auxiliary gates, Tauri, and storage configurations.
-  - After all offline examples succeed, Cargo removes their completed
-    release-profile outputs from `target/ci-private-build`. The Linux fleet
-    example is the only release invocation in this plan. Debug/coverage outputs
-    and Tinymold's store remain available for later checks and cache saving.
+  - Redundant compilations are avoided on purpose; keep them out when editing:
+    - `rust-coverage.sh` (nextest runner) builds the product-feature packages
+      (`openhuman`, `-embed`, `-tinyhumans`, `-cli`) with one Cargo argument set
+      and varies only the nextest filter per suite. Cargo hashes units by
+      resolved features and those packages resolve the core differently when
+      selected separately, so separate `-p` runs would each compile the core
+      again. The `rpc`, `tui` and default-feature suites keep their own
+      resolutions on purpose.
+    - Auxiliary coverage suites (gates-off, Tauri) pass `--no-report`; each
+      `cargo llvm-cov report` re-merges every profile in the shared coverage
+      target, so each lane ends with one report check (`gates-off-coverage-report`,
+      `tauri-coverage-report`) that still runs after a failed suite.
+    - `storage-schema` builds its dump example in `target/ci-private-build`
+      with the plain build's environment and the core product features
+      (`STORAGE_SCHEMA_FEATURES=core-product`), shared with the uninstrumented
+      Composio regression's `openhuman-cli` build. The schema only depends on
+      gates present in both sets.
+    - Offline examples run with `--profile dev`, so the release-declared Linux
+      fleet measurement shares the dev build instead of a thin-LTO one. Run the
+      script without `--profile` to get the declared release measurement.
+  - The scratch disk is the scarce resource. It is 320 GB (24 GB RAM, 4 vCPU
+    per VM) since 2026-10-20; at 160 GB, EX63 run 39292268284 ran it to 16 MB
+    free in `rust-lint`. Instrumented test binaries dominate it: each
+    one links the whole core, so the nextest coverage suites build `--tests`
+    rather than `--all-targets` (examples run nothing under nextest and each is
+    as large as a test binary). Raw profiles are not the cause: the `%8m` pool
+    above bounds them. Every lane's log ends with `df -h` of the scratch dir and
+    `du -sh` of `target/*` and the top of the scratch dir
+    (`diskUsageReport` in `lanes.mjs`, ex63 only); read those before changing
+    anything else.
   - Cargo registry, pnpm store, and content-based frontend caches remain on the
     slot cache disk. Rust output caching uses Tinymold alone.
   - VM sizing is a supervisor setting; it is not assumed by the lane scheduler.
@@ -152,8 +177,8 @@ for any commit without posting it.
     (4096 MiB of old-space heap); hosted keeps its default Node budget.
     Vitest currently uses 8 workers.
 - **`hosted`**: lanes grouped into jobs sized for 4-core, ~14 GB runners:
-  `checks`, `rust-lint` (lint and gates-off in turn), `rust-cov`, `tauri`,
-  `storage` (the `storage-drivers` lane) and `pester`. Groups whose areas are untouched don't start.
+  `checks`, `rust-lint` (lint and gates-off in turn), `rust-cov`, `tauri`
+  and `pester`. Groups whose areas are untouched don't start.
 
 ## Why the EX63 cannot run outsider code
 
@@ -198,8 +223,7 @@ CI_AREA_DOCS=true node scripts/ci/self-hosted/lanes.mjs --profile hosted --lanes
 Publish and smoke-test the image first. Roll the pinned rootfs into idle slots
 without interrupting active jobs, then change `guest-image.txt`. Check the metadata
 inside a new guest rather than trusting only the supervisor configuration. The
-current image ships Rust 1.99.1 (the host's `RUST_TOOLCHAINS` also installs the
-pinned 1.96.1), bubblewrap 0.13.1, mold 2.40.4, Tinymold 0.3.0 and nextest 0.9.148.
+current image ships Rust 1.99.1 (the pinned toolchain), mold 2.40.4, bubblewrap 0.13.1, Tinymold 0.3.0 and nextest 0.9.148.
 
 Private workflow routing runs from the trusted base branch. A PR run can therefore
 exercise the previous workflow; green pre-merge CI alone does not prove a workflow

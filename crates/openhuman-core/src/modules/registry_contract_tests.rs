@@ -75,11 +75,11 @@ fn contract_names() -> Vec<(&'static str, &'static str, &'static str)> {
         tinyhosts_bus::BUS_NAME,
         tinyhosts_bus::OBJECT_PATH,
     ));
-    #[cfg(feature = "tinymemes")]
+    #[cfg(feature = "inbound-queues")]
     names.push((
-        "tinymemes",
-        tinymemes_bus::STATE_INTERFACE,
-        tinymemes_bus::STATE_PATH,
+        "tinyeventqueues",
+        tinyeventqueues_bus::INTERFACE,
+        tinyeventqueues_bus::OBJECT_PATH,
     ));
     names
 }
@@ -115,7 +115,7 @@ fn a_drifted_contract_constant_is_reported_as_a_mismatch() {
     feature = "web3",
     feature = "voice",
     feature = "hosting",
-    feature = "tinymemes"
+    feature = "inbound-queues"
 ))]
 #[test]
 fn a_product_feature_build_carries_all_thirteen_records() {
@@ -133,7 +133,7 @@ fn a_product_feature_build_carries_all_thirteen_records() {
         "tinychannels",
         "tinyflows",
         "tinyhosts",
-        "tinymemes",
+        "tinyeventqueues",
     ] {
         assert!(find(id).is_some(), "{id} missing from the registry");
     }
@@ -142,6 +142,12 @@ fn a_product_feature_build_carries_all_thirteen_records() {
 #[test]
 fn every_record_maps_to_a_real_component() {
     for record in ALL {
+        // TinySecurity has no product component yet; the global module switch
+        // is its only host gate until its callers move behind the bus.
+        if record.id == "tinysecurity" {
+            assert_eq!(component_for(record.id), None);
+            continue;
+        }
         let component = component_for(record.id)
             .unwrap_or_else(|| panic!("module '{}' has no component mapping", record.id));
         assert!(
@@ -155,7 +161,7 @@ fn every_record_maps_to_a_real_component() {
                 || !cfg!(feature = "modules")
                 || matches!(
                     *id,
-                    "tinydocs" | "tinywallet" | "tinyvoice" | "tinyhosts" | "tinymemes"
+                    "tinydocs" | "tinywallet" | "tinyvoice" | "tinyhosts" | "tinyeventqueues"
                 ),
             "mapping for unknown module '{id}'"
         );
@@ -174,23 +180,64 @@ fn the_flows_record_serves_the_schedule_object() {
     assert_ne!(record.object_path, schedule::OBJECT_PATH);
     assert_ne!(schedule::INTERFACE, schedule::CALLBACK_INTERFACE);
     assert_ne!(schedule::INTERFACE, schedule::DOCUMENT_INTERFACE);
-    assert_eq!(schedule::CONTRACT_VERSION, 4, "the host speaks contract v4");
+    assert_eq!(schedule::CONTRACT_VERSION, 8, "the host speaks contract v8");
     assert_eq!(component_for("tinyflows"), Some("tinyflows"));
 }
 
-/// The pins are the published v0.8.23 `checksum.toml` (the first release with
-/// schedule contract v3).
+/// The pins are copied from the published v0.9.4 `checksum.toml`.
 #[test]
 fn the_flows_record_pins_every_host_of_one_release() {
     let record = find("tinyflows").unwrap();
-    assert_eq!(record.version, "0.8.23");
+    assert_eq!(record.version, "0.9.4");
     assert_eq!(record.assets.len(), 11);
-    for asset in record.assets {
-        assert!(
-            asset.archive.starts_with("tinyflows-module-0.8.23-"),
-            "{}",
-            asset.archive
-        );
-        assert_eq!(asset.sha256.len(), 64, "{}", asset.archive);
+    let expected = [
+        (
+            "tinyflows-module-0.9.4-macos-26-arm64.tar.gz",
+            "6cd6e4cc9c22504c2c14944d936d04316ca3301bc7c193baca8834161589f476",
+        ),
+        (
+            "tinyflows-module-0.9.4-macos-26-x86_64.tar.gz",
+            "b22cbcac0c23b407a0d33959e0ed6f7605f04bf2a5703ce883f488d780be4c9a",
+        ),
+        (
+            "tinyflows-module-0.9.4-macos-15-arm64.tar.gz",
+            "39cabbe3da34773039ce8423a724f684f3d06c50dc08edd575ef5b3811664159",
+        ),
+        (
+            "tinyflows-module-0.9.4-macos-15-x86_64.tar.gz",
+            "8a937a24f37afcb0cb3042dfe640caccbbbb3766f45b9c06f1d34d9c235a5346",
+        ),
+        (
+            "tinyflows-module-0.9.4-ubuntu-24.04-x86_64.tar.gz",
+            "43a831d16cf0406c6148deda1023f9d3467483b275a65e30b282e8362ebbe01f",
+        ),
+        (
+            "tinyflows-module-0.9.4-ubuntu-24.04-arm64.tar.gz",
+            "7105663eb05118f5fd7d008bc56ec35e24463e36f5762ee7871018cb3219aca6",
+        ),
+        (
+            "tinyflows-module-0.9.4-ubuntu-22.04-x86_64.tar.gz",
+            "da04b73a434b5a11b97bc98518d81f27e96c8115431c2b3bbe75a7e67aae5055",
+        ),
+        (
+            "tinyflows-module-0.9.4-ubuntu-22.04-arm64.tar.gz",
+            "eba07906b8ae276c8fee8c303e14a40e4a77797d89ffcc6c5046d63a3fda8ef2",
+        ),
+        (
+            "tinyflows-module-0.9.4-windows-2025-x86_64.zip",
+            "d2c0c1657c68e9dd89964bbc1a815afee3fa83e72fcdc342e5334814c2d45a3f",
+        ),
+        (
+            "tinyflows-module-0.9.4-windows-2022-x86_64.zip",
+            "53adbe5dab7ee8fa683026624a777b466d922212bd3118311e0a7d99b027d595",
+        ),
+        (
+            "tinyflows-module-0.9.4-windows-11-arm64.zip",
+            "087ddd9bda9b405620712fd56dcfc0289ebb1c9f96ef068ba838a3f96848282e",
+        ),
+    ];
+    for (asset, (archive, sha256)) in record.assets.iter().zip(expected) {
+        assert_eq!(asset.archive, archive);
+        assert_eq!(asset.sha256, sha256, "{}", asset.archive);
     }
 }

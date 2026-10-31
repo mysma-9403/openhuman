@@ -11,7 +11,7 @@
 # ==========================================================================
 # Keep in step with rust-toolchain.toml; an older image makes rustup download the
 # pinned toolchain on every uncached build.
-FROM rust:1.96.1-bookworm AS builder
+FROM rust:1.99.1-bookworm AS builder
 
 # Docker builds often run on small VPS/CI builders. The crate's `ci` profile
 # keeps peak rustc memory lower than `release`; override with

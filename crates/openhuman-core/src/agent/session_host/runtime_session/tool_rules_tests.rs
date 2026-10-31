@@ -1,6 +1,6 @@
 use super::*;
 
-fn config_with_rules(tmp: &tempfile::TempDir) -> crate::config::Config {
+async fn config_with_rules(tmp: &tempfile::TempDir) -> crate::config::Config {
     let config = crate::config::Config {
         workspace_dir: tmp.path().join("workspace"),
         action_dir: tmp.path().join("workspace"),
@@ -9,13 +9,14 @@ fn config_with_rules(tmp: &tempfile::TempDir) -> crate::config::Config {
         ..crate::config::Config::default()
     };
     std::fs::create_dir_all(&config.workspace_dir).unwrap();
+    crate::agent::session_host::test_support::install_managed_model_fixture(&config).await;
     config
 }
 
-#[test]
-fn a_session_composes_the_operator_and_definition_layers() {
+#[tokio::test]
+async fn a_session_composes_the_operator_and_definition_layers() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let config = config_with_rules(&tmp);
+    let config = config_with_rules(&tmp).await;
     let mut definition = crate::agent_registry::agents::load_builtins()
         .unwrap()
         .into_iter()
@@ -27,6 +28,7 @@ fn a_session_composes_the_operator_and_definition_layers() {
         &config,
         &definition,
     )
+    .await
     .expect("session builds");
 
     let rules = host.session_tool_rules();
@@ -62,6 +64,7 @@ async fn goal_session_prompt(rules: serde_json::Value) -> (String, Vec<String>) 
         std::sync::Arc::new(tinyagents_harness::testkit::ScriptedModel::new(Vec::new()));
     let mut host = crate::agent::SessionHostBuilder::new()
         .chat_model_with_config(model, std::sync::Arc::new(config))
+        .model_name("test/session-fixture".to_string())
         .tools(crate::agent::goals::goal_tools(action_dir.path()))
         .action_dir(action_dir.path().to_path_buf())
         .tool_dispatcher(Box::new(tinytools_agent::dialect::XmlDialect))
